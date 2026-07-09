@@ -17,17 +17,19 @@ pd-vm-compat-frontends = { git = "https://github.com/rustscript-lang/rustscript-
 ```
 
 ```rust
-use pd_vm::{compile_source_file_with_options, CompileSourceFileOptions};
+use vm::compile_source_file_with_options;
 
-let options = CompileSourceFileOptions::new()
-    .with_source_plugin(pd_vm_compat_frontends::plugin());
+let options = pd_vm_compat_frontends::compile_options();
 let compiled = compile_source_file_with_options("examples/example.js", options)?;
 ```
 
-For convenience, this crate also exposes:
+The crate also ships a CLI binary with the same entry surface as `pd-vm-run`, but with the JavaScript and Lua source plugins pre-registered:
 
-```rust
-let compiled = pd_vm_compat_frontends::compile_source_file("examples/example.lua")?;
+```bash
+cargo run --bin pd-vm-compat-run -- examples/example.js
+cargo run --bin pd-vm-compat-run -- examples/example.lua
+pd-vm-compat-run fmt --check examples/example.js
+pd-vm-compat-run --emit-vmbc out.vmbc examples/example.lua
 ```
 
 ## Supported extensions
@@ -42,4 +44,5 @@ Core RustScript (`.rss`) remains in the `pd-vm` crate.
 ```bash
 cargo test --workspace --jobs 4
 cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
 ```

@@ -6,8 +6,12 @@ edition = "2024"
 [lib]
 name = "pd_vm_compat_frontends"
 
+[[bin]]
+name = "pd-vm-compat-run"
+path = "src/bin/pd-vm-compat-run.rs"
+
 [dependencies]
-pd-vm = { path = "../rustscript", default-features = false }
+pd-vm = { path = "../rustscript" }
 
 [dev-dependencies]
 pd-vm = { path = "../rustscript" }
