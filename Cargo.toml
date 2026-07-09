@@ -1,0 +1,13 @@
+[package]
+name = "pd-vm-compat-frontends"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "pd_vm_compat_frontends"
+
+[dependencies]
+pd-vm = { path = "../rustscript", default-features = false }
+
+[dev-dependencies]
+pd-vm = { path = "../rustscript" }
