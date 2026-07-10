@@ -26,10 +26,6 @@ jobs:
         with:
           repository: rustscript-lang/rustscript
           path: rustscript
-      - uses: actions/checkout@v4
-        with:
-          repository: rustscript-lang/pd-edge
-          path: pd-edge
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -64,10 +60,6 @@ jobs:
         with:
           repository: rustscript-lang/rustscript
           path: rustscript
-      - uses: actions/checkout@v4
-        with:
-          repository: rustscript-lang/pd-edge
-          path: pd-edge
       - uses: dtolnay/rust-toolchain@stable
       - name: Build pd-vm-compat-run
         working-directory: rustscript-compat-frontends
