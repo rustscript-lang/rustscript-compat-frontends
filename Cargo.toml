@@ -5,7 +5,7 @@ edition = "2024"
 description = "JavaScript and Lua compatibility frontends for pd-vm"
 license = "MIT"
 repository = "https://github.com/rustscript-lang/rustscript-compat-frontends"
-homepage = "https://rustscript.org"
+homepage = "https://rustscript.org/"
 
 [lib]
 name = "pd_vm_compat_frontends"
