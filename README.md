@@ -44,7 +44,7 @@ Core RustScript (`.rss`) remains in the `pd-vm` crate.
 ## Development
 
 ```bash
-cargo test --workspace --jobs 4
+cargo test
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 ```
