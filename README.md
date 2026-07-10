@@ -1,5 +1,7 @@
 # pd-vm Compatibility Frontends
 
+[![pd-vm-compat-frontends on crates.io](https://img.shields.io/crates/v/pd-vm-compat-frontends.svg)](https://crates.io/crates/pd-vm-compat-frontends)
+
 JavaScript and Lua compatibility frontends for `pd-vm`.
 
 This crate owns the compatibility-language pieces that are intentionally outside the core `rustscript` repository:
@@ -12,8 +14,8 @@ This crate owns the compatibility-language pieces that are intentionally outside
 ## Usage
 
 ```toml
-pd-vm = { git = "https://github.com/rustscript-lang/rustscript", package = "pd-vm" }
-pd-vm-compat-frontends = { git = "https://github.com/rustscript-lang/rustscript-compat-frontends" }
+pd-vm = "0.22.2"
+pd-vm-compat-frontends = "0.1.0"
 ```
 
 ```rust
