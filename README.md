@@ -6,7 +6,7 @@ JavaScript and Lua compatibility frontends for `pd-vm`.
 
 This crate owns the compatibility-language pieces that are intentionally outside the core `rustscript` repository:
 
-- JavaScript parser dialect configuration and file-module AST/IR namespace lowering
+- JavaScript parser dialect, span-preserving parser compatibility fold for file-module `alias.member()` calls, and IR lowering onto qualified `alias::member` names
 - Lua parser/lowering helpers
 - JavaScript and Lua import scanning / import stripping for source-file loading
 - compatibility frontend tests and fixtures

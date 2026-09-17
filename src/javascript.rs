@@ -67,16 +67,19 @@ pub(crate) fn parser_dialect() -> &'static dyn ParserDialect {
 }
 
 pub(crate) fn lower_to_ir(source: &str) -> Result<FrontendIr, ParseError> {
-    // File-module `alias.member()` is a MemberExpression-rooted Call. The frozen
-    // parser's unknown dotted-call fallback rewinds those sites, so this frontend
-    // owns lowering: identify original call spans, parse, then rewrite the
-    // produced Call IR / semantic-index entries to qualified `alias::member`
-    // names while keeping the original callee spans.
+    // Frozen `try_parse_js_dotted_call` rewinds unknown file-module dotted
+    // calls. Fold those callee spans to collision-free same-length identifiers
+    // (byte length and `\n`/`\r` positions unchanged), parse the folded source,
+    // then rewrite only the implicit-extern Call IR / semantic-index entries
+    // that match the original spans to qualified `alias::member` names.
     // Local object members, shadowed aliases, computed/optional chains, and
-    // nested `obj.alias.member` are left as ordinary member access.
-    let analysis = crate::js_namespace::analyze_file_module_member_calls(source);
+    // nested `obj.alias.member` stay ordinary member access. Multiline callees
+    // cannot be an identifier without moving line boundaries, so they fail
+    // closed before parse.
+    let analysis = crate::js_namespace::analyze_file_module_member_calls(source)?;
+    let folded = analysis.parse_source(source)?;
     let mut ir = parse_source_with_dialect(
-        analysis.parse_source(source).as_ref(),
+        folded.as_ref(),
         parser_dialect(),
         SharedParserOptions {
             allow_implicit_semicolons: true,

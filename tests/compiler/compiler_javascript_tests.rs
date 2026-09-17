@@ -880,3 +880,112 @@ fn javascript_file_module_unknown_member_keeps_mapped_span() {
         other => panic!("expected SourceWithMap, got {other}"),
     }
 }
+
+#[test]
+fn javascript_file_module_call_with_user_function_m0_keeps_both() {
+    let root = namespace_case_root("js_user_fn_m0");
+    fs::write(root.join("m.rss"), "pub fn b() { 1 }\n").expect("module");
+    let main_path = root.join("main.js");
+    fs::write(
+        &main_path,
+        concat!(
+            "import * as a from \"./m.rss\";\n",
+            "function m0() { return 2; }\n",
+            "a.b() + m0();\n",
+        ),
+    )
+    .expect("js source");
+    let compiled = compile_source_file_with_options(
+        main_path.as_path(),
+        pd_vm_compat_frontends::compile_options(),
+    )
+    .expect("user function m0 plus file-module call should compile");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(3)]);
+}
+
+#[test]
+fn javascript_file_module_call_with_user_local_m0_keeps_both() {
+    let root = namespace_case_root("js_user_local_m0");
+    fs::write(root.join("m.rss"), "pub fn b() { 1 }\n").expect("module");
+    let main_path = root.join("main.js");
+    fs::write(
+        &main_path,
+        concat!(
+            "import * as a from \"./m.rss\";\n",
+            "const m0 = 2;\n",
+            "a.b() + m0;\n",
+        ),
+    )
+    .expect("js source");
+    let compiled = compile_source_file_with_options(
+        main_path.as_path(),
+        pd_vm_compat_frontends::compile_options(),
+    )
+    .expect("user local m0 plus file-module call should compile");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(3)]);
+}
+
+#[test]
+fn javascript_multiline_file_module_call_fails_closed_before_parse() {
+    let root = namespace_case_root("js_multiline_fold");
+    fs::write(
+        root.join("strings.rss"),
+        "pub fn non_empty(value) { value.length != 0; }\n",
+    )
+    .expect("module");
+    let main_path = root.join("main.js");
+    let source = concat!(
+        "import * as string from \"./strings.rss\";\n",
+        "string\n",
+        ".non_empty(\"rss\");\n",
+    );
+    fs::write(&main_path, source).expect("js source");
+    let error = match compile_source_file_with_options(
+        main_path.as_path(),
+        pd_vm_compat_frontends::compile_options(),
+    ) {
+        Ok(_) => panic!("multiline file-module call should fail closed"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("spans a line break"),
+        "diagnostic must fail closed on multiline fold, got {message}"
+    );
+    assert!(
+        message.contains("string") && message.contains("non_empty"),
+        "diagnostic must name the original qualified target, got {message}"
+    );
+    assert!(
+        !message.contains("aaa") && !message.contains("__pdns") && !message.contains(" m0"),
+        "diagnostic must not leak placeholders: {message}"
+    );
+}
+
+#[test]
+fn javascript_many_short_file_module_calls_compile() {
+    let root = namespace_case_root("js_many_short_calls");
+    fs::write(root.join("m.rss"), "pub fn b() { 1 }\n").expect("module");
+    let main_path = root.join("main.js");
+    let mut source = String::from("import * as a from \"./m.rss\";\nlet total = 0;\n");
+    for _ in 0..110 {
+        source.push_str("total = total + a.b();\n");
+    }
+    source.push_str("total;\n");
+    fs::write(&main_path, source).expect("js source");
+    let compiled = compile_source_file_with_options(
+        main_path.as_path(),
+        pd_vm_compat_frontends::compile_options(),
+    )
+    .expect("110 short file-module calls should compile");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(110)]);
+}
