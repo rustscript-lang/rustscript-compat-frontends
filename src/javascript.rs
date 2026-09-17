@@ -67,13 +67,16 @@ pub(crate) fn parser_dialect() -> &'static dyn ParserDialect {
 }
 
 pub(crate) fn lower_to_ir(source: &str) -> Result<FrontendIr, ParseError> {
-    // JavaScript now lowers directly through the shared parser with JS dialect behavior.
-    // No RustScript text rewriting layer is used.
+    // Frozen dotted-call parsing covers builtin/host namespaces only. File-module
+    // `import * as alias` injects export names as locals, so rewrite those calls
+    // to unqualified implicit externs before the shared parse.
+    let source = crate::source_loader::rewrite_js_file_module_namespace_calls(source);
     parse_source_with_dialect(
-        source,
+        &source,
         parser_dialect(),
         SharedParserOptions {
             allow_implicit_semicolons: true,
+            allow_implicit_externs: true,
             ..SharedParserOptions::default()
         },
     )
