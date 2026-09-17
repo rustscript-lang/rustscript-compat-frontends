@@ -471,4 +471,18 @@ fn publish_workflow_rewrites_git_deps_to_frozen_crates_io_versions() {
         workflow.contains("'pd-host-function': os.environ.get('PD_VM_VERSION') or '0.1.0'"),
         "publish rewrite must map pd-host-function git/path deps to crates.io 0.1.0"
     );
+
+    let readme = fs::read_to_string(manifest_dir().join("README.md")).expect("README");
+    assert!(
+        !readme.contains("0.22.2"),
+        "README must not advertise the old 0.22.2 crates.io version"
+    );
+    assert!(
+        readme.contains("pd-vm = \"0.1.0\""),
+        "README dependency example must use frozen pd-vm 0.1.0"
+    );
+    assert!(
+        readme.contains("pd-vm-compat-frontends = \"0.1.0\""),
+        "README dependency example must use frozen pd-vm-compat-frontends 0.1.0"
+    );
 }

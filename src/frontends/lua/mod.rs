@@ -763,7 +763,17 @@ fn try_lower_direct_subset_to_ir(source: &str) -> Result<Option<FrontendIr>, Par
         return Ok(None);
     }
 
-    Ok(Some(builder.finish(root_stmts)))
+    let mut ir = builder.finish(root_stmts);
+    ir.implicit_extern_names = ir
+        .functions
+        .iter()
+        .filter_map(|func| {
+            let (namespace, _) = func.name.split_once("::")?;
+            let spec = namespace_aliases.get(namespace)?;
+            crate::source_loader::is_file_module_spec(spec).then(|| func.name.clone())
+        })
+        .collect();
+    Ok(Some(ir))
 }
 
 enum LuaDirectBlock {

@@ -67,15 +67,16 @@ pub(crate) fn parser_dialect() -> &'static dyn ParserDialect {
 }
 
 pub(crate) fn lower_to_ir(source: &str) -> Result<FrontendIr, ParseError> {
-    // Frozen dotted-call parsing covers builtin/host namespaces only. File-module
-    // `alias.member()` calls are recognized from the JS token stream and lowered
-    // onto qualified `alias::member` names in IR so the loader can keep namespace
-    // provenance. Local object members and shadowed aliases are left untouched.
-    let aliases = crate::js_namespace::file_module_namespace_aliases(source);
-    let (source, renames) =
-        crate::js_namespace::lower_file_module_namespace_calls(source, &aliases);
+    // File-module `alias.member()` is a MemberExpression-rooted Call. The frozen
+    // parser's unknown dotted-call fallback rewinds those sites, so this frontend
+    // owns lowering: identify original call spans, parse, then rewrite the
+    // produced Call IR / semantic-index entries to qualified `alias::member`
+    // names while keeping the original callee spans.
+    // Local object members, shadowed aliases, computed/optional chains, and
+    // nested `obj.alias.member` are left as ordinary member access.
+    let analysis = crate::js_namespace::analyze_file_module_member_calls(source);
     let mut ir = parse_source_with_dialect(
-        &source,
+        analysis.parse_source(source).as_ref(),
         parser_dialect(),
         SharedParserOptions {
             allow_implicit_semicolons: true,
@@ -83,6 +84,6 @@ pub(crate) fn lower_to_ir(source: &str) -> Result<FrontendIr, ParseError> {
             ..SharedParserOptions::default()
         },
     )?;
-    crate::js_namespace::apply_file_module_call_renames(&mut ir, &renames);
+    analysis.lower_ir(&mut ir);
     Ok(ir)
 }

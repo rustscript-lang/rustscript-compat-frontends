@@ -800,11 +800,19 @@ fn javascript_file_module_unknown_member_keeps_mapped_span() {
     )
     .expect("strings module");
     let main_path = root.join("main.js");
-    fs::write(
-        &main_path,
-        "import * as string from \"./strings.rss\";\nstring.does_not_exist(\"rss\");\n",
-    )
-    .expect("js source");
+    let source = concat!(
+        "import * as string from \"./strings.rss\";\n",
+        "const single = 'string.does_not_exist(';\n",
+        "const double = \"string.does_not_exist(\";\n",
+        "const tmpl = \"`string.does_not_exist(`\";\n",
+        "const re = \"/string.does_not_exist(/\";\n",
+        "// template lookalike: `string.does_not_exist(`\n",
+        "/* string.does_not_exist(\"no\") */\n",
+        "const utf_before = \"是\";\n",
+        "   string.does_not_exist(\"rss\");\n",
+        "const utf_after = \"後\";\n",
+    );
+    fs::write(&main_path, source).expect("js source");
 
     let error = match compile_source_file_with_options(
         main_path.as_path(),
@@ -817,22 +825,56 @@ fn javascript_file_module_unknown_member_keeps_mapped_span() {
         vm::SourcePathError::SourceWithMap { error, sources } => {
             let message = error.to_string();
             assert!(
-                message.contains("does_not_exist")
-                    || message.contains("string::does_not_exist")
-                    || message.contains("unknown"),
-                "rejection diagnostic should name the missing member: {message}"
+                message.contains("unknown namespace call 'string::does_not_exist'"),
+                "diagnostic must identify the qualified namespace member, got {message}"
             );
-            let span = match &error {
-                vm::SourceError::Parse(parse) => parse.span,
-                _ => None,
+            assert!(
+                !message.contains("__pdns") && !message.contains(" m0"),
+                "diagnostic must not leak dialect placeholders: {message}"
+            );
+            let parse = match &error {
+                vm::SourceError::Parse(parse) => parse,
+                other => panic!("expected parse diagnostic, got {other:?}"),
             };
-            let span = span.expect("failing file-module call must keep a mapped span");
+            assert_eq!(
+                parse.line, 9,
+                "mapped diagnostic must use the call-site line, got {} ({message})",
+                parse.line
+            );
+            let span = parse
+                .span
+                .expect("failing file-module call must keep a mapped span");
+            let call_line = source.lines().nth(8).expect("call-site line");
+            let lo = source.find(call_line).expect("call-site offset");
+            assert_eq!(
+                (span.lo, span.hi),
+                (lo, lo + call_line.len()),
+                "core source-loader maps unknown namespace calls to the full call-site line"
+            );
             let text = sources
                 .span_text(span)
                 .expect("mapped span must resolve against the kept source map");
+            assert_eq!(text, call_line);
             assert!(
-                text.contains("does_not_exist") || text.contains("string"),
-                "mapped span should cover the failing call, got {text:?}"
+                text.contains("string.does_not_exist"),
+                "mapped span should cover the call expression, got {text:?}"
+            );
+            assert!(
+                !text.contains("import") && !text.contains("是") && !text.contains("後"),
+                "mapped span must not be the import line or surrounding literals, got {text:?}"
+            );
+            let original = fs::read_to_string(&main_path).expect("original source");
+            assert!(
+                original.contains("const single = 'string.does_not_exist(';"),
+                "single-quoted lookalike must stay in original source"
+            );
+            assert!(
+                original.contains("const tmpl = \"`string.does_not_exist(`\";"),
+                "template-literal lookalike must stay in original source"
+            );
+            assert!(
+                original.contains("const re = \"/string.does_not_exist(/\";"),
+                "regex-literal lookalike must stay in original source"
             );
         }
         other => panic!("expected SourceWithMap, got {other}"),

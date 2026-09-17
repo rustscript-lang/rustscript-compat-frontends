@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use vm::{FrontendIr, ImportClause};
@@ -40,77 +41,133 @@ pub(crate) fn file_module_namespace_aliases(source: &str) -> HashSet<String> {
         .collect()
 }
 
-/// Lower `alias.member(` file-module calls to unique placeholders, then map those
-/// placeholders onto qualified `alias::member` names in IR.
-pub(crate) fn lower_file_module_namespace_calls(
-    source: &str,
-    aliases: &HashSet<String>,
-) -> (String, HashMap<String, String>) {
-    if aliases.is_empty() {
-        return (source.to_string(), HashMap::new());
-    }
-    let tokens = tokenize_js(source);
-    let rewrites = collect_file_module_call_rewrites(source, &tokens, aliases);
-    if rewrites.is_empty() {
-        return (source.to_string(), HashMap::new());
-    }
-    let mut out = String::with_capacity(source.len());
-    let mut last = 0usize;
-    let mut renames = HashMap::new();
-    for (index, rewrite) in rewrites.into_iter().enumerate() {
-        out.push_str(&source[last..rewrite.start]);
-        let placeholder = format!("__pdns{index}");
-        let original_len = rewrite.end - rewrite.start;
-        if placeholder.len() <= original_len {
-            for _ in 0..(original_len - placeholder.len()) {
-                out.push(' ');
-            }
-            out.push_str(&placeholder);
-        } else {
-            out.push_str(&placeholder);
-        }
-        renames.insert(
-            placeholder,
-            format!("{}::{}", rewrite.alias, rewrite.member),
-        );
-        last = rewrite.end;
-    }
-    out.push_str(&source[last..]);
-    (out, renames)
-}
-
-pub(crate) fn apply_file_module_call_renames(
-    ir: &mut FrontendIr,
-    renames: &HashMap<String, String>,
-) {
-    if renames.is_empty() {
-        return;
-    }
-    for func in &mut ir.functions {
-        if let Some(qualified) = renames.get(&func.name) {
-            func.name = qualified.clone();
-        }
-    }
-    for name in &mut ir.implicit_extern_names {
-        if let Some(qualified) = renames.get(name) {
-            *name = qualified.clone();
-        }
-    }
-}
-
-struct CallRewrite {
-    start: usize,
-    end: usize,
+/// A Call whose callee is a MemberExpression rooted at an imported file-module
+/// alias, with the original source span of `alias.member`.
+#[derive(Clone, Debug)]
+struct FileModuleMemberCall {
     alias: String,
     member: String,
+    start: usize,
+    end: usize,
 }
 
-fn collect_file_module_call_rewrites(
+pub(crate) struct FileModuleCallAnalysis {
+    calls: Vec<FileModuleMemberCall>,
+    dialect_names: HashMap<String, String>,
+}
+
+impl FileModuleCallAnalysis {
+    pub(crate) fn parse_source<'a>(&self, source: &'a str) -> Cow<'a, str> {
+        if self.calls.is_empty() {
+            return Cow::Borrowed(source);
+        }
+        // Frozen `try_parse_js_dotted_call` rewinds unknown (file-module) dotted
+        // calls, leaving `alias.member()` unparsed. Fold only those callees to
+        // same-length idents so the dialect can parse the original argument list
+        // at the original offsets; lookalike literals/comments are untouched.
+        let mut out = String::with_capacity(source.len());
+        let mut last = 0usize;
+        for (index, call) in self.calls.iter().enumerate() {
+            out.push_str(&source[last..call.start]);
+            out.push_str(&dialect_callee_ident(index, call.end - call.start));
+            last = call.end;
+        }
+        out.push_str(&source[last..]);
+        debug_assert_eq!(out.len(), source.len());
+        Cow::Owned(out)
+    }
+
+    pub(crate) fn lower_ir(&self, ir: &mut FrontendIr) {
+        if self.dialect_names.is_empty() {
+            return;
+        }
+        for func in &mut ir.functions {
+            if let Some(qualified) = self.dialect_names.get(&func.name) {
+                func.name = qualified.clone();
+            }
+        }
+        for name in &mut ir.implicit_extern_names {
+            if let Some(qualified) = self.dialect_names.get(name) {
+                *name = qualified.clone();
+            }
+        }
+        if let Some(index) = ir.parsed_semantic_index.as_mut() {
+            for site in &mut index.call_sites {
+                let matched = self.calls.iter().find(|call| {
+                    site.callee_span.hi == call.end
+                        && site.callee_span.lo >= call.start
+                        && site.callee_span.lo < call.end
+                });
+                if let Some(call) = matched {
+                    site.name = format!("{}::{}", call.alias, call.member);
+                    site.is_namespace_call = true;
+                    site.callee_span.lo = call.start;
+                    site.callee_span.hi = call.end;
+                    continue;
+                }
+                if let Some(qualified) = self.dialect_names.get(&site.name) {
+                    site.name = qualified.clone();
+                    site.is_namespace_call = true;
+                }
+            }
+            for func_ref in &mut index.func_refs {
+                if let Some(qualified) = self.dialect_names.get(&func_ref.name) {
+                    func_ref.name = qualified.clone();
+                }
+            }
+            for func_decl in &mut index.func_decls {
+                if let Some(qualified) = self.dialect_names.get(&func_decl.name) {
+                    func_decl.name = qualified.clone();
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn analyze_file_module_member_calls(source: &str) -> FileModuleCallAnalysis {
+    let aliases = file_module_namespace_aliases(source);
+    if aliases.is_empty() {
+        return FileModuleCallAnalysis {
+            calls: Vec::new(),
+            dialect_names: HashMap::new(),
+        };
+    }
+    let tokens = tokenize_js(source);
+    let calls = collect_file_module_member_calls(source, &tokens, &aliases);
+    let mut dialect_names = HashMap::new();
+    for (index, call) in calls.iter().enumerate() {
+        dialect_names.insert(
+            dialect_callee_ident(index, call.end - call.start)
+                .trim()
+                .to_string(),
+            format!("{}::{}", call.alias, call.member),
+        );
+    }
+    FileModuleCallAnalysis {
+        calls,
+        dialect_names,
+    }
+}
+
+fn dialect_callee_ident(index: usize, original_len: usize) -> String {
+    let ident = format!("m{index}");
+    if ident.len() >= original_len {
+        return ident;
+    }
+    let mut out = String::with_capacity(original_len);
+    for _ in 0..(original_len - ident.len()) {
+        out.push(' ');
+    }
+    out.push_str(&ident);
+    out
+}
+
+fn collect_file_module_member_calls(
     source: &str,
     tokens: &[Token],
     aliases: &HashSet<String>,
-) -> Vec<CallRewrite> {
-    let mut rewrites = Vec::new();
+) -> Vec<FileModuleMemberCall> {
+    let mut calls = Vec::new();
     let mut scopes: Vec<HashSet<String>> = vec![HashSet::new()];
     let mut index = 0usize;
     while index < tokens.len() {
@@ -141,10 +198,8 @@ fn collect_file_module_call_rewrites(
             index += 1;
             continue;
         }
-        if let Some(rewrite) =
-            match_file_module_member_call(source, tokens, index, aliases, &scopes)
-        {
-            rewrites.push(rewrite);
+        if let Some(call) = match_file_module_member_call(source, tokens, index, aliases, &scopes) {
+            calls.push(call);
             index += 3;
             continue;
         }
@@ -153,7 +208,7 @@ fn collect_file_module_call_rewrites(
         }
         index += 1;
     }
-    rewrites
+    calls
 }
 
 fn match_file_module_member_call(
@@ -162,7 +217,7 @@ fn match_file_module_member_call(
     index: usize,
     aliases: &HashSet<String>,
     scopes: &[HashSet<String>],
-) -> Option<CallRewrite> {
+) -> Option<FileModuleMemberCall> {
     let alias_tok = tokens.get(index)?;
     let dot = tokens.get(index + 1)?;
     let member_tok = tokens.get(index + 2)?;
@@ -185,11 +240,11 @@ fn match_file_module_member_call(
     if !is_ident(member.as_str()) {
         return None;
     }
-    Some(CallRewrite {
-        start: alias_tok.start,
-        end: member_tok.end,
+    Some(FileModuleMemberCall {
         alias: alias.to_string(),
         member,
+        start: alias_tok.start,
+        end: member_tok.end,
     })
 }
 
@@ -570,4 +625,123 @@ fn can_start_regex(previous: Option<TokenKind>) -> bool {
                 | TokenKind::RBrace
         )
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn analysis_source() -> &'static str {
+        concat!(
+            "import * as string from \"./strings.rss\";\n",
+            "const single = 'string.non_empty(';\n",
+            "const double = \"string.non_empty(\";\n",
+            "const tmpl = \"`string.non_empty(`\";\n",
+            "const re = \"/string.non_empty(/\";\n",
+            "// string.non_empty(\"no\")\n",
+            "/* string.non_empty(\"no\") */\n",
+            "const utf = \"是\";\n",
+            "string.non_empty(\"yes\");\n",
+        )
+    }
+
+    #[test]
+    fn lookalike_literals_are_not_file_module_calls() {
+        let source = analysis_source();
+        let analysis = analyze_file_module_member_calls(source);
+        assert_eq!(analysis.calls.len(), 1);
+        assert_eq!(analysis.calls[0].alias, "string");
+        assert_eq!(analysis.calls[0].member, "non_empty");
+        assert_eq!(
+            &source[analysis.calls[0].start..analysis.calls[0].end],
+            "string.non_empty"
+        );
+        let parse_source = analysis.parse_source(source);
+        assert_eq!(parse_source.len(), source.len());
+        assert!(parse_source.contains("const single = 'string.non_empty(';"));
+        assert!(parse_source.contains(r#"const double = "string.non_empty(";"#));
+        assert!(parse_source.contains(r#"const tmpl = "`string.non_empty(`";"#));
+        assert!(parse_source.contains(r#"const re = "/string.non_empty(/";"#));
+        assert!(parse_source.contains("是"));
+        assert!(!parse_source.contains("__pdns"));
+        assert!(
+            !source[analysis.calls[0].start..analysis.calls[0].end].contains("string.non_empty(")
+        );
+    }
+
+    #[test]
+    fn same_name_locals_object_members_nested_computed_optional_are_not_namespace_calls() {
+        let source = concat!(
+            "import * as string from \"./strings.rss\";\n",
+            "string.non_empty(\"yes\");\n",
+            "{\n",
+            "  const string = {};\n",
+            "  string.non_empty(\"no\");\n",
+            "}\n",
+            "const box = { non_empty: 1 };\n",
+            "box.non_empty;\n",
+            "obj.string.non_empty(\"no\");\n",
+            "string[\"non_empty\"](\"no\");\n",
+            "string?.non_empty(\"no\");\n",
+        );
+        let analysis = analyze_file_module_member_calls(source);
+        assert_eq!(analysis.calls.len(), 1);
+        assert_eq!(analysis.calls[0].alias, "string");
+        assert_eq!(analysis.calls[0].member, "non_empty");
+        assert_eq!(
+            &source[analysis.calls[0].start..analysis.calls[0].end],
+            "string.non_empty"
+        );
+        assert!(source[..analysis.calls[0].start].contains("import * as string"));
+        assert!(source[analysis.calls[0].end..].starts_with("(\"yes\")"));
+    }
+
+    #[test]
+    fn lowered_ir_keeps_qualified_names_and_original_callee_spans() {
+        let source = analysis_source();
+        let ir = crate::javascript::lower_to_ir(source).expect("original lookalikes must parse");
+        assert!(
+            ir.functions
+                .iter()
+                .any(|func| func.name == "string::non_empty"),
+            "function table must carry the qualified file-module call, got {:?}",
+            ir.functions
+                .iter()
+                .map(|func| &func.name)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            ir.implicit_extern_names
+                .iter()
+                .any(|name| name == "string::non_empty"),
+            "implicit externs must carry the qualified file-module call, got {:?}",
+            ir.implicit_extern_names
+        );
+        assert!(
+            ir.functions
+                .iter()
+                .all(|func| !func.name.contains("m0") && !func.name.contains("__pdns")),
+            "function table must not leak parse placeholders"
+        );
+        let index = ir
+            .parsed_semantic_index
+            .as_ref()
+            .expect("parser-produced semantic index");
+        let site = index
+            .call_sites
+            .iter()
+            .find(|site| site.is_namespace_call && site.name == "string::non_empty")
+            .expect("qualified namespace call site");
+        assert_eq!(
+            source.get(site.callee_span.lo..site.callee_span.hi),
+            Some("string.non_empty")
+        );
+        assert!(
+            index
+                .call_sites
+                .iter()
+                .all(|site| !site.name.contains("m0") && !site.name.contains("__pdns")),
+            "semantic call sites must not leak parse placeholders"
+        );
+    }
 }

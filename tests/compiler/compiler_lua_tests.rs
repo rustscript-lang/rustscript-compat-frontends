@@ -427,11 +427,16 @@ fn lua_file_module_unknown_member_keeps_mapped_span() {
     )
     .expect("strings module");
     let main_path = root.join("main.lua");
-    fs::write(
-        &main_path,
-        "local string = require(\"./strings.rss\")\nstring.does_not_exist(\"rss\")\n",
-    )
-    .expect("lua source");
+    let source = concat!(
+        "local string = require(\"./strings.rss\")\n",
+        "local single = 'string.does_not_exist('\n",
+        "local double = \"string.does_not_exist(\"\n",
+        "-- string.does_not_exist(\"no\")\n",
+        "local utf_before = \"是\"\n",
+        "   string.does_not_exist(\"rss\")\n",
+        "local utf_after = \"後\"\n",
+    );
+    fs::write(&main_path, source).expect("lua source");
 
     let error = match compile_source_file_with_options(
         main_path.as_path(),
@@ -444,22 +449,39 @@ fn lua_file_module_unknown_member_keeps_mapped_span() {
         vm::SourcePathError::SourceWithMap { error, sources } => {
             let message = error.to_string();
             assert!(
-                message.contains("does_not_exist")
-                    || message.contains("string::does_not_exist")
-                    || message.contains("unknown"),
-                "rejection diagnostic should name the missing member: {message}"
+                message.contains("unknown namespace call 'string::does_not_exist'"),
+                "diagnostic must identify the qualified namespace member, got {message}"
             );
-            let span = match &error {
-                vm::SourceError::Parse(parse) => parse.span,
-                _ => None,
+            let parse = match &error {
+                vm::SourceError::Parse(parse) => parse,
+                other => panic!("expected parse diagnostic, got {other:?}"),
             };
-            let span = span.expect("failing file-module call must keep a mapped span");
+            assert_eq!(
+                parse.line, 6,
+                "mapped diagnostic must use the call-site line, got {} ({message})",
+                parse.line
+            );
+            let span = parse
+                .span
+                .expect("failing file-module call must keep a mapped span");
+            let call_line = source.lines().nth(5).expect("call-site line");
+            let lo = source.find(call_line).expect("call-site offset");
+            assert_eq!(
+                (span.lo, span.hi),
+                (lo, lo + call_line.len()),
+                "core source-loader maps unknown namespace calls to the full call-site line"
+            );
             let text = sources
                 .span_text(span)
                 .expect("mapped span must resolve against the kept source map");
+            assert_eq!(text, call_line);
             assert!(
-                text.contains("does_not_exist") || text.contains("string"),
-                "mapped span should cover the failing call, got {text:?}"
+                text.contains("string.does_not_exist"),
+                "mapped span should cover the call expression, got {text:?}"
+            );
+            assert!(
+                !text.contains("require") && !text.contains("是") && !text.contains("後"),
+                "mapped span must not be the import line or surrounding literals, got {text:?}"
             );
         }
         other => panic!("expected SourceWithMap, got {other}"),
