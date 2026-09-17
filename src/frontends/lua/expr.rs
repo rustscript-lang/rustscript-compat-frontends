@@ -578,12 +578,25 @@ fn lower_lua_namespace_call(
     }
     let imported_root = namespace_aliases.get(&path[0]).cloned();
     let root = imported_root.clone().unwrap_or_else(|| path[0].clone());
+    let root_is_local = builder.resolve_local_expr(&path[0]).is_some();
 
-    if let Some(imported_root) = imported_root
+    if let Some(spec) = imported_root.as_deref()
         && path.len() >= 2
-        && !is_builtin_namespace(&imported_root)
+        && crate::source_loader::is_file_module_spec(spec)
+        && !root_is_local
     {
-        let mut segments = vec![imported_root];
+        let call_name = path.join("::");
+        let arity = u8::try_from(args.len()).ok()?;
+        builder.declare_function(&call_name, Some(arity)).ok()?;
+        return builder.resolve_call_expr(&call_name, args);
+    }
+
+    if let Some(imported_root) = imported_root.as_deref()
+        && path.len() >= 2
+        && !is_builtin_namespace(imported_root)
+        && !crate::source_loader::is_file_module_spec(imported_root)
+    {
+        let mut segments = vec![imported_root.to_string()];
         segments.extend(path.iter().skip(1).cloned());
         let call_name = segments.join("::");
         let arity = u8::try_from(args.len()).ok()?;
@@ -596,10 +609,12 @@ fn lower_lua_namespace_call(
     }
 
     if path.len() == 2 {
-        if builder.resolve_local_expr(&path[0]).is_some() {
+        if root_is_local {
             return None;
         }
-        if let Some(expr) = builder.resolve_call_expr(&path[1], args.clone()) {
+        if imported_root.is_none()
+            && let Some(expr) = builder.resolve_call_expr(&path[1], args.clone())
+        {
             return Some(expr);
         }
         let qualified = format!("{}::{}", path[0], path[1]);

@@ -68,10 +68,13 @@ pub(crate) fn parser_dialect() -> &'static dyn ParserDialect {
 
 pub(crate) fn lower_to_ir(source: &str) -> Result<FrontendIr, ParseError> {
     // Frozen dotted-call parsing covers builtin/host namespaces only. File-module
-    // `import * as alias` injects export names as locals, so rewrite those calls
-    // to unqualified implicit externs before the shared parse.
-    let source = crate::source_loader::rewrite_js_file_module_namespace_calls(source);
-    parse_source_with_dialect(
+    // `alias.member()` calls are recognized from the JS token stream and lowered
+    // onto qualified `alias::member` names in IR so the loader can keep namespace
+    // provenance. Local object members and shadowed aliases are left untouched.
+    let aliases = crate::js_namespace::file_module_namespace_aliases(source);
+    let (source, renames) =
+        crate::js_namespace::lower_file_module_namespace_calls(source, &aliases);
+    let mut ir = parse_source_with_dialect(
         &source,
         parser_dialect(),
         SharedParserOptions {
@@ -79,5 +82,7 @@ pub(crate) fn lower_to_ir(source: &str) -> Result<FrontendIr, ParseError> {
             allow_implicit_externs: true,
             ..SharedParserOptions::default()
         },
-    )
+    )?;
+    crate::js_namespace::apply_file_module_call_renames(&mut ir, &renames);
+    Ok(ir)
 }

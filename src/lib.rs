@@ -1,4 +1,5 @@
 mod javascript;
+mod js_namespace;
 #[path = "frontends/lua/mod.rs"]
 mod lua;
 mod source_loader;
