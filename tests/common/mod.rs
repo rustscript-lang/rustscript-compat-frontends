@@ -1,5 +1,8 @@
 #![allow(unused_imports)]
 
+use std::fs;
+use std::path::PathBuf;
+
 pub use vm::{
     Assembler, BytecodeBuilder, CallOutcome, CompileSourceFileOptions, Compiler, Expr,
     HostArgsFunction, HostFunction, HostFunctionRegistry, Program, SourceFlavor,
@@ -122,10 +125,12 @@ pub fn rustscript_parse_error_case<'a>(
 pub enum CompileErrorKind {
     Assembler,
     CallArityOverflow,
+    HostImportOverflow,
     ClosureUsedAsValue,
     CallableUsedAsValue,
     NonCallableLocal,
     LocalSlotOverflow,
+    FrameLocalLimitExceeded,
     CallableArityMismatch,
     BreakOutsideLoop,
     ContinueOutsideLoop,
@@ -136,6 +141,8 @@ pub enum CompileErrorKind {
     InvalidFieldAccess,
     FunctionParameterTypeConflict,
     StrictTypingRequired,
+    HostCallResolve,
+    UnresolvedModuleCall,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -153,14 +160,55 @@ pub struct SourceErrorCase<'a> {
     pub expected_contains_all: &'a [&'a str],
 }
 
+fn unwrap_source_error(err: vm::SourcePathError, case: &str) -> vm::SourceError {
+    match err {
+        vm::SourcePathError::Source(err) => err,
+        vm::SourcePathError::SourceWithMap { error, .. } => error,
+        other => panic!("case '{case}': expected source error, got {other}"),
+    }
+}
+
+const STUB_STRINGS_RSS: &str = r#"
+pub fn non_empty(value: string) -> bool {
+    value.length != 0
+}
+"#;
+
+pub fn staged_example_path(file_name: &str) -> PathBuf {
+    let root = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("compat-frontends-staged-examples")
+        .join(file_name);
+    let examples_dir = root.join("compat").join("examples");
+    let stdlib = root
+        .join("rustscript")
+        .join("stdlib")
+        .join("rss")
+        .join("strings.rss");
+    fs::create_dir_all(&examples_dir).expect("staged examples directory");
+    fs::create_dir_all(stdlib.parent().expect("stdlib parent")).expect("stdlib directory");
+    fs::write(&stdlib, STUB_STRINGS_RSS).expect("stub strings.rss");
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("examples")
+        .join(file_name);
+    let dest = examples_dir.join(file_name);
+    fs::copy(&source, &dest).unwrap_or_else(|error| panic!("copy {}: {error}", source.display()));
+    dest
+}
+
 fn compile_error_kind(err: &vm::CompileError) -> CompileErrorKind {
     match err {
         vm::CompileError::Assembler(_) => CompileErrorKind::Assembler,
         vm::CompileError::CallArityOverflow => CompileErrorKind::CallArityOverflow,
+        vm::CompileError::HostImportOverflow => CompileErrorKind::HostImportOverflow,
         vm::CompileError::ClosureUsedAsValue => CompileErrorKind::ClosureUsedAsValue,
         vm::CompileError::CallableUsedAsValue => CompileErrorKind::CallableUsedAsValue,
         vm::CompileError::NonCallableLocal(_) => CompileErrorKind::NonCallableLocal,
         vm::CompileError::LocalSlotOverflow(_) => CompileErrorKind::LocalSlotOverflow,
+        vm::CompileError::FrameLocalLimitExceeded { .. } => {
+            CompileErrorKind::FrameLocalLimitExceeded
+        }
         vm::CompileError::CallableArityMismatch { .. } => CompileErrorKind::CallableArityMismatch,
         vm::CompileError::BreakOutsideLoop => CompileErrorKind::BreakOutsideLoop,
         vm::CompileError::ContinueOutsideLoop => CompileErrorKind::ContinueOutsideLoop,
@@ -179,6 +227,8 @@ fn compile_error_kind(err: &vm::CompileError) -> CompileErrorKind {
             CompileErrorKind::FunctionParameterTypeConflict
         }
         vm::CompileError::StrictTypingRequired { .. } => CompileErrorKind::StrictTypingRequired,
+        vm::CompileError::HostCallResolve { .. } => CompileErrorKind::HostCallResolve,
+        vm::CompileError::UnresolvedModuleCall => CompileErrorKind::UnresolvedModuleCall,
     }
 }
 
@@ -189,8 +239,7 @@ pub fn expect_source_error_case(case: &SourceErrorCase<'_>) {
         pd_vm_compat_frontends::compile_options(),
     ) {
         Ok(_) => panic!("case '{}' should fail to compile", case.name),
-        Err(vm::SourcePathError::Source(err)) => err,
-        Err(other) => panic!("case '{}': expected source error, got {other}", case.name),
+        Err(err) => unwrap_source_error(err, case.name),
     };
 
     match case.expected_kind {
@@ -283,8 +332,7 @@ pub fn expect_parse_error_contains_any_case(
         pd_vm_compat_frontends::compile_options(),
     ) {
         Ok(_) => panic!("case '{case_name}' should fail to compile"),
-        Err(vm::SourcePathError::Source(err)) => err,
-        Err(other) => panic!("case '{case_name}': expected source error, got {other}"),
+        Err(err) => unwrap_source_error(err, case_name),
     };
     match err {
         vm::SourceError::Parse(parse) => {

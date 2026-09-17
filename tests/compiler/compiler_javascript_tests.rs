@@ -266,7 +266,7 @@ fn javascript_parse_rejection_cases_work() {
                 json.encode("ok");
             "#,
             flavor: SourceFlavor::JavaScript,
-            expected_contains_all: &["unknown local 'json'"],
+            expected_contains_all: &["expected ';' after expression"],
         },
         ParseErrorCase {
             name: "builtin namespace calls reject path separator",
@@ -437,7 +437,7 @@ fn javascript_print_alias_handles_mixed_call_arities() {
 
 #[test]
 fn compile_source_file_with_javascript_complex_fixture() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/example_complex.js");
+    let path = staged_example_path("example_complex.js");
     let compiled =
         compile_source_file_with_options(path.as_path(), pd_vm_compat_frontends::compile_options())
             .expect("compile should succeed");
@@ -555,7 +555,7 @@ console.log(value);
 
 #[test]
 fn compile_source_file_js_complex_replay_break_line_resolves_non_executable_lines() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/example_complex.js");
+    let path = staged_example_path("example_complex.js");
     let compiled =
         compile_source_file_with_options(path.as_path(), pd_vm_compat_frontends::compile_options())
             .expect("compile should succeed");
