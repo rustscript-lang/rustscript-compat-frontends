@@ -31,9 +31,9 @@ jobs:
       contents: read
     env:
       PACKAGE_ORDER: pd-vm-compat-frontends
-      PD_VM_VERSION: ${{ inputs.pd_vm_version || '0.22.2' }}
+      PD_VM_VERSION: ${{ inputs.pd_vm_version || '0.1.0' }}
       PD_EDGE_ABI_VERSION: ${{ inputs.pd_edge_abi_version || '0.1.1' }}
-      WORKSPACE_VERSION_OVERRIDES: rustscript-compat-frontends=${{ inputs.version }} rustscript=${{ inputs.pd_vm_version || '0.22.2' }} pd-edge=${{ inputs.pd_edge_abi_version || '0.1.1' }}
+      WORKSPACE_VERSION_OVERRIDES: rustscript-compat-frontends=${{ inputs.version }} rustscript=${{ inputs.pd_vm_version || '0.1.0' }} pd-edge=${{ inputs.pd_edge_abi_version || '0.1.1' }}
     steps:
       - name: Checkout compatibility frontends
         uses: actions/checkout@v4
@@ -72,8 +72,8 @@ jobs:
 
           version = os.environ['PUBLISH_VERSION']
           dep_versions = {
-              'pd-vm': os.environ.get('PD_VM_VERSION') or '0.22.2',
-              'pd-host-function': os.environ.get('PD_VM_VERSION') or '0.22.2',
+              'pd-vm': os.environ.get('PD_VM_VERSION') or '0.1.0',
+              'pd-host-function': os.environ.get('PD_VM_VERSION') or '0.1.0',
               'pd-edge-abi': os.environ.get('PD_EDGE_ABI_VERSION') or '0.1.1',
           }
           workspace_versions = {}

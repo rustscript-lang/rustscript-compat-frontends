@@ -1,6 +1,7 @@
 #[path = "../common/mod.rs"]
 mod common;
 use common::*;
+use std::fs;
 
 #[test]
 fn javascript_runtime_namespace_custom_host_calls_are_supported() {
@@ -726,4 +727,114 @@ fn javascript_non_strict_comparisons_and_integer_edge_literals_work() {
         expected_locals: None,
     };
     run_runtime_case(&case);
+}
+
+#[test]
+fn javascript_file_module_namespace_calls_keep_qualified_provenance() {
+    let root = namespace_case_root("js_qualified_namespace");
+    fs::write(root.join("left.rss"), "pub fn tag() { 1 }\n").expect("left module");
+    fs::write(root.join("right.rss"), "pub fn tag() { 2 }\n").expect("right module");
+    fs::write(
+        root.join("strings.rss"),
+        r#"
+        pub fn non_empty(value) {
+            value.length != 0;
+        }
+        "#,
+    )
+    .expect("strings module");
+    let main_path = root.join("main.js");
+    fs::write(
+        &main_path,
+        r#"
+        import * as left from "./left.rss";
+        import * as right from "./right.rss";
+        import * as string from "./strings.rss";
+
+        function localProbe(value) {
+            return false;
+        }
+
+        const box = { non_empty: 9 };
+        // string.non_empty("no")
+        // /string.non_empty(/
+        const quoted = "string.non_empty(";
+        // `string.non_empty(`
+        const utf = "是";
+
+        let localFlag = 0;
+        if (localProbe("x")) {
+            localFlag = 1;
+        }
+        let moduleFlag = 0;
+        if (string.non_empty("rss")) {
+            moduleFlag = 1;
+        }
+        if (quoted.length > 0 && utf.length > 0) {
+            left.tag() + right.tag() + box.non_empty + localFlag + moduleFlag;
+        } else {
+            0;
+        }
+        "#,
+    )
+    .expect("js source");
+
+    let compiled = compile_source_file_with_options(
+        main_path.as_path(),
+        pd_vm_compat_frontends::compile_options(),
+    )
+    .expect("qualified namespace fixture should compile");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    // 1 + 2 + 9 + 0 + 1 = 13
+    assert_eq!(vm.stack(), &[Value::Int(13)]);
+}
+
+#[test]
+fn javascript_file_module_unknown_member_keeps_mapped_span() {
+    let root = namespace_case_root("js_mapped_span");
+    fs::write(
+        root.join("strings.rss"),
+        "pub fn non_empty(value) { value.length != 0; }\n",
+    )
+    .expect("strings module");
+    let main_path = root.join("main.js");
+    fs::write(
+        &main_path,
+        "import * as string from \"./strings.rss\";\nstring.does_not_exist(\"rss\");\n",
+    )
+    .expect("js source");
+
+    let error = match compile_source_file_with_options(
+        main_path.as_path(),
+        pd_vm_compat_frontends::compile_options(),
+    ) {
+        Ok(_) => panic!("unknown file-module member should fail"),
+        Err(error) => error,
+    };
+    match error {
+        vm::SourcePathError::SourceWithMap { error, sources } => {
+            let message = error.to_string();
+            assert!(
+                message.contains("does_not_exist")
+                    || message.contains("string::does_not_exist")
+                    || message.contains("unknown"),
+                "rejection diagnostic should name the missing member: {message}"
+            );
+            let span = match &error {
+                vm::SourceError::Parse(parse) => parse.span,
+                _ => None,
+            };
+            let span = span.expect("failing file-module call must keep a mapped span");
+            let text = sources
+                .span_text(span)
+                .expect("mapped span must resolve against the kept source map");
+            assert!(
+                text.contains("does_not_exist") || text.contains("string"),
+                "mapped span should cover the failing call, got {text:?}"
+            );
+        }
+        other => panic!("expected SourceWithMap, got {other}"),
+    }
 }

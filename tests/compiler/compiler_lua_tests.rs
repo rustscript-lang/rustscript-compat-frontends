@@ -1,6 +1,7 @@
 #[path = "../common/mod.rs"]
 mod common;
 use common::*;
+use std::fs;
 use vm::disassemble_program;
 
 #[test]
@@ -356,4 +357,111 @@ fn lua_non_strict_comparisons_treat_nan_as_false() {
         expected_locals: None,
     };
     run_runtime_case(&case);
+}
+
+#[test]
+fn lua_file_module_namespace_calls_keep_qualified_provenance() {
+    let root = namespace_case_root("lua_qualified_namespace");
+    fs::write(root.join("left.rss"), "pub fn tag() { 1 }\n").expect("left module");
+    fs::write(root.join("right.rss"), "pub fn tag() { 2 }\n").expect("right module");
+    fs::write(
+        root.join("strings.rss"),
+        r#"
+        pub fn non_empty(value) {
+            value.length != 0;
+        }
+        "#,
+    )
+    .expect("strings module");
+    let main_path = root.join("main.lua");
+    fs::write(
+        &main_path,
+        r#"
+        local left = require("./left.rss")
+        local right = require("./right.rss")
+        local string = require("./strings.rss")
+
+        local function non_empty(value)
+            return false
+        end
+
+        local box = { non_empty = 9 }
+        -- string.non_empty("no")
+        local quoted = "string.non_empty("
+        local utf = "是"
+
+        local local_flag = 0
+        if non_empty("x") then
+            local_flag = 1
+        end
+        local module_flag = 0
+        if string.non_empty("rss") then
+            module_flag = 1
+        end
+        if quoted ~= nil and utf ~= nil then
+            left.tag() + right.tag() + box.non_empty + local_flag + module_flag
+        else
+            0
+        end
+        "#,
+    )
+    .expect("lua source");
+
+    let compiled = compile_source_file_with_options(
+        main_path.as_path(),
+        pd_vm_compat_frontends::compile_options(),
+    )
+    .expect("qualified lua namespace fixture should compile");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(13)]);
+}
+
+#[test]
+fn lua_file_module_unknown_member_keeps_mapped_span() {
+    let root = namespace_case_root("lua_mapped_span");
+    fs::write(
+        root.join("strings.rss"),
+        "pub fn non_empty(value) { value.length != 0; }\n",
+    )
+    .expect("strings module");
+    let main_path = root.join("main.lua");
+    fs::write(
+        &main_path,
+        "local string = require(\"./strings.rss\")\nstring.does_not_exist(\"rss\")\n",
+    )
+    .expect("lua source");
+
+    let error = match compile_source_file_with_options(
+        main_path.as_path(),
+        pd_vm_compat_frontends::compile_options(),
+    ) {
+        Ok(_) => panic!("unknown file-module member should fail"),
+        Err(error) => error,
+    };
+    match error {
+        vm::SourcePathError::SourceWithMap { error, sources } => {
+            let message = error.to_string();
+            assert!(
+                message.contains("does_not_exist")
+                    || message.contains("string::does_not_exist")
+                    || message.contains("unknown"),
+                "rejection diagnostic should name the missing member: {message}"
+            );
+            let span = match &error {
+                vm::SourceError::Parse(parse) => parse.span,
+                _ => None,
+            };
+            let span = span.expect("failing file-module call must keep a mapped span");
+            let text = sources
+                .span_text(span)
+                .expect("mapped span must resolve against the kept source map");
+            assert!(
+                text.contains("does_not_exist") || text.contains("string"),
+                "mapped span should cover the failing call, got {text:?}"
+            );
+        }
+        other => panic!("expected SourceWithMap, got {other}"),
+    }
 }

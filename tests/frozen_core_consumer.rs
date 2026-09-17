@@ -5,18 +5,17 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use vm::{
-    CompileSourceFileOptions, SourceFlavor, SourcePathError, Value, Vm, VmStatus, compile_source,
+    SourceFlavor, SourcePathError, Value, Vm, VmStatus, compile_source,
     compile_source_file_with_options, compile_source_with_flavor_and_options, encode_program,
 };
 
 const FROZEN_RUSTSCRIPT_REV: &str = "b1d6cffede77f49410bf63525f30b9a46b02dc01";
 const RUSTSCRIPT_GIT: &str = "https://github.com/rustscript-lang/rustscript";
+const FROZEN_STRINGS_RSS: &str = include_str!("fixtures/frozen_stdlib/strings.rss");
+const FROZEN_STRINGS_SHA256: &str =
+    "bdee0958fc55940398bc22b46afb431c4ca34ab0a72621691c12b3fb12e0114c";
+const FROZEN_STRINGS_BYTES: usize = 3522;
 const EXPECTED_JS_LUA_EXAMPLES: usize = 4;
-const STUB_STRINGS_RSS: &str = r#"
-pub fn non_empty(value: string) -> bool {
-    value.length != 0
-}
-"#;
 
 fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -101,7 +100,7 @@ fn prepare_runnable_corpus() -> PathBuf {
         .join("rss")
         .join("strings.rss");
     fs::create_dir_all(stdlib.parent().expect("stdlib parent")).expect("stdlib directory");
-    fs::write(&stdlib, STUB_STRINGS_RSS).expect("stub strings.rss");
+    fs::write(&stdlib, FROZEN_STRINGS_RSS).expect("frozen strings.rss");
 
     for source in example_corpus() {
         let name = source
@@ -131,19 +130,29 @@ fn runner_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_pd-vm-compat-run"))
 }
 
-fn run_example_cli(path: &Path) {
+fn run_example_cli(path: &Path) -> (String, String) {
     let output = Command::new(runner_bin())
         .arg(path)
         .output()
         .unwrap_or_else(|error| panic!("run {}: {error}", path.display()));
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(
         output.status.success(),
-        "{} failed through pd-vm-compat-run (status {}):\nstdout:\n{}\nstderr:\n{}",
+        "{} failed through pd-vm-compat-run (status {}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
         path.display(),
         output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
     );
+    (stdout, stderr)
+}
+
+fn expected_corpus_output(name: &str) -> &'static str {
+    match name {
+        "example.js" => "6",
+        "example.lua" => "42",
+        "example_complex.js" | "example_complex.lua" => "12",
+        other => panic!("unexpected corpus example {other}"),
+    }
 }
 
 #[test]
@@ -268,15 +277,30 @@ fn example_corpus_compiles_emits_vmbc_and_runs_through_the_runner() {
                 source.display()
             );
             assert!(
-                imports.contains(&"print")
-                    || !compiled.program.callable_prototypes.is_empty()
-                    || !compiled.functions.is_empty(),
-                "{} should keep callable print provenance: {imports:?}",
-                source.display()
+                compiled.functions.iter().any(|func| func.name == "print")
+                    || imports.contains(&"print"),
+                "{} should keep callable print provenance: functions={:?} imports={imports:?}",
+                source.display(),
+                compiled
+                    .functions
+                    .iter()
+                    .map(|func| func.name.as_str())
+                    .collect::<Vec<_>>(),
             );
         }
 
-        run_example_cli(&runnable_path);
+        let (stdout, stderr) = run_example_cli(&runnable_path);
+        assert!(
+            stderr.trim().is_empty(),
+            "{} produced unexpected stderr:\n{stderr}",
+            source.display()
+        );
+        assert!(
+            stdout.contains(expected_corpus_output(name)),
+            "{} stdout should contain {}: {stdout:?}",
+            source.display(),
+            expected_corpus_output(name)
+        );
     }
 }
 
@@ -353,8 +377,11 @@ fn unsupported_language_and_invalid_sources_produce_portable_diagnostics() {
     );
     let message = error.to_string();
     assert!(
-        matches!(error, SourcePathError::UnsupportedExtension(_))
-            || message.to_ascii_lowercase().contains("unsupported"),
+        matches!(error, SourcePathError::UnsupportedExtension(ref ext) if ext == "py"),
+        "unsupported-language diagnostic should be UnsupportedExtension(py): {error:?}"
+    );
+    assert!(
+        message.to_ascii_lowercase().contains("unsupported") && message.contains(".py"),
         "unsupported-language diagnostic should mention the extension: {message}"
     );
     assert!(
@@ -395,5 +422,53 @@ fn unsupported_language_and_invalid_sources_produce_portable_diagnostics() {
     let rss_error = expect_err(compile_source("fn broken("), "invalid RSS should fail");
     let rss_message = rss_error.to_string();
     assert!(!rss_message.is_empty());
-    let _ = CompileSourceFileOptions::new();
+}
+
+#[test]
+fn frozen_strings_fixture_matches_pinned_core_revision() {
+    let bytes = include_bytes!("fixtures/frozen_stdlib/strings.rss");
+    assert_eq!(bytes.len(), FROZEN_STRINGS_BYTES);
+    let origin = fs::read_to_string(manifest_dir().join("tests/fixtures/frozen_stdlib/ORIGIN"))
+        .expect("frozen strings ORIGIN");
+    assert!(
+        origin.contains(FROZEN_RUSTSCRIPT_REV),
+        "ORIGIN must record the frozen rustscript revision"
+    );
+    assert!(
+        origin.contains(FROZEN_STRINGS_SHA256),
+        "ORIGIN must record the frozen strings.rss sha256"
+    );
+    let digest = Command::new("sha256sum")
+        .arg(manifest_dir().join("tests/fixtures/frozen_stdlib/strings.rss"))
+        .output()
+        .expect("sha256sum");
+    assert!(digest.status.success(), "sha256sum should run");
+    let stdout = String::from_utf8_lossy(&digest.stdout);
+    assert!(
+        stdout.starts_with(FROZEN_STRINGS_SHA256),
+        "vendored strings.rss hash drifted: {stdout}"
+    );
+    assert!(FROZEN_STRINGS_RSS.contains("pub fn non_empty(value: string) -> bool"));
+}
+
+#[test]
+fn publish_workflow_rewrites_git_deps_to_frozen_crates_io_versions() {
+    let workflow = fs::read_to_string(manifest_dir().join(".github/workflows/publish-crates.yml"))
+        .expect("publish workflow");
+    assert!(
+        !workflow.contains("0.22.2"),
+        "publish workflow must not pin the old 0.22.2 crates.io version"
+    );
+    assert!(
+        workflow.contains("PD_VM_VERSION: ${{ inputs.pd_vm_version || '0.1.0' }}"),
+        "publish workflow must default pd-vm to frozen 0.1.0"
+    );
+    assert!(
+        workflow.contains("'pd-vm': os.environ.get('PD_VM_VERSION') or '0.1.0'"),
+        "publish rewrite must map pd-vm git/path deps to crates.io 0.1.0"
+    );
+    assert!(
+        workflow.contains("'pd-host-function': os.environ.get('PD_VM_VERSION') or '0.1.0'"),
+        "publish rewrite must map pd-host-function git/path deps to crates.io 0.1.0"
+    );
 }

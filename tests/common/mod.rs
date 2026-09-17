@@ -163,16 +163,15 @@ pub struct SourceErrorCase<'a> {
 fn unwrap_source_error(err: vm::SourcePathError, case: &str) -> vm::SourceError {
     match err {
         vm::SourcePathError::Source(err) => err,
-        vm::SourcePathError::SourceWithMap { error, .. } => error,
+        vm::SourcePathError::SourceWithMap { error, sources } => {
+            let _keep_map = &sources;
+            error
+        }
         other => panic!("case '{case}': expected source error, got {other}"),
     }
 }
 
-const STUB_STRINGS_RSS: &str = r#"
-pub fn non_empty(value: string) -> bool {
-    value.length != 0
-}
-"#;
+const FROZEN_STRINGS_RSS: &str = include_str!("../fixtures/frozen_stdlib/strings.rss");
 
 pub fn staged_example_path(file_name: &str) -> PathBuf {
     let root = std::env::var_os("CARGO_TARGET_DIR")
@@ -188,13 +187,31 @@ pub fn staged_example_path(file_name: &str) -> PathBuf {
         .join("strings.rss");
     fs::create_dir_all(&examples_dir).expect("staged examples directory");
     fs::create_dir_all(stdlib.parent().expect("stdlib parent")).expect("stdlib directory");
-    fs::write(&stdlib, STUB_STRINGS_RSS).expect("stub strings.rss");
+    fs::write(&stdlib, FROZEN_STRINGS_RSS).expect("frozen strings.rss");
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("examples")
         .join(file_name);
     let dest = examples_dir.join(file_name);
     fs::copy(&source, &dest).unwrap_or_else(|error| panic!("copy {}: {error}", source.display()));
     dest
+}
+
+pub fn namespace_case_root(name: &str) -> PathBuf {
+    let unique = format!(
+        "{name}_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos()
+    );
+    let root = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("compat-frontends-namespace-cases")
+        .join(unique);
+    fs::create_dir_all(&root).expect("namespace case root");
+    root
 }
 
 fn compile_error_kind(err: &vm::CompileError) -> CompileErrorKind {
