@@ -1,6 +1,7 @@
 #[path = "../common/mod.rs"]
 mod common;
 use common::*;
+use std::fs;
 
 #[test]
 fn javascript_runtime_namespace_custom_host_calls_are_supported() {
@@ -266,7 +267,7 @@ fn javascript_parse_rejection_cases_work() {
                 json.encode("ok");
             "#,
             flavor: SourceFlavor::JavaScript,
-            expected_contains_all: &["unknown local 'json'"],
+            expected_contains_all: &["expected ';' after expression"],
         },
         ParseErrorCase {
             name: "builtin namespace calls reject path separator",
@@ -437,7 +438,7 @@ fn javascript_print_alias_handles_mixed_call_arities() {
 
 #[test]
 fn compile_source_file_with_javascript_complex_fixture() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/example_complex.js");
+    let path = staged_example_path("example_complex.js");
     let compiled =
         compile_source_file_with_options(path.as_path(), pd_vm_compat_frontends::compile_options())
             .expect("compile should succeed");
@@ -555,7 +556,7 @@ console.log(value);
 
 #[test]
 fn compile_source_file_js_complex_replay_break_line_resolves_non_executable_lines() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/example_complex.js");
+    let path = staged_example_path("example_complex.js");
     let compiled =
         compile_source_file_with_options(path.as_path(), pd_vm_compat_frontends::compile_options())
             .expect("compile should succeed");
@@ -726,4 +727,265 @@ fn javascript_non_strict_comparisons_and_integer_edge_literals_work() {
         expected_locals: None,
     };
     run_runtime_case(&case);
+}
+
+#[test]
+fn javascript_file_module_namespace_calls_keep_qualified_provenance() {
+    let root = namespace_case_root("js_qualified_namespace");
+    fs::write(root.join("left.rss"), "pub fn tag() { 1 }\n").expect("left module");
+    fs::write(root.join("right.rss"), "pub fn tag() { 2 }\n").expect("right module");
+    fs::write(
+        root.join("strings.rss"),
+        r#"
+        pub fn non_empty(value) {
+            value.length != 0;
+        }
+        "#,
+    )
+    .expect("strings module");
+    let main_path = root.join("main.js");
+    fs::write(
+        &main_path,
+        r#"
+        import * as left from "./left.rss";
+        import * as right from "./right.rss";
+        import * as string from "./strings.rss";
+
+        function localProbe(value) {
+            return false;
+        }
+
+        const box = { non_empty: 9 };
+        // string.non_empty("no")
+        // /string.non_empty(/
+        const quoted = "string.non_empty(";
+        // `string.non_empty(`
+        const utf = "是";
+
+        let localFlag = 0;
+        if (localProbe("x")) {
+            localFlag = 1;
+        }
+        let moduleFlag = 0;
+        if (string.non_empty("rss")) {
+            moduleFlag = 1;
+        }
+        if (quoted.length > 0 && utf.length > 0) {
+            left.tag() + right.tag() + box.non_empty + localFlag + moduleFlag;
+        } else {
+            0;
+        }
+        "#,
+    )
+    .expect("js source");
+
+    let compiled = compile_source_file_with_options(
+        main_path.as_path(),
+        pd_vm_compat_frontends::compile_options(),
+    )
+    .expect("qualified namespace fixture should compile");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    // 1 + 2 + 9 + 0 + 1 = 13
+    assert_eq!(vm.stack(), &[Value::Int(13)]);
+}
+
+#[test]
+fn javascript_file_module_unknown_member_keeps_mapped_span() {
+    let root = namespace_case_root("js_mapped_span");
+    fs::write(
+        root.join("strings.rss"),
+        "pub fn non_empty(value) { value.length != 0; }\n",
+    )
+    .expect("strings module");
+    let main_path = root.join("main.js");
+    let source = concat!(
+        "import * as string from \"./strings.rss\";\n",
+        "const single = 'string.does_not_exist(';\n",
+        "const double = \"string.does_not_exist(\";\n",
+        "const tmpl = \"`string.does_not_exist(`\";\n",
+        "const re = \"/string.does_not_exist(/\";\n",
+        "// template lookalike: `string.does_not_exist(`\n",
+        "/* string.does_not_exist(\"no\") */\n",
+        "const utf_before = \"是\";\n",
+        "   string.does_not_exist(\"rss\");\n",
+        "const utf_after = \"後\";\n",
+    );
+    fs::write(&main_path, source).expect("js source");
+
+    let error = match compile_source_file_with_options(
+        main_path.as_path(),
+        pd_vm_compat_frontends::compile_options(),
+    ) {
+        Ok(_) => panic!("unknown file-module member should fail"),
+        Err(error) => error,
+    };
+    match error {
+        vm::SourcePathError::SourceWithMap { error, sources } => {
+            let message = error.to_string();
+            assert!(
+                message.contains("unknown namespace call 'string::does_not_exist'"),
+                "diagnostic must identify the qualified namespace member, got {message}"
+            );
+            assert!(
+                !message.contains("__pdns") && !message.contains(" m0"),
+                "diagnostic must not leak dialect placeholders: {message}"
+            );
+            let parse = match &error {
+                vm::SourceError::Parse(parse) => parse,
+                other => panic!("expected parse diagnostic, got {other:?}"),
+            };
+            assert_eq!(
+                parse.line, 9,
+                "mapped diagnostic must use the call-site line, got {} ({message})",
+                parse.line
+            );
+            let span = parse
+                .span
+                .expect("failing file-module call must keep a mapped span");
+            let call_line = source.lines().nth(8).expect("call-site line");
+            let lo = source.find(call_line).expect("call-site offset");
+            assert_eq!(
+                (span.lo, span.hi),
+                (lo, lo + call_line.len()),
+                "core source-loader maps unknown namespace calls to the full call-site line"
+            );
+            let text = sources
+                .span_text(span)
+                .expect("mapped span must resolve against the kept source map");
+            assert_eq!(text, call_line);
+            assert!(
+                text.contains("string.does_not_exist"),
+                "mapped span should cover the call expression, got {text:?}"
+            );
+            assert!(
+                !text.contains("import") && !text.contains("是") && !text.contains("後"),
+                "mapped span must not be the import line or surrounding literals, got {text:?}"
+            );
+            let original = fs::read_to_string(&main_path).expect("original source");
+            assert!(
+                original.contains("const single = 'string.does_not_exist(';"),
+                "single-quoted lookalike must stay in original source"
+            );
+            assert!(
+                original.contains("const tmpl = \"`string.does_not_exist(`\";"),
+                "template-literal lookalike must stay in original source"
+            );
+            assert!(
+                original.contains("const re = \"/string.does_not_exist(/\";"),
+                "regex-literal lookalike must stay in original source"
+            );
+        }
+        other => panic!("expected SourceWithMap, got {other}"),
+    }
+}
+
+#[test]
+fn javascript_file_module_call_with_user_function_m0_keeps_both() {
+    let root = namespace_case_root("js_user_fn_m0");
+    fs::write(root.join("m.rss"), "pub fn b() { 1 }\n").expect("module");
+    let main_path = root.join("main.js");
+    fs::write(
+        &main_path,
+        concat!(
+            "import * as a from \"./m.rss\";\n",
+            "function m0() { return 2; }\n",
+            "a.b() + m0();\n",
+        ),
+    )
+    .expect("js source");
+    let compiled = compile_source_file_with_options(
+        main_path.as_path(),
+        pd_vm_compat_frontends::compile_options(),
+    )
+    .expect("user function m0 plus file-module call should compile");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(3)]);
+}
+
+#[test]
+fn javascript_file_module_call_with_user_local_m0_keeps_both() {
+    let root = namespace_case_root("js_user_local_m0");
+    fs::write(root.join("m.rss"), "pub fn b() { 1 }\n").expect("module");
+    let main_path = root.join("main.js");
+    fs::write(
+        &main_path,
+        concat!(
+            "import * as a from \"./m.rss\";\n",
+            "const m0 = 2;\n",
+            "a.b() + m0;\n",
+        ),
+    )
+    .expect("js source");
+    let compiled = compile_source_file_with_options(
+        main_path.as_path(),
+        pd_vm_compat_frontends::compile_options(),
+    )
+    .expect("user local m0 plus file-module call should compile");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(3)]);
+}
+
+#[test]
+fn javascript_multiline_file_module_call_fails_closed_before_parse() {
+    let root = namespace_case_root("js_multiline_fold");
+    fs::write(
+        root.join("strings.rss"),
+        "pub fn non_empty(value) { value.length != 0; }\n",
+    )
+    .expect("module");
+    let main_path = root.join("main.js");
+    let source = concat!(
+        "import * as string from \"./strings.rss\";\n",
+        "string\n",
+        ".non_empty(\"rss\");\n",
+    );
+    fs::write(&main_path, source).expect("js source");
+    let error = match compile_source_file_with_options(
+        main_path.as_path(),
+        pd_vm_compat_frontends::compile_options(),
+    ) {
+        Ok(_) => panic!("multiline file-module call should fail closed"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("spans a line break"),
+        "diagnostic must fail closed on multiline fold, got {message}"
+    );
+    assert!(
+        message.contains("string") && message.contains("non_empty"),
+        "diagnostic must name the original qualified target, got {message}"
+    );
+    assert!(
+        !message.contains("aaa") && !message.contains("__pdns") && !message.contains(" m0"),
+        "diagnostic must not leak placeholders: {message}"
+    );
+}
+
+#[test]
+fn javascript_many_short_file_module_calls_compile() {
+    let root = namespace_case_root("js_many_short_calls");
+    fs::write(root.join("m.rss"), "pub fn b() { 1 }\n").expect("module");
+    let main_path = root.join("main.js");
+    let mut source = String::from("import * as a from \"./m.rss\";\nlet total = 0;\n");
+    for _ in 0..110 {
+        source.push_str("total = total + a.b();\n");
+    }
+    source.push_str("total;\n");
+    fs::write(&main_path, source).expect("js source");
+    let compiled = compile_source_file_with_options(
+        main_path.as_path(),
+        pd_vm_compat_frontends::compile_options(),
+    )
+    .expect("110 short file-module calls should compile");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(110)]);
 }

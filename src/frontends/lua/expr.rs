@@ -172,10 +172,13 @@ pub(super) fn parse_lua_direct_expr_top(
     Ok(parse_lua_direct_expr(input, &mut lowering, false)?.map(|expr| expr.expr))
 }
 
+pub(super) fn lua_ir_call(index: u16, args: Vec<Expr>) -> Expr {
+    Expr::Call(index, Vec::new(), args, None, None)
+}
+
 pub(super) fn build_lua_unpack_get_expr(target: Expr, index: i64) -> Expr {
-    Expr::Call(
+    lua_ir_call(
         BuiltinFunction::Get.call_index(),
-        Vec::new(),
         vec![target, Expr::Int(index)],
     )
 }
@@ -262,7 +265,7 @@ fn lower_lua_callable_call(
     let unpack_arity = callee.callable_return_arity.unwrap_or(1);
     match callee.expr {
         Expr::Var(slot) => Some(LuaLoweredExpr {
-            expr: Expr::LocalCall(slot, Vec::new(), args),
+            expr: Expr::LocalCall(slot, Vec::new(), args, None),
             unpack_arity,
             callable_return_arity: None,
         }),
@@ -271,8 +274,8 @@ fn lower_lua_callable_call(
             unpack_arity,
             callable_return_arity: None,
         }),
-        Expr::FunctionRef(index) => Some(LuaLoweredExpr {
-            expr: Expr::Call(index, Vec::new(), args),
+        Expr::FunctionRef(index, _) => Some(LuaLoweredExpr {
+            expr: lua_ir_call(index, args),
             unpack_arity,
             callable_return_arity: None,
         }),
@@ -387,9 +390,8 @@ pub(super) fn lower_lua_direct_expr(
         }
         LuaDirectExpr::Member(target, member) => {
             let target = lower_lua_direct_expr(*target, lowering, false)?;
-            Some(LuaLoweredExpr::scalar(Expr::Call(
+            Some(LuaLoweredExpr::scalar(lua_ir_call(
                 BuiltinFunction::Get.call_index(),
-                Vec::new(),
                 vec![target.expr, Expr::String(member)],
             )))
         }
@@ -401,35 +403,28 @@ pub(super) fn lower_lua_direct_expr(
         LuaDirectExpr::Index(target, key) => {
             let target = lower_lua_direct_expr(*target, lowering, false)?;
             let key = lower_lua_direct_expr(*key, lowering, false)?;
-            Some(LuaLoweredExpr::scalar(Expr::Call(
+            Some(LuaLoweredExpr::scalar(lua_ir_call(
                 BuiltinFunction::Get.call_index(),
-                Vec::new(),
                 vec![target.expr, key.expr],
             )))
         }
         LuaDirectExpr::TableArray(values) => {
-            let mut out = Expr::Call(
-                BuiltinFunction::ArrayNew.call_index(),
-                Vec::new(),
-                Vec::new(),
-            );
+            let mut out = lua_ir_call(BuiltinFunction::ArrayNew.call_index(), Vec::new());
             for value in values {
                 let value = lower_lua_direct_expr(value, lowering, false)?;
-                out = Expr::Call(
+                out = lua_ir_call(
                     BuiltinFunction::ArrayPush.call_index(),
-                    Vec::new(),
                     vec![out, value.expr],
                 );
             }
             Some(LuaLoweredExpr::scalar(out))
         }
         LuaDirectExpr::TableMap(entries) => {
-            let mut out = Expr::Call(BuiltinFunction::MapNew.call_index(), Vec::new(), Vec::new());
+            let mut out = lua_ir_call(BuiltinFunction::MapNew.call_index(), Vec::new());
             for (key, value) in entries {
                 let value = lower_lua_direct_expr(value, lowering, false)?;
-                out = Expr::Call(
+                out = lua_ir_call(
                     BuiltinFunction::Set.call_index(),
-                    Vec::new(),
                     vec![out, Expr::String(key), value.expr],
                 );
             }
@@ -583,12 +578,25 @@ fn lower_lua_namespace_call(
     }
     let imported_root = namespace_aliases.get(&path[0]).cloned();
     let root = imported_root.clone().unwrap_or_else(|| path[0].clone());
+    let root_is_local = builder.resolve_local_expr(&path[0]).is_some();
 
-    if let Some(imported_root) = imported_root
+    if let Some(spec) = imported_root.as_deref()
         && path.len() >= 2
-        && !is_builtin_namespace(&imported_root)
+        && crate::source_loader::is_file_module_spec(spec)
+        && !root_is_local
     {
-        let mut segments = vec![imported_root];
+        let call_name = path.join("::");
+        let arity = u8::try_from(args.len()).ok()?;
+        builder.declare_function(&call_name, Some(arity)).ok()?;
+        return builder.resolve_call_expr(&call_name, args);
+    }
+
+    if let Some(imported_root) = imported_root.as_deref()
+        && path.len() >= 2
+        && !is_builtin_namespace(imported_root)
+        && !crate::source_loader::is_file_module_spec(imported_root)
+    {
+        let mut segments = vec![imported_root.to_string()];
         segments.extend(path.iter().skip(1).cloned());
         let call_name = segments.join("::");
         let arity = u8::try_from(args.len()).ok()?;
@@ -601,12 +609,18 @@ fn lower_lua_namespace_call(
     }
 
     if path.len() == 2 {
-        if let Some(expr) = builder.resolve_call_expr(&path[1], args.clone()) {
+        if root_is_local {
+            return None;
+        }
+        if imported_root.is_none()
+            && let Some(expr) = builder.resolve_call_expr(&path[1], args.clone())
+        {
             return Some(expr);
         }
+        let qualified = format!("{}::{}", path[0], path[1]);
         let arity = u8::try_from(args.len()).ok()?;
-        builder.declare_function(&path[1], Some(arity)).ok()?;
-        return builder.resolve_call_expr(&path[1], args);
+        builder.declare_function(&qualified, Some(arity)).ok()?;
+        return builder.resolve_call_expr(&qualified, args);
     }
 
     None
@@ -627,7 +641,7 @@ fn lower_lua_regex_or_builtin_namespace_call(
             _ => return None,
         };
         if builtin.accepts_arity(u8::try_from(args.len()).ok()?) {
-            return Some(Expr::Call(builtin.call_index(), Vec::new(), args));
+            return Some(lua_ir_call(builtin.call_index(), args));
         }
         // Preserve the previous Lua frontend behavior where regex flags are
         // accepted as a third argument and rewritten into an inline pattern.
@@ -635,7 +649,7 @@ fn lower_lua_regex_or_builtin_namespace_call(
             let flags = args.pop()?;
             let pattern = args.first().cloned()?;
             args[0] = apply_lua_regex_flags_to_pattern_expr(pattern, flags);
-            return Some(Expr::Call(builtin.call_index(), Vec::new(), args));
+            return Some(lua_ir_call(builtin.call_index(), args));
         }
         return None;
     }
@@ -644,25 +658,19 @@ fn lower_lua_regex_or_builtin_namespace_call(
     if !builtin.accepts_arity(u8::try_from(args.len()).ok()?) {
         return None;
     }
-    Some(Expr::Call(builtin.call_index(), Vec::new(), args))
+    Some(lua_ir_call(builtin.call_index(), args))
 }
 
 fn apply_lua_regex_flags_to_pattern_expr(pattern: Expr, flags: Expr) -> Expr {
-    let prefix = Expr::Call(
+    let prefix = lua_ir_call(
         BuiltinFunction::Concat.call_index(),
-        Vec::new(),
         vec![Expr::String("(?".to_string()), flags],
     );
-    let prefix = Expr::Call(
+    let prefix = lua_ir_call(
         BuiltinFunction::Concat.call_index(),
-        Vec::new(),
         vec![prefix, Expr::String(")".to_string())],
     );
-    Expr::Call(
-        BuiltinFunction::Concat.call_index(),
-        Vec::new(),
-        vec![prefix, pattern],
-    )
+    lua_ir_call(BuiltinFunction::Concat.call_index(), vec![prefix, pattern])
 }
 
 fn build_lua_optional_member_expr(
@@ -688,16 +696,14 @@ fn build_lua_optional_member_expr(
         .ok()?;
 
     let keys_len_expr = || {
-        Expr::Call(
+        lua_ir_call(
             BuiltinFunction::Len.call_index(),
-            Vec::new(),
             vec![Expr::Var(keys_slot)],
         )
     };
     let current_key_expr = || {
-        Expr::Call(
+        lua_ir_call(
             BuiltinFunction::Get.call_index(),
-            Vec::new(),
             vec![Expr::Var(keys_slot), Expr::Var(idx_slot)],
         )
     };
@@ -725,9 +731,8 @@ fn build_lua_optional_member_expr(
                     Stmt::Let {
                         index: keys_slot,
                         declared_schema: None,
-                        expr: Expr::Call(
+                        expr: lua_ir_call(
                             BuiltinFunction::Keys.call_index(),
-                            Vec::new(),
                             vec![Expr::Var(target_slot)],
                         ),
                         line,
@@ -786,9 +791,8 @@ fn build_lua_optional_member_expr(
                         then_branch: vec![Stmt::Assign {
                             kind: AssignmentKind::Set,
                             index: result_slot,
-                            expr: Expr::Call(
+                            expr: lua_ir_call(
                                 BuiltinFunction::Get.call_index(),
-                                Vec::new(),
                                 vec![Expr::Var(target_slot), Expr::String(member)],
                             ),
                             line,

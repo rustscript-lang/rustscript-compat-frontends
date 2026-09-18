@@ -1,0 +1,6 @@
+Frozen exact copy of rustscript stdlib/rss/strings.rss
+revision: b1d6cffede77f49410bf63525f30b9a46b02dc01
+source: https://github.com/rustscript-lang/rustscript
+path: stdlib/rss/strings.rss
+sha256: bdee0958fc55940398bc22b46afb431c4ca34ab0a72621691c12b3fb12e0114c
+bytes: 3522

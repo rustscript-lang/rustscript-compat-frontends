@@ -100,16 +100,17 @@ fn try_lower_direct_subset_to_ir(source: &str) -> Result<Option<FrontendIr>, Par
         if let Some((name, rhs)) = parse_lua_local_assignment(trimmed)
             && let Some((spec, remainder)) = parse_lua_require_call(rhs)
         {
-            if (spec == "io"
-                || spec == "re"
-                || spec == "json"
-                || is_virtual_host_namespace_spec(&spec))
-                && remainder.is_empty()
+            if remainder.is_empty()
+                && (spec == "io"
+                    || spec == "re"
+                    || spec == "json"
+                    || is_virtual_host_namespace_spec(&spec)
+                    || crate::source_loader::is_file_module_spec(&spec))
             {
                 namespace_aliases.insert(name.to_string(), spec);
                 continue;
             }
-            // Module require lines are import directives handled by source loader rewrites/preludes.
+            // Module require lines are import directives handled by the source loader.
             continue;
         }
 
@@ -762,7 +763,17 @@ fn try_lower_direct_subset_to_ir(source: &str) -> Result<Option<FrontendIr>, Par
         return Ok(None);
     }
 
-    Ok(Some(builder.finish(root_stmts)))
+    let mut ir = builder.finish(root_stmts);
+    ir.implicit_extern_names = ir
+        .functions
+        .iter()
+        .filter_map(|func| {
+            let (namespace, _) = func.name.split_once("::")?;
+            let spec = namespace_aliases.get(namespace)?;
+            crate::source_loader::is_file_module_spec(spec).then(|| func.name.clone())
+        })
+        .collect();
+    Ok(Some(ir))
 }
 
 enum LuaDirectBlock {

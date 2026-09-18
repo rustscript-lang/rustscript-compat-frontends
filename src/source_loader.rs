@@ -232,3 +232,7 @@ pub(crate) fn is_ident_start(ch: char) -> bool {
 pub(crate) fn is_ident_continue(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || ch == '_'
 }
+
+pub(crate) fn is_file_module_spec(spec: &str) -> bool {
+    spec.contains('/') || spec.starts_with('.') || spec.ends_with(".rss")
+}

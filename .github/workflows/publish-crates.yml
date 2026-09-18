@@ -31,9 +31,9 @@ jobs:
       contents: read
     env:
       PACKAGE_ORDER: pd-vm-compat-frontends
-      PD_VM_VERSION: ${{ inputs.pd_vm_version || '0.22.2' }}
+      PD_VM_VERSION: ${{ inputs.pd_vm_version || '0.1.0' }}
       PD_EDGE_ABI_VERSION: ${{ inputs.pd_edge_abi_version || '0.1.1' }}
-      WORKSPACE_VERSION_OVERRIDES: rustscript-compat-frontends=${{ inputs.version }} rustscript=${{ inputs.pd_vm_version || '0.22.2' }} pd-edge=${{ inputs.pd_edge_abi_version || '0.1.1' }}
+      WORKSPACE_VERSION_OVERRIDES: rustscript-compat-frontends=${{ inputs.version }} rustscript=${{ inputs.pd_vm_version || '0.1.0' }} pd-edge=${{ inputs.pd_edge_abi_version || '0.1.1' }}
     steps:
       - name: Checkout compatibility frontends
         uses: actions/checkout@v4
@@ -72,8 +72,8 @@ jobs:
 
           version = os.environ['PUBLISH_VERSION']
           dep_versions = {
-              'pd-vm': os.environ.get('PD_VM_VERSION') or '0.22.2',
-              'pd-host-function': os.environ.get('PD_VM_VERSION') or '0.22.2',
+              'pd-vm': os.environ.get('PD_VM_VERSION') or '0.1.0',
+              'pd-host-function': os.environ.get('PD_VM_VERSION') or '0.1.0',
               'pd-edge-abi': os.environ.get('PD_EDGE_ABI_VERSION') or '0.1.1',
           }
           workspace_versions = {}
@@ -97,19 +97,23 @@ jobs:
                   if section in ('[workspace.package]', '[package]') and stripped.startswith('version = '):
                       line = re.sub(r'version\s*=\s*"[^"]*"', f'version = "{manifest_version}"', line)
                   match = dep_re.match(line)
-                  if match and 'path' in match.group(3):
+                  if match and ('path' in match.group(3) or 'git' in match.group(3)):
                       prefix, key, body, suffix = match.groups()
                       package_match = re.search(r'package\s*=\s*"([^"]+)"', body)
                       dep_name = package_match.group(1) if package_match else key
                       dep_version = dep_versions.get(dep_name)
                       if dep_version:
+                          body = re.sub(r'\s*,?\s*git\s*=\s*"[^"]*"', '', body)
+                          body = re.sub(r'\s*,?\s*rev\s*=\s*"[^"]*"', '', body)
+                          body = re.sub(r'\s*,?\s*path\s*=\s*"[^"]*"', '', body)
                           if re.search(r'version\s*=\s*"[^"]*"', body):
                               body = re.sub(r'version\s*=\s*"[^"]*"', f'version = "{dep_version}"', body)
                           else:
-                              body = body.rstrip()
-                              if body and not body.endswith(','):
-                                  body += ','
-                              body += f' version = "{dep_version}"'
+                              body = body.strip().strip(',')
+                              if body:
+                                  body = f'version = "{dep_version}", {body}'
+                              else:
+                                  body = f'version = "{dep_version}"'
                           line = prefix + body + suffix
                   out.append(line)
               path.write_text('\n'.join(out) + '\n')

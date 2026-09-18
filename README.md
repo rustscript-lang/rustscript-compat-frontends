@@ -6,7 +6,7 @@ JavaScript and Lua compatibility frontends for `pd-vm`.
 
 This crate owns the compatibility-language pieces that are intentionally outside the core `rustscript` repository:
 
-- JavaScript parser dialect configuration and lowering rewrites
+- JavaScript parser dialect, span-preserving parser compatibility fold for file-module `alias.member()` calls, and IR lowering onto qualified `alias::member` names
 - Lua parser/lowering helpers
 - JavaScript and Lua import scanning / import stripping for source-file loading
 - compatibility frontend tests and fixtures
@@ -14,7 +14,7 @@ This crate owns the compatibility-language pieces that are intentionally outside
 ## Usage
 
 ```toml
-pd-vm = "0.22.2"
+pd-vm = "0.1.0"
 pd-vm-compat-frontends = "0.1.0"
 ```
 
@@ -44,7 +44,7 @@ Core RustScript (`.rss`) remains in the `pd-vm` crate.
 ## Development
 
 ```bash
-cargo test --workspace 
+cargo test --workspace
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 ```

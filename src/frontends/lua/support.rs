@@ -1,6 +1,6 @@
 use super::expr::{
     LuaDirectExpr, LuaDirectLowering, build_lua_unpack_get_expr, lower_lua_direct_expr,
-    parse_lua_direct_expr,
+    lua_ir_call, parse_lua_direct_expr,
 };
 use super::{LuaLoweredExpr, fresh_lua_direct_temp};
 use crate::source_loader::{is_ident_continue, is_ident_start};
@@ -224,18 +224,8 @@ pub(super) fn lua_return_arity(exprs: Option<&[LuaLoweredExpr]>) -> usize {
 
 fn build_lua_packed_array_expr(values: Vec<Expr>) -> Expr {
     values.into_iter().fold(
-        Expr::Call(
-            BuiltinFunction::ArrayNew.call_index(),
-            Vec::new(),
-            Vec::new(),
-        ),
-        |array, value| {
-            Expr::Call(
-                BuiltinFunction::ArrayPush.call_index(),
-                Vec::new(),
-                vec![array, value],
-            )
-        },
+        lua_ir_call(BuiltinFunction::ArrayNew.call_index(), Vec::new()),
+        |array, value| lua_ir_call(BuiltinFunction::ArrayPush.call_index(), vec![array, value]),
     )
 }
 
