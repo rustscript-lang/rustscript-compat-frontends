@@ -5,7 +5,7 @@ on:
   pull_request:
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -16,7 +16,7 @@ env:
 
 jobs:
   rust:
-    name: Rust lint and tests
+    name: Rust lint, tests, and CLI acceptance
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,14 +26,35 @@ jobs:
       - name: Format check
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - name: Tests
-        run: cargo test --workspace -- --test-threads=1
-      - name: CLI smoke
+        run: cargo test --locked --workspace -- --test-threads=1
+      - name: TypeScript, Lua, and version CLI smoke
         run: |
-          cargo run --bin pd-vm-compat-run -- examples/example.js
-          cargo run --bin pd-vm-compat-run -- examples/example.lua
-          cargo run --bin pd-vm-compat-run -- --version
+          cargo run --locked --bin pd-vm-compat-run -- examples/example.ts
+          cargo run --locked --bin pd-vm-compat-run -- examples/example.mts
+          cargo run --locked --bin pd-vm-compat-run -- examples/example.lua
+          cargo run --locked --bin pd-vm-compat-run -- --version
+      - name: Reject JavaScript CLI entry files
+        shell: bash
+        run: |
+          set -euo pipefail
+          scratch="$(mktemp -d)"
+          trap 'rm -rf "$scratch"' EXIT
+          for extension in js mjs cjs; do
+            source="$scratch/rejected.$extension"
+            log="$scratch/rejected.$extension.log"
+            printf 'const value = "JavaScript must be rejected";\n' > "$source"
+            if cargo run --locked --bin pd-vm-compat-run -- "$source" >"$log" 2>&1; then
+              echo "unexpectedly accepted .$extension entry file" >&2
+              exit 1
+            fi
+            if ! grep -Fq ".$extension" "$log"; then
+              cat "$log" >&2
+              echo "diagnostic did not identify .$extension" >&2
+              exit 1
+            fi
+          done
 
   binaries:
     name: pd-vm-compat-run (${{ matrix.os }})
@@ -46,14 +67,23 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Build pd-vm-compat-run
-        run: cargo build --bin pd-vm-compat-run --release
+        run: cargo build --locked --bin pd-vm-compat-run --release
+      - name: Run typed frontend and Lua smoke fixtures
+        run: |
+          cargo run --locked --bin pd-vm-compat-run --release -- examples/example.ts
+          cargo run --locked --bin pd-vm-compat-run --release -- examples/example.mts
+          cargo run --locked --bin pd-vm-compat-run --release -- examples/example.lua
+          cargo run --locked --bin pd-vm-compat-run --release -- --version
       - name: Stage pd-vm-compat-run artifact
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p dist
           suffix=""
           if [[ "${{ runner.os }}" == "Windows" ]]; then suffix=".exe"; fi
-          cp "target/release/pd-vm-compat-run${suffix}" "dist/pd-vm-compat-run-${{ runner.os }}-${{ runner.arch }}${suffix}"
+          source="target/release/pd-vm-compat-run${suffix}"
+          test -f "$source"
+          cp "$source" "dist/pd-vm-compat-run-${{ runner.os }}-${{ runner.arch }}${suffix}"
       - uses: actions/upload-artifact@v4
         with:
           name: pd-vm-compat-run-${{ runner.os }}-${{ runner.arch }}
