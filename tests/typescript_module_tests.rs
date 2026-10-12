@@ -11,7 +11,7 @@ impl Project {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let base = std::env::var_os("TMPDIR")
             .map(PathBuf::from)
-            .expect("test TMPDIR is assigned");
+            .unwrap_or_else(std::env::temp_dir);
         loop {
             let id = NEXT.fetch_add(1, Ordering::Relaxed);
             let path = base.join(format!(
