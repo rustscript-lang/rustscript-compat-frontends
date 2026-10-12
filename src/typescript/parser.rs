@@ -76,6 +76,109 @@ enum TypeDeclaration<'a> {
     Alias(&'a ast::TsTypeAliasDecl),
 }
 
+struct DeclaredHostType {
+    schema: TypeSchema,
+    guest_type_names: HashSet<String>,
+}
+
+struct DeclaredGuestTypeNames<'map, 'ast> {
+    declarations: &'map HashMap<String, StructDecl>,
+    aliases: &'map HashMap<String, &'ast ast::TsTypeAliasDecl>,
+    expanded_aliases: HashSet<String>,
+    generic_params: HashSet<String>,
+    names: HashSet<String>,
+}
+
+impl<'map, 'ast> DeclaredGuestTypeNames<'map, 'ast> {
+    fn new(
+        declarations: &'map HashMap<String, StructDecl>,
+        aliases: &'map HashMap<String, &'ast ast::TsTypeAliasDecl>,
+    ) -> Self {
+        Self {
+            declarations,
+            aliases,
+            expanded_aliases: HashSet::new(),
+            generic_params: HashSet::new(),
+            names: HashSet::new(),
+        }
+    }
+
+    fn collect(&mut self, ty: &ast::TsType) {
+        match ty {
+            ast::TsType::TsTypeRef(reference) => {
+                let name = entity_name(&reference.type_name);
+                if !self.generic_params.contains(&name) {
+                    if let Some(declaration) = self.declarations.get(&name) {
+                        if declaration.origin == StructDeclOrigin::Guest {
+                            self.names.insert(declaration.name.clone());
+                        }
+                    } else if let Some(alias) = self.aliases.get(&name)
+                        && self.expanded_aliases.insert(name)
+                    {
+                        let previous_params = self.generic_params.clone();
+                        if let Some(params) = &alias.type_params {
+                            self.generic_params.extend(
+                                params
+                                    .params
+                                    .iter()
+                                    .map(|parameter| parameter.name.sym.to_string()),
+                            );
+                        }
+                        self.collect(&alias.type_ann);
+                        self.generic_params = previous_params;
+                    }
+                }
+                if let Some(params) = &reference.type_params {
+                    for parameter in &params.params {
+                        self.collect(parameter);
+                    }
+                }
+            }
+            ast::TsType::TsArrayType(array) => self.collect(&array.elem_type),
+            ast::TsType::TsTupleType(tuple) => {
+                for element in &tuple.elem_types {
+                    self.collect(&element.ty);
+                }
+            }
+            ast::TsType::TsTypeLit(literal) => {
+                for member in &literal.members {
+                    if let ast::TsTypeElement::TsPropertySignature(property) = member
+                        && let Some(annotation) = &property.type_ann
+                    {
+                        self.collect(&annotation.type_ann);
+                    }
+                }
+            }
+            ast::TsType::TsParenthesizedType(paren) => self.collect(&paren.type_ann),
+            ast::TsType::TsFnOrConstructorType(ast::TsFnOrConstructorType::TsFnType(function)) => {
+                for parameter in &function.params {
+                    if let ast::TsFnParam::Ident(binding) = parameter
+                        && let Some(annotation) = &binding.type_ann
+                    {
+                        self.collect(&annotation.type_ann);
+                    }
+                }
+                self.collect(&function.type_ann.type_ann);
+            }
+            ast::TsType::TsUnionOrIntersectionType(union) => match union {
+                ast::TsUnionOrIntersectionType::TsUnionType(union) => {
+                    for member in &union.types {
+                        self.collect(member);
+                    }
+                }
+                ast::TsUnionOrIntersectionType::TsIntersectionType(intersection) => {
+                    for member in &intersection.types {
+                        self.collect(member);
+                    }
+                }
+            },
+            ast::TsType::TsOptionalType(optional) => self.collect(&optional.type_ann),
+            ast::TsType::TsRestType(rest) => self.collect(&rest.type_ann),
+            _ => {}
+        }
+    }
+}
+
 fn type_declaration_item(item: &ast::ModuleItem) -> Option<TypeDeclaration<'_>> {
     match item {
         ast::ModuleItem::Stmt(ast::Stmt::Decl(ast::Decl::TsInterface(interface))) => {
@@ -1124,10 +1227,76 @@ impl<'a> Lowerer<'a> {
         Ok(fields)
     }
 
+    fn declared_host_type(
+        &self,
+        ty: &ast::TsType,
+        aliases: &HashMap<String, &ast::TsTypeAliasDecl>,
+    ) -> Result<DeclaredHostType, ParseError> {
+        let schema = self.lower_type(ty)?;
+        let mut guest_types = DeclaredGuestTypeNames::new(&self.named_type_declarations, aliases);
+        guest_types.collect(ty);
+        Ok(DeclaredHostType {
+            schema,
+            guest_type_names: guest_types.names,
+        })
+    }
+
+    fn schema_contains_named_type(schema: &TypeSchema, names: &HashSet<String>) -> bool {
+        match schema {
+            TypeSchema::Optional(inner) | TypeSchema::Array(inner) | TypeSchema::Map(inner) => {
+                Self::schema_contains_named_type(inner, names)
+            }
+            TypeSchema::Named(name, arguments) => {
+                names.contains(name)
+                    || arguments
+                        .iter()
+                        .any(|argument| Self::schema_contains_named_type(argument, names))
+            }
+            TypeSchema::ArrayTuple(items) => items
+                .iter()
+                .any(|item| Self::schema_contains_named_type(item, names)),
+            TypeSchema::ArrayTupleRest { prefix, rest } => {
+                prefix
+                    .iter()
+                    .any(|item| Self::schema_contains_named_type(item, names))
+                    || Self::schema_contains_named_type(rest, names)
+            }
+            TypeSchema::Object(fields) => fields
+                .values()
+                .any(|field| Self::schema_contains_named_type(field, names)),
+            TypeSchema::Callable { params, result } => {
+                params
+                    .iter()
+                    .any(|param| Self::schema_contains_named_type(param, names))
+                    || Self::schema_contains_named_type(result, names)
+            }
+            TypeSchema::Unknown
+            | TypeSchema::Null
+            | TypeSchema::Int
+            | TypeSchema::Float
+            | TypeSchema::Number
+            | TypeSchema::Bool
+            | TypeSchema::String
+            | TypeSchema::Bytes
+            | TypeSchema::Resource(_)
+            | TypeSchema::GenericParam(_) => false,
+        }
+    }
+
+    fn declaration_type_matches_catalog(
+        declaration: &DeclaredHostType,
+        catalog_type: &vm::HostTypeSchema,
+    ) -> bool {
+        let catalog_schema = Self::host_type_schema(catalog_type);
+        declaration.schema == catalog_schema
+            && !Self::schema_contains_named_type(&catalog_schema, &declaration.guest_type_names)
+    }
+
     fn declared_host_signature(
         &self,
         function: &ast::FnDecl,
-    ) -> Result<(Vec<TypeSchema>, TypeSchema), ParseError> {
+        aliases: &HashMap<String, &ast::TsTypeAliasDecl>,
+    ) -> Result<(Vec<DeclaredHostType>, DeclaredHostType), ParseError> {
         if !function.declare || function.function.body.is_some() {
             return Err(unsupported(
                 function.function.span,
@@ -1168,7 +1337,7 @@ impl<'a> Lowerer<'a> {
                     ),
                 ));
             };
-            parameters.push(self.lower_type(&annotation.type_ann)?);
+            parameters.push(self.declared_host_type(&annotation.type_ann, aliases)?);
         }
         let Some(return_type) = function.function.return_type.as_ref() else {
             return Err(ParseError::at_span(
@@ -1179,10 +1348,22 @@ impl<'a> Lowerer<'a> {
                 ),
             ));
         };
-        Ok((parameters, self.lower_type(&return_type.type_ann)?))
+        Ok((
+            parameters,
+            self.declared_host_type(&return_type.type_ann, aliases)?,
+        ))
     }
 
     fn predeclare_functions(&mut self, module: &ast::Module) -> Result<(), ParseError> {
+        let type_aliases = module
+            .body
+            .iter()
+            .filter_map(type_declaration_item)
+            .filter_map(|declaration| match declaration {
+                TypeDeclaration::Alias(alias) => Some((alias.id.sym.to_string(), alias)),
+                TypeDeclaration::Interface(_) => None,
+            })
+            .collect::<HashMap<_, _>>();
         let mut declarations = HashMap::<String, Vec<(Vec<TypeSchema>, TypeSchema, Span)>>::new();
         for item in &module.body {
             let Some((function, exported)) = function_item(item) else {
@@ -1213,24 +1394,34 @@ impl<'a> Lowerer<'a> {
                         format!("host catalog does not declare '{name}'"),
                     ));
                 };
-                let signature = self.declared_host_signature(function)?;
+                let signature = self.declared_host_signature(function, &type_aliases)?;
                 if !candidates.iter().any(|candidate| {
                     candidate.params.len() == signature.0.len()
                         && candidate
                             .params
                             .iter()
-                            .map(|parameter| Self::host_type_schema(&parameter.ty))
-                            .eq(signature.0.iter().cloned())
-                        && Self::host_type_schema(&candidate.return_type) == signature.1
+                            .zip(&signature.0)
+                            .all(|(parameter, declared)| {
+                                Self::declaration_type_matches_catalog(declared, &parameter.ty)
+                            })
+                        && Self::declaration_type_matches_catalog(
+                            &signature.1,
+                            &candidate.return_type,
+                        )
                 }) {
                     return Err(ParseError::at_span(
                         declaration_span,
                         format!("host declaration '{name}' does not match its catalog signature"),
                     ));
                 }
+                let parameter_schemas = signature
+                    .0
+                    .into_iter()
+                    .map(|parameter| parameter.schema)
+                    .collect();
                 declarations.entry(name).or_default().push((
-                    signature.0,
-                    signature.1,
+                    parameter_schemas,
+                    signature.1.schema,
                     declaration_span,
                 ));
                 continue;

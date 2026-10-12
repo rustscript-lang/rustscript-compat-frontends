@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use vm::{
@@ -307,6 +308,305 @@ text;
     assert_eq!(
         machine.stack(),
         &[Value::string("int"), Value::string("string")]
+    );
+}
+
+struct CountConsume(Arc<AtomicUsize>);
+
+impl vm::HostFunction for CountConsume {
+    fn call(&mut self, _machine: &mut Vm, args: &[Value]) -> vm::VmResult<vm::CallOutcome> {
+        assert_eq!(args.len(), 1);
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(vm::CallOutcome::Return(vm::CallReturn::one(Value::Bool(
+            true,
+        ))))
+    }
+}
+
+#[test]
+fn same_name_guest_profile_cannot_impersonate_host_catalog_profile() {
+    let profile = vm::HostStructSchema::new(
+        "Profile",
+        vec![vm::HostStructField::new("name", vm::HostTypeSchema::String)],
+    );
+    let mut builder = vm::HostApiBuilder::new();
+    builder.named_struct(profile.clone());
+    builder.function(vm::HostFunctionSchema::with_return(
+        "profile::consume",
+        vec![vm::HostParamSchema::value("value", profile.as_type())],
+        vm::HostTypeSchema::Bool,
+    ));
+    let catalog = Arc::new(builder.build().expect("valid host catalog"));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let schema = vm::catalog_import_schemas(&catalog, "profile::consume")
+        .into_iter()
+        .next()
+        .expect("consume binding schema comes from the catalog");
+    let mut registry = vm::HostFunctionRegistry::new();
+    let factory_calls = Arc::clone(&calls);
+    registry
+        .register_catalog(schema, move || {
+            Box::new(CountConsume(Arc::clone(&factory_calls)))
+        })
+        .expect("counter binding matches the caller's host catalog");
+    let source = r#"import { consume } from "profile";
+interface Profile { admin: boolean }
+const value: Profile = { admin: true };
+consume(value);
+"#;
+
+    let result = compile_source_with_flavor_and_options(
+        source,
+        pd_vm_compat_frontends::typescript_flavor(),
+        pd_vm_compat_frontends::compile_options_with_catalog(Arc::clone(&catalog)),
+    );
+    let diagnostic = match result {
+        Err(error) => {
+            let diagnostic = error.to_string();
+            println!("guest/host same-name diagnostic: {error:?}");
+            Some(diagnostic)
+        }
+        Ok(compiled) => {
+            let mut machine = Vm::new(compiled.program);
+            registry
+                .bind_vm_cached(&mut machine)
+                .expect("bind the real host catalog counter");
+            let status = machine.run();
+            println!(
+                "guest/host same-name probe: compile=accepted, run={status:?}, host_calls={}",
+                calls.load(Ordering::SeqCst)
+            );
+            None
+        }
+    };
+    println!(
+        "guest/host same-name probe: compile_diagnostic={diagnostic:?}, host_calls={}",
+        calls.load(Ordering::SeqCst)
+    );
+    let diagnostic = diagnostic.expect("same-name guest type is rejected at the host call");
+    assert!(
+        diagnostic.contains("no host function `profile::consume` matches the arguments"),
+        "unexpected rejection reason: {diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("expected Profile, found __guest_type_"),
+        "rejection did not preserve distinct guest schema identity: {diagnostic}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "rejected guest/host collision must not invoke consume"
+    );
+}
+
+#[test]
+fn same_name_guest_profile_declaration_only_is_rejected_in_compile_analyze_and_hints() {
+    let profile = vm::HostStructSchema::new(
+        "Profile",
+        vec![vm::HostStructField::new("name", vm::HostTypeSchema::String)],
+    );
+    let mut builder = vm::HostApiBuilder::new();
+    builder.named_struct(profile.clone());
+    builder.function(vm::HostFunctionSchema::with_return(
+        "consume",
+        vec![vm::HostParamSchema::value("value", profile.as_type())],
+        vm::HostTypeSchema::Bool,
+    ));
+    builder.function(vm::HostFunctionSchema::with_return(
+        "consume_many",
+        vec![vm::HostParamSchema::value(
+            "values",
+            vm::HostTypeSchema::Array(Box::new(profile.as_type())),
+        )],
+        vm::HostTypeSchema::Bool,
+    ));
+    let catalog = Arc::new(builder.build().expect("valid host catalog"));
+    let source = r#"interface Profile { admin: boolean }
+const value: Profile = { admin: true };
+declare function consume(value: Profile): boolean;
+value;
+"#;
+    let options = || pd_vm_compat_frontends::compile_options_with_catalog(Arc::clone(&catalog));
+
+    let error = match compile_source_with_flavor_and_options(
+        source,
+        pd_vm_compat_frontends::typescript_flavor(),
+        options(),
+    ) {
+        Ok(_) => panic!("unused wrong-origin host declaration must be rejected"),
+        Err(error) => error,
+    };
+    let diagnostic = error.to_string();
+    println!("unused wrong-origin declaration diagnostic: {error:?}");
+    assert!(
+        diagnostic.contains("does not match its catalog signature"),
+        "unexpected declaration rejection: {diagnostic}"
+    );
+    let declaration = "declare function consume(value: Profile): boolean;";
+    let declaration_start = source
+        .find(declaration)
+        .expect("declaration signature remains in source");
+    let declaration_end = declaration_start + declaration.len();
+    let expected_span = format!("[{declaration_start}..{declaration_end}]");
+    assert!(
+        diagnostic.contains(&expected_span),
+        "declaration rejection lost its source span {expected_span}: {diagnostic}"
+    );
+    assert!(
+        pd_vm_compat_frontends::collect_typescript_type_hints_with_options(source, options())
+            .is_err(),
+        "public type hints must reject the same declaration"
+    );
+    assert!(
+        analyze_source_from_string_with_options("main.ts", source, options()).is_err(),
+        "analysis must reject the same declaration"
+    );
+
+    let nested_alias_source = r#"interface Profile { admin: boolean }
+type GuestProfiles = Profile[];
+const values: GuestProfiles = [{ admin: true }];
+declare function consume_many(values: GuestProfiles): boolean;
+values;
+"#;
+    let nested_alias_error = match compile_source_with_flavor_and_options(
+        nested_alias_source,
+        pd_vm_compat_frontends::typescript_flavor(),
+        options(),
+    ) {
+        Ok(_) => panic!("unused wrong-origin alias/nested declaration must be rejected"),
+        Err(error) => error,
+    };
+    assert!(
+        nested_alias_error
+            .to_string()
+            .contains("does not match its catalog signature"),
+        "unexpected alias/nested declaration rejection: {nested_alias_error}"
+    );
+    assert!(
+        pd_vm_compat_frontends::collect_typescript_type_hints_with_options(
+            nested_alias_source,
+            options(),
+        )
+        .is_err()
+    );
+    assert!(
+        analyze_source_from_string_with_options("main.ts", nested_alias_source, options()).is_err()
+    );
+}
+
+#[test]
+fn same_name_guest_profile_without_declaration_remains_host_free() {
+    let profile = vm::HostStructSchema::new(
+        "Profile",
+        vec![vm::HostStructField::new("name", vm::HostTypeSchema::String)],
+    );
+    let mut builder = vm::HostApiBuilder::new();
+    builder.named_struct(profile.clone());
+    builder.function(vm::HostFunctionSchema::with_return(
+        "consume",
+        vec![vm::HostParamSchema::value("value", profile.as_type())],
+        vm::HostTypeSchema::Bool,
+    ));
+    let catalog = Arc::new(builder.build().expect("valid host catalog"));
+    let options = || pd_vm_compat_frontends::compile_options_with_catalog(Arc::clone(&catalog));
+    let source = r#"interface Profile { admin: boolean }
+const value: Profile = { admin: true };
+value;
+"#;
+    let hints =
+        pd_vm_compat_frontends::collect_typescript_type_hints_with_options(source, options())
+            .expect("guest type remains available to public type hints");
+    assert!(hints.iter().any(|hint| {
+        hint.name == "value"
+            && hint.schema
+                == Some(TypeSchema::Named(
+                    "__guest_type_m0_s0".to_owned(),
+                    Vec::new(),
+                ))
+    }));
+    analyze_source_from_string_with_options("main.ts", source, options())
+        .expect("analysis accepts the independent guest type");
+    let compiled = compile_source_with_flavor_and_options(
+        source,
+        pd_vm_compat_frontends::typescript_flavor(),
+        options(),
+    )
+    .expect("guest-only same-name record remains compilable");
+    assert!(compiled.program.imports.is_empty());
+    assert!(compiled.program.host_import_schemas().is_empty());
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let factory_calls = Arc::clone(&calls);
+    let mut registry = vm::HostFunctionRegistry::new();
+    registry.register("consume", 1, move || {
+        Box::new(CountConsume(Arc::clone(&factory_calls)))
+    });
+    let mut machine = Vm::new(compiled.program);
+    registry
+        .bind_vm_cached(&mut machine)
+        .expect("bind the handler against a VM with no consume import");
+    assert_eq!(machine.run().unwrap(), VmStatus::Halted);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn explicit_host_profile_type_alias_calls_the_catalog_counter() {
+    let profile = vm::HostStructSchema::new(
+        "Profile",
+        vec![vm::HostStructField::new("name", vm::HostTypeSchema::String)],
+    );
+    let mut builder = vm::HostApiBuilder::new();
+    builder.named_struct(profile.clone());
+    builder.function(vm::HostFunctionSchema::with_return(
+        "consume",
+        vec![vm::HostParamSchema::value("value", profile.as_type())],
+        vm::HostTypeSchema::Bool,
+    ));
+    let catalog = Arc::new(builder.build().expect("valid host catalog"));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let options = || pd_vm_compat_frontends::compile_options_with_catalog(Arc::clone(&catalog));
+    let source = r#"import type { Profile as HostProfile } from "profile";
+type HostAlias = HostProfile;
+const value: HostAlias = { name: "Ada" };
+declare function consume(value: HostAlias): boolean;
+consume(value);
+"#;
+    let hints =
+        pd_vm_compat_frontends::collect_typescript_type_hints_with_options(source, options())
+            .expect("hints preserve an explicit host type alias");
+    assert!(
+        hints
+            .iter()
+            .any(|hint| hint.name == "value" && hint.schema.is_some())
+    );
+    analyze_source_from_string_with_options("main.ts", source, options())
+        .expect("analysis preserves an explicit host type alias");
+    let compiled = compile_source_with_flavor_and_options(
+        source,
+        pd_vm_compat_frontends::typescript_flavor(),
+        options(),
+    )
+    .expect("explicit host type alias should match the catalog declaration");
+    let schema = vm::catalog_import_schemas(&catalog, "consume")
+        .into_iter()
+        .next()
+        .expect("consume binding schema comes from the catalog");
+    let mut registry = vm::HostFunctionRegistry::new();
+    let factory_calls = Arc::clone(&calls);
+    registry
+        .register_catalog(schema, move || {
+            Box::new(CountConsume(Arc::clone(&factory_calls)))
+        })
+        .expect("counter binding matches the caller's host catalog");
+    let mut machine = Vm::new(compiled.program);
+    registry
+        .bind_vm_cached(&mut machine)
+        .expect("bind explicit alias program to the real host counter");
+    assert_eq!(machine.run().unwrap(), VmStatus::Halted);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    println!(
+        "explicit host Profile alias probe: compile=accepted, host_calls={}",
+        calls.load(Ordering::SeqCst)
     );
 }
 
