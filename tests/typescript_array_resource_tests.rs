@@ -203,7 +203,7 @@ fn typed_array_registry(catalog: &HostApiCatalog) -> HostFunctionRegistry {
 
 fn production_array_catalog() -> Arc<HostApiCatalog> {
     Arc::new(
-        pd_vm_compat_frontends::typescript_array_host_module()
+        pd_vm_compat_frontends::runtime::array::typescript_array_host_module()
             .catalog()
             .expect("production array module should expose a typed catalog"),
     )
@@ -220,10 +220,31 @@ fn production_array_program(source: &str, catalog: Arc<HostApiCatalog>) -> vm::C
 
 fn production_array_registry(catalog: &HostApiCatalog) -> HostFunctionRegistry {
     let mut registry = HostFunctionRegistry::restricted();
-    pd_vm_compat_frontends::typescript_array_host_module()
+    pd_vm_compat_frontends::runtime::array::typescript_array_host_module()
         .install_from_catalog(&mut registry, catalog)
         .expect("production array adapters should bind to their exact catalog");
     registry
+}
+
+#[test]
+fn production_array_host_requires_an_explicit_catalog() {
+    let source = r#"
+import { create } from "arrays";
+import type { Resource } from "rustscript:types";
+const owner: Resource<"compat.number_array"> = create([1]);
+owner;
+"#;
+    let catalog = production_array_catalog();
+    production_array_program(source, Arc::clone(&catalog));
+    let result = vm::compile_source_with_flavor_and_options(
+        source,
+        pd_vm_compat_frontends::typescript_flavor(),
+        pd_vm_compat_frontends::compile_options(),
+    );
+    assert!(
+        result.is_err(),
+        "frontend defaults must not silently grant the runtime array host module"
+    );
 }
 
 const ARRAY_DISPATCHER_PRELUDE: &str = r#"
@@ -797,7 +818,7 @@ const owner: Resource<"compat.number_array"> = create([11]);
 try_read(owner, 0.5);
 "#;
     let catalog = production_array_catalog();
-    let compiled = production_array_program(&source, Arc::clone(&catalog));
+    let compiled = production_array_program(source, Arc::clone(&catalog));
     let registry = production_array_registry(&catalog);
     let mut machine = Vm::new(compiled.program);
     registry

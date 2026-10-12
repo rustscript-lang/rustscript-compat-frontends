@@ -20,6 +20,8 @@ struct ParsedModule {
     base: u32,
 }
 
+type LoweredDefaultArguments = (Vec<u16>, Vec<Stmt>, Vec<Expr>);
+
 fn parse_module(source: &str) -> Result<ParsedModule, ParseError> {
     let source_map: Lrc<SourceMap> = Default::default();
     let file = source_map.new_source_file(
@@ -326,7 +328,9 @@ fn parsed_numeric_literal(expression: &ast::Expr) -> Option<f64> {
 }
 
 fn numeric_literal(value: f64) -> Expr {
-    if value.is_finite()
+    if value == 0.0 && value.is_sign_negative() {
+        Expr::Float(value)
+    } else if value.is_finite()
         && value.fract() == 0.0
         && value >= i64::MIN as f64
         && value < 9_223_372_036_854_775_808.0
@@ -2083,7 +2087,7 @@ impl<'a> Lowerer<'a> {
             captures: HashMap::new(),
             capture_copies: Vec::new(),
         });
-        let lowered = (|| -> Result<(Vec<u16>, Vec<Stmt>, Vec<Expr>), ParseError> {
+        let lowered = (|| -> Result<LoweredDefaultArguments, ParseError> {
             let mut closure_params = Vec::with_capacity(provided_args.len());
             let mut default_statements = Vec::new();
             let mut call_args = Vec::with_capacity(parameter_data.len());
@@ -2197,16 +2201,15 @@ impl<'a> Lowerer<'a> {
         }
         let mutable = decl.kind == ast::VarDeclKind::Let;
         for declarator in decl.decls {
-            if self.scope_id == 0 {
-                if let (ast::Pat::Ident(binding), Some(initializer)) =
+            if self.scope_id == 0
+                && let (ast::Pat::Ident(binding), Some(initializer)) =
                     (&declarator.name, &declarator.init)
-                    && let ast::Expr::Arrow(arrow) = initializer.as_ref()
-                    && self.function_indices.contains_key(binding.id.sym.as_ref())
-                {
-                    let function = arrow_function_decl(binding.id.clone(), arrow.clone());
-                    self.lower_function(&function, exported, output)?;
-                    continue;
-                }
+                && let ast::Expr::Arrow(arrow) = initializer.as_ref()
+                && self.function_indices.contains_key(binding.id.sym.as_ref())
+            {
+                let function = arrow_function_decl(binding.id.clone(), arrow.clone());
+                self.lower_function(&function, exported, output)?;
+                continue;
             }
             let ast::Pat::Ident(binding) = declarator.name else {
                 return Err(unsupported(
@@ -3007,8 +3010,69 @@ impl<'a> Lowerer<'a> {
 
     fn expression_schema(&self, expression: &ast::Expr) -> Option<TypeSchema> {
         match expression {
+            ast::Expr::Lit(ast::Lit::Num(value)) => Some(Self::numeric_literal_schema(value.value)),
+            ast::Expr::Lit(ast::Lit::Str(_)) => Some(TypeSchema::String),
+            ast::Expr::Lit(ast::Lit::Bool(_)) => Some(TypeSchema::Bool),
+            ast::Expr::Lit(ast::Lit::Null(_)) => Some(TypeSchema::Null),
             ast::Expr::Ident(ident) => self.local_types.get(ident.sym.as_ref()).cloned(),
             ast::Expr::Paren(paren) => self.expression_schema(&paren.expr),
+            ast::Expr::Unary(unary) => match unary.op {
+                ast::UnaryOp::Bang => Some(TypeSchema::Bool),
+                ast::UnaryOp::Minus => parsed_numeric_literal(expression)
+                    .map(Self::numeric_literal_schema)
+                    .or_else(|| {
+                        self.expression_schema(&unary.arg)
+                            .filter(Self::is_numeric_schema)
+                            .map(|_| TypeSchema::Number)
+                    }),
+                _ => None,
+            },
+            ast::Expr::Bin(binary) => {
+                let left = self.expression_schema(&binary.left);
+                let right = self.expression_schema(&binary.right);
+                match binary.op {
+                    ast::BinaryOp::Add
+                        if left
+                            .as_ref()
+                            .is_some_and(|schema| matches!(schema, TypeSchema::String))
+                            || right
+                                .as_ref()
+                                .is_some_and(|schema| matches!(schema, TypeSchema::String)) =>
+                    {
+                        Some(TypeSchema::String)
+                    }
+                    ast::BinaryOp::Add
+                    | ast::BinaryOp::Sub
+                    | ast::BinaryOp::Mul
+                    | ast::BinaryOp::Div
+                    | ast::BinaryOp::Mod
+                        if left.as_ref().is_some_and(Self::is_numeric_schema)
+                            && right.as_ref().is_some_and(Self::is_numeric_schema) =>
+                    {
+                        Some(TypeSchema::Number)
+                    }
+                    ast::BinaryOp::EqEq
+                    | ast::BinaryOp::EqEqEq
+                    | ast::BinaryOp::NotEq
+                    | ast::BinaryOp::NotEqEq
+                    | ast::BinaryOp::Lt
+                    | ast::BinaryOp::Gt => Some(TypeSchema::Bool),
+                    _ => None,
+                }
+            }
+            ast::Expr::Cond(conditional) => {
+                let consequent = self.expression_schema(&conditional.cons)?;
+                let alternate = self.expression_schema(&conditional.alt)?;
+                if consequent == alternate {
+                    Some(consequent)
+                } else if Self::is_numeric_schema(&consequent)
+                    && Self::is_numeric_schema(&alternate)
+                {
+                    Some(TypeSchema::Number)
+                } else {
+                    None
+                }
+            }
             ast::Expr::Arrow(arrow) => {
                 let mut params = Vec::with_capacity(arrow.params.len());
                 for parameter in &arrow.params {
@@ -3034,6 +3098,20 @@ impl<'a> Lowerer<'a> {
             }
             ast::Expr::Call(call) => self.call_result_schema(call),
             _ => None,
+        }
+    }
+
+    fn is_numeric_schema(schema: &TypeSchema) -> bool {
+        matches!(
+            schema,
+            TypeSchema::Int | TypeSchema::Float | TypeSchema::Number
+        )
+    }
+
+    fn numeric_literal_schema(value: f64) -> TypeSchema {
+        match numeric_literal(value) {
+            Expr::Int(_) => TypeSchema::Int,
+            _ => TypeSchema::Float,
         }
     }
 
@@ -3074,6 +3152,14 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    fn standard_call_result_schema(callee: &str) -> Option<TypeSchema> {
+        match callee {
+            "Math::floor" | "Math::sqrt" | "Math::round" => Some(TypeSchema::Number),
+            "Number::isInteger" | "Number::isNaN" | "isNaN" => Some(TypeSchema::Bool),
+            _ => None,
+        }
+    }
+
     fn call_result_schema(&self, call: &ast::CallExpr) -> Option<TypeSchema> {
         let callee = match &call.callee {
             ast::Callee::Expr(callee) => match callee.as_ref() {
@@ -3103,8 +3189,14 @@ impl<'a> Lowerer<'a> {
             Some(declaration)
         } else {
             let arity = u8::try_from(call.args.len()).ok()?;
-            let index = *self.host_function_indices.get(&callee)?.get(&arity)?;
-            return self.host_return_schema(index);
+            if let Some(index) = self
+                .host_function_indices
+                .get(&callee)
+                .and_then(|overloads| overloads.get(&arity))
+            {
+                return self.host_return_schema(*index);
+            }
+            return Self::standard_call_result_schema(&callee);
         }?;
         if declaration.type_params.is_empty() {
             declaration.return_schema.clone()
@@ -3119,6 +3211,66 @@ impl<'a> Lowerer<'a> {
             unsupported(span, self.base, self.source_id, "function local slot limit")
         })?;
         Ok(slot)
+    }
+
+    fn lower_math_round(
+        &mut self,
+        argument: Expr,
+        span: swc_common::Span,
+    ) -> Result<Expr, ParseError> {
+        let source_span = byte_span(span, self.base, self.source_id);
+        let line = line_at(self.source, source_span.lo);
+        let value_slot = self.alloc_hidden_local(span)?;
+        let floor_slot = self.alloc_hidden_local(span)?;
+        let rounded_slot = self.alloc_hidden_local(span)?;
+        let value = || Expr::Var(value_slot);
+        let floor = || Expr::Var(floor_slot);
+        let rounded = || Expr::Var(rounded_slot);
+        let floor_call = Self::builtin_call(vm::BuiltinFunction::MathFloor, vec![value()]);
+        let is_negative_tie = Expr::Lt(
+            Box::new(value()),
+            Box::new(Expr::Add(Box::new(floor()), Box::new(Expr::Float(0.5)))),
+        );
+        let rounded_value = Expr::IfElse {
+            condition: Box::new(Expr::Eq(Box::new(value()), Box::new(floor()))),
+            then_expr: Box::new(value()),
+            else_expr: Box::new(Expr::IfElse {
+                condition: Box::new(is_negative_tie),
+                then_expr: Box::new(floor()),
+                else_expr: Box::new(Expr::Add(Box::new(floor()), Box::new(Expr::Float(1.0)))),
+            }),
+        };
+        let negative_zero = Expr::IfElse {
+            condition: Box::new(Expr::And(
+                Box::new(Expr::Lt(Box::new(value()), Box::new(Expr::Float(0.0)))),
+                Box::new(Expr::Eq(Box::new(rounded()), Box::new(Expr::Float(0.0)))),
+            )),
+            then_expr: Box::new(Expr::Float(-0.0)),
+            else_expr: Box::new(rounded()),
+        };
+        Ok(Expr::Block {
+            stmts: vec![
+                Stmt::Let {
+                    index: value_slot,
+                    declared_schema: Some(TypeSchema::Number),
+                    expr: Expr::Div(Box::new(argument), Box::new(Expr::Float(1.0))),
+                    line,
+                },
+                Stmt::Let {
+                    index: floor_slot,
+                    declared_schema: Some(TypeSchema::Number),
+                    expr: floor_call,
+                    line,
+                },
+                Stmt::Let {
+                    index: rounded_slot,
+                    declared_schema: Some(TypeSchema::Number),
+                    expr: rounded_value,
+                    line,
+                },
+            ],
+            expr: Box::new(negative_zero),
+        })
     }
 
     fn lower_member_get(&mut self, member: ast::MemberExpr) -> Result<Expr, ParseError> {
@@ -3514,19 +3666,35 @@ impl<'a> Lowerer<'a> {
                     match callee.as_str() {
                         "Math::floor" => Some(vm::BuiltinFunction::MathFloor),
                         "Math::sqrt" => Some(vm::BuiltinFunction::MathSqrt),
-                        "Math::round" => Some(vm::BuiltinFunction::MathRound),
-                        "Number::isNaN" | "isNaN" => Some(vm::BuiltinFunction::MathIsNaN),
+                        "isNaN" => Some(vm::BuiltinFunction::MathIsNaN),
                         _ => None,
                     }
                 } else {
                     None
                 };
+                let standard_round = local_slot.is_none()
+                    && local_function.is_none()
+                    && imported_function.is_none()
+                    && host_index.is_none()
+                    && callee == "Math::round";
+                let standard_number_is_nan = local_slot.is_none()
+                    && local_function.is_none()
+                    && imported_function.is_none()
+                    && host_index.is_none()
+                    && callee == "Number::isNaN";
+                let standard_global_is_nan =
+                    standard_builtin == Some(vm::BuiltinFunction::MathIsNaN);
                 let standard_integer = local_slot.is_none()
                     && local_function.is_none()
                     && imported_function.is_none()
                     && host_index.is_none()
                     && callee == "Number::isInteger";
-                let standard_arity = (standard_builtin.is_some() || standard_integer).then_some(1);
+                let standard_arity = (standard_builtin.is_some()
+                    || standard_round
+                    || standard_number_is_nan
+                    || standard_integer)
+                    .then_some(1);
+                let standard_argument_span = call.args.first().map(|argument| argument.span());
                 let host_passings = call_arity
                     .filter(|_| host_index.is_some())
                     .and_then(|arity| {
@@ -3592,6 +3760,38 @@ impl<'a> Lowerer<'a> {
                         ),
                     ));
                 }
+                let standard_nan_argument_schema = if standard_number_is_nan
+                    || standard_global_is_nan
+                {
+                    let argument = call.args.first().expect("standard predicate arity checked");
+                    let argument_schema = self.expression_schema(&argument.expr);
+                    let numeric = argument_schema
+                        .as_ref()
+                        .is_some_and(Self::is_numeric_schema);
+                    if standard_global_is_nan && !numeric {
+                        return Err(ParseError::at_span(
+                            byte_span(argument.span(), self.base, self.source_id),
+                            "global isNaN only accepts numeric inputs in this typed subset",
+                        ));
+                    }
+                    if standard_number_is_nan
+                        && !numeric
+                        && !argument_schema.as_ref().is_some_and(|schema| {
+                            matches!(
+                                schema,
+                                TypeSchema::String | TypeSchema::Bool | TypeSchema::Null
+                            )
+                        })
+                    {
+                        return Err(ParseError::at_span(
+                            byte_span(argument.span(), self.base, self.source_id),
+                            "Number.isNaN does not support non-scalar input in this typed subset",
+                        ));
+                    }
+                    argument_schema
+                } else {
+                    None
+                };
                 if host_index.is_some() && !explicit_type_args.is_empty() {
                     return Err(unsupported(
                         call.span,
@@ -3680,21 +3880,79 @@ impl<'a> Lowerer<'a> {
                         .into_iter()
                         .next()
                         .expect("Number.isInteger has one argument");
+                    let span =
+                        standard_argument_span.expect("Number.isInteger argument span was checked");
+                    let source_span = byte_span(span, self.base, self.source_id);
+                    let hidden_slot = self.alloc_hidden_local(span)?;
+                    let hidden_value = Expr::Var(hidden_slot);
                     let finite = Expr::Call(
                         vm::BuiltinFunction::MathIsFinite.call_index(),
                         Vec::new(),
-                        vec![argument.clone()],
+                        vec![hidden_value.clone()],
                         None,
                         Some(id),
                     );
-                    let floored =
-                        Self::builtin_call(vm::BuiltinFunction::MathFloor, vec![argument.clone()]);
+                    let floored = Self::builtin_call(
+                        vm::BuiltinFunction::MathFloor,
+                        vec![hidden_value.clone()],
+                    );
                     (
                         ParsedCallTarget::Function(vm::BuiltinFunction::MathIsFinite.call_index()),
-                        Expr::And(
-                            Box::new(finite),
-                            Box::new(Expr::Eq(Box::new(argument), Box::new(floored))),
-                        ),
+                        Expr::Block {
+                            stmts: vec![Stmt::Let {
+                                index: hidden_slot,
+                                declared_schema: Some(TypeSchema::Number),
+                                expr: argument,
+                                line: line_at(self.source, source_span.lo),
+                            }],
+                            expr: Box::new(Expr::And(
+                                Box::new(finite),
+                                Box::new(Expr::Eq(Box::new(hidden_value), Box::new(floored))),
+                            )),
+                        },
+                    )
+                } else if standard_number_is_nan {
+                    let argument = args
+                        .into_iter()
+                        .next()
+                        .expect("Number.isNaN has one argument");
+                    let argument_schema = standard_nan_argument_schema
+                        .expect("Number.isNaN argument type was checked");
+                    let target =
+                        ParsedCallTarget::Function(vm::BuiltinFunction::MathIsNaN.call_index());
+                    let expression = if Self::is_numeric_schema(&argument_schema) {
+                        Expr::Call(
+                            vm::BuiltinFunction::MathIsNaN.call_index(),
+                            Vec::new(),
+                            vec![argument],
+                            None,
+                            Some(id),
+                        )
+                    } else {
+                        let span =
+                            standard_argument_span.expect("Number.isNaN argument span was checked");
+                        let source_span = byte_span(span, self.base, self.source_id);
+                        let hidden_slot = self.alloc_hidden_local(span)?;
+                        Expr::Block {
+                            stmts: vec![Stmt::Let {
+                                index: hidden_slot,
+                                declared_schema: Some(argument_schema),
+                                expr: argument,
+                                line: line_at(self.source, source_span.lo),
+                            }],
+                            expr: Box::new(Expr::Bool(false)),
+                        }
+                    };
+                    (target, expression)
+                } else if standard_round {
+                    let argument = args
+                        .into_iter()
+                        .next()
+                        .expect("Math.round has one argument");
+                    let span = standard_argument_span.expect("Math.round argument span checked");
+                    (
+                        ParsedCallTarget::Function(vm::BuiltinFunction::MathRound.call_index()),
+                        self.lower_math_round(argument, span)?,
                     )
                 } else if let Some(builtin) = standard_builtin {
                     (

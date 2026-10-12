@@ -1,9 +1,67 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use vm::{
-    TypeSchema, Value, Vm, VmStatus, compiler::{FrontendId, SourceFlavor},
+    TypeSchema, Value, Vm, VmStatus,
+    compiler::{FrontendId, SourceFlavor},
 };
 
 fn flavor() -> SourceFlavor {
     SourceFlavor::Plugin(FrontendId::new("typescript"))
+}
+
+struct CountedResult {
+    calls: Arc<AtomicUsize>,
+    value: Value,
+}
+
+impl vm::HostFunction for CountedResult {
+    fn call(&mut self, _machine: &mut Vm, _args: &[Value]) -> vm::VmResult<vm::CallOutcome> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(vm::CallOutcome::Return(vm::CallReturn::one(
+            self.value.clone(),
+        )))
+    }
+}
+
+fn counted_host_program(
+    source: &str,
+    return_type: vm::HostTypeSchema,
+    result: Value,
+    calls: Arc<AtomicUsize>,
+) -> (
+    vm::CompiledProgram,
+    vm::HostFunctionRegistry,
+    Arc<vm::HostApiCatalog>,
+) {
+    let function_name = "effects::next";
+    let mut builder = vm::HostApiBuilder::new();
+    builder.function(vm::HostFunctionSchema::with_return(
+        function_name,
+        Vec::new(),
+        return_type,
+    ));
+    let catalog = Arc::new(builder.build().expect("valid counted host catalog"));
+    let compiled = vm::compile_source_with_flavor_and_options(
+        source,
+        flavor(),
+        pd_vm_compat_frontends::compile_options_with_catalog(Arc::clone(&catalog)),
+    )
+    .expect("counted host fixture should compile against its catalog");
+    let schema = vm::catalog_import_schemas(&catalog, function_name)
+        .into_iter()
+        .next()
+        .expect("counted host schema should be catalog-owned");
+    let mut registry = vm::HostFunctionRegistry::new();
+    registry
+        .register_catalog(schema, move || {
+            Box::new(CountedResult {
+                calls: Arc::clone(&calls),
+                value: result.clone(),
+            })
+        })
+        .expect("counted host binding should match its catalog");
+    (compiled, registry, catalog)
 }
 
 #[test]
@@ -40,14 +98,25 @@ answer;
         pd_vm_compat_frontends::compile_options(),
     )
     .expect("exported annotated arrow should compile");
-    assert!(compiled.program.callable_prototypes.iter().any(|prototype| {
-        prototype.schema.as_ref() == Some(&callable)
-    }));
-    assert!(compiled.program.exported_callables.iter().any(|callable| {
-        callable.name == "factorial"
-    }));
+    assert!(
+        compiled
+            .program
+            .callable_prototypes
+            .iter()
+            .any(|prototype| { prototype.schema.as_ref() == Some(&callable) })
+    );
+    assert!(
+        compiled
+            .program
+            .exported_callables
+            .iter()
+            .any(|callable| { callable.name == "factorial" })
+    );
     let mut machine = Vm::new(compiled.program);
-    assert_eq!(machine.run().expect("recursive arrow should execute"), VmStatus::Halted);
+    assert_eq!(
+        machine.run().expect("recursive arrow should execute"),
+        VmStatus::Halted
+    );
     assert_eq!(machine.stack(), &[Value::Int(720)]);
 }
 
@@ -72,7 +141,10 @@ omitted * 10 + explicit;
     )
     .expect("typed arrow defaults should compile");
     let mut machine = Vm::new(compiled.program);
-    assert_eq!(machine.run().expect("default calls should execute"), VmStatus::Halted);
+    assert_eq!(
+        machine.run().expect("default calls should execute"),
+        VmStatus::Halted
+    );
     assert_eq!(machine.stack(), &[Value::Int(417)]);
 }
 
@@ -92,7 +164,10 @@ result;
     )
     .expect("annotated nested arrows should preserve typed captures");
     let mut machine = Vm::new(compiled.program);
-    assert_eq!(machine.run().expect("nested arrow should execute"), VmStatus::Halted);
+    assert_eq!(
+        machine.run().expect("nested arrow should execute"),
+        VmStatus::Halted
+    );
     assert_eq!(machine.stack(), &[Value::Int(42)]);
 }
 
@@ -109,7 +184,10 @@ result;
     )
     .expect("typed array length should compile");
     let mut machine = Vm::new(compiled.program);
-    assert_eq!(machine.run().expect("array length should execute"), VmStatus::Halted);
+    assert_eq!(
+        machine.run().expect("array length should execute"),
+        VmStatus::Halted
+    );
     assert_eq!(machine.stack(), &[Value::Int(3)]);
 }
 
@@ -127,7 +205,10 @@ result;
     )
     .expect("typed Math and Number globals should compile");
     let mut machine = Vm::new(compiled.program);
-    assert_eq!(machine.run().expect("numeric globals should execute"), VmStatus::Halted);
+    assert_eq!(
+        machine.run().expect("numeric globals should execute"),
+        VmStatus::Halted
+    );
     assert_eq!(machine.stack(), &[Value::Float(9.0)]);
 }
 
@@ -145,8 +226,204 @@ result;
     )
     .expect("Number.isNaN and global isNaN should compile");
     let mut machine = Vm::new(compiled.program);
-    assert_eq!(machine.run().expect("NaN predicates should execute"), VmStatus::Halted);
+    assert_eq!(
+        machine.run().expect("NaN predicates should execute"),
+        VmStatus::Halted
+    );
     assert_eq!(machine.stack(), &[Value::Int(1)]);
+}
+
+#[test]
+fn standard_api_number_is_integer_evaluates_argument_once_without_public_temporaries() {
+    let source = r#"import { next } from "effects";
+const result = Number.isInteger(next());
+result;
+"#;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (compiled, registry, catalog) = counted_host_program(
+        source,
+        vm::HostTypeSchema::Number,
+        Value::Int(3),
+        Arc::clone(&calls),
+    );
+    let hints = pd_vm_compat_frontends::collect_typescript_type_hints_with_options(
+        source,
+        pd_vm_compat_frontends::compile_options_with_catalog(catalog),
+    )
+    .expect("Number.isInteger argument should remain analyzable");
+    assert_eq!(
+        hints
+            .iter()
+            .map(|hint| hint.name.as_str())
+            .collect::<Vec<_>>(),
+        ["result"],
+        "compiler-private locals must not appear in public hints"
+    );
+
+    let mut machine = Vm::new(compiled.program);
+    registry
+        .bind_vm_cached(&mut machine)
+        .expect("counted numeric host should bind");
+    assert_eq!(
+        machine.run().expect("Number.isInteger should execute"),
+        VmStatus::Halted
+    );
+    assert_eq!(machine.stack(), &[Value::Bool(true)]);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn standard_api_math_round_matches_javascript_numeric_edges() {
+    let cases = [
+        ("-1.5", -1.0),
+        ("-2.5", -2.0),
+        ("-0.5", -0.0),
+        ("-0.1", -0.0),
+        ("-0", -0.0),
+        ("-0.49999999999999994", -0.0),
+        ("-0.5000000000000001", -1.0),
+        ("0.49999999999999994", 0.0),
+        ("0.5", 1.0),
+        ("0.5000000000000001", 1.0),
+        ("9007199254740992.0", 9_007_199_254_740_992.0),
+        ("1e308 * 10", f64::INFINITY),
+        ("-1e308 * 10", f64::NEG_INFINITY),
+        ("Math.sqrt(-1)", f64::NAN),
+    ];
+
+    for (expression, expected) in cases {
+        let source = format!("Math.round({expression});");
+        let compiled = vm::compile_source_with_flavor_and_options(
+            &source,
+            flavor(),
+            pd_vm_compat_frontends::compile_options(),
+        )
+        .unwrap_or_else(|error| panic!("Math.round({expression}) should compile: {error}"));
+        let mut machine = Vm::new(compiled.program);
+        assert_eq!(
+            machine.run().expect("Math.round case should execute"),
+            VmStatus::Halted,
+            "Math.round({expression})"
+        );
+        let actual = match machine.stack().last() {
+            Some(Value::Int(value)) => *value as f64,
+            Some(Value::Float(value)) => *value,
+            other => panic!("Math.round({expression}) returned {other:?}"),
+        };
+        if expected.is_nan() {
+            assert!(
+                actual.is_nan(),
+                "Math.round({expression}) should preserve NaN"
+            );
+        } else {
+            assert_eq!(actual, expected, "Math.round({expression})");
+            if expected == 0.0 && expected.is_sign_negative() {
+                assert!(
+                    actual.is_sign_negative(),
+                    "Math.round({expression}) should return -0"
+                );
+            }
+        }
+    }
+
+    let source = r#"import { next } from "effects";
+const rounded = Math.round(next());
+rounded;
+"#;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (compiled, registry, _) = counted_host_program(
+        source,
+        vm::HostTypeSchema::Number,
+        Value::Int(9_007_199_254_740_993),
+        Arc::clone(&calls),
+    );
+    let mut machine = Vm::new(compiled.program);
+    registry
+        .bind_vm_cached(&mut machine)
+        .expect("counted numeric host should bind for Math.round");
+    assert_eq!(
+        machine.run().expect("Math.round call should execute"),
+        VmStatus::Halted
+    );
+    assert_eq!(machine.stack(), &[Value::Float(9_007_199_254_740_992.0)]);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn standard_api_number_is_nan_is_noncoercing_for_known_scalars() {
+    let source = r#"import { next } from "effects";
+const textResult = Number.isNaN(next());
+const booleanResult = Number.isNaN(true);
+const nullResult = Number.isNaN(null);
+const numberResult = Number.isNaN(42);
+(textResult ? 1 : 0)
+    + (booleanResult ? 2 : 0)
+    + (nullResult ? 4 : 0)
+    + (numberResult ? 8 : 0);
+"#;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (compiled, registry, _) = counted_host_program(
+        source,
+        vm::HostTypeSchema::String,
+        Value::string("NaN"),
+        Arc::clone(&calls),
+    );
+    let mut machine = Vm::new(compiled.program);
+    registry
+        .bind_vm_cached(&mut machine)
+        .expect("counted string host should bind for Number.isNaN");
+    assert_eq!(
+        machine.run().expect("Number.isNaN should execute"),
+        VmStatus::Halted
+    );
+    assert_eq!(machine.stack(), &[Value::Int(0)]);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn standard_api_number_is_nan_rejects_unsupported_shapes_at_the_argument() {
+    let source = "const values: number[] = [1];\nNumber.isNaN(values);\n";
+    let error = vm::compile_source_with_flavor_and_options(
+        source,
+        flavor(),
+        pd_vm_compat_frontends::compile_options(),
+    )
+    .err()
+    .expect("Number.isNaN must reject non-scalar arrays");
+    let rendered = error.to_string();
+    let start = source.find("Number.isNaN(").unwrap() + "Number.isNaN(".len();
+    let end = start + "values".len();
+    assert!(
+        rendered.contains("Number.isNaN does not support non-scalar input"),
+        "unexpected diagnostic: {rendered}"
+    );
+    assert!(
+        rendered.contains(&format!("[{start}..{end}]")),
+        "unsupported input diagnostic should identify the argument: {rendered}"
+    );
+}
+
+#[test]
+fn standard_api_global_is_nan_remains_numeric_only_with_argument_span() {
+    let source = "const input: string = \"42\";\nconst answer = isNaN(input);\nanswer;\n";
+    let error = vm::compile_source_with_flavor_and_options(
+        source,
+        flavor(),
+        pd_vm_compat_frontends::compile_options(),
+    )
+    .err()
+    .expect("global isNaN coercion is outside the strict typed subset");
+    let rendered = error.to_string();
+    let start = source.find("isNaN(input)").unwrap() + "isNaN(".len();
+    let end = start + "input".len();
+    assert!(
+        rendered.contains("global isNaN only accepts numeric inputs in this typed subset"),
+        "unexpected diagnostic: {rendered}"
+    );
+    assert!(
+        rendered.contains(&format!("[{start}..{end}]")),
+        "global isNaN diagnostic should identify the argument: {rendered}"
+    );
 }
 
 #[test]
@@ -154,6 +431,12 @@ fn exported_arrow_parameters_remain_strictly_typed() {
     let source = "export const identity = (value) => value;\n";
     let error = pd_vm_compat_frontends::collect_typescript_type_hints(source)
         .expect_err("an exported arrow without context or annotation must fail strict typing");
-    assert!(error.to_string().contains("noImplicitAny"), "unexpected diagnostic: {error}");
-    assert!(error.to_string().contains("value"), "unexpected diagnostic: {error}");
+    assert!(
+        error.to_string().contains("noImplicitAny"),
+        "unexpected diagnostic: {error}"
+    );
+    assert!(
+        error.to_string().contains("value"),
+        "unexpected diagnostic: {error}"
+    );
 }

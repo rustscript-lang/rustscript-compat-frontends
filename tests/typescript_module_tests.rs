@@ -48,8 +48,9 @@ fn exported_annotated_arrow_imports_with_callable_schema_and_executes() {
     )
     .unwrap();
 
-    let compiled = compile_source_file_with_options(&main, pd_vm_compat_frontends::compile_options())
-        .expect("annotated exported arrows should retain their module call schema");
+    let compiled =
+        compile_source_file_with_options(&main, pd_vm_compat_frontends::compile_options())
+            .expect("annotated exported arrows should retain their module call schema");
     let mut machine = Vm::new(compiled.program);
     assert_eq!(machine.run().unwrap(), VmStatus::Halted);
     assert_eq!(machine.stack(), &[Value::Int(42)]);

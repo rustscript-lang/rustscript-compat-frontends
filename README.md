@@ -14,6 +14,16 @@ The tested subset includes scalar values, simple null unions, arrays, required a
 
 This is not a full TypeScript or JavaScript runtime. JSX, classes, enums, decorators, async/Promise, dynamic imports, CommonJS, `any`, `undefined`, unsupported assertions, and unsupported AST/type forms are rejected with source diagnostics. Optional-field reads compose with ordinary projections on the same record; a missing optional key evaluates to the VM `Null` value. An SWC parse success alone does not make a construct supported.
 
+## Numeric standard-library subset
+
+`Math.floor`, `Math.sqrt`, and `Math.round` accept one numeric argument. `Math.round` uses JavaScript's nearest-integer rule (half ties toward positive infinity), preserves negative zero, and evaluates its argument once. `Number.isInteger` is numeric-only and evaluates its argument once. `Number.isNaN` supports numeric values plus known scalar strings, booleans, and `null`; the latter three return `false` after evaluating the argument once. Non-scalar or unknown `Number.isNaN` inputs receive a source diagnostic. Global `isNaN` is intentionally limited to statically numeric inputs; this subset does not implement JavaScript's general `ToNumber` coercion.
+
+## Explicit native numeric-array resources
+
+`pd_vm_compat_frontends::runtime::array::typescript_array_host_module()` is an optional runtime-owned typed host module. It provides explicit `Resource<"compat.number_array">` create/read/write/length/close operations when the caller installs its catalog and registry. The TypeScript frontend does not silently grant this module, and ordinary `number[]` values are not automatically lowered to its resource representation.
+
+A native array resource remains in the VM resource table until explicit `close` or VM teardown/reset. Dropping the final guest callable alias does not currently notify the host resource table. Callers using this adapter must close resources explicitly; transparent `number[]` resource lowering remains disabled until Core can safely reclaim a resource when its last alias disappears, including aliases retained by closures/callbacks and cleanup after abort/reset, without introducing strong-root cycles.
+
 ## Rust API
 
 ```rust

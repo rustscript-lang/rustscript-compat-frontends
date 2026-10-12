@@ -129,7 +129,7 @@ function main(): number {{
 main();
 "#
     );
-    let module = pd_vm_compat_frontends::typescript_array_host_module();
+    let module = pd_vm_compat_frontends::runtime::array::typescript_array_host_module();
     let catalog = Arc::new(module.catalog().expect("typed array catalog should build"));
     let compiled = vm::compile_source_with_flavor_and_options(
         &source,

@@ -184,32 +184,72 @@ fn core_dependency_provenance_matches_the_selected_build_state() {
     assert_eq!(package["name"], "pd-vm");
 }
 
+fn forbidden_frontend_authority_token(source: &str) -> Option<&'static str> {
+    [
+        "HostApiBuilder",
+        "HostFunctionRegistry",
+        "HostModuleDescriptor",
+        "HostFunctionDescriptor",
+        "HostApiCatalog::new",
+        "HostApiCatalog::standard",
+        ".implicit_extern_names.push",
+        "pd_host_function",
+    ]
+    .into_iter()
+    .find(|token| source.contains(token))
+}
+
+#[test]
+fn frontend_authority_guard_detects_catalog_and_descriptor_controls() {
+    for token in [
+        "HostApiBuilder",
+        "HostFunctionRegistry",
+        "HostModuleDescriptor",
+        "HostFunctionDescriptor",
+        "HostApiCatalog::new",
+        "HostApiCatalog::standard",
+        ".implicit_extern_names.push",
+        "pd_host_function",
+    ] {
+        assert_eq!(
+            forbidden_frontend_authority_token(token),
+            Some(token),
+            "frontend guard must detect authority creation token {token}"
+        );
+    }
+}
+
 #[test]
 fn production_sources_consume_catalog_authority_without_creating_it() {
     let root = manifest_dir();
     let mut sources = rust_sources(&root.join("src/typescript"));
+    sources.extend(rust_sources(&root.join("src/frontends")));
     sources.push(root.join("src/source_loader.rs"));
+    sources.sort();
+    sources.dedup();
     assert!(!sources.is_empty());
     for path in sources {
         let source = fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
-        for token in [
-            "HostApiBuilder",
-            "HostFunctionRegistry",
-            "HostModuleDescriptor",
-            "HostFunctionDescriptor",
-            "HostApiCatalog::new",
-            "HostApiCatalog::standard",
-            ".implicit_extern_names.push",
-            "pd_host_function",
-        ] {
-            assert!(
-                !source.contains(token),
-                "{} must not create host authority ({token})",
+        if let Some(token) = forbidden_frontend_authority_token(&source) {
+            panic!(
+                "{} must consume caller authority without creating it ({token})",
                 path.display()
             );
         }
     }
+
+    let runtime_owner = root.join("src/runtime/array.rs");
+    assert!(
+        runtime_owner.is_file(),
+        "native array host authority must live under the explicit runtime owner"
+    );
+    let owner_source = fs::read_to_string(&runtime_owner)
+        .unwrap_or_else(|error| panic!("read {}: {error}", runtime_owner.display()));
+    assert!(owner_source.contains("pub fn typescript_array_host_module()"));
+    let frontend_module = fs::read_to_string(root.join("src/typescript/mod.rs"))
+        .expect("read TypeScript frontend module");
+    assert!(!frontend_module.contains("typescript_array_host_module"));
 }
 
 #[test]
