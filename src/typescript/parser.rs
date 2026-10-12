@@ -299,7 +299,7 @@ fn generic_params_in_schema(schema: &TypeSchema) -> Vec<String> {
             }
             TypeSchema::Object(fields) => {
                 let mut fields = fields.iter().collect::<Vec<_>>();
-                fields.sort_by(|(left, _), (right, _)| left.cmp(right));
+                fields.sort_by_key(|(left, _)| *left);
                 for (_, field) in fields {
                     visit(field, seen, ordered);
                 }

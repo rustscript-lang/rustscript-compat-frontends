@@ -289,7 +289,7 @@ fn format_typescript_schema(schema: &vm::TypeSchema, source_label: &str) -> Stri
                 .map(split_top_level)
                 .unwrap_or_default();
             let mut display_fields = fields.iter().collect::<Vec<_>>();
-            display_fields.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+            display_fields.sort_unstable_by_key(|(left, _)| *left);
             let rendered = display_fields
                 .into_iter()
                 .map(|(name, field_schema)| {
