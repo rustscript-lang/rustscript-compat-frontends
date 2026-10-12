@@ -18,6 +18,8 @@ jobs:
   rust:
     name: Rust lint, tests, and CLI acceptance
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -59,6 +61,8 @@ jobs:
   binaries:
     name: pd-vm-compat-run (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -88,8 +92,22 @@ jobs:
         with:
           name: pd-vm-compat-run-${{ runner.os }}-${{ runner.arch }}
           path: dist/*
-      - name: Upload pd-vm-compat-run release asset
-        if: startsWith(github.ref, 'refs/tags/')
+
+  release-assets:
+    name: Attach release assets
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [rust, binaries]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: pd-vm-compat-run-*
+          path: dist
+          merge-multiple: true
+      - name: Publish release assets
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*

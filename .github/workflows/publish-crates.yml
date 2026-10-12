@@ -28,10 +28,13 @@ jobs:
       - name: Test release preflight guards and rollback
         run: python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
       - name: Prepare the compat-only registry candidate
+        env:
+          COMPAT_VERSION: ${{ inputs.compat_version }}
+          PD_VM_VERSION: ${{ inputs.pd_vm_version }}
         run: >-
           python3 scripts/prepare-release.py
-          --compat-version "${{ inputs.compat_version }}"
-          --pd-vm-version "${{ inputs.pd_vm_version }}"
+          --compat-version "$COMPAT_VERSION"
+          --pd-vm-version "$PD_VM_VERSION"
       - name: Verify package against the selected registry dependency
         run: |
           cargo fmt --all -- --check

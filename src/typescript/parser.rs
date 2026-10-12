@@ -149,6 +149,29 @@ fn function_item(item: &ast::ModuleItem) -> Option<(&ast::FnDecl, bool)> {
     }
 }
 
+fn parsed_numeric_literal(expression: &ast::Expr) -> Option<f64> {
+    match expression {
+        ast::Expr::Lit(ast::Lit::Num(value)) => Some(value.value),
+        ast::Expr::Paren(paren) => parsed_numeric_literal(&paren.expr),
+        ast::Expr::Unary(unary) if unary.op == ast::UnaryOp::Minus => {
+            parsed_numeric_literal(&unary.arg).map(|value| -value)
+        }
+        _ => None,
+    }
+}
+
+fn numeric_literal(value: f64) -> Expr {
+    if value.is_finite()
+        && value.fract() == 0.0
+        && value >= i64::MIN as f64
+        && value < 9_223_372_036_854_775_808.0
+    {
+        Expr::Int(value as i64)
+    } else {
+        Expr::Float(value)
+    }
+}
+
 fn generic_params_in_schema(schema: &TypeSchema) -> Vec<String> {
     fn visit(schema: &TypeSchema, seen: &mut HashSet<String>, ordered: &mut Vec<String>) {
         match schema {
@@ -306,6 +329,7 @@ struct InstalledHostImports {
     parameter_passings: HashMap<String, HashMap<u8, Vec<vm::HostParamPassing>>>,
     metadata: Option<HostApiIrMetadata>,
     by_local_name: HashMap<String, HashMap<u8, u16>>,
+    declared_functions: HashMap<String, Vec<vm::HostFunctionSchema>>,
     visibility: CatalogVisibility,
     next_function_index: u16,
 }
@@ -514,6 +538,7 @@ fn install_host_imports(
     let mut by_local_name = HashMap::<String, HashMap<u8, u16>>::new();
     let mut parameter_passings = HashMap::new();
     let mut named_types = HashMap::new();
+    let mut declared_functions = HashMap::new();
     let mut direct_host_call_aliases = Vec::new();
     let mut host_namespace_aliases = Vec::new();
     for item in &module.body {
@@ -702,6 +727,111 @@ fn install_host_imports(
             }
         }
     }
+    let mut seen_declarations = HashSet::new();
+    for item in &module.body {
+        let Some((function, exported)) = function_item(item) else {
+            continue;
+        };
+        if !function.declare {
+            continue;
+        }
+        let name = function.ident.sym.to_string();
+        if !seen_declarations.insert(name.clone()) {
+            continue;
+        }
+        if exported {
+            return Err(unsupported(
+                function.ident.span,
+                base,
+                context.source_id,
+                "exported host declaration",
+            ));
+        }
+        let declaration_span = byte_span(function.ident.span, base, context.source_id);
+        if by_local_name.contains_key(&name) {
+            return Err(ParseError::at_span(
+                declaration_span,
+                format!("host declaration '{name}' conflicts with an imported host function"),
+            ));
+        }
+        let catalog = context.host_api_catalog.ok_or_else(|| {
+            ParseError::at_span(
+                declaration_span,
+                format!("host declaration '{name}' requires the caller's catalog"),
+            )
+        })?;
+        let catalog_names = catalog
+            .functions()
+            .iter()
+            .filter(|candidate| {
+                candidate.name == name
+                    || candidate
+                        .name
+                        .rsplit_once("::")
+                        .is_some_and(|(_, member)| member == name)
+            })
+            .map(|candidate| candidate.name.clone())
+            .collect::<HashSet<_>>();
+        let catalog_name = match catalog_names.len() {
+            0 => {
+                return Err(ParseError::at_span(
+                    declaration_span,
+                    format!("host catalog does not declare '{name}'"),
+                ));
+            }
+            1 => catalog_names.into_iter().next().expect("one catalog name"),
+            _ => {
+                return Err(ParseError::at_span(
+                    declaration_span,
+                    format!("host declaration '{name}' is ambiguous in the caller's catalog"),
+                ));
+            }
+        };
+        let candidates = catalog.functions_named(&catalog_name);
+        if candidates.is_empty() {
+            return Err(ParseError::at_span(
+                declaration_span,
+                format!("host catalog does not declare '{catalog_name}'"),
+            ));
+        }
+        let mut arities = Vec::new();
+        for candidate in &candidates {
+            let arity = u8::try_from(candidate.params.len()).map_err(|_| {
+                unsupported(
+                    function.function.span,
+                    base,
+                    context.source_id,
+                    "host function arity",
+                )
+            })?;
+            if !arities.contains(&arity) {
+                arities.push(arity);
+            }
+        }
+        let imported_locals = by_local_name.entry(name.clone()).or_default();
+        for arity in arities {
+            let passings = host_parameter_passings_for_arity(
+                &candidates,
+                arity,
+                function.function.span,
+                base,
+                context.source_id,
+            )?;
+            let index = context.install_host_function(&mut seed, &catalog_name, arity)?;
+            parameter_passings
+                .entry(name.clone())
+                .or_insert_with(HashMap::new)
+                .insert(arity, passings);
+            if imported_locals.insert(arity, index).is_some() {
+                return Err(ParseError::at_span(
+                    declaration_span,
+                    format!("duplicate host declaration binding '{name}'"),
+                ));
+            }
+        }
+        direct_host_call_aliases.push((name.clone(), catalog_name));
+        declared_functions.insert(name, candidates.into_iter().cloned().collect());
+    }
     let resource_keys = context
         .host_api_catalog
         .map(|catalog| {
@@ -722,6 +852,7 @@ fn install_host_imports(
         parameter_passings,
         metadata: seed.host_api_metadata,
         by_local_name,
+        declared_functions,
         visibility: CatalogVisibility {
             host_namespace_aliases,
             direct_host_call_aliases,
@@ -755,6 +886,7 @@ struct Lowerer<'a> {
     imported_functions: HashMap<String, (vm::SymbolId, FunctionDecl)>,
     host_function_indices: HashMap<String, HashMap<u8, u16>>,
     host_parameter_passings: HashMap<String, HashMap<u8, Vec<vm::HostParamPassing>>>,
+    declared_host_functions: HashMap<String, Vec<vm::HostFunctionSchema>>,
     host_api_metadata: Option<HostApiIrMetadata>,
     catalog_visibility: CatalogVisibility,
     named_types: HashMap<String, TypeSchema>,
@@ -992,12 +1124,117 @@ impl<'a> Lowerer<'a> {
         Ok(fields)
     }
 
+    fn declared_host_signature(
+        &self,
+        function: &ast::FnDecl,
+    ) -> Result<(Vec<TypeSchema>, TypeSchema), ParseError> {
+        if !function.declare || function.function.body.is_some() {
+            return Err(unsupported(
+                function.function.span,
+                self.base,
+                self.source_id,
+                "host declaration body",
+            ));
+        }
+        if function
+            .function
+            .type_params
+            .as_ref()
+            .is_some_and(|params| !params.params.is_empty())
+        {
+            return Err(unsupported(
+                function.function.span,
+                self.base,
+                self.source_id,
+                "generic host declaration",
+            ));
+        }
+        let mut parameters = Vec::new();
+        for param in &function.function.params {
+            let ast::Pat::Ident(binding) = &param.pat else {
+                return Err(unsupported(
+                    param.span(),
+                    self.base,
+                    self.source_id,
+                    "host declaration parameter pattern",
+                ));
+            };
+            let Some(annotation) = binding.type_ann.as_ref() else {
+                return Err(ParseError::at_span(
+                    byte_span(binding.id.span, self.base, self.source_id),
+                    format!(
+                        "TypeScript noImplicitAny: host declaration parameter '{}' requires a type",
+                        binding.id.sym
+                    ),
+                ));
+            };
+            parameters.push(self.lower_type(&annotation.type_ann)?);
+        }
+        let Some(return_type) = function.function.return_type.as_ref() else {
+            return Err(ParseError::at_span(
+                byte_span(function.ident.span, self.base, self.source_id),
+                format!(
+                    "TypeScript host declaration '{}' requires a return type",
+                    function.ident.sym
+                ),
+            ));
+        };
+        Ok((parameters, self.lower_type(&return_type.type_ann)?))
+    }
+
     fn predeclare_functions(&mut self, module: &ast::Module) -> Result<(), ParseError> {
+        let mut declarations = HashMap::<String, Vec<(Vec<TypeSchema>, TypeSchema, Span)>>::new();
         for item in &module.body {
-            let Some((function, _)) = function_item(item) else {
+            let Some((function, exported)) = function_item(item) else {
                 continue;
             };
             let name = function.ident.sym.to_string();
+            if function.declare {
+                let declaration_span = byte_span(function.function.span, self.base, self.source_id);
+                if exported {
+                    return Err(unsupported(
+                        function.ident.span,
+                        self.base,
+                        self.source_id,
+                        "exported host declaration",
+                    ));
+                }
+                if self.function_indices.contains_key(&name)
+                    || self.imported_functions.contains_key(&name)
+                {
+                    return Err(ParseError::at_span(
+                        byte_span(function.ident.span, self.base, self.source_id),
+                        format!("host declaration '{name}' conflicts with another function"),
+                    ));
+                }
+                let Some(candidates) = self.declared_host_functions.get(&name) else {
+                    return Err(ParseError::at_span(
+                        byte_span(function.ident.span, self.base, self.source_id),
+                        format!("host catalog does not declare '{name}'"),
+                    ));
+                };
+                let signature = self.declared_host_signature(function)?;
+                if !candidates.iter().any(|candidate| {
+                    candidate.params.len() == signature.0.len()
+                        && candidate
+                            .params
+                            .iter()
+                            .map(|parameter| Self::host_type_schema(&parameter.ty))
+                            .eq(signature.0.iter().cloned())
+                        && Self::host_type_schema(&candidate.return_type) == signature.1
+                }) {
+                    return Err(ParseError::at_span(
+                        declaration_span,
+                        format!("host declaration '{name}' does not match its catalog signature"),
+                    ));
+                }
+                declarations.entry(name).or_default().push((
+                    signature.0,
+                    signature.1,
+                    declaration_span,
+                ));
+                continue;
+            }
             let arity = u8::try_from(function.function.params.len()).map_err(|_| {
                 unsupported(
                     function.function.span,
@@ -1035,6 +1272,28 @@ impl<'a> Lowerer<'a> {
             }
             self.function_indices.insert(name, (index, arity));
         }
+        for (name, signatures) in declarations {
+            let candidates = self
+                .declared_host_functions
+                .get(&name)
+                .expect("host declarations were resolved before lowering");
+            for candidate in candidates {
+                let candidate_parameters = candidate
+                    .params
+                    .iter()
+                    .map(|parameter| Self::host_type_schema(&parameter.ty))
+                    .collect::<Vec<_>>();
+                let candidate_result = Self::host_type_schema(&candidate.return_type);
+                if !signatures.iter().any(|(parameters, result, _)| {
+                    *parameters == candidate_parameters && *result == candidate_result
+                }) {
+                    return Err(ParseError::at_span(
+                        signatures[0].2,
+                        format!("host declaration '{name}' omits a catalog overload"),
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1047,6 +1306,11 @@ impl<'a> Lowerer<'a> {
                 ast::ModuleItem::Stmt(ast::Stmt::Decl(
                     ast::Decl::TsInterface(_) | ast::Decl::TsTypeAlias(_),
                 )) => continue,
+                ast::ModuleItem::Stmt(ast::Stmt::Decl(ast::Decl::Fn(function)))
+                    if function.declare =>
+                {
+                    continue;
+                }
                 ast::ModuleItem::Stmt(stmt) => match stmt {
                     ast::Stmt::Decl(ast::Decl::Fn(function)) => {
                         self.lower_function(&function, false, &mut stmts)?;
@@ -2357,14 +2621,7 @@ impl<'a> Lowerer<'a> {
                 Ok(Expr::String(value.value.to_string_lossy().into_owned()))
             }
             ast::Expr::Lit(ast::Lit::Num(value)) if value.value.is_finite() => {
-                if value.value.fract() == 0.0
-                    && value.value >= i64::MIN as f64
-                    && value.value <= i64::MAX as f64
-                {
-                    Ok(Expr::Int(value.value as i64))
-                } else {
-                    Ok(Expr::Float(value.value))
-                }
+                Ok(numeric_literal(value.value))
             }
             ast::Expr::Lit(ast::Lit::Bool(value)) => Ok(Expr::Bool(value.value)),
             ast::Expr::Lit(ast::Lit::Null(_)) => Ok(Expr::Null),
@@ -2628,6 +2885,12 @@ impl<'a> Lowerer<'a> {
             ast::Expr::Arrow(arrow) => self.lower_arrow(arrow),
             ast::Expr::Paren(value) => self.lower_expr(*value.expr),
             ast::Expr::Unary(value) => {
+                if value.op == ast::UnaryOp::Minus
+                    && let Some(number) = parsed_numeric_literal(&value.arg)
+                    && number.is_finite()
+                {
+                    return Ok(numeric_literal(-number));
+                }
                 let inner = Box::new(self.lower_expr(*value.arg)?);
                 match value.op {
                     ast::UnaryOp::Minus => Ok(Expr::Neg(inner)),
@@ -3047,6 +3310,7 @@ pub(crate) fn lower(
         imported_functions,
         host_function_indices: host_imports.by_local_name,
         host_parameter_passings: host_imports.parameter_passings,
+        declared_host_functions: host_imports.declared_functions,
         host_api_metadata: host_imports.metadata,
         catalog_visibility: host_imports.visibility,
         named_types,
