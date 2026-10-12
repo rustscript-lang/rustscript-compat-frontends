@@ -34,6 +34,28 @@ impl Drop for Project {
 }
 
 #[test]
+fn exported_annotated_arrow_imports_with_callable_schema_and_executes() {
+    let project = Project::new();
+    fs::write(
+        project.0.join("math.ts"),
+        "export const double = (value: number): number => value * 2;\n",
+    )
+    .unwrap();
+    let main = project.0.join("main.ts");
+    fs::write(
+        &main,
+        "import { double } from \"./math.ts\";\nconst result: number = double(21);\nresult;\n",
+    )
+    .unwrap();
+
+    let compiled = compile_source_file_with_options(&main, pd_vm_compat_frontends::compile_options())
+        .expect("annotated exported arrows should retain their module call schema");
+    let mut machine = Vm::new(compiled.program);
+    assert_eq!(machine.run().unwrap(), VmStatus::Halted);
+    assert_eq!(machine.stack(), &[Value::Int(42)]);
+}
+
+#[test]
 fn nested_ts_and_mts_imports_preserve_type_identity_and_run() {
     let project = Project::new();
     let nested = project.0.join("nested");

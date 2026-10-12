@@ -1,5 +1,8 @@
+mod array_runtime;
 mod parser;
 mod validation;
+
+pub use array_runtime::typescript_array_host_module;
 
 use std::path::Path;
 use std::sync::Arc;

@@ -252,6 +252,68 @@ fn function_item(item: &ast::ModuleItem) -> Option<(&ast::FnDecl, bool)> {
     }
 }
 
+fn variable_declaration_item(item: &ast::ModuleItem) -> Option<(&ast::VarDecl, bool)> {
+    match item {
+        ast::ModuleItem::Stmt(ast::Stmt::Decl(ast::Decl::Var(declaration))) => {
+            Some((declaration, false))
+        }
+        ast::ModuleItem::ModuleDecl(ast::ModuleDecl::ExportDecl(export)) => match &export.decl {
+            ast::Decl::Var(declaration) => Some((declaration, true)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn arrow_function_decl(ident: ast::Ident, arrow: ast::ArrowExpr) -> ast::FnDecl {
+    let body = match *arrow.body {
+        ast::ArrowFunctionBody::FunctionBody(body) => body,
+        ast::ArrowFunctionBody::Expr(expression) => ast::FunctionBody {
+            span: arrow.span,
+            stmts: vec![ast::Stmt::Return(ast::ReturnStmt {
+                span: arrow.span,
+                arg: Some(expression),
+            })],
+        },
+    };
+    let params = arrow
+        .params
+        .into_iter()
+        .map(|pat| ast::Param {
+            span: pat.span(),
+            decorators: Vec::new(),
+            pat,
+        })
+        .collect();
+    ast::FnDecl {
+        ident,
+        declare: false,
+        function: Box::new(ast::Function {
+            this_param: None,
+            params,
+            decorators: Vec::new(),
+            span: arrow.span,
+            ctxt: arrow.ctxt,
+            body: Some(body),
+            is_generator: arrow.is_generator,
+            is_async: arrow.is_async,
+            type_params: arrow.type_params,
+            return_type: arrow.return_type,
+        }),
+    }
+}
+
+fn parameter_binding(parameter: &ast::Pat) -> Option<(&ast::BindingIdent, Option<&ast::Expr>)> {
+    match parameter {
+        ast::Pat::Ident(binding) => Some((binding, None)),
+        ast::Pat::Assign(assign) => match assign.left.as_ref() {
+            ast::Pat::Ident(binding) => Some((binding, Some(assign.right.as_ref()))),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn parsed_numeric_literal(expression: &ast::Expr) -> Option<f64> {
     match expression {
         ast::Expr::Lit(ast::Lit::Num(value)) => Some(value.value),
@@ -1001,6 +1063,7 @@ struct Lowerer<'a> {
     struct_decl_sites: Vec<StructDeclSite>,
     generic_type_params: HashSet<String>,
     function_indices: HashMap<String, (u16, u8)>,
+    function_parameters: HashMap<String, Vec<ast::Pat>>,
     generic_function_indices: HashSet<u16>,
     functions: Vec<FunctionDecl>,
     function_impls: HashMap<u16, FunctionImpl>,
@@ -1434,6 +1497,15 @@ impl<'a> Lowerer<'a> {
                     "function arity",
                 )
             })?;
+            self.function_parameters.insert(
+                name.clone(),
+                function
+                    .function
+                    .params
+                    .iter()
+                    .map(|parameter| parameter.pat.clone())
+                    .collect(),
+            );
             if self.function_indices.contains_key(&name)
                 || self.host_function_indices.contains_key(&name)
                 || self.imported_functions.contains_key(&name)
@@ -1462,6 +1534,62 @@ impl<'a> Lowerer<'a> {
                 self.generic_function_indices.insert(index);
             }
             self.function_indices.insert(name, (index, arity));
+        }
+        for item in &module.body {
+            let Some((declaration, exported)) = variable_declaration_item(item) else {
+                continue;
+            };
+            for declarator in &declaration.decls {
+                let (ast::Pat::Ident(binding), Some(initializer)) =
+                    (&declarator.name, &declarator.init)
+                else {
+                    continue;
+                };
+                let ast::Expr::Arrow(arrow) = initializer.as_ref() else {
+                    continue;
+                };
+                let explicitly_typed = exported
+                    || arrow.return_type.is_some()
+                    || arrow.params.iter().any(|parameter| {
+                        matches!(parameter, ast::Pat::Ident(binding) if binding.type_ann.is_some())
+                    });
+                if !explicitly_typed {
+                    continue;
+                }
+                let name = binding.id.sym.to_string();
+                if self.function_indices.contains_key(&name)
+                    || self.host_function_indices.contains_key(&name)
+                    || self.imported_functions.contains_key(&name)
+                {
+                    return Err(ParseError::at_span(
+                        byte_span(binding.id.span, self.base, self.source_id),
+                        format!("duplicate TypeScript function '{name}'"),
+                    ));
+                }
+                let arity = u8::try_from(arrow.params.len()).map_err(|_| {
+                    unsupported(arrow.span, self.base, self.source_id, "function arity")
+                })?;
+                let index = self.next_function_index;
+                self.next_function_index =
+                    self.next_function_index.checked_add(1).ok_or_else(|| {
+                        unsupported(
+                            binding.id.span,
+                            self.base,
+                            self.source_id,
+                            "function table size",
+                        )
+                    })?;
+                if arrow
+                    .type_params
+                    .as_ref()
+                    .is_some_and(|params| !params.params.is_empty())
+                {
+                    self.generic_function_indices.insert(index);
+                }
+                self.function_parameters
+                    .insert(name.clone(), arrow.params.clone());
+                self.function_indices.insert(name, (index, arity));
+            }
         }
         for (name, signatures) in declarations {
             let candidates = self
@@ -1515,6 +1643,9 @@ impl<'a> Lowerer<'a> {
                             self.lower_function(&function, true, &mut stmts)?
                         }
                         ast::Decl::TsInterface(_) | ast::Decl::TsTypeAlias(_) => continue,
+                        ast::Decl::Var(declaration) => {
+                            self.lower_var_decl(*declaration, true, &mut stmts)?
+                        }
                         other => {
                             return Err(unsupported(
                                 other.span(),
@@ -1679,9 +1810,10 @@ impl<'a> Lowerer<'a> {
         let previous_bindings_len = self.local_bindings.len();
         let declaration_start = self.local_decls.len();
         let mut param_slots = Vec::new();
+        let mut default_seen = false;
 
         for (order, param) in function.function.params.iter().enumerate() {
-            let ast::Pat::Ident(binding) = &param.pat else {
+            let Some((binding, default)) = parameter_binding(&param.pat) else {
                 return Err(unsupported(
                     param.span(),
                     self.base,
@@ -1689,6 +1821,16 @@ impl<'a> Lowerer<'a> {
                     "function parameter pattern",
                 ));
             };
+            if default.is_some() {
+                default_seen = true;
+            } else if default_seen {
+                return Err(unsupported(
+                    param.span(),
+                    self.base,
+                    self.source_id,
+                    "required parameter after a default parameter",
+                ));
+            }
             let param_name = binding.id.sym.to_string();
             let Some(annotation) = binding.type_ann.as_ref() else {
                 return Err(ParseError::at_span(
@@ -1853,9 +1995,196 @@ impl<'a> Lowerer<'a> {
         });
         Ok(())
     }
+    fn lower_defaulted_function_call(
+        &mut self,
+        function_name: &str,
+        function_index: u16,
+        type_args: Vec<TypeSchema>,
+        provided_args: Vec<Expr>,
+        call_id: SemanticNodeId,
+    ) -> Result<Expr, ParseError> {
+        if self.generic_function_indices.contains(&function_index) {
+            return Err(ParseError::new(
+                "default parameters on generic TypeScript functions are unsupported",
+            ));
+        }
+        let parameters = self
+            .function_parameters
+            .get(function_name)
+            .cloned()
+            .ok_or_else(|| ParseError::new("default parameter declaration metadata is missing"))?;
+        let mut parameter_data = Vec::with_capacity(parameters.len());
+        let mut default_seen = false;
+        for parameter in &parameters {
+            let Some((binding, default)) = parameter_binding(parameter) else {
+                return Err(unsupported(
+                    parameter.span(),
+                    self.base,
+                    self.source_id,
+                    "default parameter pattern",
+                ));
+            };
+            let Some(annotation) = binding.type_ann.as_ref() else {
+                return Err(ParseError::at_span(
+                    byte_span(binding.id.span, self.base, self.source_id),
+                    format!(
+                        "TypeScript noImplicitAny: parameter '{}' requires a type",
+                        binding.id.sym
+                    ),
+                ));
+            };
+            let schema = self.lower_type(&annotation.type_ann)?;
+            if default.is_some() {
+                default_seen = true;
+            } else if default_seen {
+                return Err(unsupported(
+                    parameter.span(),
+                    self.base,
+                    self.source_id,
+                    "required parameter after a default parameter",
+                ));
+            }
+            parameter_data.push((
+                binding.id.sym.to_string(),
+                binding.id.span,
+                parameter.span(),
+                schema,
+                default.cloned(),
+            ));
+        }
+        if provided_args.len() >= parameter_data.len()
+            || parameter_data[provided_args.len()..]
+                .iter()
+                .any(|(_, _, _, _, default)| default.is_none())
+        {
+            return Err(ParseError::new(
+                "defaulted TypeScript call does not omit only defaulted parameters",
+            ));
+        }
+
+        let parent_scope = self.scope_id;
+        let scope_id = self.next_scope_id;
+        self.next_scope_id = self.next_scope_id.checked_add(1).ok_or_else(|| {
+            unsupported(
+                parameters[0].span(),
+                self.base,
+                self.source_id,
+                "lexical scope count",
+            )
+        })?;
+        let previous_locals = std::mem::take(&mut self.locals);
+        let previous_local_types = std::mem::take(&mut self.local_types);
+        let previous_mutable_locals = std::mem::take(&mut self.mutable_locals);
+        let previous_scope = self.scope_id;
+        self.scope_id = scope_id;
+        let previous_capture_depth = self.closure_captures.len();
+        self.closure_captures.push(ClosureCaptureContext {
+            local_slots: HashSet::new(),
+            captures: HashMap::new(),
+            capture_copies: Vec::new(),
+        });
+        let lowered = (|| -> Result<(Vec<u16>, Vec<Stmt>, Vec<Expr>), ParseError> {
+            let mut closure_params = Vec::with_capacity(provided_args.len());
+            let mut default_statements = Vec::new();
+            let mut call_args = Vec::with_capacity(parameter_data.len());
+            for (index, (name, ident_span, parameter_span, schema, default)) in
+                parameter_data.iter().enumerate()
+            {
+                let slot = self.next_slot;
+                self.next_slot = self.next_slot.checked_add(1).ok_or_else(|| {
+                    ParseError::at_span(
+                        byte_span(*ident_span, self.base, self.source_id),
+                        "TypeScript closure local slot limit exceeded",
+                    )
+                })?;
+                self.closure_captures
+                    .last_mut()
+                    .expect("default call closure context remains active")
+                    .local_slots
+                    .insert(slot);
+                if index < provided_args.len() {
+                    closure_params.push(slot);
+                } else {
+                    let expression = default.as_ref().ok_or_else(|| {
+                        ParseError::at_span(
+                            byte_span(*ident_span, self.base, self.source_id),
+                            "missing argument has no default initializer",
+                        )
+                    })?;
+                    let expression = self.lower_expr(expression.clone())?;
+                    default_statements.push(Stmt::Let {
+                        index: slot,
+                        declared_schema: Some(schema.clone()),
+                        expr: expression,
+                        line: line_at(
+                            self.source,
+                            byte_span(*parameter_span, self.base, self.source_id).lo,
+                        ),
+                    });
+                }
+                self.locals.insert(name.clone(), slot);
+                self.local_types.insert(name.clone(), schema.clone());
+                call_args.push(Expr::Var(slot));
+            }
+            Ok((closure_params, default_statements, call_args))
+        })();
+        let closure_context = self
+            .closure_captures
+            .pop()
+            .expect("default call closure context remains active");
+        debug_assert_eq!(self.closure_captures.len(), previous_capture_depth);
+        let declarations = Vec::new();
+        let span = parameters
+            .iter()
+            .map(|parameter| byte_span(parameter.span(), self.base, self.source_id))
+            .fold(None, |range: Option<Span>, current| {
+                Some(match range {
+                    Some(range) => Span::new(
+                        self.source_id,
+                        range.lo.min(current.lo),
+                        range.hi.max(current.hi),
+                    ),
+                    None => current,
+                })
+            })
+            .expect("defaulted function parameter spans are non-empty");
+        self.scope_id = previous_scope;
+        self.locals = previous_locals;
+        self.local_types = previous_local_types;
+        self.mutable_locals = previous_mutable_locals;
+        self.next_scope_id = self.next_scope_id.max(scope_id + 1);
+        self.function_scopes.push(ParsedLexicalScope {
+            id: scope_id,
+            parent: Some(parent_scope),
+            range: span,
+            declarations,
+            functions: Vec::new(),
+        });
+        let (param_slots, default_statements, call_args) = lowered?;
+        let body = Expr::Block {
+            stmts: default_statements,
+            expr: Box::new(Expr::Call(
+                function_index,
+                type_args,
+                call_args,
+                None,
+                Some(call_id),
+            )),
+        };
+        Ok(Expr::ClosureCall(
+            vm::compiler::ir::ClosureExpr {
+                param_slots,
+                capture_copies: closure_context.capture_copies,
+                body: Box::new(body),
+            },
+            provided_args,
+        ))
+    }
+
     fn lower_var_decl(
         &mut self,
         decl: ast::VarDecl,
+        exported: bool,
         output: &mut Vec<Stmt>,
     ) -> Result<(), ParseError> {
         if decl.kind == ast::VarDeclKind::Var {
@@ -1868,6 +2197,17 @@ impl<'a> Lowerer<'a> {
         }
         let mutable = decl.kind == ast::VarDeclKind::Let;
         for declarator in decl.decls {
+            if self.scope_id == 0 {
+                if let (ast::Pat::Ident(binding), Some(initializer)) =
+                    (&declarator.name, &declarator.init)
+                    && let ast::Expr::Arrow(arrow) = initializer.as_ref()
+                    && self.function_indices.contains_key(binding.id.sym.as_ref())
+                {
+                    let function = arrow_function_decl(binding.id.clone(), arrow.clone());
+                    self.lower_function(&function, exported, output)?;
+                    continue;
+                }
+            }
             let ast::Pat::Ident(binding) = declarator.name else {
                 return Err(unsupported(
                     declarator.name.span(),
@@ -1999,6 +2339,18 @@ impl<'a> Lowerer<'a> {
     }
 
     fn lower_block(&mut self, block: ast::BlockStmt) -> Result<Vec<Stmt>, ParseError> {
+        self.lower_block_contents(block.span, block.stmts)
+    }
+
+    fn lower_function_body(&mut self, body: ast::FunctionBody) -> Result<Vec<Stmt>, ParseError> {
+        self.lower_block_contents(body.span, body.stmts)
+    }
+
+    fn lower_block_contents(
+        &mut self,
+        block_span: swc_common::Span,
+        block_stmts: Vec<ast::Stmt>,
+    ) -> Result<Vec<Stmt>, ParseError> {
         let parent_scope = self.scope_id;
         let previous_locals = self.locals.clone();
         let previous_local_types = self.local_types.clone();
@@ -2006,7 +2358,7 @@ impl<'a> Lowerer<'a> {
         let scope_id = self.next_scope_id;
         self.next_scope_id = self.next_scope_id.checked_add(1).ok_or_else(|| {
             ParseError::at_span(
-                byte_span(block.span, self.base, self.source_id),
+                byte_span(block_span, self.base, self.source_id),
                 "TypeScript lexical scope count exceeded",
             )
         })?;
@@ -2014,7 +2366,7 @@ impl<'a> Lowerer<'a> {
         let declaration_start = self.local_decls.len();
         let result = (|| {
             let mut statements = Vec::new();
-            for statement in block.stmts {
+            for statement in block_stmts {
                 self.lower_stmt(statement, &mut statements)?;
             }
             Ok(statements)
@@ -2027,7 +2379,7 @@ impl<'a> Lowerer<'a> {
         self.function_scopes.push(ParsedLexicalScope {
             id: scope_id,
             parent: Some(parent_scope),
-            range: byte_span(block.span, self.base, self.source_id),
+            range: byte_span(block_span, self.base, self.source_id),
             declarations,
             functions: Vec::new(),
         });
@@ -2057,6 +2409,15 @@ impl<'a> Lowerer<'a> {
                     ));
                 };
                 let ast::SimpleAssignTarget::Ident(binding) = target else {
+                    if let ast::SimpleAssignTarget::Member(member) = target {
+                        return self.lower_array_index_assignment(
+                            member,
+                            assignment.op,
+                            *assignment.right,
+                            line,
+                            output,
+                        );
+                    }
                     return Err(unsupported(
                         assignment.span,
                         self.base,
@@ -2065,18 +2426,19 @@ impl<'a> Lowerer<'a> {
                     ));
                 };
                 let name = binding.id.sym.to_string();
-                let Some(slot) = self.locals.get(&name).copied() else {
+                let Some(source_slot) = self.locals.get(&name).copied() else {
                     return Err(ParseError::at_span(
                         byte_span(binding.id.span, self.base, self.source_id),
                         format!("unresolved TypeScript assignment target '{name}'"),
                     ));
                 };
-                if !self.mutable_locals.contains(&slot) {
+                if !self.mutable_locals.contains(&source_slot) {
                     return Err(ParseError::at_span(
                         byte_span(binding.id.span, self.base, self.source_id),
                         format!("cannot assign to const binding '{name}'"),
                     ));
                 }
+                let slot = self.capture_slot(source_slot, &name, binding.id.span)?;
                 let kind = match assignment.op {
                     ast::AssignOp::Assign => AssignmentKind::Set,
                     ast::AssignOp::AddAssign => AssignmentKind::Add,
@@ -2146,6 +2508,77 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
+    fn lower_array_index_assignment(
+        &mut self,
+        member: ast::MemberExpr,
+        op: ast::AssignOp,
+        right: ast::Expr,
+        line: u32,
+        output: &mut Vec<Stmt>,
+    ) -> Result<(), ParseError> {
+        let ast::MemberProp::Computed(property) = member.prop else {
+            return Err(unsupported(
+                member.span,
+                self.base,
+                self.source_id,
+                "non-indexed assignment target",
+            ));
+        };
+        let array_schema = self.expression_schema(&member.obj);
+        if !array_schema.as_ref().is_some_and(|schema| {
+            matches!(
+                schema,
+                TypeSchema::Array(_)
+                    | TypeSchema::ArrayTuple(_)
+                    | TypeSchema::ArrayTupleRest { .. }
+            )
+        }) {
+            return Err(unsupported(
+                member.span,
+                self.base,
+                self.source_id,
+                "indexed assignment to a non-array expression",
+            ));
+        }
+        let ast::Expr::Ident(binding) = *member.obj else {
+            return Err(unsupported(
+                member.span,
+                self.base,
+                self.source_id,
+                "indexed assignment through a non-local array expression",
+            ));
+        };
+        let name = binding.sym.to_string();
+        let Some(source_slot) = self.locals.get(&name).copied() else {
+            return Err(ParseError::at_span(
+                byte_span(binding.span, self.base, self.source_id),
+                format!("unresolved TypeScript indexed assignment target '{name}'"),
+            ));
+        };
+        let slot = self.capture_slot(source_slot, &name, binding.span)?;
+        if op != ast::AssignOp::Assign {
+            return Err(unsupported(
+                member.span,
+                self.base,
+                self.source_id,
+                "compound indexed assignment operator",
+            ));
+        }
+        let index = self.lower_expr(*property.expr)?;
+        let value = self.lower_expr(right)?;
+        let updated = Self::builtin_call(
+            vm::BuiltinFunction::Set,
+            vec![Expr::Var(slot), index, value],
+        );
+        output.push(Stmt::Assign {
+            kind: AssignmentKind::Set,
+            index: slot,
+            expr: updated,
+            line,
+        });
+        Ok(())
+    }
+
     fn lower_for(
         &mut self,
         statement: ast::ForStmt,
@@ -2171,7 +2604,7 @@ impl<'a> Lowerer<'a> {
                 None => Stmt::Noop { line },
                 Some(ast::VarDeclOrExpr::VarDecl(declaration)) => {
                     let mut lowered = Vec::new();
-                    self.lower_var_decl(*declaration, &mut lowered)?;
+                    self.lower_var_decl(*declaration, false, &mut lowered)?;
                     if lowered.len() != 1 {
                         return Err(unsupported(
                             statement.span,
@@ -2241,7 +2674,7 @@ impl<'a> Lowerer<'a> {
 
     fn lower_stmt(&mut self, stmt: ast::Stmt, output: &mut Vec<Stmt>) -> Result<(), ParseError> {
         match stmt {
-            ast::Stmt::Decl(ast::Decl::Var(decl)) => self.lower_var_decl(*decl, output)?,
+            ast::Stmt::Decl(ast::Decl::Var(decl)) => self.lower_var_decl(*decl, false, output)?,
             ast::Stmt::Expr(expr) => {
                 self.lower_assignment_statement(*expr.expr, output)?;
             }
@@ -2330,6 +2763,9 @@ impl<'a> Lowerer<'a> {
             context.captures.insert(slot, capture_slot);
             context.capture_copies.push((slot, capture_slot));
             context.local_slots.insert(capture_slot);
+            if self.mutable_locals.contains(&slot) {
+                self.mutable_locals.insert(capture_slot);
+            }
             slot = capture_slot;
         }
         if !self.closure_captures.is_empty() {
@@ -2339,12 +2775,12 @@ impl<'a> Lowerer<'a> {
     }
 
     fn lower_arrow(&mut self, arrow: ast::ArrowExpr) -> Result<Expr, ParseError> {
-        if arrow.is_async || arrow.type_params.is_some() || arrow.return_type.is_some() {
+        if arrow.is_async || arrow.type_params.is_some() {
             return Err(unsupported(
                 arrow.span,
                 self.base,
                 self.source_id,
-                "async, generic, or explicitly returned arrow function",
+                "async or generic arrow function",
             ));
         }
         let parent_scope = self.scope_id;
@@ -2364,7 +2800,7 @@ impl<'a> Lowerer<'a> {
         let mut local_slots = HashSet::new();
         let mut seen = HashSet::new();
         for (order, param) in arrow.params.iter().enumerate() {
-            let ast::Pat::Ident(binding) = param else {
+            let Some((binding, default)) = parameter_binding(param) else {
                 return Err(unsupported(
                     param.span(),
                     self.base,
@@ -2372,21 +2808,26 @@ impl<'a> Lowerer<'a> {
                     "arrow parameter pattern",
                 ));
             };
-            let name = binding.id.sym.to_string();
-            if binding.type_ann.is_some() {
+            if default.is_some() {
                 return Err(unsupported(
-                    binding.id.span,
+                    param.span(),
                     self.base,
                     self.source_id,
-                    "explicit arrow parameter annotation",
+                    "default parameter on nested arrow function",
                 ));
             }
+            let name = binding.id.sym.to_string();
             if !seen.insert(name.clone()) {
                 return Err(ParseError::at_span(
                     byte_span(binding.id.span, self.base, self.source_id),
                     format!("duplicate TypeScript arrow parameter '{name}'"),
                 ));
             }
+            let schema = binding
+                .type_ann
+                .as_ref()
+                .map(|annotation| self.lower_type(&annotation.type_ann))
+                .transpose()?;
             let slot = self.next_slot;
             self.next_slot = self.next_slot.checked_add(1).ok_or_else(|| {
                 ParseError::at_span(
@@ -2395,6 +2836,11 @@ impl<'a> Lowerer<'a> {
                 )
             })?;
             self.locals.insert(name.clone(), slot);
+            if let Some(schema) = schema {
+                self.local_types.insert(name.clone(), schema);
+            } else {
+                self.local_types.remove(&name);
+            }
             local_slots.insert(slot);
             param_slots.push(slot);
             let ident_span = byte_span(binding.id.span, self.base, self.source_id);
@@ -2416,12 +2862,13 @@ impl<'a> Lowerer<'a> {
         });
         let body_result = match *arrow.body {
             ast::ArrowFunctionBody::Expr(expression) => self.lower_expr(*expression),
-            ast::ArrowFunctionBody::FunctionBody(block) => Err(unsupported(
-                block.span,
-                self.base,
-                self.source_id,
-                "block-bodied arrow function",
-            )),
+            ast::ArrowFunctionBody::FunctionBody(block) => {
+                self.lower_function_body(block)
+                    .map(|statements| Expr::Block {
+                        stmts: statements,
+                        expr: Box::new(Expr::Null),
+                    })
+            }
         };
         let capture_context = self
             .closure_captures
@@ -2465,6 +2912,13 @@ impl<'a> Lowerer<'a> {
                 return None;
             }
             match schema {
+                TypeSchema::Array(_)
+                | TypeSchema::ArrayTuple(_)
+                | TypeSchema::ArrayTupleRest { .. }
+                    if property == "length" =>
+                {
+                    Some(TypeSchema::Number)
+                }
                 TypeSchema::Object(fields) => fields.get(property).cloned(),
                 TypeSchema::Optional(_) => None,
                 TypeSchema::Named(name, arguments) => {
@@ -2555,6 +3009,22 @@ impl<'a> Lowerer<'a> {
         match expression {
             ast::Expr::Ident(ident) => self.local_types.get(ident.sym.as_ref()).cloned(),
             ast::Expr::Paren(paren) => self.expression_schema(&paren.expr),
+            ast::Expr::Arrow(arrow) => {
+                let mut params = Vec::with_capacity(arrow.params.len());
+                for parameter in &arrow.params {
+                    let (binding, default) = parameter_binding(parameter)?;
+                    if default.is_some() {
+                        return None;
+                    }
+                    let annotation = binding.type_ann.as_ref()?;
+                    params.push(self.lower_type(&annotation.type_ann).ok()?);
+                }
+                let return_type = arrow.return_type.as_ref()?;
+                Some(TypeSchema::Callable {
+                    params,
+                    result: Box::new(self.lower_type(&return_type.type_ann).ok()?),
+                })
+            }
             ast::Expr::Member(member) => {
                 let ast::MemberProp::Ident(property) = &member.prop else {
                     return None;
@@ -2652,25 +3122,96 @@ impl<'a> Lowerer<'a> {
     }
 
     fn lower_member_get(&mut self, member: ast::MemberExpr) -> Result<Expr, ParseError> {
-        let ast::MemberProp::Ident(property) = member.prop else {
-            return Err(unsupported(
-                member.span,
-                self.base,
-                self.source_id,
-                "computed property access",
-            ));
+        let member_span = member.span;
+        let object = member.obj;
+        let property = match member.prop {
+            ast::MemberProp::Ident(property) => property,
+            ast::MemberProp::Computed(property) => {
+                let array_schema = self.expression_schema(&object);
+                if !array_schema.as_ref().is_some_and(|schema| {
+                    matches!(
+                        schema,
+                        TypeSchema::Array(_)
+                            | TypeSchema::ArrayTuple(_)
+                            | TypeSchema::ArrayTupleRest { .. }
+                    )
+                }) {
+                    return Err(unsupported(
+                        member_span,
+                        self.base,
+                        self.source_id,
+                        "computed property access",
+                    ));
+                }
+                let container = self.lower_expr(*object)?;
+                let index = self.lower_expr(*property.expr)?;
+                let id = self.alloc_node_id();
+                self.call_sites.push(ParsedCallSite {
+                    id,
+                    callee_span: byte_span(property.span, self.base, self.source_id),
+                    expr_span: byte_span(member_span, self.base, self.source_id),
+                    target: ParsedCallTarget::Function(vm::BuiltinFunction::Get.call_index()),
+                    name: "[]".to_owned(),
+                    scope_id: self.scope_id,
+                    is_namespace_call: false,
+                });
+                return Ok(Expr::Call(
+                    vm::BuiltinFunction::Get.call_index(),
+                    Vec::new(),
+                    vec![container, index],
+                    None,
+                    Some(id),
+                ));
+            }
+            _ => {
+                return Err(unsupported(
+                    member_span,
+                    self.base,
+                    self.source_id,
+                    "computed property access",
+                ));
+            }
         };
         let property_name = property.sym.to_string();
-        let receiver_schema = self.expression_schema(&member.obj);
+        let receiver_schema = self.expression_schema(&object);
+        if property_name == "length"
+            && receiver_schema.as_ref().is_some_and(|schema| {
+                matches!(
+                    schema,
+                    TypeSchema::Array(_)
+                        | TypeSchema::ArrayTuple(_)
+                        | TypeSchema::ArrayTupleRest { .. }
+                )
+            })
+        {
+            let container = self.lower_expr(*object)?;
+            let id = self.alloc_node_id();
+            self.call_sites.push(ParsedCallSite {
+                id,
+                callee_span: byte_span(property.span, self.base, self.source_id),
+                expr_span: byte_span(member_span, self.base, self.source_id),
+                target: ParsedCallTarget::Function(vm::BuiltinFunction::Len.call_index()),
+                name: property_name,
+                scope_id: self.scope_id,
+                is_namespace_call: false,
+            });
+            return Ok(Expr::Call(
+                vm::BuiltinFunction::Len.call_index(),
+                Vec::new(),
+                vec![container],
+                None,
+                Some(id),
+            ));
+        }
         let optional_field = receiver_schema
             .as_ref()
             .and_then(|schema| self.schema_field(schema, &property_name))
             .is_some_and(|schema| matches!(schema, TypeSchema::Optional(_)));
-        let direct_nonoptional_local_root = matches!(&*member.obj, ast::Expr::Ident(_))
+        let direct_nonoptional_local_root = matches!(&*object, ast::Expr::Ident(_))
             && receiver_schema
                 .as_ref()
                 .is_some_and(|schema| !matches!(schema, TypeSchema::Optional(_)));
-        let container = self.lower_expr(*member.obj)?;
+        let container = self.lower_expr(*object)?;
         let id = self.alloc_node_id();
         if optional_field {
             let field_projection =
@@ -2680,12 +3221,12 @@ impl<'a> Lowerer<'a> {
             } else {
                 Expr::Borrow(Box::new(container))
             };
-            let container_slot = self.alloc_hidden_local(member.span)?;
-            let key_slot = self.alloc_hidden_local(member.span)?;
+            let container_slot = self.alloc_hidden_local(member_span)?;
+            let key_slot = self.alloc_hidden_local(member_span)?;
             self.call_sites.push(ParsedCallSite {
                 id,
                 callee_span: byte_span(property.span, self.base, self.source_id),
-                expr_span: byte_span(member.span, self.base, self.source_id),
+                expr_span: byte_span(member_span, self.base, self.source_id),
                 target: ParsedCallTarget::Unresolved,
                 name: property_name,
                 scope_id: self.scope_id,
@@ -2703,7 +3244,7 @@ impl<'a> Lowerer<'a> {
         self.call_sites.push(ParsedCallSite {
             id,
             callee_span: byte_span(property.span, self.base, self.source_id),
-            expr_span: byte_span(member.span, self.base, self.source_id),
+            expr_span: byte_span(member_span, self.base, self.source_id),
             target: ParsedCallTarget::Function(vm::BuiltinFunction::Get.call_index()),
             name: property_name,
             scope_id: self.scope_id,
@@ -2845,6 +3386,13 @@ impl<'a> Lowerer<'a> {
                     ));
                 };
                 let slot = self.capture_slot(source_slot, &name, ident.span)?;
+                let is_shared_mutable_capture = self.mutable_locals.contains(&slot)
+                    && self.closure_captures.iter().any(|context| {
+                        context
+                            .captures
+                            .values()
+                            .any(|captured_slot| *captured_slot == slot)
+                    });
                 let span = byte_span(ident.span, self.base, self.source_id);
                 let node_id = self.alloc_node_id();
                 self.local_refs.push(LocalRefSite {
@@ -2854,7 +3402,12 @@ impl<'a> Lowerer<'a> {
                     name,
                     scope_id: self.scope_id,
                 });
-                Ok(Expr::Var(slot))
+                let expression = Expr::Var(slot);
+                Ok(if is_shared_mutable_capture {
+                    Expr::Borrow(Box::new(expression))
+                } else {
+                    expression
+                })
             }
             ast::Expr::Call(call) => {
                 let explicit_type_args = call
@@ -2953,6 +3506,27 @@ impl<'a> Lowerer<'a> {
                 } else {
                     None
                 };
+                let standard_builtin = if local_slot.is_none()
+                    && local_function.is_none()
+                    && imported_function.is_none()
+                    && host_index.is_none()
+                {
+                    match callee.as_str() {
+                        "Math::floor" => Some(vm::BuiltinFunction::MathFloor),
+                        "Math::sqrt" => Some(vm::BuiltinFunction::MathSqrt),
+                        "Math::round" => Some(vm::BuiltinFunction::MathRound),
+                        "Number::isNaN" | "isNaN" => Some(vm::BuiltinFunction::MathIsNaN),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let standard_integer = local_slot.is_none()
+                    && local_function.is_none()
+                    && imported_function.is_none()
+                    && host_index.is_none()
+                    && callee == "Number::isInteger";
+                let standard_arity = (standard_builtin.is_some() || standard_integer).then_some(1);
                 let host_passings = call_arity
                     .filter(|_| host_index.is_some())
                     .and_then(|arity| {
@@ -2969,15 +3543,46 @@ impl<'a> Lowerer<'a> {
                             .as_ref()
                             .map(|(_, declaration)| declaration.arity)
                     })
-                    .or_else(|| host_index.map(|_| call_arity.unwrap_or_default()));
+                    .or_else(|| host_index.map(|_| call_arity.unwrap_or_default()))
+                    .or(standard_arity);
                 if local_slot.is_none() && arity.is_none() {
                     return Err(ParseError::at_span(
                         byte_span(callee_span, self.base, self.source_id),
                         format!("unresolved TypeScript function '{callee}'"),
                     ));
                 }
+                let defaulted_call = match (local_function, arity) {
+                    (Some((_, function_arity)), Some(expected))
+                        if function_arity == expected
+                            && call.args.len() < usize::from(expected) =>
+                    {
+                        self.function_parameters
+                            .get(&callee)
+                            .is_some_and(|parameters| {
+                                parameters.len() == usize::from(expected)
+                                    && parameters
+                                        .iter()
+                                        .position(|parameter| {
+                                            parameter_binding(parameter)
+                                                .is_some_and(|(_, default)| default.is_some())
+                                        })
+                                        .is_some_and(|first_default| {
+                                            call.args.len() >= first_default
+                                                && parameters[first_default..].iter().all(
+                                                    |parameter| {
+                                                        parameter_binding(parameter).is_some_and(
+                                                            |(_, default)| default.is_some(),
+                                                        )
+                                                    },
+                                                )
+                                        })
+                            })
+                    }
+                    _ => false,
+                };
                 if let Some(arity) = arity
                     && call.args.len() != usize::from(arity)
+                    && !defaulted_call
                 {
                     return Err(ParseError::at_span(
                         call_span,
@@ -3011,28 +3616,36 @@ impl<'a> Lowerer<'a> {
                         }
                         let expression = self.lower_expr(*argument.expr)?;
                         match host_passings.get(index) {
-                            Some(vm::HostParamPassing::Borrow) => {
-                                if !matches!(&expression, Expr::Var(_)) {
-                                    return Err(unsupported(
-                                        argument_span,
-                                        self.base,
-                                        self.source_id,
-                                        "borrowed host argument must be a local binding",
-                                    ));
+                            Some(vm::HostParamPassing::Borrow) => match expression {
+                                variable @ Expr::Var(_) => Ok(Expr::Borrow(Box::new(variable))),
+                                Expr::Borrow(inner) if matches!(inner.as_ref(), Expr::Var(_)) => {
+                                    Ok(Expr::Borrow(inner))
                                 }
-                                Ok(Expr::Borrow(Box::new(expression)))
-                            }
-                            Some(vm::HostParamPassing::BorrowMut) => {
-                                if !matches!(&expression, Expr::Var(_)) {
-                                    return Err(unsupported(
-                                        argument_span,
-                                        self.base,
-                                        self.source_id,
-                                        "mutable-borrow host argument must be a local binding",
-                                    ));
+                                _ => Err(unsupported(
+                                    argument_span,
+                                    self.base,
+                                    self.source_id,
+                                    "borrowed host argument must be a local binding",
+                                )),
+                            },
+                            Some(vm::HostParamPassing::BorrowMut) => match expression {
+                                variable @ Expr::Var(_) => Ok(Expr::BorrowMut(Box::new(variable))),
+                                Expr::Borrow(inner) if matches!(inner.as_ref(), Expr::Var(_)) => {
+                                    Ok(Expr::BorrowMut(inner))
                                 }
-                                Ok(Expr::BorrowMut(Box::new(expression)))
-                            }
+                                _ => Err(unsupported(
+                                    argument_span,
+                                    self.base,
+                                    self.source_id,
+                                    "mutable-borrow host argument must be a local binding",
+                                )),
+                            },
+                            Some(vm::HostParamPassing::TakeOwned) => match expression {
+                                Expr::Borrow(inner) if matches!(inner.as_ref(), Expr::Var(_)) => {
+                                    Ok(*inner)
+                                }
+                                other => Ok(other),
+                            },
                             _ => Ok(expression),
                         }
                     })
@@ -3044,14 +3657,49 @@ impl<'a> Lowerer<'a> {
                         Expr::LocalCall(slot, explicit_type_args, args, Some(id)),
                     )
                 } else if let Some((index, _)) = local_function {
-                    (
-                        ParsedCallTarget::Function(index),
-                        Expr::Call(index, explicit_type_args, args, None, Some(id)),
-                    )
+                    let target = ParsedCallTarget::Function(index);
+                    let expression = if defaulted_call {
+                        self.lower_defaulted_function_call(
+                            &callee,
+                            index,
+                            explicit_type_args,
+                            args,
+                            id,
+                        )?
+                    } else {
+                        Expr::Call(index, explicit_type_args, args, None, Some(id))
+                    };
+                    (target, expression)
                 } else if let Some((symbol, _)) = imported_function {
                     (
                         ParsedCallTarget::Module(symbol),
                         Expr::ModuleCall(symbol, explicit_type_args, args, Some(id)),
+                    )
+                } else if standard_integer {
+                    let argument = args
+                        .into_iter()
+                        .next()
+                        .expect("Number.isInteger has one argument");
+                    let finite = Expr::Call(
+                        vm::BuiltinFunction::MathIsFinite.call_index(),
+                        Vec::new(),
+                        vec![argument.clone()],
+                        None,
+                        Some(id),
+                    );
+                    let floored =
+                        Self::builtin_call(vm::BuiltinFunction::MathFloor, vec![argument.clone()]);
+                    (
+                        ParsedCallTarget::Function(vm::BuiltinFunction::MathIsFinite.call_index()),
+                        Expr::And(
+                            Box::new(finite),
+                            Box::new(Expr::Eq(Box::new(argument), Box::new(floored))),
+                        ),
+                    )
+                } else if let Some(builtin) = standard_builtin {
+                    (
+                        ParsedCallTarget::Function(builtin.call_index()),
+                        Expr::Call(builtin.call_index(), Vec::new(), args, None, Some(id)),
                     )
                 } else if let Some(index) = host_index {
                     (
@@ -3072,6 +3720,11 @@ impl<'a> Lowerer<'a> {
                 });
                 Ok(expression)
             }
+            ast::Expr::Cond(conditional) => Ok(Expr::IfElse {
+                condition: Box::new(self.lower_expr(*conditional.test)?),
+                then_expr: Box::new(self.lower_expr(*conditional.cons)?),
+                else_expr: Box::new(self.lower_expr(*conditional.alt)?),
+            }),
             ast::Expr::Member(member) => self.lower_member_get(member),
             ast::Expr::Arrow(arrow) => self.lower_arrow(arrow),
             ast::Expr::Paren(value) => self.lower_expr(*value.expr),
@@ -3513,6 +4166,7 @@ pub(crate) fn lower(
         struct_decl_sites: Vec::new(),
         generic_type_params: HashSet::new(),
         function_indices: HashMap::new(),
+        function_parameters: HashMap::new(),
         generic_function_indices: HashSet::new(),
         functions: host_imports.functions,
         function_impls: HashMap::new(),

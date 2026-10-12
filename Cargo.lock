@@ -828,6 +828,7 @@ dependencies = [
 name = "pd-vm-compat-frontends"
 version = "0.1.0"
 dependencies = [
+ "pd-host-function",
  "pd-vm",
  "serde_json",
  "swc_common",
