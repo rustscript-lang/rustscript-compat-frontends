@@ -120,12 +120,31 @@ pub fn collect_typescript_type_hints_with_options(
 ) -> Result<Vec<vm::compiler::InferredLocalTypeHint>, SourcePathError> {
     let mut hints =
         vm::collect_inferred_local_type_hints_with_options(source, typescript_flavor(), options)?;
-    for hint in &mut hints {
+    format_typescript_type_hints(&mut hints);
+    Ok(hints)
+}
+
+pub fn collect_typescript_type_hints_at_path_with_options(
+    path: impl AsRef<Path>,
+    source: &str,
+    options: CompileSourceFileOptions,
+) -> Result<Vec<vm::compiler::InferredLocalTypeHint>, SourcePathError> {
+    let mut hints = vm::collect_inferred_local_type_hints_at_path_with_options(
+        path,
+        source,
+        typescript_flavor(),
+        options,
+    )?;
+    format_typescript_type_hints(&mut hints);
+    Ok(hints)
+}
+
+fn format_typescript_type_hints(hints: &mut [vm::compiler::InferredLocalTypeHint]) {
+    for hint in hints {
         if let Some(schema) = &hint.schema {
             hint.inferred_type = format_typescript_schema(schema, &hint.inferred_type);
         }
     }
-    Ok(hints)
 }
 
 fn split_top_level(input: &str) -> Vec<&str> {

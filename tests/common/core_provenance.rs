@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 const CORE_GIT: &str = "https://github.com/rustscript-lang/rustscript";
-const CORE_REV: &str = "d8c21caf8f91a8e5ceaffa10ea0b1473cdd4f43b";
+const CORE_REV: &str = "a6863bc33da37f06f271ba6766993b3b26c6968a";
 const CRATES_IO_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 const REGISTRY_VERSION_ENV: &str = "PD_VM_EXPECTED_REGISTRY_VERSION";
 
