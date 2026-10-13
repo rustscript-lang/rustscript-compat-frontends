@@ -781,7 +781,7 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 [[package]]
 name = "pd-host-function"
 version = "0.1.0"
-source = "git+https://github.com/rustscript-lang/rustscript?rev=a6863bc33da37f06f271ba6766993b3b26c6968a#a6863bc33da37f06f271ba6766993b3b26c6968a"
+source = "git+https://github.com/rustscript-lang/rustscript?rev=ef09b3f4925b1dcb39fb44420b050e631a954290#ef09b3f4925b1dcb39fb44420b050e631a954290"
 dependencies = [
  "pd-host-schema",
  "proc-macro2",
@@ -792,7 +792,7 @@ dependencies = [
 [[package]]
 name = "pd-host-schema"
 version = "0.1.0"
-source = "git+https://github.com/rustscript-lang/rustscript?rev=a6863bc33da37f06f271ba6766993b3b26c6968a#a6863bc33da37f06f271ba6766993b3b26c6968a"
+source = "git+https://github.com/rustscript-lang/rustscript?rev=ef09b3f4925b1dcb39fb44420b050e631a954290#ef09b3f4925b1dcb39fb44420b050e631a954290"
 dependencies = [
  "proc-macro2",
  "syn 2.0.118",
@@ -801,7 +801,7 @@ dependencies = [
 [[package]]
 name = "pd-vm"
 version = "0.1.0"
-source = "git+https://github.com/rustscript-lang/rustscript?rev=a6863bc33da37f06f271ba6766993b3b26c6968a#a6863bc33da37f06f271ba6766993b3b26c6968a"
+source = "git+https://github.com/rustscript-lang/rustscript?rev=ef09b3f4925b1dcb39fb44420b050e631a954290#ef09b3f4925b1dcb39fb44420b050e631a954290"
 dependencies = [
  "base64",
  "cranelift-codegen",
