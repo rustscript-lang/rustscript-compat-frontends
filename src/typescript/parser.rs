@@ -2965,7 +2965,12 @@ impl<'a> Lowerer<'a> {
             scope_id: self.scope_id,
             is_namespace_call: false,
         });
-        output.push(Stmt::Expr {
+        // The host adapter always errors, but static control-flow analysis must
+        // also balance its declared Null result on the non-error successor.
+        let result_slot = self.alloc_hidden_local(new_expression.span)?;
+        output.push(Stmt::Let {
+            index: result_slot,
+            declared_schema: Some(TypeSchema::Null),
             expr: Expr::Call(index, Vec::new(), vec![message], None, Some(id)),
             line,
         });

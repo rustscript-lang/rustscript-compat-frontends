@@ -419,6 +419,205 @@ fn imported_original_factorial_cli_matches_all_node_return_and_error_vectors() {
 }
 
 #[test]
+fn imported_original_factorial_runs_actual_native_ssa_without_branch_stack_leak() {
+    let scratch = ScratchTree::new();
+    let main = factorial_project(&scratch.0);
+    fs::write(
+        &main,
+        "import { factorial as factorialFromFile } from \"./maths/factorial.ts\";\nconst result: number = factorialFromFile(6);\nresult;\n",
+    )
+    .expect("write unchanged-file native importer");
+    let output = run_cli(&[
+        "--aot".to_owned(),
+        "--aot-dump".to_owned(),
+        "--fuel".to_owned(),
+        "100000".to_owned(),
+        main.display().to_string(),
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "original native importer failed: {stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("stack: [Int(720)]"),
+        "actual native result: {stdout}"
+    );
+    assert!(
+        stdout.contains("lowering=ssa"),
+        "native lowering missing: {stdout}"
+    );
+    let count = stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("aot executions: "))
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .expect("native execution counter is observable");
+    assert!(
+        count > 1,
+        "definition-only/interpreter execution is insufficient: {stdout}"
+    );
+}
+
+#[test]
+fn original_factorial_native_matches_node_vectors_and_fresh_artifact_routes() {
+    let vectors: serde_json::Value =
+        serde_json::from_str(NODE_FACTORIAL_VECTORS).expect("Node vectors");
+    let cases = vectors["cases"].as_array().expect("nine Node cases");
+    assert_eq!(cases.len(), 9);
+    let mut successful_returns = 0;
+    let mut exact_throws = 0;
+    for (index, case) in cases.iter().enumerate() {
+        let scratch = ScratchTree::new();
+        let main = factorial_project(&scratch.0);
+        let expression = case["expression"].as_str().expect("Node expression");
+        fs::write(&main, format!("import {{ factorial as factorialFromFile }} from \"./maths/factorial.ts\";\nconst result: number = factorialFromFile({expression});\nresult;\n")).expect("write original importer");
+        let artifact = scratch.0.join(format!("original-{index}.pat"));
+        let written = run_cli(&[
+            "--aot-save".to_owned(),
+            artifact.display().to_string(),
+            "--aot-dump".to_owned(),
+            "--fuel".to_owned(),
+            "100000".to_owned(),
+            main.display().to_string(),
+        ]);
+        let stdout = String::from_utf8_lossy(&written.stdout);
+        let stderr = String::from_utf8_lossy(&written.stderr);
+        // CLI diagnostics are emitted after successful execution only. On a
+        // throw, inspect and run the saved SSA artifact with a retained VM too.
+        assert!(
+            artifact.is_file(),
+            "AOT-save must compile before executing {expression}: {stderr}"
+        );
+        let mut retained =
+            Vm::new_from_aot_artifact_file_with_jit_config(&artifact, vm::JitConfig::default())
+                .expect("rematerialize original native program");
+        let catalog =
+            pd_vm_compat_frontends::runtime::scalar_error::typescript_error_host_catalog();
+        let mut registry = HostFunctionRegistry::new();
+        pd_vm_compat_frontends::runtime::scalar_error::typescript_error_host_module()
+            .install_from_catalog(&mut registry, &catalog)
+            .expect("install exact typed throw schema");
+        registry
+            .bind_vm_cached(&mut retained)
+            .expect("bind saved original imports");
+        retained.set_fuel(100000);
+        assert!(retained.dump_aot_info().contains("lowering=ssa"));
+        let retained_outcome = retained.run();
+        assert!(
+            retained.aot_exec_count() > 1,
+            "original function was not executed natively: {}",
+            retained.dump_aot_info()
+        );
+        eprintln!(
+            "original factorial retained expression={expression} native_count={}",
+            retained.aot_exec_count()
+        );
+        if case["outcome"] == "throw" {
+            exact_throws += 1;
+            let message = case["message"].as_str().expect("exact Node Error message");
+            match retained_outcome {
+                Err(VmError::HostError(actual)) => assert_eq!(actual, message),
+                other => panic!("native throw changed outcome for {expression}: {other:?}"),
+            }
+            assert!(
+                !written.status.success(),
+                "native throw returned for {expression}"
+            );
+            assert!(stderr.contains(message), "{stderr}");
+            assert!(
+                !stdout.contains("stack:"),
+                "throw published a return stack: {stdout}"
+            );
+            fs::remove_file(&main).expect("remove throwing importer");
+            fs::remove_file(scratch.0.join("maths/factorial.ts"))
+                .expect("remove throwing original source copy");
+            let fresh = run_cli(&[
+                "--aot-load".to_owned(),
+                artifact.display().to_string(),
+                "--fuel".to_owned(),
+                "100000".to_owned(),
+            ]);
+            assert!(!fresh.status.success(), "standalone native throw returned");
+            assert!(String::from_utf8_lossy(&fresh.stderr).contains(message));
+            continue;
+        }
+        assert!(matches!(retained_outcome, Ok(VmStatus::Halted)));
+        successful_returns += 1;
+        let expected = case["value"].as_i64().expect("Node integral return");
+        assert_native_original_return(&written, expected, expression);
+        assert!(
+            artifact.is_file(),
+            "native artifact writer must produce bytes"
+        );
+        let companion = run_cli(&[
+            "--aot-load".to_owned(),
+            artifact.display().to_string(),
+            "--aot-dump".to_owned(),
+            "--fuel".to_owned(),
+            "100000".to_owned(),
+            main.display().to_string(),
+        ]);
+        assert_native_original_return(&companion, expected, expression);
+        fs::remove_file(&main).expect("remove importer before standalone load");
+        fs::remove_file(scratch.0.join("maths/factorial.ts"))
+            .expect("remove original source copy before standalone load");
+        let standalone = run_cli(&[
+            "--aot-load".to_owned(),
+            artifact.display().to_string(),
+            "--aot-dump".to_owned(),
+            "--fuel".to_owned(),
+            "100000".to_owned(),
+        ]);
+        assert_native_original_return(&standalone, expected, expression);
+        let plain = run_cli(&[
+            "--aot-load".to_owned(),
+            artifact.display().to_string(),
+            "--fuel".to_owned(),
+            "100000".to_owned(),
+        ]);
+        assert!(
+            plain.status.success(),
+            "standalone no-dump failed: {}",
+            String::from_utf8_lossy(&plain.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&plain.stdout).contains(&format!("stack: [Int({expected})]"))
+        );
+    }
+    assert_eq!((successful_returns, exact_throws), (4, 5));
+}
+
+fn assert_native_original_return(output: &Output, expected: i64, expression: &str) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "original native {expression} failed: {stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains(&format!("stack: [Int({expected})]")),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("lowering=ssa"),
+        "native SSA evidence missing: {stdout}"
+    );
+    let count = stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("aot executions: "))
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .expect("actual original native counter");
+    assert!(
+        count > 1,
+        "native importer must invoke the algorithm: {stdout}"
+    );
+    eprintln!(
+        "original factorial native expression={expression} result=Int({expected}) native_count={count}"
+    );
+}
+
+#[test]
 fn imported_module_alias_type_hints_match_prototype_and_runtime_call() {
     let scratch = ScratchTree::new();
     let main = factorial_project(&scratch.0);
