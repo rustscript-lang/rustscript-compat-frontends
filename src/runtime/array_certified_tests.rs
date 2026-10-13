@@ -1780,13 +1780,82 @@ fn file_cli_native_artifact_child() {
     assert_file_cli_unavailable(&cli, &[false], true, false);
 }
 
+fn assert_file_cli_live(cli: &FileCliServices, native: bool) {
+    let observed = cli.observations.lock().unwrap();
+    assert_eq!(observed.init_certified, [true]);
+    assert_eq!(observed.query_certified, [true]);
+    assert_eq!(observed.candidate_values, [Value::Int(10)]);
+    assert_eq!(observed.owner_values, [Value::Int(10)]);
+    assert_eq!(observed.candidate_handles.len(), 1);
+    assert_eq!(observed.candidate_handles, observed.owner_handles);
+    assert_eq!(observed.comparisons, [true]);
+    assert_eq!(observed.roots_live_during_call, [true]);
+    assert!(observed.query_errors.is_empty());
+    if native {
+        assert!(observed.native_counts[0] > 1);
+        assert_eq!(observed.native_ssa, [true]);
+    }
+    eprintln!(
+        "file CLI checked live: init={:?} query={:?} candidate={:?} owner={:?} native_counts={:?} native_ssa={:?}",
+        observed.init_certified,
+        observed.query_certified,
+        observed.candidate_handles,
+        observed.owner_handles,
+        observed.native_counts,
+        observed.native_ssa
+    );
+}
+
 #[test]
-fn public_file_cli_native_companion_and_fresh_artifact_fail_closed() {
+fn public_file_cli_source_native_checked_owner_through_dependency_and_alias() {
+    let scratch = FileCliScratch::new();
+    let split = FILE_CLI_NATIVE_BOUNDARY_SOURCE
+        .find("\nconst reader = makeReader();")
+        .unwrap();
+    let dependency = FILE_CLI_NATIVE_BOUNDARY_SOURCE[..split]
+        .replace("function makeReader()", "export function makeReader()");
+    std::fs::create_dir(scratch.0.join("dep")).unwrap();
+    std::fs::write(scratch.0.join("dep/native-owner.ts"), dependency).unwrap();
+    let entry = scratch.0.join("entry.ts");
+    std::fs::write(&entry, "import { makeReader as allocate } from './dep/native-owner.ts';\nconst reader = allocate(); const alias = reader; const result = alias(0); reader(1); result;\n").unwrap();
+    let cli = file_cli_services(ProbePlan::MatchOwner);
+    let result = vm::cli::run_with_args(
+        &file_cli_runtime(),
+        &[
+            "--aot-save".into(),
+            scratch.0.join("owner.aot").display().to_string(),
+            entry.display().to_string(),
+        ],
+        &cli.services,
+    );
+    {
+        let observed = cli.observations.lock().unwrap();
+        eprintln!(
+            "native dependency owner result={result:?} init={:?} query={:?} candidate={:?} errors={:?} native_counts={:?} native_ssa={:?}",
+            observed.init_certified,
+            observed.query_certified,
+            observed.candidate_values,
+            observed.query_errors,
+            observed.native_counts,
+            observed.native_ssa
+        );
+        assert_eq!(observed.init_certified, [true]);
+        assert_eq!(observed.query_certified, [true]);
+        assert_eq!(observed.candidate_values, [Value::Int(10)]);
+        assert!(observed.native_counts[0] > 1);
+        assert_eq!(observed.native_ssa, [true]);
+    }
+    result.expect("source-native dependency/alias must expose a genuine checked Live owner");
+    assert_file_cli_live(&cli, true);
+}
+
+#[test]
+fn public_file_cli_source_native_owner_is_live_while_loaded_artifacts_fail_closed() {
     let scratch = FileCliScratch::new();
     let entry = scratch.0.join("native-owner.ts");
     let artifact = scratch.0.join("owner.aot");
     std::fs::write(&entry, FILE_CLI_NATIVE_BOUNDARY_SOURCE).unwrap();
-    let cli = file_cli_services(ProbePlan::Unavailable);
+    let cli = file_cli_services(ProbePlan::MatchOwner);
     vm::cli::run_with_args(
         &file_cli_runtime(),
         &[
@@ -1797,7 +1866,7 @@ fn public_file_cli_native_companion_and_fresh_artifact_fail_closed() {
         &cli.services,
     )
     .unwrap();
-    assert_file_cli_unavailable(&cli, &[true], true, true);
+    assert_file_cli_live(&cli, true);
     let companion = file_cli_services(ProbePlan::Unavailable);
     vm::cli::run_with_args(
         &file_cli_runtime(),
