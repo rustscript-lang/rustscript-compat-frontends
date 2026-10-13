@@ -2290,15 +2290,44 @@ impl<'a> Lowerer<'a> {
                     ));
                 }
             }
-            let expr = self.lower_expr(*init)?;
-            let slot = self.next_slot;
-            self.next_slot = self.next_slot.checked_add(1).ok_or_else(|| {
-                ParseError::at_span(
-                    byte_span(binding.id.span, self.base, self.source_id),
-                    "TypeScript local slot limit exceeded",
-                )
-            })?;
             let local_type = declared_schema.clone().or(inferred_schema);
+            // Reserve the binding while lowering an arrow so recursive references resolve.
+            let is_arrow_initializer = matches!(init.as_ref(), ast::Expr::Arrow(_));
+            let slot = if is_arrow_initializer {
+                let slot = self.next_slot;
+                self.next_slot = self.next_slot.checked_add(1).ok_or_else(|| {
+                    ParseError::at_span(
+                        byte_span(binding.id.span, self.base, self.source_id),
+                        "TypeScript local slot limit exceeded",
+                    )
+                })?;
+                self.locals.insert(name.clone(), slot);
+                if let Some(schema) = &local_type {
+                    self.local_types.insert(name.clone(), schema.clone());
+                } else {
+                    self.local_types.remove(&name);
+                }
+                if mutable {
+                    self.mutable_locals.insert(slot);
+                }
+                Some(slot)
+            } else {
+                None
+            };
+            let expr = self.lower_expr(*init)?;
+            let slot = match slot {
+                Some(slot) => slot,
+                None => {
+                    let slot = self.next_slot;
+                    self.next_slot = self.next_slot.checked_add(1).ok_or_else(|| {
+                        ParseError::at_span(
+                            byte_span(binding.id.span, self.base, self.source_id),
+                            "TypeScript local slot limit exceeded",
+                        )
+                    })?;
+                    slot
+                }
+            };
             self.locals.insert(name.clone(), slot);
             if let Some(schema) = &local_type {
                 self.local_types.insert(name.clone(), schema.clone());
@@ -2343,10 +2372,6 @@ impl<'a> Lowerer<'a> {
 
     fn lower_block(&mut self, block: ast::BlockStmt) -> Result<Vec<Stmt>, ParseError> {
         self.lower_block_contents(block.span, block.stmts)
-    }
-
-    fn lower_function_body(&mut self, body: ast::FunctionBody) -> Result<Vec<Stmt>, ParseError> {
-        self.lower_block_contents(body.span, body.stmts)
     }
 
     fn lower_block_contents(
@@ -2777,6 +2802,63 @@ impl<'a> Lowerer<'a> {
         Ok(slot)
     }
 
+    fn lower_arrow_body(&mut self, block: ast::FunctionBody) -> Result<Expr, ParseError> {
+        let block_span = block.span;
+        let mut statements = block.stmts;
+        let return_value = match statements.pop() {
+            Some(ast::Stmt::Return(return_statement)) => return_statement.arg.map(|value| *value),
+            Some(statement) => {
+                statements.push(statement);
+                None
+            }
+            None => None,
+        };
+        let parent_scope = self.scope_id;
+        let previous_locals = self.locals.clone();
+        let previous_local_types = self.local_types.clone();
+        let previous_mutable = self.mutable_locals.clone();
+        let scope_id = self.next_scope_id;
+        self.next_scope_id = self.next_scope_id.checked_add(1).ok_or_else(|| {
+            ParseError::at_span(
+                byte_span(block_span, self.base, self.source_id),
+                "TypeScript lexical scope count exceeded",
+            )
+        })?;
+        self.scope_id = scope_id;
+        let declaration_start = self.local_decls.len();
+        let result = (|| {
+            let mut lowered_statements = Vec::new();
+            for statement in statements {
+                self.lower_stmt(statement, &mut lowered_statements)?;
+            }
+            let expr = match return_value {
+                Some(value) => self.lower_expr(value)?,
+                None => Expr::Null,
+            };
+            Ok(Expr::Block {
+                stmts: lowered_statements,
+                expr: Box::new(expr),
+            })
+        })();
+        let declarations = self.local_decls[declaration_start..]
+            .iter()
+            .filter(|site| site.scope_id == scope_id)
+            .map(|site| site.slot)
+            .collect();
+        self.function_scopes.push(ParsedLexicalScope {
+            id: scope_id,
+            parent: Some(parent_scope),
+            range: byte_span(block_span, self.base, self.source_id),
+            declarations,
+            functions: Vec::new(),
+        });
+        self.scope_id = parent_scope;
+        self.locals = previous_locals;
+        self.local_types = previous_local_types;
+        self.mutable_locals = previous_mutable;
+        result
+    }
+
     fn lower_arrow(&mut self, arrow: ast::ArrowExpr) -> Result<Expr, ParseError> {
         if arrow.is_async || arrow.type_params.is_some() {
             return Err(unsupported(
@@ -2865,13 +2947,7 @@ impl<'a> Lowerer<'a> {
         });
         let body_result = match *arrow.body {
             ast::ArrowFunctionBody::Expr(expression) => self.lower_expr(*expression),
-            ast::ArrowFunctionBody::FunctionBody(block) => {
-                self.lower_function_body(block)
-                    .map(|statements| Expr::Block {
-                        stmts: statements,
-                        expr: Box::new(Expr::Null),
-                    })
-            }
+            ast::ArrowFunctionBody::FunctionBody(block) => self.lower_arrow_body(block),
         };
         let capture_context = self
             .closure_captures

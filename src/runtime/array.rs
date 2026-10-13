@@ -329,3 +329,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "array_lifecycle_tests.rs"]
+mod lifecycle_tests;
