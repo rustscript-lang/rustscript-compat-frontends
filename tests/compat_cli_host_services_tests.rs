@@ -283,6 +283,40 @@ fn wrong_error_options() -> vm::CompileSourceFileOptions {
 }
 
 #[test]
+fn production_cli_factory_retains_source_certification_before_guest() {
+    let scratch = ScratchTree::new();
+    let main = factorial_project(&scratch.0);
+    fs::write(&main, "import { factorial as original } from \"./maths/factorial.ts\";\nconst result: number = original(6);\nresult;\n").expect("write real original-file importer");
+    let observed = Arc::new(AtomicBool::new(false));
+    let during_init = Arc::clone(&observed);
+    let services = pd_vm_compat_frontends::runtime::cli::typescript_cli_host_services()
+        .with_vm_init(move |machine| {
+            during_init.store(
+                machine
+                    .capture_certification_stats()
+                    .is_some_and(|stats| stats.valid),
+                Ordering::SeqCst,
+            );
+            Ok(())
+        });
+    let runtime = vm::cli::CliRuntime {
+        binary_name: "pd-vm-compat-run",
+        default_source: "examples/example.ts",
+        compile_options: pd_vm_compat_frontends::compile_options,
+    };
+    vm::cli::run_with_args(
+        &runtime,
+        &["--fuel".into(), "100000".into(), main.display().to_string()],
+        &services,
+    )
+    .expect("actual production source CLI must execute the original import");
+    assert!(
+        observed.load(Ordering::SeqCst),
+        "production source facts must reach vm_init before guest execution"
+    );
+}
+
+#[test]
 fn original_factorial_entry_runs_through_the_published_services_cli() {
     let scratch = ScratchTree::new();
     let entry = scratch.0.join("factorial.ts");

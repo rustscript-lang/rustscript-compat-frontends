@@ -1,4 +1,4 @@
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 
 use vm::resource::{HostResource, ResourceHandle};
 use vm::{
@@ -1375,4 +1375,478 @@ fn uncertified_compilation_and_safe_vmbc_roundtrip_execute_without_capture_autho
         .reset_for_reuse()
         .expect("explicit reset closes VMBC resource");
     assert_eq!(artifact_vm.host_context().resource_count(), 0);
+}
+
+#[derive(Default)]
+struct FileCliObservation {
+    init_certified: Vec<bool>,
+    candidate_handles: Vec<ResourceHandle>,
+    owner_handles: Vec<ResourceHandle>,
+    comparisons: Vec<bool>,
+    candidate_values: Vec<Value>,
+    owner_values: Vec<Value>,
+    roots_live_during_call: Vec<bool>,
+    query_errors: Vec<CaptureQueryError>,
+    query_certified: Vec<bool>,
+    native_counts: Vec<u64>,
+    native_ssa: Vec<bool>,
+}
+
+struct FileCliObserver {
+    inner: CertifiedOwnerProbe,
+    observations: Arc<Mutex<FileCliObservation>>,
+}
+
+impl HostOwnedFunction for FileCliObserver {
+    fn call(&mut self, call: &mut OwnedHostCall<'_>) -> VmResult<CallOutcome> {
+        let outcome = self.inner.call(call);
+        let query_certified = call
+            .vm()
+            .capture_certification_stats()
+            .is_some_and(|stats| stats.valid);
+        let native_count = call.vm().aot_exec_count();
+        let native_ssa = call.vm().dump_aot_info().contains("lowering=ssa");
+        let context = call.vm().host_context();
+        let state = context
+            .module_state::<ProbeState>()
+            .expect("file-CLI VM installs proof state before guest execution");
+        let mut observed = self
+            .observations
+            .lock()
+            .expect("file-CLI observation record");
+        observed.query_certified.push(query_certified);
+        observed.native_counts.push(native_count);
+        observed.native_ssa.push(native_ssa);
+        observed
+            .candidate_handles
+            .extend(state.candidate_handles.iter().copied());
+        observed
+            .owner_handles
+            .extend(state.owner_handles.iter().copied());
+        observed
+            .comparisons
+            .extend(state.comparisons.iter().copied());
+        observed
+            .candidate_values
+            .extend(state.candidate_values.iter().cloned());
+        observed
+            .owner_values
+            .extend(state.owner_values.iter().cloned());
+        observed.roots_live_during_call.extend(
+            state
+                .root_during_call
+                .iter()
+                .map(|root| *root == CaptureRootState::Live),
+        );
+        observed
+            .query_errors
+            .extend(state.query_errors.iter().cloned());
+        outcome
+    }
+}
+
+struct FileCliServices {
+    services: vm::cli::CliHostServices<'static>,
+    observations: Arc<Mutex<FileCliObservation>>,
+}
+
+fn file_cli_services(plan: ProbePlan) -> FileCliServices {
+    let catalog = owner_catalog();
+    let check_schema = vm::catalog_import_schemas(&catalog, "proof::check")
+        .into_iter()
+        .next()
+        .expect("owner-check catalog schema");
+    let observations = Arc::new(Mutex::new(FileCliObservation::default()));
+    let init_observations = Arc::clone(&observations);
+    let returned_observations = Arc::clone(&observations);
+    let registry_catalog = Arc::clone(&catalog);
+    let services = vm::cli::CliHostServices::new(catalog, move || {
+        let mut registry = array_registry(&registry_catalog);
+        let schema = check_schema.clone();
+        let probe_observations = Arc::clone(&observations);
+        registry
+            .register_exact_owned("proof::check", 1, schema, move |_context| {
+                Box::new(FileCliObserver {
+                    inner: CertifiedOwnerProbe,
+                    observations: Arc::clone(&probe_observations),
+                })
+            })
+            .expect("guarded owner probe must bind only against the complete exact schema");
+        registry.authorize_registered_builtin_import("proof::check");
+        Ok(registry)
+    })
+    .with_capture_certification()
+    .with_vm_init(move |machine| {
+        init_observations
+            .lock()
+            .expect("file-CLI init observation record")
+            .init_certified
+            .push(
+                machine
+                    .capture_certification_stats()
+                    .is_some_and(|stats| stats.valid),
+            );
+        assert!(
+            !machine
+                .host_context()
+                .set_module_state(ProbeState::with_plan(plan))
+        );
+        Ok(())
+    });
+    FileCliServices {
+        services,
+        observations: returned_observations,
+    }
+}
+
+fn file_cli_runtime() -> vm::cli::CliRuntime {
+    vm::cli::CliRuntime {
+        binary_name: "compat-file-cli-owner-test",
+        default_source: "unused.ts",
+        compile_options: file_cli_compile_options,
+    }
+}
+
+fn file_cli_compile_options() -> vm::CompileSourceFileOptions {
+    crate::compile_options_with_catalog(owner_catalog())
+}
+
+const FILE_CLI_OWNER_SOURCE: &str = r#"
+import { create, length, write, close } from "arrays";
+import { check } from "proof";
+import type { Resource } from "rustscript:types";
+type Dispatcher = (operation: number) => number;
+function makeDispatcher(): Dispatcher {
+    let owner: Resource<"compat.number_array"> = create([10]);
+    const dispatcher: Dispatcher = (operation: number): number =>
+        operation === 0
+            ? (dispatcher === dispatcher
+                ? check(owner) + write(owner, 0, 11) + length(owner)
+                : check(owner) + write(owner, 0, 11) + length(owner))
+            : close(owner);
+    return dispatcher;
+}
+function main(): number {
+    const dispatcher = makeDispatcher();
+    const alias = dispatcher;
+    const first = alias(0);
+    return first + dispatcher(1);
+}
+main();
+"#;
+
+#[test]
+fn public_file_cli_retains_source_certification_and_real_move_owner_through_alias() {
+    let legacy = legacy_raw_source("LEGITIMATE_DISPATCHER_SOURCE");
+    assert!(
+        FILE_CLI_OWNER_SOURCE.trim() == legacy.trim(),
+        "the public file-CLI owner source must match the unchanged legacy dispatcher fixture"
+    );
+    let scratch = std::env::var_os("TMPDIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(format!("compat-file-cli-owner-{}", std::process::id()));
+    std::fs::create_dir_all(&scratch).expect("create file-CLI owner scratch tree");
+    let entry = scratch.join("owner-entry.ts");
+    std::fs::write(&entry, FILE_CLI_OWNER_SOURCE).expect("write file-CLI owner entry");
+    assert_eq!(
+        std::fs::read_to_string(&entry).expect("read file-CLI owner entry"),
+        FILE_CLI_OWNER_SOURCE,
+        "the file CLI must consume the exact owner-dispatcher source bytes"
+    );
+    let cli = file_cli_services(ProbePlan::MatchOwner);
+    let runtime = file_cli_runtime();
+    vm::cli::run_with_args(
+        &runtime,
+        &[
+            "--fuel".to_owned(),
+            "100000".to_owned(),
+            entry.display().to_string(),
+        ],
+        &cli.services,
+    )
+    .expect("public file CLI must execute the source-owned dispatcher through an alias");
+    let observed = cli.observations.lock().expect("read file-CLI observations");
+    assert_eq!(observed.init_certified, [true]);
+    assert_eq!(observed.candidate_handles.len(), 1);
+    assert_eq!(observed.owner_handles.len(), 1);
+    assert_eq!(observed.candidate_handles, observed.owner_handles);
+    assert_eq!(observed.comparisons, [true]);
+    assert_eq!(observed.candidate_values, [Value::Int(10)]);
+    assert_eq!(observed.owner_values, [Value::Int(10)]);
+    assert_eq!(observed.roots_live_during_call, [true]);
+    assert!(
+        observed.query_errors.is_empty(),
+        "MatchOwner must not record query errors: {:?}",
+        observed.query_errors
+    );
+    eprintln!(
+        "public file-CLI owner event: candidate={:?} owner={:?} payload={:?} live_root={} init_certified={:?}",
+        observed.candidate_handles[0],
+        observed.owner_handles[0],
+        observed.owner_values[0],
+        observed.roots_live_during_call[0],
+        observed.init_certified,
+    );
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn public_file_cli_without_opt_in_keeps_valid_binding_but_no_owner_authority() {
+    let scratch = std::env::var_os("TMPDIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(format!("compat-file-cli-no-optin-{}", std::process::id()));
+    std::fs::create_dir_all(&scratch).expect("create no-opt-in scratch tree");
+    let entry = scratch.join("owner-entry.ts");
+    std::fs::write(&entry, FILE_CLI_OWNER_SOURCE).expect("write no-opt-in owner entry");
+    let catalog = owner_catalog();
+    let check_schema = vm::catalog_import_schemas(&catalog, "proof::check")
+        .into_iter()
+        .next()
+        .expect("owner-check catalog schema");
+    let registry_catalog = Arc::clone(&catalog);
+    let plain = vm::cli::CliHostServices::new(Arc::clone(&catalog), move || {
+        let mut registry = array_registry(&registry_catalog);
+        registry
+            .register_exact_owned("proof::check", 1, check_schema.clone(), |_context| {
+                Box::new(CertifiedOwnerProbe)
+            })
+            .expect("guarded owner probe must bind only against the complete exact schema");
+        registry.authorize_registered_builtin_import("proof::check");
+        Ok(registry)
+    })
+    .with_vm_init(|machine| {
+        assert!(
+            machine.capture_certification_stats().is_none(),
+            "no-opt-in file CLI must not attach source capture facts"
+        );
+        assert!(
+            !machine
+                .host_context()
+                .set_module_state(ProbeState::with_plan(ProbePlan::Unavailable))
+        );
+        Ok(())
+    });
+    let runtime = file_cli_runtime();
+    vm::cli::run_with_args(
+        &runtime,
+        &[
+            "--fuel".to_owned(),
+            "100000".to_owned(),
+            entry.display().to_string(),
+        ],
+        &plain,
+    )
+    .expect("the same bound file must execute without source certification");
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+struct FileCliScratch(std::path::PathBuf);
+impl FileCliScratch {
+    fn new() -> Self {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::var_os("TMPDIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!("compat-owner-boundary-{}-{id}", std::process::id()));
+        std::fs::create_dir(&root).expect("create unique source boundary tree");
+        Self(root)
+    }
+    fn owner_project(&self) -> std::path::PathBuf {
+        let split = FILE_CLI_OWNER_SOURCE
+            .find("function main(): number {")
+            .expect("legacy root main boundary");
+        let dependency = FILE_CLI_OWNER_SOURCE[..split].replace(
+            "function makeDispatcher()",
+            "export function makeDispatcher()",
+        );
+        std::fs::create_dir(self.0.join("dep")).unwrap();
+        std::fs::write(self.0.join("dep/owner.ts"), dependency).unwrap();
+        let entry = self.0.join("entry.ts");
+        std::fs::write(&entry, "import { makeDispatcher as allocate } from './dep/owner.ts';\nfunction main(): number { const dispatcher = allocate(); const alias = dispatcher; const first = alias(0); return first + dispatcher(1); }\nmain();\n").unwrap();
+        entry
+    }
+}
+impl Drop for FileCliScratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn assert_file_cli_unavailable(
+    cli: &FileCliServices,
+    initial: &[bool],
+    native: bool,
+    query_valid: bool,
+) {
+    let observed = cli.observations.lock().unwrap();
+    assert_eq!(observed.init_certified, initial);
+    assert_eq!(observed.candidate_values, [Value::Int(10)]);
+    assert_eq!(observed.candidate_handles.len(), 1);
+    assert!(observed.owner_handles.is_empty());
+    assert!(observed.roots_live_during_call.is_empty());
+    assert_eq!(observed.query_errors, [CaptureQueryError::Unavailable]);
+    assert_eq!(observed.query_certified, [query_valid]);
+    if native {
+        assert!(observed.native_counts[0] > 1);
+        assert_eq!(observed.native_ssa, [true]);
+    }
+    eprintln!(
+        "file CLI unavailable: init={:?} candidate={:?} native_counts={:?} native_ssa={:?}",
+        observed.init_certified,
+        observed.candidate_handles,
+        observed.native_counts,
+        observed.native_ssa
+    );
+}
+
+#[test]
+fn public_file_cli_dependency_owner_and_vmbc_boundaries_are_observed() {
+    let scratch = FileCliScratch::new();
+    let entry = scratch.owner_project();
+    let cli = file_cli_services(ProbePlan::MatchOwner);
+    vm::cli::run_with_args(
+        &file_cli_runtime(),
+        &[entry.display().to_string()],
+        &cli.services,
+    )
+    .unwrap();
+    let observed = cli.observations.lock().unwrap();
+    assert_eq!(observed.init_certified, [true]);
+    assert_eq!(observed.candidate_values, [Value::Int(10)]);
+    assert_eq!(observed.owner_values, [Value::Int(10)]);
+    assert_eq!(observed.candidate_handles, observed.owner_handles);
+    assert_eq!(observed.comparisons, [true]);
+    assert_eq!(observed.roots_live_during_call, [true]);
+    assert!(observed.query_errors.is_empty());
+    drop(observed);
+    let emitted = scratch.0.join("owner.vmbc");
+    let untrusted = file_cli_services(ProbePlan::Unavailable);
+    vm::cli::run_with_args(
+        &file_cli_runtime(),
+        &[
+            "--emit-vmbc".into(),
+            emitted.display().to_string(),
+            entry.display().to_string(),
+        ],
+        &untrusted.services,
+    )
+    .unwrap();
+    let ordinary =
+        vm::compile_source_file_with_options(&entry, file_cli_compile_options()).unwrap();
+    assert_eq!(
+        std::fs::read(&emitted).unwrap(),
+        vm::encode_program(&ordinary.program).unwrap()
+    );
+    vm::cli::run_with_args(
+        &file_cli_runtime(),
+        &[emitted.display().to_string()],
+        &untrusted.services,
+    )
+    .unwrap();
+    assert_file_cli_unavailable(&untrusted, &[true, false], false, false);
+}
+
+const FILE_CLI_NATIVE_BOUNDARY_SOURCE: &str = r#"
+import { create, close } from "arrays";
+import { check } from "proof";
+import type { Resource } from "rustscript:types";
+type Reader = (operation: number) => number;
+function makeReader(): Reader {
+    let owner: Resource<"compat.number_array"> = create([10]);
+    const reader: Reader = (operation: number): number => operation === 0 ? check(owner) : close(owner);
+    return reader;
+}
+const reader = makeReader();
+const alias = reader;
+const result = alias(0);
+reader(1);
+result;
+"#;
+
+#[test]
+#[ignore = "fresh artifact child invoked by maintained outer control"]
+fn file_cli_native_artifact_child() {
+    let artifact = std::env::var("COMPAT_OWNER_ARTIFACT").expect("artifact child path");
+    let cli = file_cli_services(ProbePlan::Unavailable);
+    vm::cli::run_with_args(
+        &file_cli_runtime(),
+        &["--aot-load".into(), artifact],
+        &cli.services,
+    )
+    .unwrap();
+    assert_file_cli_unavailable(&cli, &[false], true, false);
+}
+
+#[test]
+fn public_file_cli_native_companion_and_fresh_artifact_fail_closed() {
+    let scratch = FileCliScratch::new();
+    let entry = scratch.0.join("native-owner.ts");
+    let artifact = scratch.0.join("owner.aot");
+    std::fs::write(&entry, FILE_CLI_NATIVE_BOUNDARY_SOURCE).unwrap();
+    let cli = file_cli_services(ProbePlan::Unavailable);
+    vm::cli::run_with_args(
+        &file_cli_runtime(),
+        &[
+            "--aot-save".into(),
+            artifact.display().to_string(),
+            entry.display().to_string(),
+        ],
+        &cli.services,
+    )
+    .unwrap();
+    assert_file_cli_unavailable(&cli, &[true], true, true);
+    let companion = file_cli_services(ProbePlan::Unavailable);
+    vm::cli::run_with_args(
+        &file_cli_runtime(),
+        &[
+            "--aot-load".into(),
+            artifact.display().to_string(),
+            entry.display().to_string(),
+        ],
+        &companion.services,
+    )
+    .unwrap();
+    assert_file_cli_unavailable(&companion, &[true], true, false);
+    std::fs::remove_file(&entry).unwrap();
+    let stdout = std::fs::File::create(scratch.0.join("child.stdout")).unwrap();
+    let stderr = std::fs::File::create(scratch.0.join("child.stderr")).unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "runtime::array::certified_tests::file_cli_native_artifact_child",
+            "--nocapture",
+        ])
+        .env("COMPAT_OWNER_ARTIFACT", &artifact)
+        .stdout(stdout)
+        .stderr(stderr)
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("fresh artifact child exceeded deadline");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let stdout = std::fs::read_to_string(scratch.0.join("child.stdout")).unwrap();
+    let stderr = std::fs::read_to_string(scratch.0.join("child.stderr")).unwrap();
+    assert!(
+        status.success(),
+        "fresh standalone failed: {stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("1 passed; 0 failed"),
+        "child filter must execute its control: {stdout}"
+    );
+    assert!(stderr.contains("file CLI unavailable: init=[false]"));
+    eprintln!("fresh owner artifact child:\n{stdout}\n{stderr}");
 }

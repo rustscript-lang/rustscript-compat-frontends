@@ -12,4 +12,5 @@ pub fn typescript_cli_host_services() -> CliHostServices<'static> {
             .install_from_catalog(&mut registry, &registry_catalog)?;
         Ok(registry)
     })
+    .with_capture_certification()
 }
