@@ -333,3 +333,7 @@ mod tests {
 #[cfg(test)]
 #[path = "array_lifecycle_tests.rs"]
 mod lifecycle_tests;
+
+#[cfg(test)]
+#[path = "array_certified_tests.rs"]
+mod certified_tests;
