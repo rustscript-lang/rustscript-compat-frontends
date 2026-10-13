@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use vm::{
     TypeSchema, Value, Vm, VmStatus,
@@ -62,6 +62,65 @@ fn counted_host_program(
         })
         .expect("counted host binding should match its catalog");
     (compiled, registry, catalog)
+}
+
+struct OrderedOperand {
+    events: Arc<Mutex<Vec<&'static str>>>,
+    name: &'static str,
+    value: Value,
+}
+
+impl vm::HostFunction for OrderedOperand {
+    fn call(&mut self, _machine: &mut Vm, args: &[Value]) -> vm::VmResult<vm::CallOutcome> {
+        assert!(args.is_empty());
+        self.events
+            .lock()
+            .expect("operand event recorder should not be poisoned")
+            .push(self.name);
+        Ok(vm::CallOutcome::Return(vm::CallReturn::one(
+            self.value.clone(),
+        )))
+    }
+}
+
+fn strict_equality_effect_program(
+    source: &str,
+    events: Arc<Mutex<Vec<&'static str>>>,
+) -> (vm::CompiledProgram, vm::HostFunctionRegistry) {
+    let mut builder = vm::HostApiBuilder::new();
+    for name in ["effects::left", "effects::right"] {
+        builder.function(vm::HostFunctionSchema::with_return(
+            name,
+            Vec::<vm::HostParamSchema>::new(),
+            vm::HostTypeSchema::Number,
+        ));
+    }
+    let catalog = Arc::new(builder.build().expect("valid operand recorder catalog"));
+    let compiled = vm::compile_source_with_flavor_and_options(
+        source,
+        flavor(),
+        pd_vm_compat_frontends::compile_options_with_catalog(Arc::clone(&catalog)),
+    )
+    .expect("numeric equality side-effect fixture should compile");
+
+    let mut registry = vm::HostFunctionRegistry::new();
+    for (function_name, event_name) in [("effects::left", "left"), ("effects::right", "right")] {
+        let schema = vm::catalog_import_schemas(&catalog, function_name)
+            .into_iter()
+            .next()
+            .expect("operand recorder schema should be catalog-owned");
+        let function_events = Arc::clone(&events);
+        registry
+            .register_catalog(schema, move || {
+                Box::new(OrderedOperand {
+                    events: Arc::clone(&function_events),
+                    name: event_name,
+                    value: Value::Int(7),
+                })
+            })
+            .expect("operand recorder binding should match its catalog");
+    }
+    (compiled, registry)
 }
 
 #[test]
@@ -343,6 +402,43 @@ fn strict_numeric_equality_uses_javascript_number_precision() {
         &[Value::Bool(true)],
         "JavaScript rounds both values to the same binary64 Number"
     );
+}
+
+#[test]
+fn strict_numeric_equality_evaluates_each_operand_once_left_to_right() {
+    for (operator, expected) in [("===", true), ("!==", false)] {
+        let source =
+            format!("import {{ left, right }} from \"effects\";\nleft() {operator} right();\n");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (compiled, registry) = strict_equality_effect_program(&source, Arc::clone(&events));
+        let mut machine = Vm::new(compiled.program);
+        registry
+            .bind_vm_cached(&mut machine)
+            .expect("operand recorder imports should bind");
+        assert_eq!(
+            machine
+                .run()
+                .expect("strict equality operands should execute"),
+            VmStatus::Halted
+        );
+        assert_eq!(machine.stack(), &[Value::Bool(expected)], "{operator}");
+
+        let recorded = events
+            .lock()
+            .expect("operand event recorder should not be poisoned")
+            .clone();
+        assert_eq!(recorded, ["left", "right"], "{operator} evaluation order");
+        assert_eq!(
+            recorded.iter().filter(|event| **event == "left").count(),
+            1,
+            "{operator} must evaluate the left operand once"
+        );
+        assert_eq!(
+            recorded.iter().filter(|event| **event == "right").count(),
+            1,
+            "{operator} must evaluate the right operand once"
+        );
+    }
 }
 
 #[test]

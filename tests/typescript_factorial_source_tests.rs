@@ -183,6 +183,53 @@ fn custom_catalog_must_explicitly_authorize_the_error_adapter() {
 }
 
 #[test]
+fn scalar_error_shadow_and_invalid_arguments_keep_specific_rejections() {
+    let cases = [
+        (
+            "shadowed Error binding",
+            "const Error: string = \"shadow\";\nthrow new Error(\"message\");\n",
+            "TypeScript throw cannot use a shadowed Error binding",
+        ),
+        (
+            "missing message",
+            "throw new Error();\n",
+            "TypeScript throw new Error requires one string-typed message",
+        ),
+        (
+            "extra message",
+            "throw new Error(\"first\", \"second\");\n",
+            "TypeScript throw new Error requires one string-typed message",
+        ),
+        (
+            "spread message",
+            "const messages: string[] = [\"message\"];\nthrow new Error(...messages);\n",
+            "TypeScript throw new Error requires one string-typed message",
+        ),
+        (
+            "non-string message",
+            "const message: number = 42;\nthrow new Error(message);\n",
+            "TypeScript throw new Error requires one string-typed message",
+        ),
+    ];
+
+    for (label, source, expected_diagnostic) in cases {
+        let result = vm::compile_source_with_flavor_and_options(
+            source,
+            vm::compiler::SourceFlavor::Plugin(vm::compiler::FrontendId::new("typescript")),
+            pd_vm_compat_frontends::compile_options(),
+        );
+        let error = match result {
+            Ok(_) => panic!("{label} should be rejected during TypeScript lowering"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains(expected_diagnostic),
+            "{label} should produce its specific Error diagnostic, got: {error}"
+        );
+    }
+}
+
+#[test]
 fn imported_original_factorial_matches_all_recorded_node_cases() {
     let vectors: serde_json::Value =
         serde_json::from_str(NODE_FACTORIAL_VECTORS).expect("recorded Node vectors are JSON");

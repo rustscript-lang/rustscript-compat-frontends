@@ -3638,36 +3638,9 @@ impl<'a> Lowerer<'a> {
         })
     }
 
-    fn lower_numeric_strict_equality(
-        &mut self,
-        left: Expr,
-        right: Expr,
-        span: swc_common::Span,
-    ) -> Result<Expr, ParseError> {
-        let source_span = byte_span(span, self.base, self.source_id);
-        let line = line_at(self.source, source_span.lo);
-        let left_slot = self.alloc_hidden_local(span)?;
-        let right_slot = self.alloc_hidden_local(span)?;
-        let left_value = || Expr::Var(left_slot);
-        let right_value = || Expr::Var(right_slot);
+    fn lower_numeric_strict_equality(left: Expr, right: Expr) -> Expr {
         let as_number = |value| Expr::Div(Box::new(value), Box::new(Expr::Float(1.0)));
-        Ok(Expr::Block {
-            stmts: vec![
-                Stmt::Let {
-                    index: left_slot,
-                    declared_schema: Some(TypeSchema::Number),
-                    expr: as_number(left),
-                    line,
-                },
-                Stmt::Let {
-                    index: right_slot,
-                    declared_schema: Some(TypeSchema::Number),
-                    expr: as_number(right),
-                    line,
-                },
-            ],
-            expr: Box::new(Expr::Eq(Box::new(left_value()), Box::new(right_value()))),
-        })
+        Expr::Eq(Box::new(as_number(left)), Box::new(as_number(right)))
     }
 
     fn lower_member_get(&mut self, member: ast::MemberExpr) -> Result<Expr, ParseError> {
@@ -4414,7 +4387,7 @@ impl<'a> Lowerer<'a> {
                 let left = Box::new(self.lower_expr(*value.left)?);
                 let right = Box::new(self.lower_expr(*value.right)?);
                 if numeric_strict_equality {
-                    let equality = self.lower_numeric_strict_equality(*left, *right, value.span)?;
+                    let equality = Self::lower_numeric_strict_equality(*left, *right);
                     return Ok(if value.op == ast::BinaryOp::NotEqEq {
                         Expr::Not(Box::new(equality))
                     } else {
