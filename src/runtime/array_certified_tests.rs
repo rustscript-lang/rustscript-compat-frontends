@@ -1850,3 +1850,247 @@ fn public_file_cli_native_companion_and_fresh_artifact_fail_closed() {
     assert!(stderr.contains("file CLI unavailable: init=[false]"));
     eprintln!("fresh owner artifact child:\n{stdout}\n{stderr}");
 }
+
+#[derive(Default)]
+struct A3ConsumptionObservation {
+    calls: usize,
+    before: Option<CaptureRootState>,
+    after_take: Option<CaptureRootState>,
+    payload: Vec<Value>,
+    certified_before: bool,
+    live_payloads_before: usize,
+}
+struct A3Consume;
+impl HostOwnedFunction for A3Consume {
+    fn call(&mut self, call: &mut OwnedHostCall<'_>) -> VmResult<CallOutcome> {
+        let raw = match call.arg(0) {
+            Some(Value::Int(raw)) => {
+                u64::try_from(*raw).map_err(|_| VmError::TypeMismatch("owned resource argument"))?
+            }
+            _ => return Err(VmError::TypeMismatch("owned resource argument")),
+        };
+        let handle =
+            ResourceHandle::from_raw(raw).map_err(|e| VmError::HostError(e.to_string()))?;
+        let certified = call
+            .vm_ref()
+            .capture_certification_stats()
+            .is_some_and(|s| s.valid);
+        let mut context = call.vm().host_context();
+        let root = context
+            .module_state::<ProbeState>()
+            .unwrap()
+            .roots
+            .first()
+            .unwrap()
+            .clone();
+        let issued_handle = context.module_state::<ProbeState>().unwrap().owner_handles[0];
+        assert_eq!(handle, issued_handle);
+        let token = context
+            .typed_resource_with_key::<NumberArray>(handle, &array_key())
+            .map_err(|e| VmError::HostError(e.to_string()))?;
+        let payload = context
+            .resource(&token)
+            .map_err(|e| VmError::HostError(e.to_string()))?
+            .get()
+            .0
+            .clone();
+        let before = root.observe(&context);
+        let resources = context.resource_count();
+        let owned = context
+            .take_resource_with_key::<NumberArray>(handle, &array_key())
+            .map_err(|e| VmError::HostError(e.to_string()))?;
+        assert_eq!(owned.0, payload);
+        let after = root.observe(&context);
+        drop(owned);
+        let state = context
+            .module_state_mut::<A3ConsumptionObservation>()
+            .unwrap();
+        state.calls += 1;
+        state.before = Some(before);
+        state.after_take = Some(after);
+        state.payload = payload;
+        state.certified_before = certified;
+        state.live_payloads_before = resources;
+        eprintln!(
+            "A3 guest TakeOwned before={before:?} after_payload_take={after:?} resources_before={resources} certified={certified}"
+        );
+        Ok(CallOutcome::Return(CallReturn::one(Value::Int(1))))
+    }
+}
+fn a3_consume_catalog() -> Arc<HostApiCatalog> {
+    let original = owner_catalog();
+    let mut builder = HostApiCatalog::builder();
+    for resource in original.resources() {
+        builder.resource(resource.clone());
+    }
+    for function in original.functions() {
+        builder.function(function.clone());
+    }
+    builder.function(HostFunctionSchema::with_return(
+        "proof::consume",
+        vec![HostParamSchema::with_passing(
+            "owner",
+            HostTypeSchema::Resource(array_key()),
+            HostParamPassing::TakeOwned,
+        )],
+        HostTypeSchema::Number,
+    ));
+    Arc::new(builder.build().unwrap())
+}
+const A3_GUEST_CONSUMPTION: &str = r#"
+import { create } from "arrays";
+import { check, consume } from "proof";
+import type { Resource } from "rustscript:types";
+type Dispatcher = () => number;
+function factory(): Dispatcher {
+    let owner: Resource<"compat.number_array"> = create([31]);
+    const dispatcher: Dispatcher = (): number => { check(owner); return consume(owner); };
+    return dispatcher;
+}
+const dispatcher = factory();
+dispatcher();
+"#;
+#[test]
+fn a3_guest_owned_transfer_observes_old_root_before_payload_consumption() {
+    let catalog = a3_consume_catalog();
+    let compilation = vm::compile_source_with_flavor_and_options_with_capture_certification(
+        A3_GUEST_CONSUMPTION,
+        crate::typescript_flavor(),
+        crate::compile_options_with_catalog(Arc::clone(&catalog)),
+    )
+    .unwrap();
+    let mut machine = compilation.into_vm().unwrap();
+    let emitted = vm::disassemble_program(machine.program());
+    let checked = emitted.find("import proof::check/1 (argc=1)").unwrap();
+    let consuming = emitted.find("import proof::consume/1 (argc=1)").unwrap();
+    assert!(
+        checked < consuming && emitted[checked..consuming].contains("builtin __detach_local/1")
+    );
+    eprintln!("A3 emitted guest transfer:\n{emitted}");
+    machine
+        .host_context()
+        .set_module_state(ProbeState::with_plan(ProbePlan::MatchOwner));
+    machine
+        .host_context()
+        .set_module_state(A3ConsumptionObservation::default());
+    let mut registry = owner_registry(&catalog);
+    let schema = vm::catalog_import_schemas(&catalog, "proof::consume")
+        .into_iter()
+        .next()
+        .unwrap();
+    registry
+        .register_exact_owned("proof::consume", 1, schema, |_context| Box::new(A3Consume))
+        .unwrap();
+    registry.authorize_registered_builtin_import("proof::consume");
+    registry.bind_vm_cached(&mut machine).unwrap();
+    run_to_halt(&mut machine, "actual guest ownership transfer");
+    let context = machine.host_context();
+    let state = context.module_state::<A3ConsumptionObservation>().unwrap();
+    assert_eq!(state.calls, 1);
+    let checked = context.module_state::<ProbeState>().unwrap();
+    assert_eq!(checked.root_during_call, [CaptureRootState::Live]);
+    assert_eq!(checked.candidate_handles, checked.owner_handles);
+    assert_eq!(checked.owner_borrows, 1);
+    assert_eq!(state.payload, [Value::Int(31)]);
+    assert_eq!(state.live_payloads_before, 1);
+    assert!(state.certified_before);
+    assert_eq!(state.before, Some(CaptureRootState::Unavailable));
+    assert_eq!(state.after_take, Some(CaptureRootState::Unavailable));
+    assert_eq!(context.resource_count(), 0);
+    machine.reset_for_reuse().unwrap();
+    assert_eq!(machine.host_context().resource_count(), 0);
+}
+
+const A3_ARTIFACT_READER: &str = r#"
+import { create, close } from "arrays";
+import { check } from "proof";
+import type { Resource } from "rustscript:types";
+type Reader = (operation: number) => number;
+export function factory(): Reader {
+    let owner: Resource<"compat.number_array"> = create([41]);
+    const reader: Reader = (operation: number): number => operation === 0 ? check(owner) : close(owner);
+    return reader;
+}
+"#;
+#[test]
+fn a3_same_vm_artifact_binding_revokes_issued_root_and_preserves_program_and_payload() {
+    let catalog = owner_catalog();
+    let mut machine = certified_vm(A3_ARTIFACT_READER, ProbePlan::MatchOwner);
+    let program_before = vm::encode_program(machine.program()).unwrap();
+    run_to_halt(&mut machine, "initialize exported factory module");
+    let factory = machine.resolve_exported_callable("factory").unwrap();
+    let reader = machine.invoke_callable(factory, &[]).unwrap();
+    let result = machine
+        .invoke_callable(reader.clone(), &[Value::Int(0)])
+        .unwrap();
+    assert_eq!(result, Value::Int(1));
+    let (root, handle) = {
+        let context = machine.host_context();
+        let state = context.module_state::<ProbeState>().unwrap();
+        assert_eq!(state.comparisons, [true]);
+        (state.roots[0].clone(), state.owner_handles[0])
+    };
+    assert_eq!(
+        root.observe(&machine.host_context()),
+        CaptureRootState::Live
+    );
+    let ordinary = vm::compile_source_with_flavor_and_options(
+        A3_ARTIFACT_READER,
+        crate::typescript_flavor(),
+        crate::compile_options_with_catalog(Arc::clone(&catalog)),
+    )
+    .unwrap();
+    assert_eq!(
+        vm::encode_program(&ordinary.program).unwrap(),
+        program_before
+    );
+    let mut writer = bind_probe(Vm::new(ordinary.program), &catalog, ProbePlan::Unavailable);
+    let artifact = writer.encode_aot_artifact().unwrap();
+    let mut corrupt = artifact.clone();
+    corrupt[0] ^= 0xff;
+    let error = machine
+        .load_aot_artifact(&corrupt)
+        .expect_err("malformed real artifact must be refused transactionally");
+    eprintln!("A3 rejected malformed artifact: {error}");
+    assert_eq!(
+        vm::encode_program(machine.program()).unwrap(),
+        program_before
+    );
+    assert!(machine.capture_certification_stats().unwrap().valid);
+    assert_eq!(
+        root.observe(&machine.host_context()),
+        CaptureRootState::Live
+    );
+    {
+        let context = machine.host_context();
+        let token = context
+            .typed_resource_with_key::<NumberArray>(handle, &array_key())
+            .unwrap();
+        assert_eq!(context.resource(&token).unwrap().get().0, [Value::Int(41)]);
+        assert_eq!(context.resource_count(), 1);
+    }
+    machine.load_aot_artifact(&artifact).unwrap();
+    assert_eq!(
+        vm::encode_program(machine.program()).unwrap(),
+        program_before
+    );
+    assert!(!machine.capture_certification_stats().unwrap().valid);
+    assert_eq!(
+        root.observe(&machine.host_context()),
+        CaptureRootState::Unavailable
+    );
+    {
+        let context = machine.host_context();
+        let token = context
+            .typed_resource_with_key::<NumberArray>(handle, &array_key())
+            .unwrap();
+        assert_eq!(context.resource(&token).unwrap().get().0, [Value::Int(41)]);
+        assert_eq!(context.resource_count(), 1);
+    }
+    eprintln!(
+        "A3 same VM engine binding: old_root=Unavailable program_bytes_unchanged=true payload=[Int(41)] resources=1"
+    );
+    drop(reader);
+    machine.reset_for_reuse().unwrap();
+    assert_eq!(machine.host_context().resource_count(), 0);
+}
