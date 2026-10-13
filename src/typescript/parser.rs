@@ -2301,6 +2301,7 @@ impl<'a> Lowerer<'a> {
                         "TypeScript local slot limit exceeded",
                     )
                 })?;
+                self.own_closure_local(slot);
                 self.locals.insert(name.clone(), slot);
                 if let Some(schema) = &local_type {
                     self.local_types.insert(name.clone(), schema.clone());
@@ -2328,6 +2329,7 @@ impl<'a> Lowerer<'a> {
                     slot
                 }
             };
+            self.own_closure_local(slot);
             self.locals.insert(name.clone(), slot);
             if let Some(schema) = &local_type {
                 self.local_types.insert(name.clone(), schema.clone());
@@ -2765,6 +2767,12 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
+    fn own_closure_local(&mut self, slot: u16) {
+        if let Some(context) = self.closure_captures.last_mut() {
+            context.local_slots.insert(slot);
+        }
+    }
+
     fn capture_slot(
         &mut self,
         source_slot: u16,
@@ -2772,10 +2780,15 @@ impl<'a> Lowerer<'a> {
         span: swc_common::Span,
     ) -> Result<u16, ParseError> {
         let mut slot = source_slot;
-        for index in 0..self.closure_captures.len() {
-            if self.closure_captures[index].local_slots.contains(&slot) {
-                continue;
-            }
+        // Slots are globally unique before Core frame compaction. A binding (including
+        // an already remapped capture) belongs to its innermost declaring context;
+        // only closures inside that context need to capture it.
+        let capture_start = self
+            .closure_captures
+            .iter()
+            .rposition(|context| context.local_slots.contains(&source_slot))
+            .map_or(0, |index| index + 1);
+        for index in capture_start..self.closure_captures.len() {
             if let Some(captured) = self.closure_captures[index].captures.get(&slot).copied() {
                 slot = captured;
                 continue;
@@ -3286,6 +3299,7 @@ impl<'a> Lowerer<'a> {
         self.next_slot = self.next_slot.checked_add(1).ok_or_else(|| {
             unsupported(span, self.base, self.source_id, "function local slot limit")
         })?;
+        self.own_closure_local(slot);
         Ok(slot)
     }
 

@@ -37,9 +37,12 @@ fn owner_catalog() -> Arc<HostApiCatalog> {
     Arc::new(builder.build().expect("owner proof catalog should build"))
 }
 
-struct CheckedSelfOwnerAssociation;
+// Fixture-only experiment: the aggregate TypeMap merges physical slots from
+// different frames. Its source-slot schema is not declaring-frame provenance.
+// This handler must not be used as a general checked owner API or collector.
+struct FixtureAggregateSelfOwnerAssociation;
 
-impl HostOwnedFunction for CheckedSelfOwnerAssociation {
+impl HostOwnedFunction for FixtureAggregateSelfOwnerAssociation {
     fn call(&mut self, call: &mut OwnedHostCall<'_>) -> VmResult<CallOutcome> {
         let candidate_raw = match call.arg(0) {
             Some(Value::Int(raw)) => {
@@ -159,6 +162,9 @@ impl HostOwnedFunction for CheckedSelfOwnerAssociation {
                         .local_schemas
                         .get(usize::from(*source))
                         .and_then(Option::as_ref);
+                    eprintln!(
+                        "fixture aggregate capture: prototype={prototype_id} source={source} target={target} mode={mode:?} source_schema={source_schema:?}; candidate typed borrow passed"
+                    );
                     (*mode == CaptureBindingMode::Move
                         && Some(*target) != prototype.self_slot
                         && source_schema == Some(&expected_schema))
@@ -205,6 +211,10 @@ impl HostOwnedFunction for CheckedSelfOwnerAssociation {
             drop(borrowed);
             handle
         };
+        eprintln!(
+            "fixture typed owner comparison: equal={}",
+            candidate == captured_owner
+        );
         if candidate != captured_owner {
             return Err(VmError::HostError(
                 "proof::check candidate is not the active callable's Move-captured resource"
@@ -226,7 +236,7 @@ fn owner_registry(catalog: &HostApiCatalog) -> HostFunctionRegistry {
         .expect("typed owner proof import schema");
     registry
         .register_exact_owned("proof::check", 1, schema, |_context| {
-            Box::new(CheckedSelfOwnerAssociation)
+            Box::new(FixtureAggregateSelfOwnerAssociation)
         })
         .expect("guarded owned adapter should register against the extended catalog schema");
     registry.authorize_registered_builtin_import("proof::check");
@@ -316,9 +326,7 @@ fn self_bearing_move_owner_with_another_resource_parameter_hits_pinned_barrier()
     );
 }
 
-#[test]
-fn self_bearing_move_owner_dispatcher_executes_through_an_alias() {
-    let source = r#"
+const LEGITIMATE_DISPATCHER_SOURCE: &str = r#"
 import { create, length, write, close } from "arrays";
 import { check } from "proof";
 import type { Resource } from "rustscript:types";
@@ -341,6 +349,10 @@ function main(): number {
 }
 main();
 "#;
+
+#[test]
+fn self_bearing_move_owner_dispatcher_executes_through_an_alias() {
+    let source = LEGITIMATE_DISPATCHER_SOURCE;
     let catalog = owner_catalog();
     let compiled = vm::compile_source_with_flavor_and_options(
         source,
@@ -465,5 +477,300 @@ main();
     machine
         .reset_for_reuse()
         .expect("ordinary caller rejection should leave the resource resettable");
+    assert_eq!(machine.host_context().resource_count(), 0);
+}
+
+fn fixture_program(source: &str) -> (vm::CompiledProgram, Arc<HostApiCatalog>) {
+    let catalog = owner_catalog();
+    crate::collect_typescript_type_hints_with_options(
+        source,
+        crate::compile_options_with_catalog(Arc::clone(&catalog)),
+    )
+    .expect("owner probe must pass public typehints");
+    vm::analyze_source_from_string_with_options(
+        "main.ts",
+        source,
+        crate::compile_options_with_catalog(Arc::clone(&catalog)),
+    )
+    .expect("owner probe must pass public analysis");
+    let compiled = vm::compile_source_with_flavor_and_options(
+        source,
+        crate::typescript_flavor(),
+        crate::compile_options_with_catalog(Arc::clone(&catalog)),
+    )
+    .expect("owner probe must compile through the real catalog");
+    for (id, p) in compiled.program.callable_prototypes.iter().enumerate() {
+        assert_eq!(p.capture_slots.len(), p.capture_source_slots.len());
+        assert_eq!(p.capture_slots.len(), p.capture_modes.len());
+        eprintln!(
+            "fixture prototype={id} schema={:?} params={:?} self={:?} source={:?} target={:?} modes={:?}",
+            p.schema,
+            p.parameter_slots,
+            p.self_slot,
+            p.capture_source_slots,
+            p.capture_slots,
+            p.capture_modes
+        );
+        for source in &p.capture_source_slots {
+            eprintln!(
+                "fixture source={source} aggregate_schema={:?}",
+                compiled
+                    .program
+                    .type_map
+                    .as_ref()
+                    .and_then(|m| m.local_schemas.get(usize::from(*source)))
+            );
+        }
+    }
+    (compiled, catalog)
+}
+
+#[test]
+fn aggregate_schema_perturbation_exposes_fixture_false_rejection() {
+    let perturbation = r#"
+function unrelated(value: string): string {
+    const local: string = value;
+    return local;
+}
+function independent(flag: boolean, value: string): string {
+    const local: boolean = flag;
+    return local ? value : "unused";
+}
+"#;
+    let (baseline, catalog) = fixture_program(LEGITIMATE_DISPATCHER_SOURCE);
+    let baseline_dispatcher = baseline
+        .program
+        .callable_prototypes
+        .iter()
+        .find(|p| p.self_slot.is_some() && p.capture_modes.contains(&CaptureBindingMode::Move))
+        .expect("baseline self-bearing Move dispatcher");
+    let baseline_signature = baseline_dispatcher.schema.clone();
+    let baseline_modes = baseline_dispatcher.capture_modes.clone();
+    let baseline_source = baseline_dispatcher
+        .capture_source_slots
+        .iter()
+        .zip(&baseline_dispatcher.capture_modes)
+        .find_map(|(source, mode)| (*mode == CaptureBindingMode::Move).then_some(*source))
+        .expect("one baseline Move source");
+    assert_eq!(
+        baseline.program.type_map.as_ref().unwrap().local_schemas[usize::from(baseline_source)],
+        Some(TypeSchema::Resource(array_key()))
+    );
+    let mut baseline_machine = Vm::new(baseline.program);
+    owner_registry(&catalog)
+        .bind_vm_cached(&mut baseline_machine)
+        .expect("baseline imports bind");
+    baseline_machine
+        .run()
+        .expect("the unchanged dispatcher must pass the unperturbed fixture");
+    assert_eq!(baseline_machine.stack().last(), Some(&Value::Int(14)));
+    assert_eq!(baseline_machine.host_context().resource_count(), 0);
+    baseline_machine.reset_for_reuse().expect("baseline reset");
+
+    let source = format!("{LEGITIMATE_DISPATCHER_SOURCE}\n{perturbation}");
+    let (compiled, catalog) = fixture_program(&source);
+    let dispatcher = compiled
+        .program
+        .callable_prototypes
+        .iter()
+        .find(|p| p.self_slot.is_some() && p.capture_modes.contains(&CaptureBindingMode::Move))
+        .expect("perturbed self-bearing Move dispatcher");
+    assert_eq!(dispatcher.schema, baseline_signature);
+    assert_eq!(dispatcher.capture_modes, baseline_modes);
+    let source_slot = dispatcher
+        .capture_source_slots
+        .iter()
+        .zip(&dispatcher.capture_modes)
+        .find_map(|(source, mode)| (*mode == CaptureBindingMode::Move).then_some(*source))
+        .expect("one perturbed Move source");
+    assert_eq!(
+        compiled.program.type_map.as_ref().unwrap().local_schemas[usize::from(source_slot)],
+        Some(TypeSchema::Bool),
+        "the unrelated boolean parameter replaced the aggregate source schema"
+    );
+    let mut machine = Vm::new(compiled.program);
+    owner_registry(&catalog)
+        .bind_vm_cached(&mut machine)
+        .expect("probe imports bind");
+    let outcome = machine.run();
+    eprintln!("same legitimate dispatcher with independent typed frames: {outcome:?}");
+    let error =
+        outcome.expect_err("aggregate schema fixture falsely rejects this legitimate owner");
+    assert!(
+        matches!(error, VmError::HostError(ref message) if message == "proof::check requires exactly one checked Move resource capture")
+    );
+    assert_eq!(machine.host_context().resource_count(), 1);
+    machine
+        .reset_for_reuse()
+        .expect("schema perturbation reset");
+    assert_eq!(machine.host_context().resource_count(), 0);
+}
+
+const NUMERIC_WRONG_RESOURCE_SOURCE: &str = r#"
+import { create, length, close } from "arrays";
+import { check } from "proof";
+import type { Resource } from "rustscript:types";
+type Dispatcher = (operation: number) => number;
+function makeDispatcher(): Dispatcher {
+    let owner: Resource<"compat.number_array"> = create([10]);
+    const dispatcher: Dispatcher = (operation: number): number => {
+        const other: Resource<"compat.number_array"> = create([20]);
+        return operation === 0
+            ? (dispatcher === dispatcher ? check(other) + length(owner) : check(other) + length(owner))
+            : close(owner);
+    };
+    return dispatcher;
+}
+function main(): number {
+    const dispatcher = makeDispatcher();
+    return dispatcher(0);
+}
+main();
+"#;
+
+#[test]
+fn numeric_signature_wrong_resource_reaches_typed_owner_comparison() {
+    let (compiled, catalog) = fixture_program(NUMERIC_WRONG_RESOURCE_SOURCE);
+    let mut machine = Vm::new(compiled.program);
+    owner_registry(&catalog)
+        .bind_vm_cached(&mut machine)
+        .expect("wrong-resource probe imports bind");
+    let error = machine
+        .run()
+        .expect_err("two valid resources must not prove owner association");
+    eprintln!("numeric-signature wrong-resource error: {error:?}");
+    assert!(
+        error
+            .to_string()
+            .contains("candidate is not the active callable's Move-captured resource"),
+        "comparison not reached: {error}"
+    );
+    assert_eq!(machine.host_context().resource_count(), 2);
+    machine
+        .reset_for_reuse()
+        .expect("wrong-resource rejection reset");
+    assert_eq!(machine.host_context().resource_count(), 0);
+}
+
+#[test]
+fn resource_signature_self_copy_without_owner_keeps_core_rejection() {
+    let source = r#"
+import { create, length } from "arrays";
+import type { Resource } from "rustscript:types";
+type Reader = (candidate: Resource<"compat.number_array">) => number;
+function main(): number {
+    const reader: Reader = (candidate: Resource<"compat.number_array">): number =>
+        reader === reader ? length(candidate) : length(candidate);
+    const candidate: Resource<"compat.number_array"> = create([1]);
+    return reader(candidate);
+}
+main();
+"#;
+    let catalog = owner_catalog();
+    let error = match vm::compile_source_with_flavor_and_options(
+        source,
+        crate::typescript_flavor(),
+        crate::compile_options_with_catalog(catalog),
+    ) {
+        Ok(_) => panic!("resource-containing callable self Copy must remain rejected"),
+        Err(error) => error,
+    };
+    eprintln!("resource-signature self Copy without owner: {error:?}");
+    assert!(format!("{error:?}").contains("E_OWNERSHIP_COPY_RESOURCE"));
+}
+
+#[test]
+fn resource_signature_move_owner_without_self_executes() {
+    let source = r#"
+import { create, length, close } from "arrays";
+import type { Resource } from "rustscript:types";
+type Reader = (candidate: Resource<"compat.number_array">) => number;
+function makeReader(): Reader {
+    let owner: Resource<"compat.number_array"> = create([1]);
+    const reader: Reader = (candidate: Resource<"compat.number_array">): number => length(candidate) + close(owner);
+    return reader;
+}
+function main(): number {
+    const reader = makeReader();
+    const candidate: Resource<"compat.number_array"> = create([2]);
+    return reader(candidate);
+}
+main();
+"#;
+    let (compiled, catalog) = fixture_program(source);
+    assert!(
+        compiled
+            .program
+            .callable_prototypes
+            .iter()
+            .any(|p| p.self_slot.is_none() && p.capture_modes == [CaptureBindingMode::Move])
+    );
+    let mut machine = Vm::new(compiled.program);
+    owner_registry(&catalog)
+        .bind_vm_cached(&mut machine)
+        .expect("Resource-signature imports bind");
+    machine
+        .run()
+        .expect("Resource signature with Move owner and no self must execute");
+    assert_eq!(machine.stack().last(), Some(&Value::Int(2)));
+    assert_eq!(machine.host_context().resource_count(), 1);
+    machine.reset_for_reuse().expect("Resource signature reset");
+    assert_eq!(machine.host_context().resource_count(), 0);
+}
+
+#[test]
+fn native_resource_signature_self_copy_and_move_owner_controls() {
+    let catalog = owner_catalog();
+    let self_source = r#"
+use arrays;
+let reader: fn(resource<compat.number_array>) -> number = |candidate| if reader == reader => {
+    arrays::length(candidate)
+} else => { arrays::length(candidate) };
+let candidate: resource<compat.number_array> = arrays::create([1]);
+reader(candidate);
+"#;
+    let error = match vm::compile_source_with_flavor_and_options(
+        self_source,
+        vm::compiler::SourceFlavor::RustScript,
+        crate::compile_options_with_catalog(Arc::clone(&catalog)),
+    ) {
+        Ok(_) => panic!("native resource-containing self Copy must remain rejected"),
+        Err(error) => error,
+    };
+    eprintln!("native resource-signature self Copy: {error:?}");
+    assert!(format!("{error:?}").contains("E_OWNERSHIP_COPY_RESOURCE"));
+
+    let move_source = r#"
+use arrays;
+let owner: resource<compat.number_array> = arrays::create([1]);
+let reader: fn(resource<compat.number_array>) -> number = |candidate| arrays::length(candidate) + arrays::close(owner);
+let candidate: resource<compat.number_array> = arrays::create([2]);
+reader(candidate);
+"#;
+    let compiled = vm::compile_source_with_flavor_and_options(
+        move_source,
+        vm::compiler::SourceFlavor::RustScript,
+        crate::compile_options_with_catalog(Arc::clone(&catalog)),
+    )
+    .expect("native Resource signature and Move owner without self should compile");
+    assert!(
+        compiled
+            .program
+            .callable_prototypes
+            .iter()
+            .any(|p| p.self_slot.is_none() && p.capture_modes == [CaptureBindingMode::Move])
+    );
+    let mut machine = Vm::new(compiled.program);
+    owner_registry(&catalog)
+        .bind_vm_cached(&mut machine)
+        .expect("native imports bind");
+    machine
+        .run()
+        .expect("native Resource signature and owner Move should execute");
+    assert_eq!(machine.stack().last(), Some(&Value::Int(2)));
+    assert_eq!(machine.host_context().resource_count(), 1);
+    machine
+        .reset_for_reuse()
+        .expect("native owner control reset");
     assert_eq!(machine.host_context().resource_count(), 0);
 }
