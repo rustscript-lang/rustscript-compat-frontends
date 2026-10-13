@@ -273,6 +273,79 @@ result;
 }
 
 #[test]
+fn standard_api_number_is_integer_accepts_negative_zero() {
+    let compiled = vm::compile_source_with_flavor_and_options(
+        "Number.isInteger(-0);",
+        flavor(),
+        pd_vm_compat_frontends::compile_options(),
+    )
+    .expect("Number.isInteger(-0) should compile");
+    let mut machine = Vm::new(compiled.program);
+    assert_eq!(
+        machine.run().expect("negative zero should execute"),
+        VmStatus::Halted
+    );
+    assert_eq!(machine.stack(), &[Value::Bool(true)]);
+}
+
+#[test]
+fn relational_comparison_does_not_treat_negative_zero_as_less_than_zero() {
+    let compiled = vm::compile_source_with_flavor_and_options(
+        "-0 < 0;",
+        flavor(),
+        pd_vm_compat_frontends::compile_options(),
+    )
+    .expect("negative-zero comparison should compile");
+    let mut machine = Vm::new(compiled.program);
+    assert_eq!(
+        machine
+            .run()
+            .expect("negative-zero comparison should execute"),
+        VmStatus::Halted
+    );
+    assert_eq!(machine.stack(), &[Value::Bool(false)]);
+}
+
+#[test]
+fn strict_equality_treats_negative_zero_as_equal_to_zero() {
+    let compiled = vm::compile_source_with_flavor_and_options(
+        "-0 === 0;",
+        flavor(),
+        pd_vm_compat_frontends::compile_options(),
+    )
+    .expect("negative-zero equality should compile");
+    let mut machine = Vm::new(compiled.program);
+    assert_eq!(
+        machine
+            .run()
+            .expect("negative-zero equality should execute"),
+        VmStatus::Halted
+    );
+    assert_eq!(machine.stack(), &[Value::Bool(true)]);
+}
+
+#[test]
+fn strict_numeric_equality_uses_javascript_number_precision() {
+    let source = "const a: number = 9007199254740992;\nconst b: number = a + 1;\na === b;\n";
+    let compiled = vm::compile_source_with_flavor_and_options(
+        source,
+        flavor(),
+        pd_vm_compat_frontends::compile_options(),
+    )
+    .expect("typed number equality should compile");
+    let mut machine = Vm::new(compiled.program);
+    assert_eq!(
+        machine.run().expect("typed number equality should execute"),
+        VmStatus::Halted
+    );
+    assert_eq!(
+        machine.stack(),
+        &[Value::Bool(true)],
+        "JavaScript rounds both values to the same binary64 Number"
+    );
+}
+
+#[test]
 fn standard_api_math_round_matches_javascript_numeric_edges() {
     let cases = [
         ("-1.5", -1.0),

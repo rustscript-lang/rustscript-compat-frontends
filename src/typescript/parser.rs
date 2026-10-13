@@ -528,6 +528,152 @@ fn is_host_import_spec(spec: &str) -> bool {
     !(spec.starts_with('.') || spec.starts_with('/') || spec.contains('/'))
 }
 
+fn variable_decl_contains_throw(declaration: &ast::VarDecl) -> bool {
+    declaration.decls.iter().any(|declaration| {
+        declaration
+            .init
+            .as_deref()
+            .is_some_and(expression_contains_throw)
+    })
+}
+
+fn function_body_contains_throw(body: &ast::FunctionBody) -> bool {
+    body.stmts.iter().any(statement_contains_throw)
+}
+
+fn statement_contains_throw(statement: &ast::Stmt) -> bool {
+    match statement {
+        ast::Stmt::Throw(_) => true,
+        ast::Stmt::Block(block) => block.stmts.iter().any(statement_contains_throw),
+        ast::Stmt::Decl(ast::Decl::Var(declaration)) => variable_decl_contains_throw(declaration),
+        ast::Stmt::Decl(ast::Decl::Fn(function)) => function
+            .function
+            .body
+            .as_ref()
+            .is_some_and(function_body_contains_throw),
+        ast::Stmt::Expr(expression) => expression_contains_throw(&expression.expr),
+        ast::Stmt::If(statement) => {
+            expression_contains_throw(&statement.test)
+                || statement_contains_throw(&statement.cons)
+                || statement
+                    .alt
+                    .as_deref()
+                    .is_some_and(statement_contains_throw)
+        }
+        ast::Stmt::While(statement) => {
+            expression_contains_throw(&statement.test) || statement_contains_throw(&statement.body)
+        }
+        ast::Stmt::For(statement) => {
+            let initializer_contains_throw =
+                statement
+                    .init
+                    .as_ref()
+                    .is_some_and(|initializer| match initializer {
+                        ast::VarDeclOrExpr::VarDecl(declaration) => {
+                            variable_decl_contains_throw(declaration)
+                        }
+                        ast::VarDeclOrExpr::Expr(expression) => {
+                            expression_contains_throw(expression)
+                        }
+                    });
+            initializer_contains_throw
+                || statement
+                    .test
+                    .as_deref()
+                    .is_some_and(expression_contains_throw)
+                || statement
+                    .update
+                    .as_deref()
+                    .is_some_and(expression_contains_throw)
+                || statement_contains_throw(&statement.body)
+        }
+        ast::Stmt::Return(statement) => statement
+            .arg
+            .as_deref()
+            .is_some_and(expression_contains_throw),
+        _ => false,
+    }
+}
+
+fn expression_contains_throw(expression: &ast::Expr) -> bool {
+    match expression {
+        ast::Expr::Arrow(arrow) => match arrow.body.as_ref() {
+            ast::ArrowFunctionBody::FunctionBody(body) => function_body_contains_throw(body),
+            ast::ArrowFunctionBody::Expr(expression) => expression_contains_throw(expression),
+        },
+        ast::Expr::Fn(function) => function
+            .function
+            .body
+            .as_ref()
+            .is_some_and(function_body_contains_throw),
+        ast::Expr::Call(call) => {
+            let callee_contains_throw = match &call.callee {
+                ast::Callee::Expr(callee) => expression_contains_throw(callee),
+                ast::Callee::Super(_) | ast::Callee::Import(_) => false,
+            };
+            callee_contains_throw
+                || call
+                    .args
+                    .iter()
+                    .any(|argument| expression_contains_throw(&argument.expr))
+        }
+        ast::Expr::New(expression) => {
+            expression_contains_throw(&expression.callee)
+                || expression.args.as_ref().is_some_and(|arguments| {
+                    arguments
+                        .iter()
+                        .any(|argument| expression_contains_throw(&argument.expr))
+                })
+        }
+        ast::Expr::Cond(expression) => {
+            expression_contains_throw(&expression.test)
+                || expression_contains_throw(&expression.cons)
+                || expression_contains_throw(&expression.alt)
+        }
+        ast::Expr::Bin(expression) => {
+            expression_contains_throw(&expression.left)
+                || expression_contains_throw(&expression.right)
+        }
+        ast::Expr::Unary(expression) => expression_contains_throw(&expression.arg),
+        ast::Expr::Assign(expression) => expression_contains_throw(&expression.right),
+        ast::Expr::Paren(expression) => expression_contains_throw(&expression.expr),
+        ast::Expr::Seq(expression) => expression
+            .exprs
+            .iter()
+            .any(|expression| expression_contains_throw(expression)),
+        _ => false,
+    }
+}
+
+fn module_contains_throw(module: &ast::Module) -> bool {
+    module.body.iter().any(|item| match item {
+        ast::ModuleItem::Stmt(statement) => statement_contains_throw(statement),
+        ast::ModuleItem::ModuleDecl(ast::ModuleDecl::ExportDecl(export)) => match &export.decl {
+            ast::Decl::Var(declaration) => variable_decl_contains_throw(declaration),
+            ast::Decl::Fn(function) => function
+                .function
+                .body
+                .as_ref()
+                .is_some_and(function_body_contains_throw),
+            _ => false,
+        },
+        _ => false,
+    })
+}
+
+fn catalog_has_exact_error_adapter(catalog: &vm::HostApiCatalog) -> bool {
+    let candidates = catalog.functions_named(crate::runtime::scalar_error::THROW_ERROR_FUNCTION);
+    let [candidate] = candidates.as_slice() else {
+        return false;
+    };
+    candidate.name == crate::runtime::scalar_error::THROW_ERROR_FUNCTION
+        && candidate.params.len() == 1
+        && candidate.params[0].name == "message"
+        && candidate.params[0].passing == vm::HostParamPassing::Value
+        && matches!(&candidate.params[0].ty, vm::HostTypeSchema::String)
+        && matches!(&candidate.return_type, vm::HostTypeSchema::Null)
+}
+
 fn collect_host_named_type_names(schema: &vm::HostTypeSchema, names: &mut HashSet<String>) {
     match schema {
         vm::HostTypeSchema::Array(inner)
@@ -1000,6 +1146,26 @@ fn install_host_imports(
         }
         direct_host_call_aliases.push((name.clone(), catalog_name));
         declared_functions.insert(name, candidates.into_iter().cloned().collect());
+    }
+    if module_contains_throw(module)
+        && context
+            .host_api_catalog
+            .is_some_and(catalog_has_exact_error_adapter)
+    {
+        let index = context.install_host_function(
+            &mut seed,
+            crate::runtime::scalar_error::THROW_ERROR_FUNCTION,
+            1,
+        )?;
+        let binding = crate::runtime::scalar_error::THROW_ERROR_BINDING.to_owned();
+        by_local_name
+            .entry(binding.clone())
+            .or_default()
+            .insert(1, index);
+        parameter_passings
+            .entry(binding)
+            .or_insert_with(HashMap::new)
+            .insert(1, vec![vm::HostParamPassing::Value]);
     }
     let resource_keys = context
         .host_api_catalog
@@ -2702,9 +2868,118 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
+    fn lower_throw(
+        &mut self,
+        statement: ast::ThrowStmt,
+        output: &mut Vec<Stmt>,
+    ) -> Result<(), ParseError> {
+        let statement_span = byte_span(statement.span, self.base, self.source_id);
+        let line = line_at(self.source, statement_span.lo);
+        let ast::Expr::New(new_expression) = *statement.arg else {
+            return Err(unsupported(
+                statement.span,
+                self.base,
+                self.source_id,
+                "throw expression",
+            ));
+        };
+        let ast::Expr::Ident(error_constructor) = new_expression.callee.as_ref() else {
+            return Err(unsupported(
+                new_expression.span,
+                self.base,
+                self.source_id,
+                "throw constructor",
+            ));
+        };
+        if error_constructor.sym != "Error" {
+            return Err(unsupported(
+                new_expression.span,
+                self.base,
+                self.source_id,
+                "throw constructor",
+            ));
+        }
+        let constructor_span = byte_span(error_constructor.span, self.base, self.source_id);
+        if self.locals.contains_key("Error")
+            || self.function_indices.contains_key("Error")
+            || self.imported_functions.contains_key("Error")
+            || self.host_function_indices.contains_key("Error")
+        {
+            return Err(ParseError::at_span(
+                constructor_span,
+                "TypeScript throw cannot use a shadowed Error binding",
+            ));
+        }
+        if new_expression.type_args.is_some() {
+            return Err(unsupported(
+                new_expression.span,
+                self.base,
+                self.source_id,
+                "Error constructor type arguments",
+            ));
+        }
+        let Some(mut arguments) = new_expression.args else {
+            return Err(ParseError::at_span(
+                byte_span(new_expression.span, self.base, self.source_id),
+                "TypeScript throw new Error requires one string-typed message",
+            ));
+        };
+        if arguments.len() != 1 {
+            return Err(ParseError::at_span(
+                byte_span(new_expression.span, self.base, self.source_id),
+                "TypeScript throw new Error requires one string-typed message",
+            ));
+        }
+        let argument = arguments.remove(0);
+        if argument.spread.is_some()
+            || !matches!(
+                self.expression_schema(&argument.expr),
+                Some(TypeSchema::String)
+            )
+        {
+            return Err(ParseError::at_span(
+                byte_span(argument.span(), self.base, self.source_id),
+                "TypeScript throw new Error requires one string-typed message",
+            ));
+        }
+        let Some(index) = self
+            .host_function_indices
+            .get(crate::runtime::scalar_error::THROW_ERROR_BINDING)
+            .and_then(|by_arity| by_arity.get(&1))
+            .copied()
+        else {
+            return Err(ParseError::at_span(
+                constructor_span,
+                "TypeScript throw new Error requires the exact typescript::throw_error(message: string): null host catalog entry",
+            ));
+        };
+        let message = self.lower_expr(*argument.expr)?;
+        let id = self.alloc_node_id();
+        let expression_span = byte_span(new_expression.span, self.base, self.source_id);
+        self.call_sites.push(ParsedCallSite {
+            id,
+            callee_span: constructor_span,
+            expr_span: expression_span,
+            target: ParsedCallTarget::Function(index),
+            name: crate::runtime::scalar_error::THROW_ERROR_FUNCTION.to_owned(),
+            scope_id: self.scope_id,
+            is_namespace_call: false,
+        });
+        output.push(Stmt::Expr {
+            expr: Expr::Call(index, Vec::new(), vec![message], None, Some(id)),
+            line,
+        });
+        self.stmt_spans.push(StmtSpanSite {
+            line,
+            span: statement_span,
+        });
+        Ok(())
+    }
+
     fn lower_stmt(&mut self, stmt: ast::Stmt, output: &mut Vec<Stmt>) -> Result<(), ParseError> {
         match stmt {
             ast::Stmt::Decl(ast::Decl::Var(decl)) => self.lower_var_decl(*decl, false, output)?,
+            ast::Stmt::Throw(statement) => self.lower_throw(statement, output)?,
             ast::Stmt::Expr(expr) => {
                 self.lower_assignment_statement(*expr.expr, output)?;
             }
@@ -3360,6 +3635,38 @@ impl<'a> Lowerer<'a> {
                 },
             ],
             expr: Box::new(negative_zero),
+        })
+    }
+
+    fn lower_numeric_strict_equality(
+        &mut self,
+        left: Expr,
+        right: Expr,
+        span: swc_common::Span,
+    ) -> Result<Expr, ParseError> {
+        let source_span = byte_span(span, self.base, self.source_id);
+        let line = line_at(self.source, source_span.lo);
+        let left_slot = self.alloc_hidden_local(span)?;
+        let right_slot = self.alloc_hidden_local(span)?;
+        let left_value = || Expr::Var(left_slot);
+        let right_value = || Expr::Var(right_slot);
+        let as_number = |value| Expr::Div(Box::new(value), Box::new(Expr::Float(1.0)));
+        Ok(Expr::Block {
+            stmts: vec![
+                Stmt::Let {
+                    index: left_slot,
+                    declared_schema: Some(TypeSchema::Number),
+                    expr: as_number(left),
+                    line,
+                },
+                Stmt::Let {
+                    index: right_slot,
+                    declared_schema: Some(TypeSchema::Number),
+                    expr: as_number(right),
+                    line,
+                },
+            ],
+            expr: Box::new(Expr::Eq(Box::new(left_value()), Box::new(right_value()))),
         })
     }
 
@@ -4096,8 +4403,24 @@ impl<'a> Lowerer<'a> {
                 }
             }
             ast::Expr::Bin(value) => {
+                let numeric_strict_equality =
+                    matches!(value.op, ast::BinaryOp::EqEqEq | ast::BinaryOp::NotEqEq)
+                        && self
+                            .expression_schema(&value.left)
+                            .is_some_and(|schema| Self::is_numeric_schema(&schema))
+                        && self
+                            .expression_schema(&value.right)
+                            .is_some_and(|schema| Self::is_numeric_schema(&schema));
                 let left = Box::new(self.lower_expr(*value.left)?);
                 let right = Box::new(self.lower_expr(*value.right)?);
+                if numeric_strict_equality {
+                    let equality = self.lower_numeric_strict_equality(*left, *right, value.span)?;
+                    return Ok(if value.op == ast::BinaryOp::NotEqEq {
+                        Expr::Not(Box::new(equality))
+                    } else {
+                        equality
+                    });
+                }
                 match value.op {
                     ast::BinaryOp::Add => Ok(Expr::Add(left, right)),
                     ast::BinaryOp::Sub => Ok(Expr::Sub(left, right)),

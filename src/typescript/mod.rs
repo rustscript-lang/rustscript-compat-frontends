@@ -96,11 +96,12 @@ impl SourcePlugin for LuaPlugin {
 }
 
 pub fn compile_options() -> CompileSourceFileOptions {
-    plugins()
+    let options = plugins()
         .into_iter()
         .fold(CompileSourceFileOptions::new(), |options, plugin| {
             options.with_source_plugin(plugin)
-        })
+        });
+    options.with_host_api_catalog(crate::runtime::scalar_error::typescript_error_host_catalog())
 }
 
 pub fn compile_options_with_catalog(catalog: Arc<vm::HostApiCatalog>) -> CompileSourceFileOptions {
