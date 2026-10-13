@@ -107,6 +107,7 @@ struct ProbeState {
     root_during_call: Vec<CaptureRootState>,
     root_after_alias_drop: Vec<CaptureRootState>,
     root_after_public_write: Vec<CaptureRootState>,
+    replacement_handle: Option<ResourceHandle>,
     environment: Option<Weak<CallableEnvironment>>,
     environment_expired_during_call: Vec<bool>,
     held_alias: Option<Value>,
@@ -371,7 +372,19 @@ impl HostOwnedFunction for CertifiedOwnerProbe {
                 }
                 if plan == ProbePlan::PublicSameValueWrite {
                     let local = active_single_move_local(call)?;
-                    let raw = i64::try_from(owner.handle.raw()).map_err(|_| {
+                    let replacement = {
+                        let context = call.vm().host_context();
+                        let handle = context
+                            .module_state::<ProbeState>()
+                            .expect("per-VM proof state")
+                            .replacement_handle
+                            .unwrap_or(owner.handle);
+                        context
+                            .typed_resource_with_key::<NumberArray>(handle, &array_key())
+                            .map_err(|error| VmError::HostError(error.to_string()))?;
+                        handle
+                    };
+                    let raw = i64::try_from(replacement.raw()).map_err(|_| {
                         VmError::HostError("resource handle exceeds Int".to_owned())
                     })?;
                     call.vm().set_local(local, Value::Int(raw))?;
@@ -1030,6 +1043,124 @@ export function factory(): Reader {
         .reset_for_reuse()
         .expect("explicit reset closes payload after invalidation");
     assert_eq!(machine.host_context().resource_count(), 0);
+}
+
+#[test]
+fn public_different_value_write_revokes_owner_root_and_keeps_both_payloads_open() {
+    let source = r#"
+import { create, length, close } from "arrays";
+import { check } from "proof";
+import type { Resource } from "rustscript:types";
+type Reader = (operation: number) => number;
+export function factory(): Reader {
+    let owner: Resource<"compat.number_array"> = create([19]);
+    const reader: Reader = (operation: number): number => operation === 0
+        ? check(owner) + length(owner)
+        : close(owner);
+    return reader;
+}
+"#;
+    let mut machine = certified_vm(source, ProbePlan::PublicSameValueWrite);
+    run_to_halt(&mut machine, "different-value source factory declaration");
+    let factory = machine
+        .resolve_exported_callable("factory")
+        .expect("factory export");
+    let closure = machine
+        .invoke_callable(factory, &[])
+        .expect("factory result");
+    let replacement = {
+        let mut context = machine.host_context();
+        let token = context
+            .push_resource(NumberArray(vec![Value::Int(29), Value::Int(31)]))
+            .expect("independently typed replacement array");
+        let handle = token.handle();
+        context
+            .typed_resource_with_key::<NumberArray>(handle, &array_key())
+            .expect("replacement key, arena, generation and concrete type");
+        context
+            .module_state_mut::<ProbeState>()
+            .expect("proof state")
+            .replacement_handle = Some(handle);
+        handle
+    };
+    assert_eq!(
+        machine
+            .invoke_callable(closure.clone(), &[Value::Int(0)])
+            .expect("replace captured value"),
+        Value::Int(3),
+        "the continued source call must read the two-element replacement payload"
+    );
+    let (root, original) = {
+        let context = machine.host_context();
+        let state = context.module_state::<ProbeState>().expect("proof state");
+        assert_eq!(state.comparisons, [true]);
+        assert_eq!(state.root_during_call, [CaptureRootState::Live]);
+        assert_eq!(
+            state.root_after_public_write,
+            [CaptureRootState::Unavailable]
+        );
+        (state.roots[0].clone(), state.owner_handles[0])
+    };
+    assert_ne!(original, replacement);
+    assert_eq!(
+        root.observe(&machine.host_context()),
+        CaptureRootState::Unavailable
+    );
+    assert!(
+        machine
+            .capture_certification_stats()
+            .is_some_and(|stats| !stats.valid)
+    );
+    assert_eq!(machine.host_context().resource_count(), 2);
+    for (handle, values) in [
+        (original, vec![Value::Int(19)]),
+        (replacement, vec![Value::Int(29), Value::Int(31)]),
+    ] {
+        let context = machine.host_context();
+        let token = context
+            .typed_resource_with_key::<NumberArray>(handle, &array_key())
+            .expect("both typed payloads remain open");
+        assert_eq!(
+            context
+                .resource(&token)
+                .expect("typed payload borrow")
+                .get()
+                .0,
+            values
+        );
+    }
+    machine
+        .host_context()
+        .module_state_mut::<ProbeState>()
+        .expect("proof state")
+        .plan = Some(ProbePlan::Unavailable);
+    assert_eq!(
+        machine
+            .invoke_callable(closure, &[Value::Int(0)])
+            .expect("ordinary access after authority revocation"),
+        Value::Int(3)
+    );
+    {
+        let context = machine.host_context();
+        let state = context.module_state::<ProbeState>().expect("proof state");
+        assert_eq!(state.query_errors, [CaptureQueryError::Unavailable]);
+        assert_eq!(
+            state.owner_borrows, 1,
+            "invalidated relation must not issue another owner token"
+        );
+        eprintln!(
+            "different-value replacement: original={original:?} replacement={replacement:?} Live→Unavailable, payloads=2, continued=Int(3), subsequent_query={:?}",
+            state.query_errors
+        );
+    }
+    machine
+        .reset_for_reuse()
+        .expect("explicit reset closes both payloads");
+    assert_eq!(machine.host_context().resource_count(), 0);
+    assert_eq!(
+        root.observe(&machine.host_context()),
+        CaptureRootState::Unavailable
+    );
 }
 
 #[test]
