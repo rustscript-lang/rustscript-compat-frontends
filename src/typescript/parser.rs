@@ -2150,22 +2150,22 @@ impl<'a> Lowerer<'a> {
         // partition returning `i`). Pre-body inference only sees params;
         // after lowering, body locals are known. Keeps logical Number for
         // callers' floating projection without inventing unboxing facts.
-        if return_schema.is_none() && self.ref_mode {
-            if let Some(ast::Stmt::Return(tail)) = body.stmts.last()
-                && let Some(returned) = tail.arg.as_ref()
+        if return_schema.is_none()
+            && self.ref_mode
+            && let Some(ast::Stmt::Return(tail)) = body.stmts.last()
+            && let Some(returned) = tail.arg.as_ref()
+        {
+            if self
+                .expression_schema(returned)
+                .is_some_and(super::array_lowering::is_carrier_schema)
             {
-                if self
-                    .expression_schema(returned)
-                    .is_some_and(super::array_lowering::is_carrier_schema)
-                {
-                    return_schema = Some(super::array_lowering::carrier_schema());
-                } else if self
-                    .expression_schema(returned)
-                    .as_ref()
-                    .is_some_and(Self::is_numeric_schema)
-                {
-                    return_schema = Some(TypeSchema::Number);
-                }
+                return_schema = Some(super::array_lowering::carrier_schema());
+            } else if self
+                .expression_schema(returned)
+                .as_ref()
+                .is_some_and(Self::is_numeric_schema)
+            {
+                return_schema = Some(TypeSchema::Number);
             }
         }
         let scope_declarations = self.local_decls[declaration_start..]
@@ -2780,7 +2780,7 @@ impl<'a> Lowerer<'a> {
                 };
                 let rhs_needs_factory = self
                     .expression_schema(&assignment.right)
-                    .is_some_and(|schema| super::array_lowering::is_logical_number_array(schema));
+                    .is_some_and(super::array_lowering::is_logical_number_array);
                 let value = self.lower_expr(*assignment.right)?;
                 // Rebinding a reference-array variable to a plain staging
                 // array converts through the owning factory; carrier to
