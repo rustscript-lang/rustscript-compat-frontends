@@ -1861,6 +1861,10 @@ impl<'a> Lowerer<'a> {
                 }
             }
         }
+        // Callee-owned default thunks/carriers/getters for reference-array
+        // mode (plain mode untouched). Must run before root collection so
+        // synthetic top-level FuncDecls join the same IR.
+        self.generate_default_callables(&mut stmts)?;
         let root_declarations = self
             .local_decls
             .iter()
@@ -2244,6 +2248,566 @@ impl<'a> Lowerer<'a> {
         });
         Ok(())
     }
+
+    /// Generates callee-owned default-callable thunks, carriers and getters
+    /// for reference-array mode. Called once after all user functions are
+    /// lowered, before building the final IR. Only in `ref_mode`; plain mode
+    /// is untouched. Thunks evaluate only omitted defaults left-to-right in
+    /// the callee scope then invoke one full implementation (no body
+    /// duplication). Carriers hold truthful callable fields for the full
+    /// arity and each accepted supplied arity; getters return carriers.
+    /// Hygienic collisions fail precisely as duplicates.
+    fn generate_default_callables(&mut self, output: &mut Vec<Stmt>) -> Result<(), ParseError> {
+        // Generate for both modes so synthetic getter/carrier imports always
+        // resolve; call-site use of the getter path stays ref_mode-gated to
+        // keep ordinary mode unchanged. Plain schemas stay plain (ref_map is
+        // itself ref_mode-gated), numeric default projection inside thunks is
+        // also ref_mode-gated.
+        // Snapshot candidates to avoid borrowing issues. Only top-level user
+        // functions with defaults (non-generic, non-synthetic, non-prelude).
+        // Prelude helpers use `__compat_ref_` and have no defaults; our own
+        // synthetic uses `__compat_default*` / `__CompatDefaultCarrier_*`.
+        let candidates: Vec<(String, u16, u8)> = self
+            .function_indices
+            .iter()
+            .filter_map(|(name, (index, arity))| {
+                if name.starts_with("__compat_ref_")
+                    || name.starts_with("__compat_default_thunk_")
+                    || name.starts_with("__compat_default_get_")
+                    || name.starts_with("__CompatDefaultCarrier_")
+                {
+                    return None;
+                }
+                if super::default_lowering::is_synthetic_default_name(name) {
+                    return None;
+                }
+                if self.generic_function_indices.contains(index) {
+                    return None;
+                }
+                let params = self.function_parameters.get(name)?;
+                let has_default = params
+                    .iter()
+                    .any(|p| parameter_binding(p).is_some_and(|(_, d)| d.is_some()));
+                if !has_default {
+                    // Still generate carrier/getter with only full for
+                    // import safety? For now, only functions with defaults
+                    // need carriers (getters for all would bloat). Import
+                    // synthesis requests getters only for value imports; if
+                    // dependency function has no defaults, requesting getter
+                    // would fail. To keep imports safe, we generate getters
+                    // for all user functions (even without defaults) below.
+                    // Mark all user functions as candidates; thunks only for
+                    // those with defaults.
+                    return Some((name.clone(), *index, *arity));
+                }
+                Some((name.clone(), *index, *arity))
+            })
+            .collect();
+        // Deterministic order by function index.
+        let mut candidates = candidates;
+        candidates.sort_by_key(|(_, index, _)| *index);
+        for (name, full_index, full_arity) in candidates {
+            // Skip prelude helpers that slipped through (no defaults, but
+            // also not user? They have no defaults, but we still generate
+            // getters for all? To avoid bloat for prelude (14 helpers),
+            // skip our own prelude prefix here; user functions never use it
+            // (collision would have already failed as duplicate).
+            if name.starts_with("__compat_ref_") {
+                continue;
+            }
+            // Only exported user functions need carriers/getters (importable).
+            // Non-exported (e.g. test `main`, private `choosePivot`) never
+            // appear in imports; generating getters for them would needlessly
+            // materialise callable slots (self) and break ordinary
+            // no-self guarantees. Thunks/carriers/getters for exported
+            // without defaults still exist (full only) so synthetic
+            // getter/carrier imports always resolve.
+            let exported = self
+                .functions
+                .iter()
+                .find(|d| d.index == full_index)
+                .is_some_and(|d| d.exported);
+            if !exported {
+                continue;
+            }
+            self.generate_default_for_one(&name, full_index, full_arity, output)?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn generate_default_for_one(
+        &mut self,
+        full_name: &str,
+        full_index: u16,
+        full_arity: u8,
+        output: &mut Vec<Stmt>,
+    ) -> Result<(), ParseError> {
+        // Full declaration for schemas/return/exported/span.
+        let full_decl = self
+            .functions
+            .iter()
+            .find(|d| d.index == full_index)
+            .cloned()
+            .ok_or_else(|| ParseError::new("default callable declaration is missing"))?;
+        let full_site = self
+            .function_sites
+            .iter()
+            .find(|s| s.function_index == full_index)
+            .cloned();
+        let ident_span = full_site
+            .as_ref()
+            .map(|s| s.ident_span)
+            .unwrap_or(Span::new(self.source_id, 0, self.source.len()));
+        let func_span = full_site
+            .as_ref()
+            .map(|s| {
+                // function_sites stores ident_span + function_index; use ident
+                // span for synthetic lines (points at original).
+                s.ident_span
+            })
+            .unwrap_or(ident_span);
+        let line = line_at(self.source, ident_span.lo);
+        let params = self
+            .function_parameters
+            .get(full_name)
+            .cloned()
+            .unwrap_or_default();
+        // First default position (N if none).
+        let first_default = params
+            .iter()
+            .position(|p| parameter_binding(p).is_some_and(|(_, d)| d.is_some()))
+            .unwrap_or(params.len());
+        let total = usize::from(full_arity);
+        // Validate trailing-default shape (lower_function already enforces
+        // for user functions; synthetic never has defaults).
+        // Accepted supplied arities: first_default..total (total is full, no thunk).
+        let mut thunk_indices: Vec<(u8, u16, String)> = Vec::new();
+        // Save outer top-level bindings (module scope) to restore after;
+        // thunks are top-level like full (empty outer, no captures).
+        let saved_locals = std::mem::take(&mut self.locals);
+        let saved_types = std::mem::take(&mut self.local_types);
+        let saved_mut = std::mem::take(&mut self.mutable_locals);
+        let saved_bindings_len = self.local_bindings.len();
+        let saved_scope = self.scope_id;
+        // Generate thunks for each omitted arity.
+        if first_default < total {
+            for supplied in first_default..total {
+                let supplied_u8 = u8::try_from(supplied).map_err(|_| {
+                    ParseError::at_span(ident_span, "default callable arity exceeds VM limit")
+                })?;
+                let thunk_name = super::default_lowering::thunk_name(full_name, supplied_u8);
+                // Collision refusal (precise duplicates like any other).
+                if self.function_indices.contains_key(&thunk_name)
+                    || self.host_function_indices.contains_key(&thunk_name)
+                    || self.imported_functions.contains_key(&thunk_name)
+                {
+                    return Err(ParseError::at_span(
+                        ident_span,
+                        format!("duplicate TypeScript function '{thunk_name}'"),
+                    ));
+                }
+                // Allocate thunk index.
+                let thunk_index = self.next_function_index;
+                self.next_function_index = self
+                    .next_function_index
+                    .checked_add(1)
+                    .ok_or_else(|| ParseError::at_span(ident_span, "function table size"))?;
+                self.function_indices
+                    .insert(thunk_name.clone(), (thunk_index, supplied_u8));
+                // New scope for thunk.
+                let scope_id = self.next_scope_id;
+                self.next_scope_id = self
+                    .next_scope_id
+                    .checked_add(1)
+                    .ok_or_else(|| ParseError::at_span(ident_span, "lexical scope count"))?;
+                self.scope_id = scope_id;
+                // Clear locals for thunk (top-level, empty outer).
+                self.locals.clear();
+                self.local_types.clear();
+                self.mutable_locals.clear();
+                let decl_start = self.local_decls.len();
+                let mut param_slots: Vec<u16> = Vec::with_capacity(supplied);
+                let mut arg_names: Vec<String> = Vec::with_capacity(supplied);
+                let mut arg_schemas: Vec<Option<TypeSchema>> = Vec::with_capacity(supplied);
+                // First `supplied` params (strip defaults, keep names/schemas).
+                for (order, idx) in (0..supplied).enumerate() {
+                    let (pname, pschema) = {
+                        let decl_arg = full_decl
+                            .args
+                            .get(idx)
+                            .cloned()
+                            .unwrap_or_else(|| format!("arg{idx}"));
+                        let decl_schema = full_decl.arg_schemas.get(idx).cloned().unwrap_or(None);
+                        (decl_arg, decl_schema)
+                    };
+                    // Original param Pat for span (if available) for diagnostics.
+                    let _ = order;
+                    let slot = self.next_slot;
+                    self.next_slot = self.next_slot.checked_add(1).ok_or_else(|| {
+                        ParseError::at_span(ident_span, "function local slot limit")
+                    })?;
+                    self.locals.insert(pname.clone(), slot);
+                    if let Some(schema) = pschema.clone() {
+                        self.local_types.insert(pname.clone(), schema);
+                    }
+                    self.mutable_locals.insert(slot);
+                    self.local_bindings.push((pname.clone(), slot));
+                    let node_id = self.alloc_node_id();
+                    self.local_decls.push(LocalDeclSite {
+                        id: node_id,
+                        ident_span,
+                        stmt_span: ident_span,
+                        slot,
+                        name: pname.clone(),
+                        scope_id,
+                        decl_order: u32::try_from(order).unwrap_or(u32::MAX),
+                    });
+                    param_slots.push(slot);
+                    arg_names.push(pname);
+                    arg_schemas.push(pschema);
+                }
+                // Omitted defaults (supplied..total) left-to-right in callee scope.
+                let mut body_stmts: Vec<Stmt> = Vec::new();
+                // Map all param names (supplied + omitted) for later defaults.
+                // Supplied already in locals; now process omitted.
+                let mut all_slots: Vec<u16> = param_slots.clone();
+                for idx in supplied..total {
+                    // Original param name/schema.
+                    let (pname, pschema) = {
+                        let n = full_decl
+                            .args
+                            .get(idx)
+                            .cloned()
+                            .unwrap_or_else(|| format!("arg{idx}"));
+                        let s = full_decl.arg_schemas.get(idx).cloned().unwrap_or(None);
+                        (n, s)
+                    };
+                    // Default AST from original Pat.
+                    let default_expr: Option<ast::Expr> = params
+                        .get(idx)
+                        .and_then(|pat| parameter_binding(pat).and_then(|(_, d)| d.cloned()));
+                    let Some(default_ast) = default_expr else {
+                        return Err(ParseError::at_span(
+                            ident_span,
+                            "defaulted TypeScript call omits a required parameter",
+                        ));
+                    };
+                    // Predicate before lowering (statically justified).
+                    let needs_proj = matches!(pschema, Some(TypeSchema::Number))
+                        && self
+                            .expression_schema(&default_ast)
+                            .as_ref()
+                            .is_some_and(Self::is_numeric_schema);
+                    let lowered = self.lower_expr(default_ast)?;
+                    let lowered = if needs_proj && self.ref_mode && !self.in_ref_prelude {
+                        Self::project_numeric_call_arg(lowered)
+                    } else {
+                        lowered
+                    };
+                    let slot = self.next_slot;
+                    self.next_slot = self.next_slot.checked_add(1).ok_or_else(|| {
+                        ParseError::at_span(ident_span, "function local slot limit")
+                    })?;
+                    // Hidden Lets for omitted do not get local_decls (like inline).
+                    body_stmts.push(Stmt::Let {
+                        index: slot,
+                        declared_schema: pschema.clone(),
+                        expr: lowered,
+                        line,
+                    });
+                    self.locals.insert(pname.clone(), slot);
+                    if let Some(schema) = pschema.clone() {
+                        self.local_types.insert(pname.clone(), schema);
+                    }
+                    // Omitted slots are mutable? Not needed, but keep consistent.
+                    self.mutable_locals.insert(slot);
+                    all_slots.push(slot);
+                    let _ = pschema;
+                }
+                // Inner call to full with all N args (Vars).
+                let call_id = self.alloc_node_id();
+                let call_args: Vec<Expr> = all_slots.into_iter().map(Expr::Var).collect();
+                let site_span = ident_span;
+                self.call_sites.push(ParsedCallSite {
+                    id: call_id,
+                    callee_span: site_span,
+                    expr_span: site_span,
+                    target: ParsedCallTarget::Function(full_index),
+                    name: full_name.to_owned(),
+                    scope_id,
+                    is_namespace_call: false,
+                });
+                let body_expr = Expr::Call(full_index, Vec::new(), call_args, None, Some(call_id));
+                // FunctionDecl for thunk (exported iff full exported, to avoid broadening).
+                let return_schema = full_decl.return_schema.clone();
+                let return_type = return_schema
+                    .as_ref()
+                    .map(schema_value_type)
+                    .unwrap_or(vm::ValueType::Unknown);
+                let thunk_order = u32::try_from(self.function_sites.len()).unwrap_or(u32::MAX);
+                let thunk_site_id = self.alloc_node_id();
+                self.function_sites.push(FunctionDeclSite {
+                    id: thunk_site_id,
+                    ident_span,
+                    function_index: thunk_index,
+                    name: thunk_name.clone(),
+                    scope_id: 0,
+                    decl_order: thunk_order,
+                });
+                self.functions.push(FunctionDecl {
+                    name: thunk_name.clone(),
+                    arity: supplied_u8,
+                    index: thunk_index,
+                    args: arg_names.clone(),
+                    arg_schemas: arg_schemas.clone(),
+                    return_schema: return_schema.clone(),
+                    type_params: Vec::new(),
+                    exported: full_decl.exported,
+                    return_type,
+                    symbol: None,
+                });
+                self.function_impls.insert(
+                    thunk_index,
+                    FunctionImpl {
+                        param_slots: param_slots.clone(),
+                        capture_copies: Vec::new(),
+                        body_stmts,
+                        body_expr,
+                        body_expr_line: line,
+                    },
+                );
+                let scope_decls = self.local_decls[decl_start..]
+                    .iter()
+                    .filter(|s| s.scope_id == scope_id)
+                    .map(|s| s.slot)
+                    .collect();
+                self.function_scopes.push(ParsedLexicalScope {
+                    id: scope_id,
+                    parent: Some(0),
+                    range: func_span,
+                    declarations: scope_decls,
+                    functions: Vec::new(),
+                });
+                self.next_scope_id = self.next_scope_id.max(scope_id + 1);
+                output.push(Stmt::FuncDecl {
+                    name: thunk_name.clone(),
+                    index: thunk_index,
+                    arity: supplied_u8,
+                    args: arg_names,
+                    exported: full_decl.exported,
+                    has_impl: true,
+                    line,
+                });
+                self.stmt_spans.push(StmtSpanSite {
+                    line,
+                    span: func_span,
+                });
+                self.functions.sort_by_key(|d| d.index);
+                thunk_indices.push((supplied_u8, thunk_index, thunk_name));
+                // Clear thunk locals for next thunk (keep outer saved for later restore after all).
+                self.locals.clear();
+                self.local_types.clear();
+                self.mutable_locals.clear();
+                // Truncate bindings pushed for this thunk's params (keep outer saved len).
+                self.local_bindings.truncate(saved_bindings_len);
+                // local_decls for thunk params remain (needed for scopes); omitted Lets have none.
+            }
+        }
+        // Restore outer top-level bindings.
+        self.locals = saved_locals;
+        self.local_types = saved_types;
+        self.mutable_locals = saved_mut;
+        self.scope_id = saved_scope;
+        // Carrier + getter (even for functions without defaults, for import safety).
+        // Carrier fields: full + each thunk.
+        let carrier_name = super::default_lowering::carrier_name(full_name);
+        if self.struct_schemas.contains_key(&carrier_name)
+            || self.named_types.contains_key(&carrier_name)
+            || self.function_indices.contains_key(&carrier_name)
+        {
+            return Err(ParseError::at_span(
+                ident_span,
+                format!("duplicate TypeScript type '{carrier_name}'"),
+            ));
+        }
+        let getter_name = super::default_lowering::getter_name(full_name);
+        if self.function_indices.contains_key(&getter_name)
+            || self.host_function_indices.contains_key(&getter_name)
+            || self.imported_functions.contains_key(&getter_name)
+        {
+            return Err(ParseError::at_span(
+                ident_span,
+                format!("duplicate TypeScript function '{getter_name}'"),
+            ));
+        }
+        for (_, _, thunk_name) in &thunk_indices {
+            if !self.function_indices.contains_key(thunk_name) {
+                return Err(ParseError::new("thunk declaration is missing"));
+            }
+        }
+        // Build carrier Callable schemas (physical, truthful).
+        let full_callable = TypeSchema::Callable {
+            params: full_decl
+                .arg_schemas
+                .iter()
+                .map(|s| s.clone().unwrap_or(TypeSchema::Unknown))
+                .collect(),
+            result: Box::new(
+                full_decl
+                    .return_schema
+                    .clone()
+                    .unwrap_or(TypeSchema::Unknown),
+            ),
+        };
+        let mut fields: HashMap<String, TypeSchema> = HashMap::new();
+        fields.insert(
+            super::default_lowering::FIELD_FULL.to_owned(),
+            full_callable,
+        );
+        for (supplied, thunk_index, _) in &thunk_indices {
+            let thunk_decl = self
+                .functions
+                .iter()
+                .find(|d| d.index == *thunk_index)
+                .cloned()
+                .ok_or_else(|| ParseError::new("thunk declaration is missing"))?;
+            let callable = TypeSchema::Callable {
+                params: thunk_decl
+                    .arg_schemas
+                    .iter()
+                    .map(|s| s.clone().unwrap_or(TypeSchema::Unknown))
+                    .collect(),
+                result: Box::new(
+                    thunk_decl
+                        .return_schema
+                        .clone()
+                        .unwrap_or(TypeSchema::Unknown),
+                ),
+            };
+            fields.insert(super::default_lowering::arity_field(*supplied), callable);
+        }
+        let carrier_decl = StructDecl {
+            name: carrier_name.clone(),
+            type_params: Vec::new(),
+            body_schema: TypeSchema::Object(fields),
+            origin: StructDeclOrigin::Guest,
+        };
+        self.struct_schemas
+            .insert(carrier_name.clone(), carrier_decl.clone());
+        self.named_types.insert(
+            carrier_name.clone(),
+            TypeSchema::Named(carrier_name.clone(), Vec::new()),
+        );
+        self.named_type_declarations
+            .insert(carrier_name.clone(), carrier_decl.clone());
+        let struct_site_id = self.alloc_node_id();
+        self.struct_decl_sites.push(StructDeclSite {
+            id: struct_site_id,
+            ident_span,
+            decl_span: func_span,
+            name: carrier_name.clone(),
+            scope_id: 0,
+        });
+        self.type_provenance.push(GuestTypeProvenance {
+            canonical_name: carrier_name.clone(),
+            source_name: full_name.to_owned(),
+            source_id: self.source_id,
+            declaration_span: Some(ident_span),
+        });
+        // Getter (0 args -> carrier). Exported iff full exported.
+        let getter_index = self.next_function_index;
+        self.next_function_index = self
+            .next_function_index
+            .checked_add(1)
+            .ok_or_else(|| ParseError::at_span(ident_span, "function table size"))?;
+        self.function_indices
+            .insert(getter_name.clone(), (getter_index, 0));
+        let getter_scope = self.next_scope_id;
+        self.next_scope_id = self
+            .next_scope_id
+            .checked_add(1)
+            .ok_or_else(|| ParseError::at_span(ident_span, "lexical scope count"))?;
+        // Getter body: `{ full: Full, arityK: ThunkK, ... }` as Map.
+        // Build via MapNew + Sets with FunctionRefs (existing IR, no new opcodes).
+        // FunctionRefs for full/thunks (local functions, not imported).
+        let mut map_expr = Self::builtin_call(vm::BuiltinFunction::MapNew, Vec::new());
+        // Deterministic field order: full first, then arity ascending.
+        let mut ordered: Vec<(String, u16)> = Vec::new();
+        ordered.push((super::default_lowering::FIELD_FULL.to_owned(), full_index));
+        let mut sorted_thunks = thunk_indices.clone();
+        sorted_thunks.sort_by_key(|(supplied, _, _)| *supplied);
+        for (supplied, thunk_index, _) in &sorted_thunks {
+            ordered.push((
+                super::default_lowering::arity_field(*supplied),
+                *thunk_index,
+            ));
+        }
+        for (field, target_index) in ordered {
+            let value = Expr::FunctionRef(target_index, Vec::new());
+            map_expr = Self::builtin_call(
+                vm::BuiltinFunction::Set,
+                vec![map_expr, Expr::String(field), value],
+            );
+        }
+        let carrier_schema = TypeSchema::Named(carrier_name.clone(), Vec::new());
+        let getter_return = Some(carrier_schema.clone());
+        let getter_order = u32::try_from(self.function_sites.len()).unwrap_or(u32::MAX);
+        let getter_site_id = self.alloc_node_id();
+        self.function_sites.push(FunctionDeclSite {
+            id: getter_site_id,
+            ident_span,
+            function_index: getter_index,
+            name: getter_name.clone(),
+            scope_id: 0,
+            decl_order: getter_order,
+        });
+        self.functions.push(FunctionDecl {
+            name: getter_name.clone(),
+            arity: 0,
+            index: getter_index,
+            args: Vec::new(),
+            arg_schemas: Vec::new(),
+            return_schema: getter_return.clone(),
+            type_params: Vec::new(),
+            exported: full_decl.exported,
+            return_type: vm::ValueType::Map,
+            symbol: None,
+        });
+        self.function_impls.insert(
+            getter_index,
+            FunctionImpl {
+                param_slots: Vec::new(),
+                capture_copies: Vec::new(),
+                body_stmts: Vec::new(),
+                body_expr: map_expr,
+                body_expr_line: line,
+            },
+        );
+        self.function_scopes.push(ParsedLexicalScope {
+            id: getter_scope,
+            parent: Some(0),
+            range: func_span,
+            declarations: Vec::new(),
+            functions: Vec::new(),
+        });
+        self.next_scope_id = self.next_scope_id.max(getter_scope + 1);
+        output.push(Stmt::FuncDecl {
+            name: getter_name,
+            index: getter_index,
+            arity: 0,
+            args: Vec::new(),
+            exported: full_decl.exported,
+            has_impl: true,
+            line,
+        });
+        self.stmt_spans.push(StmtSpanSite {
+            line,
+            span: func_span,
+        });
+        self.functions.sort_by_key(|d| d.index);
+        Ok(())
+    }
     fn lower_defaulted_function_call(
         &mut self,
         function_name: &str,
@@ -2361,7 +2925,23 @@ impl<'a> Lowerer<'a> {
                             "missing argument has no default initializer",
                         )
                     })?;
+                    // Numeric projection predicate from the guest AST before
+                    // lowering; the wrap applies after lowering so the
+                    // default still evaluates exactly once, in order, in the
+                    // callee scope.
+                    let needs_number_projection = self.ref_mode
+                        && !self.in_ref_prelude
+                        && matches!(schema, TypeSchema::Number)
+                        && self
+                            .expression_schema(expression)
+                            .as_ref()
+                            .is_some_and(Self::is_numeric_schema);
                     let expression = self.lower_expr(expression.clone())?;
+                    let expression = if needs_number_projection {
+                        Self::project_numeric_call_arg(expression)
+                    } else {
+                        expression
+                    };
                     default_statements.push(Stmt::Let {
                         index: slot,
                         declared_schema: Some(schema.clone()),
@@ -4510,6 +5090,16 @@ impl<'a> Lowerer<'a> {
         Expr::Add(Box::new(as_float(left)), Box::new(as_float(right)))
     }
 
+    /// Projects a statically proven numeric call argument onto the existing
+    /// checked floating domain at a guest-call boundary where the declared
+    /// formal is `number`. The argument is already lowered exactly once;
+    /// wrapping it in the existing `Div(_, Float(1.0))` coercion feeds the
+    /// existing `Float` inference without new IR/opcodes. Strings, bools,
+    /// carriers, resources and host parameters never reach here.
+    fn project_numeric_call_arg(expr: Expr) -> Expr {
+        Expr::Div(Box::new(expr), Box::new(Expr::Float(1.0)))
+    }
+
     fn lower_member_get(&mut self, member: ast::MemberExpr) -> Result<Expr, ParseError> {
         let member_span = member.span;
         let object = member.obj;
@@ -4998,6 +5588,38 @@ impl<'a> Lowerer<'a> {
                 } else {
                     Vec::new()
                 };
+                // Reference-array numeric call boundary: where the declared
+                // formal is exactly `number` and the actual is statically
+                // proven numeric, project the already-once-lowered argument
+                // through the existing floating coercion so recursive Int and
+                // Float flows share one Float inference. Strings, bools,
+                // carriers, resources, host and prelude helpers never qualify.
+                // Ordinary mode is untouched.
+                let ref_number_params: Vec<bool> = if self.ref_mode && !self.in_ref_prelude {
+                    if let Some((index, _)) = local_function {
+                        self.functions
+                            .iter()
+                            .find(|declaration| declaration.index == index)
+                            .map(|declaration| declaration.arg_schemas.clone())
+                            .unwrap_or_default()
+                    } else if let Some((_, declaration)) = imported_function.as_ref() {
+                        declaration.arg_schemas.clone()
+                    } else if local_slot.is_some() {
+                        match self.local_types.get(&callee).cloned() {
+                            Some(TypeSchema::Callable { params, .. }) => {
+                                params.into_iter().map(Some).collect()
+                            }
+                            _ => Vec::new(),
+                        }
+                    } else {
+                        Vec::new()
+                    }
+                    .into_iter()
+                    .map(|schema| matches!(schema, Some(TypeSchema::Number)))
+                    .collect()
+                } else {
+                    Vec::new()
+                };
                 let arity = local_function
                     .map(|(_, arity)| arity)
                     .or_else(|| {
@@ -5042,9 +5664,65 @@ impl<'a> Lowerer<'a> {
                     }
                     _ => false,
                 };
+                // Imported omitted defaults via callee-owned carrier (ref_mode only).
+                // Uses actual import + type identities (getter + carrier field for
+                // the supplied arity); no caller-local names, no filename reading,
+                // no literal special-casing. Plain mode keeps the historical arity
+                // error. If the getter/carrier/field is absent (function without
+                // defaults or invalid arity omitting required), fall through to
+                // the precise arity error below.
+                let imported_defaulted_via_getter = if self.ref_mode
+                    && !self.in_ref_prelude
+                    && local_function.is_none()
+                    && local_slot.is_none()
+                    && host_index.is_none()
+                    && standard_arity.is_none()
+                    && !standard_round
+                    && !standard_number_is_nan
+                    && !standard_global_is_nan
+                    && !standard_integer
+                {
+                    if let (Some((_, _decl)), Some(expected)) = (imported_function.as_ref(), arity)
+                    {
+                        let supplied = call.args.len();
+                        if supplied < usize::from(expected) {
+                            let supplied_u8 = u8::try_from(supplied).ok();
+                            if let Some(supplied_u8) = supplied_u8 {
+                                let getter_local = super::default_lowering::getter_name(&callee);
+                                let carrier_local = super::default_lowering::carrier_name(&callee);
+                                let getter_ok = self
+                                    .imported_functions
+                                    .get(&getter_local)
+                                    .is_some_and(|(_, gdecl)| gdecl.arity == 0);
+                                let field = super::default_lowering::arity_field(supplied_u8);
+                                let field_ok = self
+                                    .named_type_declarations
+                                    .get(&carrier_local)
+                                    .is_some_and(|sdecl| match &sdecl.body_schema {
+                                        TypeSchema::Object(fields) => fields.contains_key(&field),
+                                        _ => false,
+                                    });
+                                // Also require full decl has carrier? No, Number
+                                // formals already covered by F1; here we only
+                                // need getter+field existence (which exporter
+                                // generates exactly for valid omitted arities).
+                                getter_ok && field_ok
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
                 if let Some(arity) = arity
                     && call.args.len() != usize::from(arity)
                     && !defaulted_call
+                    && !imported_defaulted_via_getter
                 {
                     return Err(ParseError::at_span(
                         call_span,
@@ -5115,6 +5793,16 @@ impl<'a> Lowerer<'a> {
                                     .is_some_and(|schema| {
                                         super::array_lowering::is_logical_number_array(schema)
                                     }));
+                        // Numeric projection predicate is computed before
+                        // lowering (statically justified from the guest AST);
+                        // the wrap itself applies after lowering so the
+                        // argument still evaluates exactly once, in order.
+                        let needs_number_projection = !needs_factory
+                            && ref_number_params.get(index).copied().unwrap_or(false)
+                            && self
+                                .expression_schema(&argument.expr)
+                                .as_ref()
+                                .is_some_and(Self::is_numeric_schema);
                         let expression = self.lower_expr(*argument.expr)?;
                         // Reference-array call boundary conversion: a plain
                         // staging array (including an empty literal) becomes
@@ -5126,6 +5814,15 @@ impl<'a> Lowerer<'a> {
                                 vec![expression],
                                 argument_span,
                             )?
+                        } else {
+                            expression
+                        };
+                        // Numeric computational-domain projection: a declared
+                        // `number` formal with a statically numeric actual
+                        // runs through the existing floating coercion so Int
+                        // and Float call sites share one Float inference.
+                        let expression = if needs_number_projection {
+                            Self::project_numeric_call_arg(expression)
                         } else {
                             expression
                         };
@@ -5185,10 +5882,127 @@ impl<'a> Lowerer<'a> {
                     };
                     (target, expression)
                 } else if let Some((symbol, _)) = imported_function {
-                    (
-                        ParsedCallTarget::Module(symbol),
-                        Expr::ModuleCall(symbol, explicit_type_args, args, Some(id)),
-                    )
+                    // Imported omitted defaults via callee-owned carrier (ref_mode only).
+                    // `imported_defaulted_via_getter` was proven above via actual
+                    // getter + carrier field identities for the supplied arity.
+                    // Lower to: carrier = getter(); thunk = carrier.<arityK>;
+                    // LocalCall(thunk, supplied...). Defaults run inside the
+                    // callee thunk at call time, left-to-right, once-only, in
+                    // callee scope; no body duplication, no global caches.
+                    if imported_defaulted_via_getter {
+                        let supplied_u8 = u8::try_from(args.len()).map_err(|_| {
+                            ParseError::at_span(
+                                call_span,
+                                "TypeScript function call exceeds the VM argument limit",
+                            )
+                        })?;
+                        let getter_local = super::default_lowering::getter_name(&callee);
+                        let carrier_local = super::default_lowering::carrier_name(&callee);
+                        let (getter_symbol, getter_decl) = self
+                            .imported_functions
+                            .get(&getter_local)
+                            .cloned()
+                            .ok_or_else(|| {
+                                ParseError::new("default callable getter declaration is missing")
+                            })?;
+                        if getter_decl.arity != 0 {
+                            return Err(ParseError::new(
+                                "default callable getter must take zero arguments",
+                            ));
+                        }
+                        let carrier_decl = self
+                            .named_type_declarations
+                            .get(&carrier_local)
+                            .cloned()
+                            .ok_or_else(|| {
+                                ParseError::new("default callable carrier declaration is missing")
+                            })?;
+                        let field = super::default_lowering::arity_field(supplied_u8);
+                        let thunk_callable = match &carrier_decl.body_schema {
+                            TypeSchema::Object(fields) => fields.get(&field).cloned(),
+                            _ => None,
+                        }
+                        .ok_or_else(|| {
+                            ParseError::new(
+                                "default callable carrier is missing the supplied arity",
+                            )
+                        })?;
+                        // Carrier = getter().
+                        let getter_id = self.alloc_node_id();
+                        let getter_site_span = call_span;
+                        self.call_sites.push(ParsedCallSite {
+                            id: getter_id,
+                            callee_span: byte_span(callee_span, self.base, self.source_id),
+                            expr_span: getter_site_span,
+                            target: ParsedCallTarget::Module(getter_symbol),
+                            name: getter_local.clone(),
+                            scope_id: self.scope_id,
+                            is_namespace_call: false,
+                        });
+                        let getter_call = Expr::ModuleCall(
+                            getter_symbol,
+                            Vec::new(),
+                            Vec::new(),
+                            Some(getter_id),
+                        );
+                        let carrier_slot = self.alloc_hidden_local(call.span)?;
+                        let carrier_schema = getter_decl
+                            .return_schema
+                            .clone()
+                            .unwrap_or(TypeSchema::Named(carrier_local.clone(), Vec::new()));
+                        let line = line_at(self.source, call_span.lo);
+                        let mut block_stmts = vec![Stmt::Let {
+                            index: carrier_slot,
+                            declared_schema: Some(carrier_schema),
+                            expr: getter_call,
+                            line,
+                        }];
+                        // Thunk = carrier.<field> (truthful Callable field).
+                        let get_id = self.alloc_node_id();
+                        self.call_sites.push(ParsedCallSite {
+                            id: get_id,
+                            callee_span: byte_span(callee_span, self.base, self.source_id),
+                            expr_span: call_span,
+                            target: ParsedCallTarget::Function(
+                                vm::BuiltinFunction::Get.call_index(),
+                            ),
+                            name: field.clone(),
+                            scope_id: self.scope_id,
+                            is_namespace_call: false,
+                        });
+                        let get_expr = Expr::Call(
+                            vm::BuiltinFunction::Get.call_index(),
+                            Vec::new(),
+                            vec![Expr::Var(carrier_slot), Expr::String(field)],
+                            None,
+                            Some(get_id),
+                        );
+                        let thunk_slot = self.alloc_hidden_local(call.span)?;
+                        block_stmts.push(Stmt::Let {
+                            index: thunk_slot,
+                            declared_schema: Some(thunk_callable),
+                            expr: get_expr,
+                            line,
+                        });
+                        // LocalCall(thunk, supplied...) with original ID to
+                        // preserve provenance; supplied args already projected.
+                        let target = ParsedCallTarget::Module(symbol);
+                        let expression = Expr::Block {
+                            stmts: block_stmts,
+                            expr: Box::new(Expr::LocalCall(
+                                thunk_slot,
+                                explicit_type_args,
+                                args,
+                                Some(id),
+                            )),
+                        };
+                        (target, expression)
+                    } else {
+                        (
+                            ParsedCallTarget::Module(symbol),
+                            Expr::ModuleCall(symbol, explicit_type_args, args, Some(id)),
+                        )
+                    }
                 } else if standard_integer {
                     let argument = args
                         .into_iter()
@@ -5901,6 +6715,46 @@ pub(crate) fn exports(
             declaration: Some(declaration),
         });
     }
+    // Synthetic default carriers (our own generated, proven by IR presence +
+    // provenance; user colliding hygienic names would have already failed as
+    // duplicates during lowering, so any such carrier here is ours, not a
+    // broad prefix grant to user shapes).
+    // Export all carriers whose names use our prefix and whose provenance
+    // marks them as generated from a real function (source_name is the
+    // original function). This uses actual IR identities + metadata.
+    if let Some(index) = &ir.parsed_semantic_index {
+        use std::collections::HashSet;
+        let mut seen: HashSet<String> = HashSet::new();
+        for prov in &index.type_provenance {
+            if !prov
+                .canonical_name
+                .starts_with(super::default_lowering::CARRIER_PREFIX)
+            {
+                continue;
+            }
+            if !seen.insert(prov.canonical_name.clone()) {
+                continue;
+            }
+            if let Some(declaration) = ir.struct_schemas.get(&prov.canonical_name) {
+                exports.push(FrontendTypeExport {
+                    source_name: prov.canonical_name.clone(),
+                    schema: TypeSchema::Named(prov.canonical_name.clone(), Vec::new()),
+                    declaration: Some(declaration.clone()),
+                });
+            }
+        }
+    } else {
+        // Fallback (no semantic index): export carriers present in IR.
+        for (name, declaration) in &ir.struct_schemas {
+            if name.starts_with(super::default_lowering::CARRIER_PREFIX) {
+                exports.push(FrontendTypeExport {
+                    source_name: name.clone(),
+                    schema: TypeSchema::Named(name.clone(), Vec::new()),
+                    declaration: Some(declaration.clone()),
+                });
+            }
+        }
+    }
     Ok(exports)
 }
 
@@ -5916,6 +6770,8 @@ pub(crate) fn module_imports(
         };
         let source_name = import.src.value.to_string_lossy().into_owned();
         let mut clause = Vec::new();
+        // Collect original value imports for synthetic getter/carrier synthesis.
+        let mut value_pairs: Vec<(String, String)> = Vec::new();
         for specifier in import.specifiers {
             match specifier {
                 ast::ImportSpecifier::Named(named) => {
@@ -5929,11 +6785,20 @@ pub(crate) fn module_imports(
                         })
                         .unwrap_or_else(|| named.local.sym.to_string());
                     let local = named.local.sym.to_string();
-                    clause.push(if import.type_only || named.is_type_only {
-                        vm::NamedImport::type_only(imported, local)
+                    let is_type = import.type_only || named.is_type_only;
+                    clause.push(if is_type {
+                        vm::NamedImport::type_only(imported.clone(), local.clone())
                     } else {
-                        vm::NamedImport::value(imported, local)
+                        vm::NamedImport::value(imported.clone(), local.clone())
                     });
+                    if !is_type
+                        && !super::default_lowering::is_synthetic_default_name(&imported)
+                        && !super::default_lowering::is_synthetic_default_name(&local)
+                        && !imported.starts_with("__compat_ref_")
+                        && !local.starts_with("__compat_ref_")
+                    {
+                        value_pairs.push((imported, local));
+                    }
                 }
                 ast::ImportSpecifier::Default(default) => clause.push(vm::NamedImport::value(
                     "default",
@@ -5954,6 +6819,31 @@ pub(crate) fn module_imports(
                         span: Some(span),
                     });
                 }
+            }
+        }
+        // Synthetic callee-owned default imports (same spec, same line):
+        // one zero-arg getter (value) + one carrier type per value import.
+        // Uses actual binding identities (exported/local names) plus hygienic
+        // derivation; existence is verified via actual imports at lowering
+        // (no broad prefix authority, no filename reading). Skips synthetic
+        // themselves to avoid recursion. Generated getters/carriers exist for
+        // all user functions (both modes) so these always resolve; call-site
+        // use stays ref_mode-gated to keep ordinary mode unchanged.
+        // Only for file imports (user modules with defaults); host imports
+        // (arrays, proof, compat_math, etc.) never have defaults and must not
+        // gain synthetic requests (would fail resolution + broaden authority).
+        // Also only for TypeScript file imports (.ts/.mts); RSS/Lua/etc.
+        // modules never have default carriers (would fail with missing type).
+        if !is_host_import_spec(&source_name)
+            && (source_name.ends_with(".ts") || source_name.ends_with(".mts"))
+        {
+            for (imported, local) in value_pairs {
+                let getter_imported = super::default_lowering::getter_name(&imported);
+                let getter_local = super::default_lowering::getter_name(&local);
+                clause.push(vm::NamedImport::value(getter_imported, getter_local));
+                let carrier_imported = super::default_lowering::carrier_name(&imported);
+                let carrier_local = super::default_lowering::carrier_name(&local);
+                clause.push(vm::NamedImport::type_only(carrier_imported, carrier_local));
             }
         }
         if !clause.is_empty() {

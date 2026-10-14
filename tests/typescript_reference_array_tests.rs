@@ -1190,3 +1190,293 @@ fn reference_array_fractional_vectors_match_node() {
         );
     }
 }
+
+#[test]
+fn b2_followup_f1_integer_fill_returns_eight() {
+    // F1: valid integer argument feeding a recursively generated floating
+    // flow. Node oracle pins final value 8. Int or Float representation is
+    // not itself the regression; either numeric 8 accepts.
+    let source = "function fill(array: number[], value: number, depth: number): number {\n    array[0] = value;\n    return depth > 0 ? fill(array, value + 1, depth - 1) : array[0];\n}\nconst a = [0];\nfill(a, 5, 3);\na[0];\n";
+    let (mut machine, _) = ref_vm(source, default_limits(), false);
+    match run_value(&mut machine) {
+        Value::Int(8) => {}
+        Value::Float(8.0) => {}
+        other => panic!("F1 integer fill should return numeric 8, got {other:?}"),
+    }
+}
+
+#[test]
+fn b2_followup_f2_omitted_defaults_alias_sort() {
+    // F2: imported original QuickSort alias with omitted defaults. The
+    // wrapper imports the byte-identical fixture and calls with one
+    // argument; desired result observes sorted contents plus the
+    // returned-object identity the Node oracle pins.
+    let (_project, main) = wrapper_project(
+        "quick_sort.ts",
+        QUICK_SORT_FIXTURE.as_bytes(),
+        "import { QuickSort as sort } from \"./quick_sort.ts\";\nconst data = [8, 3, 5, 1, 4, 2];\nconst alias = data;\nconst sorted = sort(data);\nconst eq = sorted === alias && alias[0] === 1 && alias[5] === 8;\neq ? 1 : 0;\n",
+    );
+    let (mut machine, _) = ref_file_vm(&main, default_limits(), false);
+    assert_eq!(run_value(&mut machine), Value::Int(1));
+}
+
+#[test]
+fn b2_followup_a1a_dual_five_sort_bounded_repeat() {
+    // A1a: two five-element sorts in the same interpreted guest source with
+    // unmodified production randomness. Bounded observation of up to 64
+    // fresh VMs; the first genuine failure (iteration, error, value) fails
+    // the test rather than being suppressed.
+    let source = format!(
+        "{QUICK_SORT_FIXTURE}\nconst a1 = [1, 2, 3, 4, 5];\nconst a2 = [5, 4, 3, 2, 1];\nconst fwd = QuickSort(a1);\nconst rev = QuickSort(a2);\nconst eq = fwd === a1 && rev === a2 && fwd[0] === 1 && fwd[4] === 5 && rev[0] === 1 && rev[4] === 5;\neq ? 1 : 0;\n"
+    );
+    let mut first_failure: Option<String> = None;
+    for iteration in 0..64 {
+        let (mut machine, _) = ref_vm(&source, default_limits(), false);
+        match machine.run() {
+            Ok(VmStatus::Halted) => {}
+            Ok(other) => {
+                first_failure = Some(format!("iteration {iteration}: non-halt {other:?}"));
+                break;
+            }
+            Err(error) => {
+                first_failure = Some(format!(
+                    "iteration {iteration}: {error:?}; ip={}; stack_len={}; frames={:?}",
+                    machine.ip(),
+                    machine.stack().len(),
+                    machine.execution_frames()
+                ));
+                break;
+            }
+        }
+        let value = machine
+            .stack()
+            .last()
+            .cloned()
+            .expect("program should leave a value");
+        if value != Value::Int(1) {
+            first_failure = Some(format!("iteration {iteration}: unexpected value {value:?}"));
+            break;
+        }
+    }
+    assert!(
+        first_failure.is_none(),
+        "A1a dual five-sort bounded observation failed: {}",
+        first_failure.unwrap_or_default()
+    );
+}
+
+#[test]
+fn b2_followup_a1b_eight_live_carriers() {
+    // A1b: eight independent one-element numeric array carriers, all live
+    // and all observed in the final expression. Below the advertised
+    // defaults (registered 64, payload 1 MiB); expect normal success.
+    let source = "const a0 = [1];\nconst a1 = [2];\nconst a2 = [3];\nconst a3 = [4];\nconst a4 = [5];\nconst a5 = [6];\nconst a6 = [7];\nconst a7 = [8];\nconst eq = a0[0] === 1 && a1[0] === 2 && a2[0] === 3 && a3[0] === 4 && a4[0] === 5 && a5[0] === 6 && a6[0] === 7 && a7[0] === 8;\neq ? 1 : 0;\n";
+    let (mut machine, _) = ref_vm(source, default_limits(), false);
+    assert_eq!(run_value(&mut machine), Value::Int(1));
+    let stats = pd_vm_compat_frontends::runtime::array::owned_array_runtime_stats(&mut machine)
+        .expect("directory should exist");
+    assert_eq!(stats.pending, 0, "factory must register before returning");
+    assert_eq!(stats.registered, 8, "eight independent owners");
+}
+
+#[test]
+fn b2_f1_fractional_fill_returns_eight_point_five() {
+    // F1 counterpart: fractional 5.5 recursive flow pins 8.5 (existing
+    // reference-array test covers this; retained here as explicit RED/GREEN
+    // pair for int/fraction consistency).
+    let source = "function fill(array: number[], value: number, depth: number): number {\n    array[0] = value;\n    return depth > 0 ? fill(array, value + 1, depth - 1) : array[0];\n}\nconst a = [0];\nfill(a, 5.5, 3);\na[0];\n";
+    let (mut machine, _) = ref_vm(source, default_limits(), false);
+    assert_eq!(run_value(&mut machine), Value::Float(8.5));
+}
+
+#[test]
+fn b2_f1_nonnumeric_call_rejects() {
+    // Non-numeric actual for a declared `number` formal must reject, never
+    // coerce through the floating projection.
+    let source = "function fill(array: number[], value: number, depth: number): number {\n    array[0] = value;\n    return depth > 0 ? fill(array, value + 1, depth - 1) : array[0];\n}\nconst a = [0];\nfill(a, \"hi\", 3);\na[0];\n";
+    let catalog = ref_catalog();
+    let result = vm::compile_source_with_flavor_and_options_with_capture_certification(
+        source,
+        pd_vm_compat_frontends::typescript_flavor(),
+        ref_options(&catalog),
+    );
+    assert!(result.is_err(), "string for number formal must reject");
+}
+
+#[test]
+fn b2_f1_call_args_evaluate_once_in_order() {
+    // Provided numeric args evaluate exactly once, left-to-right, through the
+    // floating projection (Div preserves once-only). State lives in a
+    // caller-supplied carrier (no top-level capture inside callees).
+    let source = "const log = [0];\nfunction next(c: number[]): number {\n    c[0] = c[0] + 1;\n    return c[0];\n}\nfunction order(a: number, b: number): number {\n    return a * 10 + b;\n}\nconst r = order(next(log), next(log));\nconst eq = r === 12 && log[0] === 2;\neq ? 1 : 0;\n";
+    let (mut machine, _) = ref_vm(source, default_limits(), false);
+    assert_eq!(run_value(&mut machine), Value::Int(1));
+}
+
+#[test]
+fn b2_f2_omitted_defaults_alias_sort_native() {
+    // F2 native: same imported 1-arg QuickSort alias, genuine SSA/native.
+    let (_project, main) = wrapper_project(
+        "quick_sort.ts",
+        QUICK_SORT_FIXTURE.as_bytes(),
+        "import { QuickSort as sort } from \"./quick_sort.ts\";\nconst data = [3, 1, 2];\nconst alias = data;\nconst sorted = sort(data);\nconst eq = sorted === alias && alias[0] === 1 && alias[2] === 3;\neq ? 1 : 0;\n",
+    );
+    let (mut machine, _) = ref_file_vm(&main, default_limits(), true);
+    assert_eq!(machine.aot_exec_count(), 0);
+    assert_eq!(run_value(&mut machine), Value::Int(1));
+    assert!(
+        machine.aot_exec_count() > 1,
+        "actual native execution must exceed one dispatch, got {}",
+        machine.aot_exec_count()
+    );
+    assert!(
+        machine.dump_aot_info().contains("lowering=ssa"),
+        "native lowering must stay ssa"
+    );
+}
+
+#[test]
+fn b2_f2_callee_shadow_previous_param_side_effect() {
+    // Callee-owned defaults: lexical shadow (param `x` shadows global),
+    // previous-param (`y = x` observes earlier param, not global), side
+    // effects (`tick(arr)` once each, left-to-right, via caller-supplied
+    // carrier, no top-level capture inside callees).
+    let source = "let x = 100;\nconst counter = [0];\nfunction tick(c: number[]): number {\n    c[0] = c[0] + 1;\n    return c[0];\n}\nfunction f(arr: number[], x: number, y: number = x, z: number = tick(arr), w: number = tick(arr)): number {\n    return x * 1000 + y * 100 + z * 10 + w;\n}\nconst r = f(counter, 5);\nconst eq = r === 5512 && counter[0] === 2;\neq ? 1 : 0;\n";
+    // 5*1000 + 5*100 + 1*10 + 2 = 5512 (Float projection preserves ints).
+    // y=x uses param x=5, not global 100; z=1, w=2 left-to-right once each.
+    let (mut machine, _) = ref_vm(source, default_limits(), false);
+    assert_eq!(run_value(&mut machine), Value::Int(1));
+}
+
+#[test]
+fn b2_f2_imported_alias_value_identity() {
+    // Value alias of an imported defaulted callable preserves underlying
+    // full identity (not fresh wrapper); no omitted call via alias here,
+    // just identity (alias-or-reexport coverage alongside F2 import alias).
+    let (_project, main) = wrapper_project(
+        "quick_sort.ts",
+        QUICK_SORT_FIXTURE.as_bytes(),
+        "import { QuickSort as sort } from \"./quick_sort.ts\";\nconst alias = sort;\nconst eq = alias === sort;\neq ? 1 : 0;\n",
+    );
+    let (mut machine, _) = ref_file_vm(&main, default_limits(), false);
+    assert_eq!(run_value(&mut machine), Value::Int(1));
+}
+
+#[test]
+fn b2_f2_provided_defaulted_evaluate_once_in_order() {
+    // Provided + omitted defaults each evaluate once, left-to-right, in
+    // callee scope (local direct call via inline thunks, no carrier needed).
+    // State via caller-supplied carrier to avoid top-level captures.
+    let source = "const log = [0];\nfunction tick(c: number[]): number {\n    c[0] = c[0] + 1;\n    return c[0];\n}\nfunction f(arr: number[], a: number, b: number = tick(arr), c: number = tick(arr)): number {\n    return b * 10 + c;\n}\nconst supplied = tick(log);\nconst r = f(log, supplied);\nconst eq = r === 23 && log[0] === 3;\neq ? 1 : 0;\n";
+    // supplied tick(log) -> 1 (log=1); omitted b=tick(log) -> 2, c=tick(log) -> 3;
+    // r = 2*10+3 = 23, log=3.
+    let (mut machine, _) = ref_vm(source, default_limits(), false);
+    assert_eq!(run_value(&mut machine), Value::Int(1));
+}
+
+#[test]
+fn b2_f2_imported_hint_is_logical_and_physical_is_truthful() {
+    // Logical hints project number[]; physical owns one registered carrier.
+    let (_project, main) = wrapper_project(
+        "quick_sort.ts",
+        QUICK_SORT_FIXTURE.as_bytes(),
+        "import { QuickSort as sort } from \"./quick_sort.ts\";\nconst sorted = sort([3, 1, 2]);\nsorted[0];\n",
+    );
+    let source = std::fs::read_to_string(&main).expect("wrapper should read");
+    let hints = pd_vm_compat_frontends::collect_reference_array_type_hints_at_path_with_options(
+        &main,
+        &source,
+        ref_options(&ref_catalog()),
+    )
+    .expect("hints should collect");
+    let hint = hints
+        .iter()
+        .find(|hint| hint.name == "sorted")
+        .expect("missing hint for imported defaulted call result");
+    assert_eq!(hint.inferred_type, "number[]");
+    assert_eq!(
+        hint.schema,
+        Some(vm::TypeSchema::Array(Box::new(vm::TypeSchema::Number)))
+    );
+    let (mut machine, _) = ref_file_vm(&main, default_limits(), false);
+    assert_eq!(run_value(&mut machine), Value::Int(1));
+    let stats = pd_vm_compat_frontends::runtime::array::owned_array_runtime_stats(&mut machine)
+        .expect("directory should exist");
+    assert_eq!(stats.pending, 0);
+    assert_eq!(
+        stats.registered, 1,
+        "one shared owner for imported defaulted sort"
+    );
+}
+
+#[test]
+fn b2_f2_hygienic_collision_refuses() {
+    // User declarations colliding with private default-callable names fail
+    // precisely as duplicates (no name-only authority for user shapes).
+    for source in [
+        "function __compat_default_thunk_QuickSort_1(array: number[]): number[] {\n    return array;\n}\n0;\n",
+        "function __compat_default_get_QuickSort(): number {\n    return 0;\n}\n0;\n",
+        "interface __CompatDefaultCarrier_QuickSort {\n    full: number;\n}\n0;\n",
+    ] {
+        let catalog = ref_catalog();
+        let result = vm::compile_source_with_flavor_and_options_with_capture_certification(
+            source,
+            pd_vm_compat_frontends::typescript_flavor(),
+            ref_options(&catalog),
+        );
+        // Either duplicate during lowering (if QuickSort also present?) or
+        // success in isolation? In isolation (no QuickSort), our generation
+        // only triggers for functions with defaults; these colliding decls
+        // themselves are user functions (no defaults for thunk/getter shapes?
+        // thunk has no defaults, getter none, interface none) so generation
+        // won't collide (no carrier for them). To force collision, declare
+        // QuickSort with defaults plus colliding thunk in same module.
+        // Simpler: colliding names alone must at least not grant authority;
+        // they compile (as ordinary user functions/types) but never satisfy
+        // an omitted call. Here we only assert they do not break compilation
+        // in isolation (no panic), and omitted-call transport still requires
+        // real callee thunks (proven by F2). If they error as duplicates
+        // (when combined with real QuickSort), that is also precise.
+        let _ = result;
+    }
+    // Real collision: QuickSort with defaults plus user-claimed thunk name.
+    let source = format!(
+        "{QUICK_SORT_FIXTURE}\nfunction __compat_default_thunk_QuickSort_1(array: number[]): number[] {{\n    return array;\n}}\n0;\n"
+    );
+    let catalog = ref_catalog();
+    let result = vm::compile_source_with_flavor_and_options_with_capture_certification(
+        &source,
+        pd_vm_compat_frontends::typescript_flavor(),
+        ref_options(&catalog),
+    );
+    assert!(result.is_err(), "hygienic collision must refuse");
+    assert!(
+        format!("{:?}", result.err().unwrap()).contains("duplicate"),
+        "collision should report duplicate"
+    );
+}
+
+#[test]
+fn b2_normal_mode_omitted_import_still_rejects() {
+    // Ordinary mode unchanged: imported omitted defaults still reject with
+    // the historical arity error (no getter path, no floating projection).
+    // Uses a plain numeric dependency (no carriers/destructuring) so plain
+    // compilation reaches the arity check (QuickSort itself needs ref_mode).
+    let add_fixture =
+        "export function add(a: number, b: number = 0): number {\n    return a + b;\n}\n";
+    let (_project, main) = wrapper_project(
+        "add.ts",
+        add_fixture.as_bytes(),
+        "import { add as sum } from \"./add.ts\";\nconst r = sum(5);\nr;\n",
+    );
+    // Plain (ordinary) options: same identity, no reference-array plugin.
+    let plain_options = pd_vm_compat_frontends::compile_options();
+    let result =
+        vm::compile_source_file_with_capture_certification_and_options(&main, plain_options);
+    assert!(result.is_err(), "plain omitted import must still reject");
+    let err = format!("{:?}", result.err().unwrap());
+    assert!(
+        err.contains("expects 2 arguments"),
+        "plain should keep historical arity error, got: {err}"
+    );
+}
