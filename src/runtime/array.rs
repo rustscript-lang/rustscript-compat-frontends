@@ -9,6 +9,10 @@ use vm::{
 #[path = "array_owned.rs"]
 mod owned;
 
+#[path = "array_boundary.rs"]
+mod boundary;
+
+pub use boundary::typescript_array_snapshot_host_module;
 pub use owned::{
     OwnedArrayLimits, OwnedArrayRuntimeStats, initialize_typescript_owned_arrays,
     owned_array_runtime_stats, typescript_owned_array_host_module,

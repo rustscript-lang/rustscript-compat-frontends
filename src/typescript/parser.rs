@@ -1214,6 +1214,26 @@ struct Lowerer<'a> {
     next_scope_id: u32,
     next_function_index: u16,
     scope_id: u32,
+    /// Explicit reference-array mode: logical `number[]` bindings in the
+    /// user region lower to the private B1-backed carrier. Plain mode
+    /// never sets this and behaves exactly as before.
+    ref_mode: bool,
+    /// Number of leading module items that belong to the private
+    /// reference-array prelude. Those keep plain array semantics (notably
+    /// the factory staging parameter); user items lower to the carrier.
+    /// The prelude is parsed separately and merged as AST items, never as
+    /// source-text concatenation, so user bytes/spans are untouched.
+    ref_prelude_items: usize,
+    /// True while lowering a prelude item. Drives `ref_is_user` without
+    /// consulting span offsets (the two parses share numeric span space).
+    in_ref_prelude: bool,
+    /// Statements nested inside function, closure, loop or branch bodies
+    /// bind their expression-statement values to hidden locals instead of
+    /// leaving them on the stack. The native SSA backend rejects a value
+    /// left on the stack at those merge points (FrameMismatch), while top
+    /// level keeps evaluating to the stack. Plain and reference modes
+    /// share this shape; behavior is identical either way.
+    stmt_value_depth: usize,
     locals: HashMap<String, u16>,
     local_types: HashMap<String, TypeSchema>,
     mutable_locals: HashSet<u16>,
@@ -1790,7 +1810,12 @@ impl<'a> Lowerer<'a> {
         self.predeclare_types(&module)?;
         self.predeclare_functions(&module)?;
         let mut stmts = Vec::new();
-        for item in module.body {
+        let total = module.body.len();
+        let prelude_count = self.ref_prelude_items.min(total);
+        for (position, item) in module.body.into_iter().enumerate() {
+            // Hygienic provenance: leading prelude items keep plain array
+            // semantics; user items map logical number[] to the carrier.
+            self.in_ref_prelude = self.ref_mode && position < prelude_count;
             match item {
                 ast::ModuleItem::Stmt(ast::Stmt::Decl(
                     ast::Decl::TsInterface(_) | ast::Decl::TsTypeAlias(_),
@@ -2015,6 +2040,7 @@ impl<'a> Lowerer<'a> {
                 ));
             }
             let schema = self.lower_type(&annotation.type_ann)?;
+            let schema = self.ref_map_number_array(schema, binding.id.span);
             let slot = self.next_slot;
             self.next_slot = self.next_slot.checked_add(1).ok_or_else(|| {
                 unsupported(
@@ -2044,12 +2070,40 @@ impl<'a> Lowerer<'a> {
             arg_schemas.push(Some(schema));
         }
 
-        let return_schema = function
+        let mut return_schema = function
             .function
             .return_type
             .as_ref()
-            .map(|annotation| self.lower_type(&annotation.type_ann))
+            .map(|annotation| {
+                self.lower_type(&annotation.type_ann)
+                    .map(|schema| self.ref_map_number_array(schema, annotation.span))
+            })
             .transpose()?;
+        // Reference-array mode: an un-annotated function whose body
+        // returns a carrier (like the upstream QuickSort shape) records
+        // the physical carrier as its return schema so callers alias the
+        // same owner. A numeric return records Number so callers can use
+        // the existing floating projection for `+` (e.g. partition's index).
+        // Other shapes keep no declared return. Plain mode never has
+        // carriers, so this changes nothing there.
+        if return_schema.is_none()
+            && self.ref_mode
+            && let Some(ast::Stmt::Return(tail)) = body.stmts.last()
+            && let Some(returned) = tail.arg.as_ref()
+        {
+            if self
+                .expression_schema(returned)
+                .is_some_and(super::array_lowering::is_carrier_schema)
+            {
+                return_schema = Some(super::array_lowering::carrier_schema());
+            } else if self
+                .expression_schema(returned)
+                .as_ref()
+                .is_some_and(Self::is_numeric_schema)
+            {
+                return_schema = Some(TypeSchema::Number);
+            }
+        }
         let mut body_stmts = Vec::new();
         let mut body_expr = Expr::Null;
         let mut body_expr_line = line_at(
@@ -2085,10 +2139,35 @@ impl<'a> Lowerer<'a> {
                         "statement after return",
                     ));
                 }
-                self.lower_stmt(statement.clone(), &mut body_stmts)?;
+                self.with_consumed_stmt_values(|this| {
+                    this.lower_stmt(statement.clone(), &mut body_stmts)
+                })?;
             }
         }
 
+        // Post-body numeric/carrier return inference for un-annotated
+        // functions whose returned local is declared in the body (e.g.
+        // partition returning `i`). Pre-body inference only sees params;
+        // after lowering, body locals are known. Keeps logical Number for
+        // callers' floating projection without inventing unboxing facts.
+        if return_schema.is_none() && self.ref_mode {
+            if let Some(ast::Stmt::Return(tail)) = body.stmts.last()
+                && let Some(returned) = tail.arg.as_ref()
+            {
+                if self
+                    .expression_schema(returned)
+                    .is_some_and(super::array_lowering::is_carrier_schema)
+                {
+                    return_schema = Some(super::array_lowering::carrier_schema());
+                } else if self
+                    .expression_schema(returned)
+                    .as_ref()
+                    .is_some_and(Self::is_numeric_schema)
+                {
+                    return_schema = Some(TypeSchema::Number);
+                }
+            }
+        }
         let scope_declarations = self.local_decls[declaration_start..]
             .iter()
             .filter(|site| site.scope_id == scope_id)
@@ -2204,6 +2283,7 @@ impl<'a> Lowerer<'a> {
                 ));
             };
             let schema = self.lower_type(&annotation.type_ann)?;
+            let schema = self.ref_map_number_array(schema, binding.id.span);
             if default.is_some() {
                 default_seen = true;
             } else if default_seen {
@@ -2456,7 +2536,25 @@ impl<'a> Lowerer<'a> {
                     ));
                 }
             }
-            let local_type = declared_schema.clone().or(inferred_schema);
+            let local_type = declared_schema.clone().or(inferred_schema.clone());
+            // Reference-array mode: a user-region logical `number[]`
+            // binding takes the physical carrier, and a plain staging
+            // array initializer converts through the owning factory. An
+            // already-carrier initializer is a plain alias share.
+            let ref_wrap_span = if self.ref_is_user_span(binding.id.span)
+                && local_type.as_ref().is_some_and(|schema| {
+                    super::array_lowering::is_logical_number_array(schema.clone())
+                })
+                && !inferred_schema
+                    .as_ref()
+                    .is_some_and(|schema| super::array_lowering::is_carrier_schema(schema.clone()))
+            {
+                Some(init.span())
+            } else {
+                None
+            };
+            let local_type =
+                local_type.map(|schema| self.ref_map_number_array(schema, binding.id.span));
             // Reserve the binding while lowering an arrow so recursive references resolve.
             let is_arrow_initializer = matches!(init.as_ref(), ast::Expr::Arrow(_));
             let slot = if is_arrow_initializer {
@@ -2482,6 +2580,12 @@ impl<'a> Lowerer<'a> {
                 None
             };
             let expr = self.lower_expr(*init)?;
+            let expr = match ref_wrap_span {
+                Some(span) => {
+                    self.syn_call(super::array_lowering::HELPER_MAKE, vec![expr], span)?
+                }
+                None => expr,
+            };
             let slot = match slot {
                 Some(slot) => slot,
                 None => {
@@ -2596,13 +2700,18 @@ impl<'a> Lowerer<'a> {
         let line = line_at(self.source, site.lo);
         match expr {
             ast::Expr::Assign(assignment) => {
-                let ast::AssignTarget::Simple(target) = assignment.left else {
-                    return Err(unsupported(
-                        assignment.span,
-                        self.base,
-                        self.source_id,
-                        "non-local assignment target",
-                    ));
+                let target = match assignment.left {
+                    ast::AssignTarget::Simple(target) => target,
+                    ast::AssignTarget::Pat(pattern) => {
+                        return self.lower_destructuring_assignment(
+                            pattern,
+                            *assignment.right,
+                            assignment.op,
+                            assignment.span,
+                            line,
+                            output,
+                        );
+                    }
                 };
                 let ast::SimpleAssignTarget::Ident(binding) = target else {
                     if let ast::SimpleAssignTarget::Member(member) = target {
@@ -2635,8 +2744,30 @@ impl<'a> Lowerer<'a> {
                     ));
                 }
                 let slot = self.capture_slot(source_slot, &name, binding.id.span)?;
+                // Explicit reference-array mode: `+=` on a Number/Float local
+                // lowers to Set with the floating projection (native Float
+                // Add exists); pure Int keeps the Add kind. `--`/Sub stays.
+                let target_is_int_add = self
+                    .local_types
+                    .get(&name)
+                    .is_some_and(|schema| matches!(schema, TypeSchema::Int));
+                let rhs_is_int_add = self
+                    .expression_schema(&assignment.right)
+                    .is_some_and(|schema| matches!(schema, TypeSchema::Int));
+                let use_float_addassign = self.ref_mode
+                    && assignment.op == ast::AssignOp::AddAssign
+                    && !(target_is_int_add && rhs_is_int_add)
+                    && self
+                        .local_types
+                        .get(&name)
+                        .is_some_and(Self::is_numeric_schema)
+                    && self
+                        .expression_schema(&assignment.right)
+                        .as_ref()
+                        .is_some_and(Self::is_numeric_schema);
                 let kind = match assignment.op {
                     ast::AssignOp::Assign => AssignmentKind::Set,
+                    ast::AssignOp::AddAssign if use_float_addassign => AssignmentKind::Set,
                     ast::AssignOp::AddAssign => AssignmentKind::Add,
                     _ => {
                         return Err(unsupported(
@@ -2647,7 +2778,32 @@ impl<'a> Lowerer<'a> {
                         ));
                     }
                 };
+                let rhs_needs_factory = self
+                    .expression_schema(&assignment.right)
+                    .is_some_and(|schema| super::array_lowering::is_logical_number_array(schema));
                 let value = self.lower_expr(*assignment.right)?;
+                // Rebinding a reference-array variable to a plain staging
+                // array converts through the owning factory; carrier to
+                // carrier assignment stays a plain rebinding share.
+                let value = if rhs_needs_factory
+                    && self.local_types.get(&name).is_some_and(|schema| {
+                        super::array_lowering::is_carrier_schema(schema.clone())
+                    }) {
+                    self.syn_call(
+                        super::array_lowering::HELPER_MAKE,
+                        vec![value],
+                        assignment.span,
+                    )?
+                } else {
+                    value
+                };
+                // Floating `+=`: `x += rhs` becomes `x = float_add(x, rhs)`
+                // with once-only semantics (local target evaluates once).
+                let value = if use_float_addassign {
+                    Self::lower_numeric_add(Expr::Var(slot), value)
+                } else {
+                    value
+                };
                 output.push(Stmt::Assign {
                     kind,
                     index: slot,
@@ -2656,48 +2812,144 @@ impl<'a> Lowerer<'a> {
                 });
             }
             ast::Expr::Update(update) => {
-                if update.op != ast::UpdateOp::PlusPlus {
-                    return Err(unsupported(
-                        update.span,
-                        self.base,
-                        self.source_id,
-                        "decrement update",
-                    ));
+                let update_span = update.span;
+                let update_op = update.op;
+                match *update.arg {
+                    ast::Expr::Member(member)
+                        if self
+                            .expression_schema(&member.obj)
+                            .is_some_and(super::array_lowering::is_carrier_schema) =>
+                    {
+                        // Indexed element update on a reference-array
+                        // carrier: evaluate the receiver and index exactly
+                        // once, then read-modify-write through the owning
+                        // dispatcher. The statement value is discarded.
+                        let ast::MemberProp::Computed(property) = member.prop else {
+                            return Err(unsupported(
+                                member.span,
+                                self.base,
+                                self.source_id,
+                                "non-indexed update target",
+                            ));
+                        };
+                        let container = self.lower_expr(*member.obj)?;
+                        let index = self.lower_expr(*property.expr)?;
+                        let carrier_slot = self.alloc_hidden_local(update_span)?;
+                        output.push(Stmt::Let {
+                            index: carrier_slot,
+                            declared_schema: Some(super::array_lowering::carrier_schema()),
+                            expr: container,
+                            line,
+                        });
+                        let index_slot = self.alloc_hidden_local(update_span)?;
+                        output.push(Stmt::Let {
+                            index: index_slot,
+                            declared_schema: Some(TypeSchema::Number),
+                            expr: index,
+                            line,
+                        });
+                        let previous = self.syn_call(
+                            super::array_lowering::HELPER_READ,
+                            vec![Expr::Var(carrier_slot), Expr::Var(index_slot)],
+                            update_span,
+                        )?;
+                        let previous_slot = self.alloc_hidden_local(update_span)?;
+                        output.push(Stmt::Let {
+                            index: previous_slot,
+                            declared_schema: Some(TypeSchema::Number),
+                            expr: previous,
+                            line,
+                        });
+                        // Carrier elements are Number: `++` uses the floating
+                        // projection in this mode, `--` keeps Sub.
+                        let updated = if update_op == ast::UpdateOp::MinusMinus {
+                            Expr::Sub(Box::new(Expr::Var(previous_slot)), Box::new(Expr::Int(1)))
+                        } else if self.ref_mode {
+                            Self::lower_numeric_add(Expr::Var(previous_slot), Expr::Int(1))
+                        } else {
+                            Expr::Add(Box::new(Expr::Var(previous_slot)), Box::new(Expr::Int(1)))
+                        };
+                        let written = self.syn_call(
+                            super::array_lowering::HELPER_WRITE,
+                            vec![Expr::Var(carrier_slot), Expr::Var(index_slot), updated],
+                            update_span,
+                        )?;
+                        self.push_expr_stmt(
+                            written,
+                            Some(TypeSchema::Number),
+                            update_span,
+                            line,
+                            output,
+                        )?;
+                    }
+                    ast::Expr::Member(_) => {
+                        return Err(unsupported(
+                            update_span,
+                            self.base,
+                            self.source_id,
+                            "non-local increment target",
+                        ));
+                    }
+                    ast::Expr::Ident(ident) => {
+                        let name = ident.sym.to_string();
+                        let Some(slot) = self.locals.get(&name).copied() else {
+                            return Err(ParseError::at_span(
+                                byte_span(ident.span, self.base, self.source_id),
+                                format!("unresolved TypeScript increment target '{name}'"),
+                            ));
+                        };
+                        if !self.mutable_locals.contains(&slot) {
+                            return Err(ParseError::at_span(
+                                byte_span(ident.span, self.base, self.source_id),
+                                format!("cannot increment const binding '{name}'"),
+                            ));
+                        }
+                        // Plain read-modify-write assignment: the dedicated
+                        // increment kind does not advance loop-nested slots
+                        // on this Core version (the loop spins forever),
+                        // while read-modify-write assignment is the proven
+                        // path (native 2048-iteration loops, factorial).
+                        // Semantically identical for numbers.
+                        if update_op == ast::UpdateOp::MinusMinus {
+                            output.push(Stmt::Assign {
+                                kind: AssignmentKind::Set,
+                                index: slot,
+                                expr: Expr::Sub(Box::new(Expr::Var(slot)), Box::new(Expr::Int(1))),
+                                line,
+                            });
+                        } else {
+                            let target_is_int = self
+                                .local_types
+                                .get(&name)
+                                .is_some_and(|schema| matches!(schema, TypeSchema::Int));
+                            let expr = if self.ref_mode && !target_is_int {
+                                Self::lower_numeric_add(Expr::Var(slot), Expr::Int(1))
+                            } else {
+                                Expr::Add(Box::new(Expr::Var(slot)), Box::new(Expr::Int(1)))
+                            };
+                            output.push(Stmt::Assign {
+                                kind: AssignmentKind::Set,
+                                index: slot,
+                                expr,
+                                line,
+                            });
+                        }
+                    }
+                    _ => {
+                        return Err(unsupported(
+                            update_span,
+                            self.base,
+                            self.source_id,
+                            "non-local increment target",
+                        ));
+                    }
                 }
-                let ast::Expr::Ident(ident) = *update.arg else {
-                    return Err(unsupported(
-                        update.span,
-                        self.base,
-                        self.source_id,
-                        "non-local increment target",
-                    ));
-                };
-                let name = ident.sym.to_string();
-                let Some(slot) = self.locals.get(&name).copied() else {
-                    return Err(ParseError::at_span(
-                        byte_span(ident.span, self.base, self.source_id),
-                        format!("unresolved TypeScript increment target '{name}'"),
-                    ));
-                };
-                if !self.mutable_locals.contains(&slot) {
-                    return Err(ParseError::at_span(
-                        byte_span(ident.span, self.base, self.source_id),
-                        format!("cannot increment const binding '{name}'"),
-                    ));
-                }
-                output.push(Stmt::Assign {
-                    kind: AssignmentKind::Increment,
-                    index: slot,
-                    expr: Expr::Int(1),
-                    line,
-                });
             }
             other => {
+                let span = other.span();
+                let declared = self.expression_schema(&other);
                 let lowered = self.lower_expr(other)?;
-                output.push(Stmt::Expr {
-                    expr: lowered,
-                    line,
-                });
+                self.push_expr_stmt(lowered, declared, span, line, output)?;
             }
         }
         self.stmt_spans.push(StmtSpanSite { line, span: site });
@@ -2721,6 +2973,31 @@ impl<'a> Lowerer<'a> {
             ));
         };
         let array_schema = self.expression_schema(&member.obj);
+        // Reference-array carriers lower indexed writes through the owning
+        // dispatcher; the plain Core-array path below never sees one.
+        if array_schema
+            .as_ref()
+            .is_some_and(|schema| super::array_lowering::is_carrier_schema(schema.clone()))
+        {
+            if op != ast::AssignOp::Assign {
+                return Err(unsupported(
+                    member.span,
+                    self.base,
+                    self.source_id,
+                    "compound indexed assignment operator",
+                ));
+            }
+            let container = self.lower_expr(*member.obj)?;
+            let index = self.lower_expr(*property.expr)?;
+            let value = self.lower_expr(right)?;
+            let written = self.syn_call(
+                super::array_lowering::HELPER_WRITE,
+                vec![container, index, value],
+                member.span,
+            )?;
+            self.push_expr_stmt(written, Some(TypeSchema::Number), member.span, line, output)?;
+            return Ok(());
+        }
         if !array_schema.as_ref().is_some_and(|schema| {
             matches!(
                 schema,
@@ -2813,7 +3090,9 @@ impl<'a> Lowerer<'a> {
                 }
                 Some(ast::VarDeclOrExpr::Expr(expression)) => {
                     let mut lowered = Vec::new();
-                    self.lower_assignment_statement(*expression, &mut lowered)?;
+                    self.with_consumed_stmt_values(|this| {
+                        this.lower_assignment_statement(*expression, &mut lowered)
+                    })?;
                     lowered
                         .pop()
                         .expect("expression initializer emits one statement")
@@ -2826,7 +3105,9 @@ impl<'a> Lowerer<'a> {
             let post = match statement.update {
                 Some(update) => {
                     let mut lowered = Vec::new();
-                    self.lower_assignment_statement(*update, &mut lowered)?;
+                    self.with_consumed_stmt_values(|this| {
+                        this.lower_assignment_statement(*update, &mut lowered)
+                    })?;
                     lowered
                         .pop()
                         .expect("update expression emits one statement")
@@ -2834,7 +3115,7 @@ impl<'a> Lowerer<'a> {
                 None => Stmt::Noop { line },
             };
             let mut body = Vec::new();
-            self.lower_stmt(*statement.body, &mut body)?;
+            self.with_consumed_stmt_values(|this| this.lower_stmt(*statement.body, &mut body))?;
             Ok((init, condition, post, body))
         })();
         let declarations = self.local_decls[declaration_start..]
@@ -2994,10 +3275,14 @@ impl<'a> Lowerer<'a> {
             ast::Stmt::If(if_statement) => {
                 let condition = self.lower_expr(*if_statement.test)?;
                 let mut then_branch = Vec::new();
-                self.lower_stmt(*if_statement.cons, &mut then_branch)?;
+                self.with_consumed_stmt_values(|this| {
+                    this.lower_stmt(*if_statement.cons, &mut then_branch)
+                })?;
                 let mut else_branch = Vec::new();
                 if let Some(else_statement) = if_statement.alt {
-                    self.lower_stmt(*else_statement, &mut else_branch)?;
+                    self.with_consumed_stmt_values(|this| {
+                        this.lower_stmt(*else_statement, &mut else_branch)
+                    })?;
                 }
                 let span = byte_span(if_statement.span, self.base, self.source_id);
                 let line = line_at(self.source, span.lo);
@@ -3013,7 +3298,9 @@ impl<'a> Lowerer<'a> {
             ast::Stmt::While(while_statement) => {
                 let condition = self.lower_expr(*while_statement.test)?;
                 let mut body = Vec::new();
-                self.lower_stmt(*while_statement.body, &mut body)?;
+                self.with_consumed_stmt_values(|this| {
+                    this.lower_stmt(*while_statement.body, &mut body)
+                })?;
                 let span = byte_span(while_statement.span, self.base, self.source_id);
                 let line = line_at(self.source, span.lo);
                 output.push(Stmt::While {
@@ -3035,6 +3322,7 @@ impl<'a> Lowerer<'a> {
                 output.push(Stmt::Continue { line });
                 self.stmt_spans.push(StmtSpanSite { line, span });
             }
+            ast::Stmt::Empty(_) => {}
             other => {
                 return Err(unsupported(
                     other.span(),
@@ -3122,7 +3410,9 @@ impl<'a> Lowerer<'a> {
         let result = (|| {
             let mut lowered_statements = Vec::new();
             for statement in statements {
-                self.lower_stmt(statement, &mut lowered_statements)?;
+                self.with_consumed_stmt_values(|this| {
+                    this.lower_stmt(statement, &mut lowered_statements)
+                })?;
             }
             let expr = match return_value {
                 Some(value) => self.lower_expr(value)?,
@@ -3204,7 +3494,10 @@ impl<'a> Lowerer<'a> {
             let schema = binding
                 .type_ann
                 .as_ref()
-                .map(|annotation| self.lower_type(&annotation.type_ann))
+                .map(|annotation| {
+                    self.lower_type(&annotation.type_ann)
+                        .map(|schema| self.ref_map_number_array(schema, binding.id.span))
+                })
                 .transpose()?;
             let slot = self.next_slot;
             self.next_slot = self.next_slot.checked_add(1).ok_or_else(|| {
@@ -3384,6 +3677,48 @@ impl<'a> Lowerer<'a> {
             ast::Expr::Lit(ast::Lit::Bool(_)) => Some(TypeSchema::Bool),
             ast::Expr::Lit(ast::Lit::Null(_)) => Some(TypeSchema::Null),
             ast::Expr::Ident(ident) => self.local_types.get(ident.sym.as_ref()).cloned(),
+            ast::Expr::Array(array) => {
+                // Reference-array mode only: infer a staging array so
+                // `number[]` bindings convert through the factory. Plain
+                // mode keeps the historical `None`. Indexed carrier reads
+                // count as numeric elements (strict reads yield numbers);
+                // anything else keeps `None`.
+                if !self.ref_mode || array.elems.is_empty() {
+                    return None;
+                }
+                let mut numeric = true;
+                for element in &array.elems {
+                    let Some(element) = element else {
+                        return None;
+                    };
+                    if element.spread.is_some() {
+                        return None;
+                    }
+                    let element_numeric = self
+                        .expression_schema(&element.expr)
+                        .is_some_and(|schema| Self::is_numeric_schema(&schema))
+                        || self.ref_index_access(&element.expr).is_some();
+                    if !element_numeric {
+                        numeric = false;
+                        break;
+                    }
+                }
+                numeric.then(|| TypeSchema::Array(Box::new(TypeSchema::Number)))
+            }
+            ast::Expr::Update(update) => {
+                if !self.ref_mode {
+                    return None;
+                }
+                // An indexed carrier read yields a number; a numeric local
+                // keeps its own schema so Int bindings stay Int.
+                match update.arg.as_ref() {
+                    ast::Expr::Ident(_) => self
+                        .expression_schema(&update.arg)
+                        .filter(Self::is_numeric_schema),
+                    target if self.ref_index_access(target).is_some() => Some(TypeSchema::Number),
+                    _ => None,
+                }
+            }
             ast::Expr::Paren(paren) => self.expression_schema(&paren.expr),
             ast::Expr::Unary(unary) => match unary.op {
                 ast::UnaryOp::Bang => Some(TypeSchema::Bool),
@@ -3459,6 +3794,16 @@ impl<'a> Lowerer<'a> {
                 })
             }
             ast::Expr::Member(member) => {
+                // A strict indexed carrier read yields a number. Routing it
+                // through numeric strict equality (instead of the generic
+                // object comparison) keeps both the interpreter and the
+                // native backend on the statically typed path. Plain arrays
+                // keep the historical `None`.
+                if matches!(member.prop, ast::MemberProp::Computed(_))
+                    && self.ref_carrier_of(&member.obj)
+                {
+                    return Some(TypeSchema::Number);
+                }
                 let ast::MemberProp::Ident(property) = &member.prop else {
                     return None;
                 };
@@ -3553,7 +3898,14 @@ impl<'a> Lowerer<'a> {
             };
         }
         let declaration = if let Some((index, _)) = self.function_indices.get(&callee) {
-            self.functions.get(usize::from(*index))
+            // Index search, not positional access: predeclare assigns table
+            // indices with function declarations first and scope-0 arrow
+            // functions second, while lowering pushes declarations in module
+            // order. Positional access returns the wrong declaration (or
+            // nothing) whenever those orders differ.
+            self.functions
+                .iter()
+                .find(|function| function.index == *index)
         } else if let Some((_, declaration)) = self.imported_functions.get(&callee) {
             Some(declaration)
         } else {
@@ -3572,6 +3924,505 @@ impl<'a> Lowerer<'a> {
         } else {
             None
         }
+    }
+
+    /// True for declaration sites in the user region. Prelude helpers are
+    /// parsed separately and merged as hygienic AST items; they keep plain
+    /// array semantics while user bindings map to the carrier.
+    fn ref_is_user_span(&self, _span: swc_common::Span) -> bool {
+        self.ref_mode && !self.in_ref_prelude
+    }
+
+    /// Flag-based user-region check used by newly merged code paths.
+    #[allow(dead_code)]
+    fn ref_is_user(&self) -> bool {
+        self.ref_mode && !self.in_ref_prelude
+    }
+
+    /// Maps a logical `number[]` binding schema to the physical carrier in
+    /// the user region. Every other schema (including prelude-region
+    /// staging arrays) passes through unchanged.
+    fn ref_map_number_array(&self, schema: TypeSchema, site: swc_common::Span) -> TypeSchema {
+        if self.ref_is_user_span(site)
+            && super::array_lowering::is_logical_number_array(schema.clone())
+        {
+            super::array_lowering::carrier_schema()
+        } else {
+            schema
+        }
+    }
+
+    /// True when `expr` denotes a reference-array carrier: its schema is
+    /// exactly the private carrier record. Callable shapes, global slots
+    /// and names never qualify.
+    fn ref_carrier_of(&self, expr: &ast::Expr) -> bool {
+        self.expression_schema(expr)
+            .is_some_and(super::array_lowering::is_carrier_schema)
+    }
+
+    /// Decomposes `carrier[index]` over a reference-array carrier.
+    fn ref_index_access<'e>(&self, expr: &'e ast::Expr) -> Option<(&'e ast::Expr, &'e ast::Expr)> {
+        let ast::Expr::Member(member) = expr else {
+            return None;
+        };
+        if !matches!(member.prop, ast::MemberProp::Computed(_)) {
+            return None;
+        }
+        if !self.ref_carrier_of(&member.obj) {
+            return None;
+        }
+        let ast::MemberProp::Computed(index) = &member.prop else {
+            return None;
+        };
+        Some((member.obj.as_ref(), index.expr.as_ref()))
+    }
+
+    /// Lowers an ordinary guest call into a reference-array prelude helper.
+    /// Generated operations never synthesize direct host calls; capture
+    /// inference, host-call wrapping and schema checking reuse the exact
+    /// existing call lowering path through the helper bodies.
+    fn syn_call(
+        &mut self,
+        helper: &str,
+        args: Vec<Expr>,
+        span: swc_common::Span,
+    ) -> Result<Expr, ParseError> {
+        let (index, _) = self.function_indices.get(helper).copied().ok_or_else(|| {
+            ParseError::at_span(
+                byte_span(span, self.base, self.source_id),
+                format!("reference-array helper '{helper}' is not available"),
+            )
+        })?;
+        let id = self.alloc_node_id();
+        let site = byte_span(span, self.base, self.source_id);
+        self.call_sites.push(ParsedCallSite {
+            id,
+            callee_span: site,
+            expr_span: site,
+            target: ParsedCallTarget::Function(index),
+            name: helper.to_owned(),
+            scope_id: self.scope_id,
+            is_namespace_call: false,
+        });
+        Ok(Expr::Call(index, Vec::new(), args, None, Some(id)))
+    }
+
+    /// Hoists an already-lowered receiver, index or snapshot expression into
+    /// a hidden local appended to `output`, returning its slot. Call sites
+    /// evaluate their arguments exactly once, so hoisting the receiver and
+    /// index first gives correct once-only evaluation for guarded
+    /// comparisons, updates and destructuring swaps.
+    fn hoist_hidden(
+        &mut self,
+        value_ast: &ast::Expr,
+        output: &mut Vec<Stmt>,
+        line: u32,
+        span: swc_common::Span,
+    ) -> Result<u16, ParseError> {
+        let declared = self
+            .expression_schema(value_ast)
+            .or(Some(TypeSchema::Number));
+        let value = self.lower_expr(value_ast.clone())?;
+        let slot = self.alloc_hidden_local(span)?;
+        output.push(Stmt::Let {
+            index: slot,
+            declared_schema: declared,
+            expr: value,
+            line,
+        });
+        Ok(slot)
+    }
+
+    /// Lowers `[carrier[i], carrier[j]] = [x, y]` over reference-array
+    /// carriers. Every right-hand side element evaluates left to right
+    /// into a snapshot first; then each left-hand receiver and index
+    /// evaluates exactly once at its assignment point, left to right.
+    /// Observable order matches an independent Node execution.
+    fn lower_destructuring_assignment(
+        &mut self,
+        pattern: ast::AssignTargetPat,
+        right: ast::Expr,
+        op: ast::AssignOp,
+        span: swc_common::Span,
+        line: u32,
+        output: &mut Vec<Stmt>,
+    ) -> Result<(), ParseError> {
+        if op != ast::AssignOp::Assign {
+            return Err(unsupported(
+                span,
+                self.base,
+                self.source_id,
+                "compound destructuring assignment",
+            ));
+        }
+        let ast::AssignTargetPat::Array(elements) = pattern else {
+            return Err(unsupported(
+                span,
+                self.base,
+                self.source_id,
+                "non-array destructuring target",
+            ));
+        };
+        let ast::Expr::Array(sources) = right else {
+            return Err(unsupported(
+                span,
+                self.base,
+                self.source_id,
+                "non-array destructuring source",
+            ));
+        };
+        if sources.elems.len() != elements.elems.len() {
+            return Err(unsupported(
+                span,
+                self.base,
+                self.source_id,
+                "destructuring arity",
+            ));
+        }
+        let mut targets = Vec::with_capacity(elements.elems.len());
+        for element in &elements.elems {
+            let Some(element) = element else {
+                return Err(unsupported(
+                    span,
+                    self.base,
+                    self.source_id,
+                    "destructuring hole",
+                ));
+            };
+            let ast::Pat::Expr(target) = element else {
+                return Err(unsupported(
+                    span,
+                    self.base,
+                    self.source_id,
+                    "destructuring target",
+                ));
+            };
+            let Some((receiver, index)) = self.ref_index_access(target) else {
+                return Err(unsupported(
+                    span,
+                    self.base,
+                    self.source_id,
+                    "non-indexed destructuring target",
+                ));
+            };
+            targets.push((receiver, index));
+        }
+        let mut snapshots = Vec::with_capacity(sources.elems.len());
+        for element in sources.elems {
+            let Some(element) = element else {
+                return Err(unsupported(
+                    span,
+                    self.base,
+                    self.source_id,
+                    "sparse destructuring source",
+                ));
+            };
+            if element.spread.is_some() {
+                return Err(unsupported(
+                    span,
+                    self.base,
+                    self.source_id,
+                    "spread destructuring source",
+                ));
+            }
+            snapshots.push(Expr::Var(self.hoist_hidden(
+                &element.expr,
+                output,
+                line,
+                span,
+            )?));
+        }
+        for ((receiver, index), snapshot) in targets.into_iter().zip(snapshots) {
+            let carrier = Expr::Var(self.hoist_hidden(receiver, output, line, span)?);
+            let position = Expr::Var(self.hoist_hidden(index, output, line, span)?);
+            let written = self.syn_call(
+                super::array_lowering::HELPER_WRITE,
+                vec![carrier, position, snapshot],
+                span,
+            )?;
+            self.push_expr_stmt(written, Some(TypeSchema::Number), span, line, output)?;
+        }
+        Ok(())
+    }
+
+    /// Lowers a guarded relational comparison with an absent-aware numeric
+    /// element. A guarded comparison evaluates to false when an integral
+    /// index is missing instead of presenting a fabricated element value;
+    /// other missing-value contexts keep failing precisely. Returns `None`
+    /// when neither operand is a carrier-indexed read, leaving the plain
+    /// comparison path untouched.
+    fn lower_guarded_comparison(
+        &mut self,
+        value: &ast::BinExpr,
+    ) -> Result<Option<Expr>, ParseError> {
+        let two_sided_helper = match value.op {
+            ast::BinaryOp::Lt => Some((
+                super::array_lowering::HELPER_LT,
+                super::array_lowering::HELPER_GT,
+                super::array_lowering::HELPER_LT2,
+            )),
+            ast::BinaryOp::Gt => Some((
+                super::array_lowering::HELPER_GT,
+                super::array_lowering::HELPER_LT,
+                super::array_lowering::HELPER_GT2,
+            )),
+            _ => None,
+        };
+        let Some((one_sided, swapped, two_sided)) = two_sided_helper else {
+            return Ok(None);
+        };
+        let left = self.ref_index_access(&value.left);
+        let right = self.ref_index_access(&value.right);
+        if left.is_none() && right.is_none() {
+            return Ok(None);
+        }
+        let site = byte_span(value.span, self.base, self.source_id);
+        let line = line_at(self.source, site.lo);
+        let mut stmts = Vec::new();
+        let guarded = match (left, right) {
+            (Some((receiver, index)), Some((other_receiver, other_index))) => {
+                // Two-sided guarded comparisons stay on one owning
+                // dispatcher: the second index travels in the `value`
+                // parameter. Cross-carrier element comparisons fail
+                // precisely instead of silently dropping presence semantics.
+                let same = match (receiver, other_receiver) {
+                    (ast::Expr::Ident(first), ast::Expr::Ident(second)) => {
+                        first.sym == second.sym
+                            && self.locals.get(first.sym.as_ref())
+                                == self.locals.get(second.sym.as_ref())
+                    }
+                    _ => false,
+                };
+                if !same {
+                    return Err(unsupported(
+                        value.span,
+                        self.base,
+                        self.source_id,
+                        "cross-carrier guarded comparison",
+                    ));
+                }
+                let carrier = Expr::Var(self.hoist_hidden(receiver, &mut stmts, line, value.span)?);
+                let position = Expr::Var(self.hoist_hidden(index, &mut stmts, line, value.span)?);
+                let other_position =
+                    Expr::Var(self.hoist_hidden(other_index, &mut stmts, line, value.span)?);
+                self.syn_call(
+                    two_sided,
+                    vec![carrier, position, other_position],
+                    value.span,
+                )?
+            }
+            (Some((receiver, index)), None) => {
+                let carrier = Expr::Var(self.hoist_hidden(receiver, &mut stmts, line, value.span)?);
+                let position = Expr::Var(self.hoist_hidden(index, &mut stmts, line, value.span)?);
+                let other = self.lower_expr((*value.right).clone())?;
+                self.syn_call(one_sided, vec![carrier, position, other], value.span)?
+            }
+            (None, Some((receiver, index))) => {
+                // `x < carrier[i]` canonicalizes to `carrier[i] > x` so one
+                // helper family covers both operand orders. The left side
+                // still evaluates first, preserving JS order.
+                let other = self.lower_expr((*value.left).clone())?;
+                let carrier = Expr::Var(self.hoist_hidden(receiver, &mut stmts, line, value.span)?);
+                let position = Expr::Var(self.hoist_hidden(index, &mut stmts, line, value.span)?);
+                self.syn_call(swapped, vec![carrier, position, other], value.span)?
+            }
+            (None, None) => return Ok(None),
+        };
+        Ok(Some(Expr::Block {
+            stmts,
+            expr: Box::new(guarded),
+        }))
+    }
+
+    /// Lowers prefix/postfix `++` and `--` in expression position with
+    /// correct once-only evaluation: the target and, for indexed elements,
+    /// the receiver and index each evaluate exactly once. Uses the
+    /// existing `Expr::Block` with typed hidden locals; no IR or opcode
+    /// changes and no hoisting across short-circuit boundaries.
+    fn lower_update_expr(&mut self, update: ast::UpdateExpr) -> Result<Expr, ParseError> {
+        let span = update.span;
+        let site = byte_span(span, self.base, self.source_id);
+        let line = line_at(self.source, site.lo);
+        let decrement = update.op == ast::UpdateOp::MinusMinus;
+        let bump_int = |previous: Expr| {
+            if decrement {
+                Expr::Sub(Box::new(previous), Box::new(Expr::Int(1)))
+            } else {
+                Expr::Add(Box::new(previous), Box::new(Expr::Int(1)))
+            }
+        };
+        // Explicit reference-array mode floating `++`: feeds the existing
+        // Float Add backend. `--` keeps Sub (tagged-Number Sub exists).
+        let bump_float = |previous: Expr| {
+            if decrement {
+                Expr::Sub(Box::new(previous), Box::new(Expr::Int(1)))
+            } else {
+                Self::lower_numeric_add(previous, Expr::Int(1))
+            }
+        };
+        match *update.arg {
+            ast::Expr::Ident(ident) => {
+                let name = ident.sym.to_string();
+                let Some(source_slot) = self.locals.get(&name).copied() else {
+                    return Err(ParseError::at_span(
+                        byte_span(ident.span, self.base, self.source_id),
+                        format!("unresolved TypeScript update target '{name}'"),
+                    ));
+                };
+                if !self.mutable_locals.contains(&source_slot) {
+                    return Err(ParseError::at_span(
+                        byte_span(ident.span, self.base, self.source_id),
+                        format!("cannot update const binding '{name}'"),
+                    ));
+                }
+                // The hidden previous value keeps the target's own numeric
+                // schema (Int stays Int) so bindings of the update result
+                // keep their precise type.
+                let target_schema = self
+                    .expression_schema(&ast::Expr::Ident(ident.clone()))
+                    .filter(Self::is_numeric_schema)
+                    .or(Some(TypeSchema::Number));
+                let slot = self.capture_slot(source_slot, &name, ident.span)?;
+                let read = self.lower_expr(ast::Expr::Ident(ident))?;
+                let previous_slot = self.alloc_hidden_local(span)?;
+                // In explicit reference-array mode a Number/Float local
+                // `++` uses the floating projection; pure Int keeps the
+                // exact integer path (native Int Add exists).
+                let use_float =
+                    self.ref_mode && !decrement && !matches!(target_schema, Some(TypeSchema::Int));
+                let updated = if use_float {
+                    bump_float(Expr::Var(previous_slot))
+                } else {
+                    bump_int(Expr::Var(previous_slot))
+                };
+                let result = if use_float {
+                    bump_float(Expr::Var(previous_slot))
+                } else {
+                    bump_int(Expr::Var(previous_slot))
+                };
+                Ok(Expr::Block {
+                    stmts: vec![
+                        Stmt::Let {
+                            index: previous_slot,
+                            declared_schema: target_schema,
+                            expr: read,
+                            line,
+                        },
+                        Stmt::Assign {
+                            kind: AssignmentKind::Set,
+                            index: slot,
+                            expr: updated,
+                            line,
+                        },
+                    ],
+                    expr: Box::new(if update.prefix {
+                        result
+                    } else {
+                        Expr::Var(previous_slot)
+                    }),
+                })
+            }
+            ast::Expr::Member(member)
+                if self
+                    .expression_schema(&member.obj)
+                    .is_some_and(super::array_lowering::is_carrier_schema) =>
+            {
+                let ast::MemberProp::Computed(property) = member.prop else {
+                    return Err(unsupported(
+                        member.span,
+                        self.base,
+                        self.source_id,
+                        "non-indexed update target",
+                    ));
+                };
+                let mut stmts = Vec::new();
+                let carrier_slot = self.hoist_hidden(&member.obj, &mut stmts, line, span)?;
+                let position_slot = self.hoist_hidden(&property.expr, &mut stmts, line, span)?;
+                let previous = self.syn_call(
+                    super::array_lowering::HELPER_READ,
+                    vec![Expr::Var(carrier_slot), Expr::Var(position_slot)],
+                    span,
+                )?;
+                let previous_slot = self.alloc_hidden_local(span)?;
+                stmts.push(Stmt::Let {
+                    index: previous_slot,
+                    declared_schema: Some(TypeSchema::Number),
+                    expr: previous,
+                    line,
+                });
+                // Indexed carrier elements are always Number: `++` uses the
+                // floating projection in reference-array mode, `--` keeps Sub.
+                let updated = if self.ref_mode && !decrement {
+                    bump_float(Expr::Var(previous_slot))
+                } else {
+                    bump_int(Expr::Var(previous_slot))
+                };
+                let written = self.syn_call(
+                    super::array_lowering::HELPER_WRITE,
+                    vec![Expr::Var(carrier_slot), Expr::Var(position_slot), updated],
+                    span,
+                )?;
+                stmts.push(Stmt::Expr {
+                    expr: written,
+                    line,
+                });
+                Ok(Expr::Block {
+                    stmts,
+                    expr: Box::new(if update.prefix {
+                        if self.ref_mode && !decrement {
+                            bump_float(Expr::Var(previous_slot))
+                        } else {
+                            bump_int(Expr::Var(previous_slot))
+                        }
+                    } else {
+                        Expr::Var(previous_slot)
+                    }),
+                })
+            }
+            _ => Err(unsupported(
+                span,
+                self.base,
+                self.source_id,
+                "non-local update target",
+            )),
+        }
+    }
+
+    /// Runs `body` with expression-statement values bound to hidden
+    /// locals (see `stmt_value_depth`).
+    fn with_consumed_stmt_values<T>(
+        &mut self,
+        body: impl FnOnce(&mut Self) -> Result<T, ParseError>,
+    ) -> Result<T, ParseError> {
+        self.stmt_value_depth += 1;
+        let result = body(self);
+        self.stmt_value_depth -= 1;
+        result
+    }
+
+    /// Pushes an expression statement: at top level it evaluates to the
+    /// stack, while nested bodies bind the value to a hidden local so the
+    /// native backend never sees a leftover stack value at a merge point.
+    fn push_expr_stmt(
+        &mut self,
+        expr: Expr,
+        declared: Option<TypeSchema>,
+        span: swc_common::Span,
+        line: u32,
+        output: &mut Vec<Stmt>,
+    ) -> Result<(), ParseError> {
+        if self.stmt_value_depth == 0 {
+            output.push(Stmt::Expr { expr, line });
+        } else {
+            let slot = self.alloc_hidden_local(span)?;
+            output.push(Stmt::Let {
+                index: slot,
+                declared_schema: declared,
+                expr,
+                line,
+            });
+        }
+        Ok(())
     }
 
     fn alloc_hidden_local(&mut self, span: swc_common::Span) -> Result<u16, ParseError> {
@@ -3648,12 +4499,35 @@ impl<'a> Lowerer<'a> {
         Expr::Eq(Box::new(as_number(left)), Box::new(as_number(right)))
     }
 
+    /// Projects a statically proven numeric `+` onto the existing checked
+    /// floating path in explicit reference-array mode. Both operands are
+    /// already lowered exactly once (left then right); wrapping each in the
+    /// existing `Div(_, Float(1.0))` coercion feeds the existing `Float`
+    /// `Add` backend without new IR/opcodes. Pure `Int + Int` keeps the
+    /// exact integer path; string addition never reaches here.
+    fn lower_numeric_add(left: Expr, right: Expr) -> Expr {
+        let as_float = |value: Expr| Expr::Div(Box::new(value), Box::new(Expr::Float(1.0)));
+        Expr::Add(Box::new(as_float(left)), Box::new(as_float(right)))
+    }
+
     fn lower_member_get(&mut self, member: ast::MemberExpr) -> Result<Expr, ParseError> {
         let member_span = member.span;
         let object = member.obj;
         let property = match member.prop {
             ast::MemberProp::Ident(property) => property,
             ast::MemberProp::Computed(property) => {
+                // Reference-array carriers lower indexed reads through the
+                // owning dispatcher; the plain Core-array path below never
+                // sees a carrier value.
+                if self.ref_carrier_of(&object) {
+                    let container = self.lower_expr(*object)?;
+                    let index = self.lower_expr(*property.expr)?;
+                    return self.syn_call(
+                        super::array_lowering::HELPER_READ,
+                        vec![container, index],
+                        member_span,
+                    );
+                }
                 let array_schema = self.expression_schema(&object);
                 if !array_schema.as_ref().is_some_and(|schema| {
                     matches!(
@@ -3701,6 +4575,14 @@ impl<'a> Lowerer<'a> {
         };
         let property_name = property.sym.to_string();
         let receiver_schema = self.expression_schema(&object);
+        if property_name == "length" && self.ref_carrier_of(&object) {
+            let container = self.lower_expr(*object)?;
+            return self.syn_call(
+                super::array_lowering::HELPER_LENGTH,
+                vec![container],
+                member_span,
+            );
+        }
         if property_name == "length"
             && receiver_schema.as_ref().is_some_and(|schema| {
                 matches!(
@@ -4008,6 +4890,14 @@ impl<'a> Lowerer<'a> {
                 } else {
                     self.locals.get(&callee).copied()
                 };
+                // Reference-array mode resolves `Math.random()` through the
+                // prelude randomness helper. Plain mode keeps the historical
+                // rejection: no new global is introduced there.
+                let callee = if self.ref_mode && callee == "Math::random" {
+                    super::array_lowering::HELPER_RAND.to_owned()
+                } else {
+                    callee
+                };
                 let local_function = local_slot
                     .is_none()
                     .then(|| self.function_indices.get(&callee).copied())
@@ -4079,6 +4969,35 @@ impl<'a> Lowerer<'a> {
                     })
                     .cloned()
                     .unwrap_or_default();
+                // Reference-array call boundary: a plain staging array
+                // argument converts through the owning factory wherever the
+                // callee parameter is physically the carrier. Carrier
+                // arguments pass through untouched.
+                let ref_carrier_params: Vec<bool> = if self.ref_mode {
+                    if let Some((index, _)) = local_function {
+                        self.functions
+                            .iter()
+                            .find(|declaration| declaration.index == index)
+                            .map(|declaration| declaration.arg_schemas.clone())
+                            .unwrap_or_default()
+                    } else if let Some((_, declaration)) = imported_function.as_ref() {
+                        declaration.arg_schemas.clone()
+                    } else if local_slot.is_some() {
+                        match self.local_types.get(&callee).cloned() {
+                            Some(TypeSchema::Callable { params, .. }) => {
+                                params.into_iter().map(Some).collect()
+                            }
+                            _ => Vec::new(),
+                        }
+                    } else {
+                        Vec::new()
+                    }
+                    .into_iter()
+                    .map(|schema| schema.is_some_and(super::array_lowering::is_carrier_schema))
+                    .collect()
+                } else {
+                    Vec::new()
+                };
                 let arity = local_function
                     .map(|(_, arity)| arity)
                     .or_else(|| {
@@ -4189,7 +5108,27 @@ impl<'a> Lowerer<'a> {
                                 "spread call argument",
                             ));
                         }
+                        let needs_factory = ref_carrier_params.get(index).copied().unwrap_or(false)
+                            && (matches!(&*argument.expr, ast::Expr::Array(_))
+                                || self
+                                    .expression_schema(&argument.expr)
+                                    .is_some_and(|schema| {
+                                        super::array_lowering::is_logical_number_array(schema)
+                                    }));
                         let expression = self.lower_expr(*argument.expr)?;
+                        // Reference-array call boundary conversion: a plain
+                        // staging array (including an empty literal) becomes
+                        // an owned carrier wherever the callee parameter is
+                        // physically the carrier.
+                        let expression = if needs_factory {
+                            self.syn_call(
+                                super::array_lowering::HELPER_MAKE,
+                                vec![expression],
+                                argument_span,
+                            )?
+                        } else {
+                            expression
+                        };
                         match host_passings.get(index) {
                             Some(vm::HostParamPassing::Borrow) => match expression {
                                 variable @ Expr::Var(_) => Ok(Expr::Borrow(Box::new(variable))),
@@ -4360,6 +5299,7 @@ impl<'a> Lowerer<'a> {
             }),
             ast::Expr::Member(member) => self.lower_member_get(member),
             ast::Expr::Arrow(arrow) => self.lower_arrow(arrow),
+            ast::Expr::Update(update) => self.lower_update_expr(update),
             ast::Expr::Paren(value) => self.lower_expr(*value.expr),
             ast::Expr::Unary(value) => {
                 if value.op == ast::UnaryOp::Minus
@@ -4389,6 +5329,16 @@ impl<'a> Lowerer<'a> {
                         && self
                             .expression_schema(&value.right)
                             .is_some_and(|schema| Self::is_numeric_schema(&schema));
+                // Presence-aware relational comparisons over reference-array
+                // elements evaluate false on a missing integral index
+                // instead of fabricating an element value.
+                if matches!(value.op, ast::BinaryOp::Lt | ast::BinaryOp::Gt)
+                    && let Some(guarded) = self.lower_guarded_comparison(&value)?
+                {
+                    return Ok(guarded);
+                }
+                let left_schema_for_add = self.expression_schema(&value.left);
+                let right_schema_for_add = self.expression_schema(&value.right);
                 let left = Box::new(self.lower_expr(*value.left)?);
                 let right = Box::new(self.lower_expr(*value.right)?);
                 if numeric_strict_equality {
@@ -4398,6 +5348,25 @@ impl<'a> Lowerer<'a> {
                     } else {
                         equality
                     });
+                }
+                // Explicit reference-array mode: statically proven numeric
+                // `+` (other than pure Int+Int and string `+`) runs through
+                // the existing checked floating coercion so the existing
+                // Float Add backend covers it. Ordinary mode is untouched.
+                if value.op == ast::BinaryOp::Add
+                    && self.ref_mode
+                    && left_schema_for_add
+                        .as_ref()
+                        .is_some_and(Self::is_numeric_schema)
+                    && right_schema_for_add
+                        .as_ref()
+                        .is_some_and(Self::is_numeric_schema)
+                    && !matches!(left_schema_for_add, Some(TypeSchema::String))
+                    && !matches!(right_schema_for_add, Some(TypeSchema::String))
+                    && !(matches!(left_schema_for_add, Some(TypeSchema::Int))
+                        && matches!(right_schema_for_add, Some(TypeSchema::Int)))
+                {
+                    return Ok(Self::lower_numeric_add(*left, *right));
                 }
                 match value.op {
                     ast::BinaryOp::Add => Ok(Expr::Add(left, right)),
@@ -4723,8 +5692,63 @@ pub(crate) fn lower(
     source: &str,
     context: &SourceFrontendContext<'_>,
 ) -> Result<FrontendIr, ParseError> {
+    lower_impl(source, context, false, 0, None)
+}
+
+/// Explicit reference-array compilation entry. The fixed private prelude
+/// is parsed separately and merged as hygienic AST items (prelude first);
+/// user source bytes and spans are never rewritten or concatenated, and
+/// helper authority comes from real typed predeclare indices, never from
+/// user-controlled names. Plain `lower` stays untouched.
+pub(crate) fn lower_reference_array(
+    source: &str,
+    context: &SourceFrontendContext<'_>,
+) -> Result<FrontendIr, ParseError> {
+    let user = parse_module(source)?;
+    let prelude = parse_module(super::array_lowering::REFERENCE_ARRAY_PRELUDE)?;
+    lower_impl_merged(user, Some(prelude), source, context, true)
+}
+
+fn lower_impl(
+    source: &str,
+    context: &SourceFrontendContext<'_>,
+    ref_mode: bool,
+    _ref_user_len: usize,
+    _extra: Option<ParsedModule>,
+) -> Result<FrontendIr, ParseError> {
+    debug_assert!(!ref_mode, "reference-array mode must use lower_impl_merged");
     let parsed = parse_module(source)?;
-    let host_imports = install_host_imports(&parsed.module, context, parsed.base)?;
+    lower_impl_merged(parsed, None, source, context, false)
+}
+
+fn lower_impl_merged(
+    user: ParsedModule,
+    prelude: Option<ParsedModule>,
+    source: &str,
+    context: &SourceFrontendContext<'_>,
+    ref_mode: bool,
+) -> Result<FrontendIr, ParseError> {
+    // Merge prelude AST items before user items in memory (no source-text
+    // concatenation). Prelude helpers lower first so user calls resolve to
+    // real predeclared helper indices; a user declaration colliding with a
+    // hygienic helper name fails as a duplicate like any other.
+    let mut module = user.module;
+    let mut parsed_base = user.base;
+    let ref_prelude_items = if ref_mode {
+        let prelude = prelude.expect("reference-array prelude must parse");
+        let mut body = prelude.module.body;
+        let count = body.len();
+        body.extend(std::mem::take(&mut module.body));
+        module.body = body;
+        // Keep the user base for user spans; prelude spans live in their own
+        // numeric space and are distinguished by item position (in_ref_prelude),
+        // never by offsets into the user source.
+        parsed_base = user.base;
+        count
+    } else {
+        0
+    };
+    let host_imports = install_host_imports(&module, context, parsed_base)?;
     let imported_functions = context
         .imports
         .iter()
@@ -4790,12 +5814,16 @@ pub(crate) fn lower(
     Lowerer {
         source,
         source_id: context.source_id,
-        base: parsed.base,
+        base: parsed_base,
         next_slot: 0,
         next_node_id: 0,
         next_scope_id: 1,
         next_function_index: host_imports.next_function_index,
         scope_id: 0,
+        ref_mode,
+        ref_prelude_items,
+        in_ref_prelude: false,
+        stmt_value_depth: 0,
         locals: HashMap::new(),
         local_types: HashMap::new(),
         mutable_locals: HashSet::new(),
@@ -4827,7 +5855,7 @@ pub(crate) fn lower(
         local_refs: Vec::new(),
         stmt_spans: Vec::new(),
     }
-    .lower(parsed.module)
+    .lower(module)
 }
 
 pub(crate) fn exports(
