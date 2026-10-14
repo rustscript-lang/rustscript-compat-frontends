@@ -18,6 +18,8 @@ struct ScopeOwners {
     last_scanned: usize,
     total_scanned: usize,
     guest_iterations: usize,
+    max_identity_entries: usize,
+    max_identity_capacity: usize,
     quota_refusal: Option<QuotaKind>,
     lookup_failure: Option<vm::resource::ResourceErrorCode>,
 }
@@ -82,6 +84,8 @@ impl Default for ScopeOwners {
             last_scanned: 0,
             total_scanned: 0,
             guest_iterations: 0,
+            max_identity_entries: 0,
+            max_identity_capacity: 0,
             quota_refusal: None,
             lookup_failure: None,
         }
@@ -133,10 +137,15 @@ fn registered_metadata_quota_refuses_a_second_factory() {
 }
 
 fn collect_scope_owners(machine: &mut Vm) -> VmResult<usize> {
+    let identity_stats = machine.callable_identity_maintenance_stats();
     let mut context = machine.host_context();
     let mut owners = context
         .take_scope_state::<ScopeOwners>()
         .unwrap_or_default();
+    if let Some(stats) = identity_stats {
+        owners.max_identity_entries = owners.max_identity_entries.max(stats.entries);
+        owners.max_identity_capacity = owners.max_identity_capacity.max(stats.capacity);
+    }
     let result = (|| {
         let budget = owners.entries.len().min(4);
         let mut closed = 0;
@@ -720,6 +729,7 @@ fn one_vm_2048_factories_keep_scope_metadata_payload_and_probe_work_bounded() {
     {
         let native = false;
         let mut machine = scope_factory_vm(&registered_source("makeReader;"));
+        machine.set_callable_identity_maintenance(vm::CallableIdentityMaintenanceConfig::new(4));
         if native {
             machine.compile_aot().unwrap();
         }
@@ -744,7 +754,22 @@ fn one_vm_2048_factories_keep_scope_metadata_payload_and_probe_work_bounded() {
             max_capacity = max_capacity.max(stats.capacity);
             assert!(stats.probes <= stats.registrations * 4);
             assert!(stats.entries <= 12 && stats.capacity <= 16);
+            let identity = machine
+                .callable_identity_maintenance_stats()
+                .expect("independent callable identity measurement must be enabled");
+            assert_eq!(identity.probes_per_registration, 4);
+            assert!(identity.entries <= 32 && identity.capacity <= 64);
+            assert!(identity.probes <= identity.registrations * 4);
         }
+        let identity = machine.callable_identity_maintenance_stats().unwrap();
+        assert!(identity.registrations >= 2048 && identity.retired > 0);
+        let context = machine.host_context();
+        let owners = context.scope_state::<ScopeOwners>().unwrap();
+        assert!(owners.max_identity_entries <= 32 && owners.max_identity_capacity <= 64);
+        eprintln!(
+            "A4 interpreted independent identity history: stats={identity:?} peak_entries={} peak_capacity={}",
+            owners.max_identity_entries, owners.max_identity_capacity
+        );
         eprintln!(
             "A4 one-VM history: native={native} iterations=2048 max_capture_entries={max_entries} max_capture_capacity={max_capacity} stats={:?} inspected={}",
             machine.capture_certification_stats(),
@@ -774,6 +799,7 @@ fn native_guest_2048_factory_cycles_have_actual_native_and_bounded_scan_evidence
         "import { collect, more } from 'factory'; while (more()) { const abandoned = makeReader(); const swept = collect(); } 0;",
     );
     let mut machine = scope_factory_vm(&source);
+    machine.set_callable_identity_maintenance(vm::CallableIdentityMaintenanceConfig::new(4));
     eprintln!("A4 native guest history before compile");
     machine.compile_aot().unwrap();
     eprintln!("A4 native guest history compiled, before run");
@@ -789,6 +815,19 @@ fn native_guest_2048_factory_cycles_have_actual_native_and_bounded_scan_evidence
     assert!(owners.total_scanned >= 2048 && owners.total_scanned <= 2048 * 4 + 4);
     assert_eq!(owners.guest_iterations, 2048);
     let inspected = owners.total_scanned;
+    let max_identity_entries = owners.max_identity_entries;
+    let max_identity_capacity = owners.max_identity_capacity;
+    assert!(max_identity_entries <= 32 && max_identity_capacity <= 64);
+    let identity = machine
+        .callable_identity_maintenance_stats()
+        .expect("independent callable identity measurement must be enabled");
+    assert_eq!(identity.probes_per_registration, 4);
+    assert!(identity.entries <= 32 && identity.capacity <= 64);
+    assert!(identity.registrations >= 2048 && identity.retired > 0);
+    assert!(identity.probes <= identity.registrations * 4);
+    eprintln!(
+        "A4 native independent identity history: stats={identity:?} peak_entries={max_identity_entries} peak_capacity={max_identity_capacity}"
+    );
     let stats = machine.capture_certification_stats().unwrap();
     assert!(stats.entries <= 12 && stats.capacity <= 16 && stats.probes <= stats.registrations * 4);
     eprintln!(
