@@ -1780,6 +1780,10 @@ fn file_cli_native_artifact_child() {
     assert_file_cli_unavailable(&cli, &[false], true, false);
 }
 
+#[cfg(test)]
+#[path = "array_factory_lifecycle_tests.rs"]
+mod factory_lifecycle_tests;
+
 fn assert_file_cli_live(cli: &FileCliServices, native: bool) {
     let observed = cli.observations.lock().unwrap();
     assert_eq!(observed.init_certified, [true]);
