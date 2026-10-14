@@ -6,6 +6,14 @@ use vm::{
     ResourceTypeKey, Value, Vm, VmError, VmResult,
 };
 
+#[path = "array_owned.rs"]
+mod owned;
+
+pub use owned::{
+    OwnedArrayLimits, OwnedArrayRuntimeStats, initialize_typescript_owned_arrays,
+    owned_array_runtime_stats, typescript_owned_array_host_module,
+};
+
 #[derive(Debug)]
 struct NumberArray(Vec<Value>);
 
