@@ -37,6 +37,21 @@ jobs:
           cargo run --locked --bin pd-vm-compat-run -- examples/example.mts
           cargo run --locked --bin pd-vm-compat-run -- examples/example.lua
           cargo run --locked --bin pd-vm-compat-run -- --version
+      - name: Selected reference-array CLI smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          scratch="$(mktemp -d)"
+          trap 'rm -rf "$scratch"' EXIT
+          mkdir -p "$scratch/sorts"
+          cp tests/fixtures/typescript/bubble_sort.ts "$scratch/sorts/"
+          cat > "$scratch/main.ts" <<'EOF'
+          import { bubbleSort as sort } from "./sorts/bubble_sort.ts";
+          const sorted = sort([8, 3, 5, 1, 4, 2]);
+          const eq = sorted[0] === 1 && sorted[5] === 8;
+          eq ? 1 : 0;
+          EOF
+          cargo run --locked --bin pd-vm-compat-run -- --typescript-reference-arrays --fuel 100000 "$scratch/main.ts" | grep -F "Int(1)"
       - name: Reject JavaScript CLI entry files
         shell: bash
         run: |

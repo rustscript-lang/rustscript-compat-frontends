@@ -55,6 +55,25 @@ cargo run --locked --bin pd-vm-compat-run -- --version
 
 The CLI registers only TypeScript and Lua compatibility plugins. Core RustScript continues to handle `.rss` through `pd-vm`.
 
+### Explicit reference-array mode
+
+A leading Compat-only selector admits the accepted general typed
+reference-array/generator mode for one invocation:
+
+```bash
+cargo run --locked --bin pd-vm-compat-run -- --typescript-reference-arrays entry.ts
+```
+
+The selector must come first: only that exact first token is stripped, and
+every remaining argument reaches Core's existing CLI unchanged with the
+selected-mode compile options and a fresh per-VM production host-services
+factory (same effective catalog for compiler and registry, per-VM owned
+array initialization). A selector-looking token anywhere else stays
+Core-owned (file argument or Core's own `unknown flag` refusal). Default
+invocations, `--help`/`--version`, output values, errors and artifact
+authority behavior are unchanged. This documents the Compat-side selection
+only; it adds no new Core flags.
+
 ## Dependency and release status
 
 The development manifest pins `pd-vm` to the accepted Git revision that provides the generic typed frontend API. A published registry `pd-vm` version compatible with that API has not yet been established. The release workflow requires an explicit registry version, validates publication and locked resolution, then runs the package build, tests, and dry run before publishing only this compat crate; it does not publish Core crates.
