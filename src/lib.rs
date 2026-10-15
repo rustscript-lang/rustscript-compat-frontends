@@ -1,86 +1,15 @@
-mod javascript;
-mod js_namespace;
 #[path = "frontends/lua/mod.rs"]
 mod lua;
+pub mod runtime;
 mod source_loader;
+mod typescript;
 
-use std::path::Path;
-
-use vm::{
-    FrontendImportSyntax, FrontendIr, ModuleImport, ParseError, ParserDialect, SourceFlavor,
-    SourcePathError, SourcePlugin,
+pub use typescript::{
+    LUA_PLUGIN, TYPESCRIPT_PLUGIN, TYPESCRIPT_REFERENCE_ARRAY_PLUGIN,
+    collect_reference_array_type_hints_at_path_with_options,
+    collect_reference_array_type_hints_with_options, collect_typescript_type_hints,
+    collect_typescript_type_hints_at_path_with_options, collect_typescript_type_hints_with_options,
+    compile_options, compile_options_with_catalog, lua_flavor, plugins,
+    reference_array_compile_options, reference_array_effective_catalog, typescript_flavor,
 };
-
-pub struct JavaScriptPlugin;
-pub struct LuaPlugin;
-
-pub static JAVASCRIPT_PLUGIN: JavaScriptPlugin = JavaScriptPlugin;
-pub static LUA_PLUGIN: LuaPlugin = LuaPlugin;
-
-pub fn plugins() -> [&'static dyn SourcePlugin; 2] {
-    [&JAVASCRIPT_PLUGIN, &LUA_PLUGIN]
-}
-
-impl SourcePlugin for JavaScriptPlugin {
-    fn flavor(&self) -> SourceFlavor {
-        SourceFlavor::JavaScript
-    }
-
-    fn extensions(&self) -> &'static [&'static str] {
-        &["js", "mjs"]
-    }
-
-    fn import_syntax(&self) -> FrontendImportSyntax {
-        FrontendImportSyntax::JavaScript
-    }
-
-    fn parse_source(&self, source: &str) -> Result<FrontendIr, ParseError> {
-        javascript::lower_to_ir(source)
-    }
-
-    fn parser_dialect(&self) -> Option<&'static dyn ParserDialect> {
-        Some(javascript::parser_dialect())
-    }
-
-    fn parse_module_imports(
-        &self,
-        source: &str,
-        _path: &Path,
-    ) -> Result<Vec<ModuleImport>, SourcePathError> {
-        Ok(source_loader::parse_js_imports(source))
-    }
-}
-
-impl SourcePlugin for LuaPlugin {
-    fn flavor(&self) -> SourceFlavor {
-        SourceFlavor::Lua
-    }
-
-    fn extensions(&self) -> &'static [&'static str] {
-        &["lua"]
-    }
-
-    fn import_syntax(&self) -> FrontendImportSyntax {
-        FrontendImportSyntax::Lua
-    }
-
-    fn parse_source(&self, source: &str) -> Result<FrontendIr, ParseError> {
-        lua::lower_to_ir(source)
-    }
-
-    fn parse_module_imports(
-        &self,
-        source: &str,
-        _path: &Path,
-    ) -> Result<Vec<ModuleImport>, SourcePathError> {
-        Ok(source_loader::parse_lua_imports(source))
-    }
-}
-
-pub fn compile_options() -> vm::CompileSourceFileOptions {
-    plugins()
-        .into_iter()
-        .fold(vm::CompileSourceFileOptions::new(), |options, plugin| {
-            options.with_source_plugin(plugin)
-        })
-}
+pub use typescript::{LuaPlugin, TypeScriptPlugin, TypeScriptReferenceArrayPlugin};

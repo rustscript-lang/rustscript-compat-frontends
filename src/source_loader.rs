@@ -1,65 +1,4 @@
-use vm::{ImportClause, ModuleImport, NamedImport};
-
-pub(crate) fn parse_js_imports(source: &str) -> Vec<ModuleImport> {
-    let mut imports = Vec::new();
-    let mut pending = String::new();
-    let mut pending_line = 0usize;
-    for (index, raw_line) in source.lines().enumerate() {
-        let line_no = index + 1;
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with("//") {
-            continue;
-        }
-        if pending.is_empty() {
-            if !line.starts_with("import ") {
-                continue;
-            }
-            pending_line = line_no;
-        }
-        if !pending.is_empty() {
-            pending.push(' ');
-        }
-        pending.push_str(line);
-        if line.ends_with(';') || line.contains(" from ") || is_side_effect_import(line) {
-            if let Some(import) = parse_js_import_from_block(&pending, pending_line) {
-                imports.push(import);
-            }
-            pending.clear();
-        }
-    }
-    if !pending.is_empty()
-        && let Some(import) = parse_js_import_from_block(&pending, pending_line)
-    {
-        imports.push(import);
-    }
-    imports
-}
-
-fn is_side_effect_import(line: &str) -> bool {
-    line.strip_prefix("import ")
-        .and_then(|tail| extract_quoted_literal(tail))
-        .is_some()
-}
-
-fn parse_js_import_from_block(block: &str, line: usize) -> Option<ModuleImport> {
-    if let Some(from_idx) = block.find(" from ") {
-        let head = block[..from_idx].trim();
-        let clause = parse_import_clause_head(head.strip_prefix("import")?.trim())?;
-        let tail = &block[from_idx + " from ".len()..];
-        let (spec, _) = extract_quoted_literal(tail)?;
-        return Some(ModuleImport {
-            spec: spec.to_string(),
-            clause,
-            line,
-        });
-    }
-    let tail = block.strip_prefix("import ")?;
-    extract_quoted_literal(tail).map(|(spec, _)| ModuleImport {
-        spec: spec.to_string(),
-        clause: ImportClause::AllPublic,
-        line,
-    })
-}
+use vm::{DeclarationNamespace, ImportClause, ModuleImport, NamedImport};
 
 pub(crate) fn parse_lua_imports(source: &str) -> Vec<ModuleImport> {
     let mut imports = Vec::new();
@@ -80,62 +19,12 @@ pub(crate) fn parse_lua_imports(source: &str) -> Vec<ModuleImport> {
                 spec,
                 clause: ImportClause::AllPublic,
                 line: line_no,
+                namespace: DeclarationNamespace::Value,
+                span: None,
             });
         }
     }
     imports
-}
-
-fn parse_import_clause_head(head: &str) -> Option<ImportClause> {
-    let trimmed = head.trim();
-    if let Some(rest) = trimmed.strip_prefix("*") {
-        let alias = rest.trim().strip_prefix("as")?.trim();
-        return is_valid_ident(alias).then(|| ImportClause::Namespace(alias.to_string()));
-    }
-    if let Some(rest) = trimmed.strip_prefix('{') {
-        let inner = rest.strip_suffix('}')?.trim();
-        let named = parse_named_imports(inner)?;
-        return Some(ImportClause::Named(named));
-    }
-    is_valid_ident(trimmed).then(|| {
-        ImportClause::Named(vec![NamedImport {
-            imported: "default".to_string(),
-            local: trimmed.to_string(),
-        }])
-    })
-}
-
-fn parse_named_imports(input: &str) -> Option<Vec<NamedImport>> {
-    let mut named = Vec::new();
-    for part in input.split(',') {
-        let entry = part.trim();
-        if entry.is_empty() {
-            continue;
-        }
-
-        if let Some((imported, local)) = entry.split_once(" as ") {
-            let imported = imported.trim();
-            let local = local.trim();
-            if !is_valid_ident(imported) || !is_valid_ident(local) {
-                return None;
-            }
-            named.push(NamedImport {
-                imported: imported.to_string(),
-                local: local.to_string(),
-            });
-            continue;
-        }
-
-        if !is_valid_ident(entry) {
-            return None;
-        }
-        named.push(NamedImport {
-            imported: entry.to_string(),
-            local: entry.to_string(),
-        });
-    }
-
-    Some(named)
 }
 
 fn parse_lua_local_assignment(line: &str) -> Option<(&str, &str)> {
@@ -165,6 +54,8 @@ fn parse_lua_require_binding(name: &str, rhs: &str, line: usize) -> Option<Modul
             spec: spec.to_string(),
             clause: ImportClause::Namespace(name.to_string()),
             line,
+            namespace: DeclarationNamespace::Value,
+            span: None,
         });
     }
 
@@ -173,11 +64,10 @@ fn parse_lua_require_binding(name: &str, rhs: &str, line: usize) -> Option<Modul
         if is_valid_ident(member) {
             return Some(ModuleImport {
                 spec: spec.to_string(),
-                clause: ImportClause::Named(vec![NamedImport {
-                    imported: member.to_string(),
-                    local: name.to_string(),
-                }]),
+                clause: ImportClause::Named(vec![NamedImport::value(member, name)]),
                 line,
+                namespace: DeclarationNamespace::Value,
+                span: None,
             });
         }
     }
@@ -234,5 +124,9 @@ pub(crate) fn is_ident_continue(ch: char) -> bool {
 }
 
 pub(crate) fn is_file_module_spec(spec: &str) -> bool {
-    spec.contains('/') || spec.starts_with('.') || spec.ends_with(".rss")
+    spec.contains('/')
+        || spec.starts_with('.')
+        || spec.ends_with(".rss")
+        || spec.ends_with(".ts")
+        || spec.ends_with(".mts")
 }
