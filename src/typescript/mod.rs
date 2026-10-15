@@ -1,5 +1,6 @@
 mod array_lowering;
 mod default_lowering;
+mod generator_lowering;
 mod parser;
 mod validation;
 

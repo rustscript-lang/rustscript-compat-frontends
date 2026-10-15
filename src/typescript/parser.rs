@@ -65,7 +65,7 @@ fn parse_module(source: &str) -> Result<ParsedModule, ParseError> {
     })
 }
 
-fn byte_span(span: swc_common::Span, base: u32, source_id: u32) -> Span {
+pub(crate) fn byte_span(span: swc_common::Span, base: u32, source_id: u32) -> Span {
     Span::new(
         source_id,
         span.lo.0.saturating_sub(base) as usize,
@@ -305,7 +305,9 @@ fn arrow_function_decl(ident: ast::Ident, arrow: ast::ArrowExpr) -> ast::FnDecl 
     }
 }
 
-fn parameter_binding(parameter: &ast::Pat) -> Option<(&ast::BindingIdent, Option<&ast::Expr>)> {
+pub(crate) fn parameter_binding(
+    parameter: &ast::Pat,
+) -> Option<(&ast::BindingIdent, Option<&ast::Expr>)> {
     match parameter {
         ast::Pat::Ident(binding) => Some((binding, None)),
         ast::Pat::Assign(assign) => match assign.left.as_ref() {
@@ -327,7 +329,7 @@ fn parsed_numeric_literal(expression: &ast::Expr) -> Option<f64> {
     }
 }
 
-fn numeric_literal(value: f64) -> Expr {
+pub(crate) fn numeric_literal(value: f64) -> Expr {
     if value == 0.0 && value.is_sign_negative() {
         Expr::Float(value)
     } else if value.is_finite()
@@ -456,7 +458,7 @@ fn substitute_type_schema(
     }
 }
 
-fn schema_value_type(schema: &TypeSchema) -> vm::ValueType {
+pub(crate) fn schema_value_type(schema: &TypeSchema) -> vm::ValueType {
     match schema {
         TypeSchema::Null => vm::ValueType::Null,
         TypeSchema::Int => vm::ValueType::Int,
@@ -477,13 +479,18 @@ fn schema_value_type(schema: &TypeSchema) -> vm::ValueType {
     }
 }
 
-fn line_at(source: &str, byte: usize) -> u32 {
+pub(crate) fn line_at(source: &str, byte: usize) -> u32 {
     let end = byte.min(source.len());
     let prefix = &source[..end];
     u32::try_from(prefix.bytes().filter(|byte| *byte == b'\n').count() + 1).unwrap_or(u32::MAX)
 }
 
-fn unsupported(span: swc_common::Span, base: u32, source_id: u32, what: &str) -> ParseError {
+pub(crate) fn unsupported(
+    span: swc_common::Span,
+    base: u32,
+    source_id: u32,
+    what: &str,
+) -> ParseError {
     ParseError::at_span(
         byte_span(span, base, source_id),
         format!("unsupported TypeScript {what}"),
@@ -1199,14 +1206,22 @@ fn install_host_imports(
     })
 }
 
-struct ClosureCaptureContext {
-    local_slots: HashSet<u16>,
-    captures: HashMap<u16, u16>,
-    capture_copies: Vec<(u16, u16)>,
+pub(crate) struct ClosureCaptureContext {
+    pub(crate) local_slots: HashSet<u16>,
+    pub(crate) captures: HashMap<u16, u16>,
+    pub(crate) capture_copies: Vec<(u16, u16)>,
+}
+
+/// Early-return lowering state for one ordinary function or arrow body.
+/// `done` flips on the first executed return; `ret` holds valued results.
+struct EarlyReturnFix {
+    done: u16,
+    ret: Option<u16>,
+    valued: bool,
 }
 
 #[derive(Clone)]
-enum ConstCallableOrigin {
+pub(crate) enum ConstCallableOrigin {
     Local {
         name: String,
         index: u16,
@@ -1220,13 +1235,13 @@ enum ConstCallableOrigin {
 }
 
 impl ConstCallableOrigin {
-    fn name(&self) -> &str {
+    pub(crate) fn name(&self) -> &str {
         match self {
             Self::Local { name, .. } | Self::Imported { name, .. } => name,
         }
     }
 
-    fn arity(&self) -> u8 {
+    pub(crate) fn arity(&self) -> u8 {
         match self {
             Self::Local { arity, .. } | Self::Imported { arity, .. } => *arity,
         }
@@ -1240,72 +1255,100 @@ impl ConstCallableOrigin {
     }
 }
 
-struct Lowerer<'a> {
-    source: &'a str,
-    source_id: u32,
-    base: u32,
-    next_slot: u16,
-    next_node_id: u32,
-    next_scope_id: u32,
-    next_function_index: u16,
-    scope_id: u32,
+pub(crate) struct Lowerer<'a> {
+    pub(crate) source: &'a str,
+    pub(crate) source_id: u32,
+    pub(crate) base: u32,
+    pub(crate) next_slot: u16,
+    pub(crate) next_node_id: u32,
+    pub(crate) next_scope_id: u32,
+    pub(crate) next_function_index: u16,
+    pub(crate) scope_id: u32,
     /// Explicit reference-array mode: logical `number[]` bindings in the
     /// user region lower to the private B1-backed carrier. Plain mode
     /// never sets this and behaves exactly as before.
-    ref_mode: bool,
+    pub(crate) ref_mode: bool,
     /// Number of leading module items that belong to the private
     /// reference-array prelude. Those keep plain array semantics (notably
     /// the factory staging parameter); user items lower to the carrier.
     /// The prelude is parsed separately and merged as AST items, never as
     /// source-text concatenation, so user bytes/spans are untouched.
-    ref_prelude_items: usize,
+    pub(crate) ref_prelude_items: usize,
     /// True while lowering a prelude item. Drives `ref_is_user` without
     /// consulting span offsets (the two parses share numeric span space).
-    in_ref_prelude: bool,
+    pub(crate) in_ref_prelude: bool,
     /// Statements nested inside function, closure, loop or branch bodies
     /// bind their expression-statement values to hidden locals instead of
     /// leaving them on the stack. The native SSA backend rejects a value
     /// left on the stack at those merge points (FrameMismatch), while top
     /// level keeps evaluating to the stack. Plain and reference modes
     /// share this shape; behavior is identical either way.
-    stmt_value_depth: usize,
-    locals: HashMap<String, u16>,
-    local_types: HashMap<String, TypeSchema>,
-    mutable_locals: HashSet<u16>,
+    pub(crate) stmt_value_depth: usize,
+    pub(crate) locals: HashMap<String, u16>,
+    pub(crate) local_types: HashMap<String, TypeSchema>,
+    pub(crate) mutable_locals: HashSet<u16>,
     // Source slots are globally unique before Core compaction. Only immutable
     // guest bindings acquire facts; runtime identity is checked before routing.
-    const_callable_origins: HashMap<u16, ConstCallableOrigin>,
-    closure_captures: Vec<ClosureCaptureContext>,
-    imported_functions: HashMap<String, (vm::SymbolId, FunctionDecl)>,
-    host_function_indices: HashMap<String, HashMap<u8, u16>>,
-    host_parameter_passings: HashMap<String, HashMap<u8, Vec<vm::HostParamPassing>>>,
-    declared_host_functions: HashMap<String, Vec<vm::HostFunctionSchema>>,
-    host_api_metadata: Option<HostApiIrMetadata>,
-    catalog_visibility: CatalogVisibility,
-    named_types: HashMap<String, TypeSchema>,
-    named_type_declarations: HashMap<String, StructDecl>,
-    type_alias_schemas: HashMap<String, (Vec<String>, TypeSchema)>,
-    struct_schemas: HashMap<String, StructDecl>,
-    resource_keys: HashSet<String>,
-    type_provenance: Vec<GuestTypeProvenance>,
-    struct_decl_sites: Vec<StructDeclSite>,
-    generic_type_params: HashSet<String>,
-    function_indices: HashMap<String, (u16, u8)>,
-    function_parameters: HashMap<String, Vec<ast::Pat>>,
-    generic_function_indices: HashSet<u16>,
-    functions: Vec<FunctionDecl>,
-    function_impls: HashMap<u16, FunctionImpl>,
-    function_sites: Vec<FunctionDeclSite>,
-    function_scopes: Vec<ParsedLexicalScope>,
-    call_sites: Vec<ParsedCallSite>,
-    local_bindings: Vec<(String, u16)>,
-    local_decls: Vec<LocalDeclSite>,
-    local_refs: Vec<LocalRefSite>,
-    stmt_spans: Vec<StmtSpanSite>,
+    pub(crate) const_callable_origins: HashMap<u16, ConstCallableOrigin>,
+    pub(crate) closure_captures: Vec<ClosureCaptureContext>,
+    pub(crate) imported_functions: HashMap<String, (vm::SymbolId, FunctionDecl)>,
+    pub(crate) host_function_indices: HashMap<String, HashMap<u8, u16>>,
+    pub(crate) host_parameter_passings: HashMap<String, HashMap<u8, Vec<vm::HostParamPassing>>>,
+    pub(crate) declared_host_functions: HashMap<String, Vec<vm::HostFunctionSchema>>,
+    pub(crate) host_api_metadata: Option<HostApiIrMetadata>,
+    pub(crate) catalog_visibility: CatalogVisibility,
+    pub(crate) named_types: HashMap<String, TypeSchema>,
+    pub(crate) named_type_declarations: HashMap<String, StructDecl>,
+    pub(crate) type_alias_schemas: HashMap<String, (Vec<String>, TypeSchema)>,
+    pub(crate) struct_schemas: HashMap<String, StructDecl>,
+    pub(crate) resource_keys: HashSet<String>,
+    pub(crate) type_provenance: Vec<GuestTypeProvenance>,
+    pub(crate) struct_decl_sites: Vec<StructDeclSite>,
+    pub(crate) generic_type_params: HashSet<String>,
+    pub(crate) function_indices: HashMap<String, (u16, u8)>,
+    pub(crate) function_parameters: HashMap<String, Vec<ast::Pat>>,
+    pub(crate) generic_function_indices: HashSet<u16>,
+    /// Declared (annotation-only) signatures for module functions and
+    /// explicitly typed arrows: argument schemas in order plus the declared
+    /// return schema. Populated by `predeclare_functions` before any body
+    /// lowers, so recursive and forward references observe the truthful
+    /// declared facts while the full `FunctionDecl` (with inferred returns)
+    /// is appended only after its body. Generic functions are never entered;
+    /// inferred-only returns stay `None` until lowered. Consulted only when
+    /// the full declaration is absent; never overrides it.
+    pub(crate) predeclared_signatures:
+        HashMap<String, (Vec<Option<TypeSchema>>, Option<TypeSchema>)>,
+    pub(crate) functions: Vec<FunctionDecl>,
+    pub(crate) function_impls: HashMap<u16, FunctionImpl>,
+    pub(crate) function_sites: Vec<FunctionDeclSite>,
+    pub(crate) function_scopes: Vec<ParsedLexicalScope>,
+    pub(crate) call_sites: Vec<ParsedCallSite>,
+    pub(crate) local_bindings: Vec<(String, u16)>,
+    pub(crate) local_decls: Vec<LocalDeclSite>,
+    pub(crate) local_refs: Vec<LocalRefSite>,
+    pub(crate) stmt_spans: Vec<StmtSpanSite>,
+    /// Lazily lowered generator constructors in reference-array mode: maps
+    /// each private iterator nominal to its result representation. Plain
+    /// mode never populates this; ordinary functions never consult it.
+    pub(crate) gen_iterators: HashMap<String, super::generator_lowering::GeneratorInfo>,
+    /// Reverse index from private result nominal to iterator nominal, so
+    /// result-typed values resolve to their exact representation without
+    /// name-based privileges for user shapes.
+    pub(crate) gen_results: HashMap<String, String>,
+    /// Module-level `const` initializers lowered so far (name to initializer
+    /// AST plus declared/inferred schema), in source order. Powers
+    /// pure-constant capture for isolated function bodies; shadowing, order
+    /// and purity are enforced at use.
+    pub(crate) module_const_inits: HashMap<String, (ast::Expr, Option<TypeSchema>)>,
+    /// True while lowering a lazy numeric generator body (pre-scan and
+    /// state machine). Integer-only arithmetic infers `Int` there, matching
+    /// the exact integer backend path; every other context keeps the
+    /// historical conservative `number`.
+    pub(crate) in_gen_body: bool,
 }
 
 impl<'a> Lowerer<'a> {
-    fn callable_origin_is_current(&self, origin: &ConstCallableOrigin) -> bool {
+    pub(crate) fn callable_origin_is_current(&self, origin: &ConstCallableOrigin) -> bool {
         match origin {
             ConstCallableOrigin::Local { name, index, arity } => {
                 self.function_indices.get(name) == Some(&(*index, *arity))
@@ -1321,7 +1364,7 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    fn immutable_guest_callable_origin(
+    pub(crate) fn immutable_guest_callable_origin(
         &self,
         expression: &ast::Expr,
     ) -> Option<ConstCallableOrigin> {
@@ -1366,13 +1409,61 @@ impl<'a> Lowerer<'a> {
             })
     }
 
-    fn alloc_node_id(&mut self) -> SemanticNodeId {
+    pub(crate) fn alloc_node_id(&mut self) -> SemanticNodeId {
         let id = SemanticNodeId(self.next_node_id);
         self.next_node_id = self
             .next_node_id
             .checked_add(1)
             .expect("TypeScript semantic node id overflow");
         id
+    }
+
+    /// Lower one declared annotation for predeclare, mirroring the declared
+    /// half of `lower_function` (including the user-region number-array
+    /// rule). Failures stay `None` here; lowering reports them
+    /// authoritatively when the body itself is lowered.
+    fn predeclared_annotation(
+        &self,
+        annotation: &ast::TsType,
+        span: swc_common::Span,
+    ) -> Option<TypeSchema> {
+        self.lower_type(annotation)
+            .ok()
+            .map(|schema| self.ref_map_number_array(schema, span))
+    }
+
+    /// Module function schemas by name: the lowered `FunctionDecl` once its
+    /// body is lowered, else the predeclared annotation facts (recursive and
+    /// forward references). `None` for generic functions and unknown names.
+    /// Imported functions are resolved separately by callers.
+    fn module_function_schemas(
+        &self,
+        name: &str,
+    ) -> Option<(Vec<Option<TypeSchema>>, Option<TypeSchema>)> {
+        let (index, _) = self.function_indices.get(name)?;
+        if let Some(declaration) = self.functions.iter().find(|decl| decl.index == *index) {
+            if declaration.type_params.is_empty() {
+                return Some((
+                    declaration.arg_schemas.clone(),
+                    declaration.return_schema.clone(),
+                ));
+            }
+            return None;
+        }
+        self.predeclared_signatures.get(name).cloned()
+    }
+
+    /// Argument schemas for a module function table index: the lowered
+    /// declaration once present, else the predeclared annotation facts.
+    /// Empty when unknown, matching the historical fallback.
+    fn module_function_arg_schemas(&self, name: &str, index: u16) -> Vec<Option<TypeSchema>> {
+        if let Some(declaration) = self.functions.iter().find(|decl| decl.index == index) {
+            return declaration.arg_schemas.clone();
+        }
+        self.predeclared_signatures
+            .get(name)
+            .map(|(args, _)| args.clone())
+            .unwrap_or_default()
     }
 
     fn predeclare_types(&mut self, module: &ast::Module) -> Result<(), ParseError> {
@@ -1822,7 +1913,35 @@ impl<'a> Lowerer<'a> {
             {
                 self.generic_function_indices.insert(index);
             }
-            self.function_indices.insert(name, (index, arity));
+            self.function_indices.insert(name.clone(), (index, arity));
+            // Non-generic functions publish their declared (annotation-only)
+            // facts now, so recursive and forward references lower against
+            // the same declared schemas as later calls. Inferred-only
+            // returns stay `None` until the body is lowered.
+            if function
+                .function
+                .type_params
+                .as_ref()
+                .is_none_or(|params| params.params.is_empty())
+            {
+                let mut arg_schemas = Vec::with_capacity(function.function.params.len());
+                for param in &function.function.params {
+                    arg_schemas.push(parameter_binding(&param.pat).and_then(|(ident, _)| {
+                        ident.type_ann.as_ref().and_then(|annotation| {
+                            self.predeclared_annotation(&annotation.type_ann, ident.id.span)
+                        })
+                    }));
+                }
+                let return_schema = function
+                    .function
+                    .return_type
+                    .as_ref()
+                    .and_then(|annotation| {
+                        self.predeclared_annotation(&annotation.type_ann, annotation.span)
+                    });
+                self.predeclared_signatures
+                    .insert(name.clone(), (arg_schemas, return_schema));
+            }
         }
         for item in &module.body {
             let Some((declaration, exported)) = variable_declaration_item(item) else {
@@ -1877,7 +1996,29 @@ impl<'a> Lowerer<'a> {
                 }
                 self.function_parameters
                     .insert(name.clone(), arrow.params.clone());
-                self.function_indices.insert(name, (index, arity));
+                self.function_indices.insert(name.clone(), (index, arity));
+                // Same declared-fact publication as function declarations:
+                // non-generic explicitly typed arrows serve recursive and
+                // forward references from their annotations.
+                if arrow
+                    .type_params
+                    .as_ref()
+                    .is_none_or(|params| params.params.is_empty())
+                {
+                    let mut arg_schemas = Vec::with_capacity(arrow.params.len());
+                    for pat in &arrow.params {
+                        arg_schemas.push(parameter_binding(pat).and_then(|(ident, _)| {
+                            ident.type_ann.as_ref().and_then(|annotation| {
+                                self.predeclared_annotation(&annotation.type_ann, ident.id.span)
+                            })
+                        }));
+                    }
+                    let return_schema = arrow.return_type.as_ref().and_then(|annotation| {
+                        self.predeclared_annotation(&annotation.type_ann, annotation.span)
+                    });
+                    self.predeclared_signatures
+                        .insert(name.clone(), (arg_schemas, return_schema));
+                }
             }
         }
         for (name, signatures) in declarations {
@@ -2013,6 +2154,825 @@ impl<'a> Lowerer<'a> {
         })
     }
 
+    /// True when an ordinary body needs the early-return transform: any
+    /// `return` outside the single tail position. Nested closures own their
+    /// returns and never trigger this. Bodies without early returns keep
+    /// the exact historical lowering.
+    fn body_has_early_return(stmts: &[ast::Stmt]) -> bool {
+        for (position, stmt) in stmts.iter().enumerate() {
+            if Self::stmt_has_non_tail_return(stmt, position + 1 == stmts.len()) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn stmt_has_non_tail_return(stmt: &ast::Stmt, is_tail: bool) -> bool {
+        match stmt {
+            ast::Stmt::Return(_) => !is_tail,
+            ast::Stmt::Block(block) => block
+                .stmts
+                .iter()
+                .any(|stmt| Self::stmt_has_non_tail_return(stmt, false)),
+            ast::Stmt::If(if_stmt) => {
+                Self::stmt_has_non_tail_return(&if_stmt.cons, false)
+                    || if_stmt
+                        .alt
+                        .as_ref()
+                        .is_some_and(|alt| Self::stmt_has_non_tail_return(alt, false))
+            }
+            // Returns inside loops (and any other unhandled position) still
+            // count as non-tail so the transform runs and rejects
+            // loop-carried returns precisely instead of silently keeping the
+            // legacy rejection.
+            ast::Stmt::While(while_stmt) => Self::stmt_contains_return(&while_stmt.body),
+            ast::Stmt::For(for_stmt) => Self::stmt_contains_return(&for_stmt.body),
+            _ => false,
+        }
+    }
+
+    fn stmt_contains_return(stmt: &ast::Stmt) -> bool {
+        match stmt {
+            ast::Stmt::Return(_) => true,
+            ast::Stmt::Block(block) => block.stmts.iter().any(Self::stmt_contains_return),
+            ast::Stmt::If(if_stmt) => {
+                Self::stmt_contains_return(&if_stmt.cons)
+                    || if_stmt
+                        .alt
+                        .as_ref()
+                        .is_some_and(|alt| Self::stmt_contains_return(alt))
+            }
+            ast::Stmt::While(while_stmt) => Self::stmt_contains_return(&while_stmt.body),
+            ast::Stmt::For(for_stmt) => Self::stmt_contains_return(&for_stmt.body),
+            _ => false,
+        }
+    }
+
+    /// Lower an ordinary body containing early returns. The first early
+    /// return allocates a hidden done flag (plus a hidden result cell when
+    /// any return carries a value); every later top-level statement runs
+    /// guarded by the flag, and the body evaluates to the result cell when
+    /// set. Evaluation order, once-only semantics and error behavior match
+    /// straight-line lowering exactly; loop-carried returns stay precisely
+    /// rejected.
+    fn lower_body_with_early_returns(
+        &mut self,
+        stmts: Vec<ast::Stmt>,
+        body_span: swc_common::Span,
+        declared_return: Option<TypeSchema>,
+    ) -> Result<(Vec<Stmt>, Expr, u32), ParseError> {
+        let mut valued_schemas: Vec<Option<TypeSchema>> = Vec::new();
+        let mut bare_count = 0usize;
+        let mut last_return_span: Option<swc_common::Span> = None;
+        Self::collect_body_returns(
+            self,
+            &stmts,
+            false,
+            &mut valued_schemas,
+            &mut bare_count,
+            &mut last_return_span,
+        )?;
+        let has_valued = !valued_schemas.is_empty();
+        if has_valued && bare_count > 0 {
+            return Err(ParseError::at_span(
+                byte_span(body_span, self.base, self.source_id),
+                "mixed bare and valued returns in function body".to_owned(),
+            ));
+        }
+        let mut joined: Option<TypeSchema> = None;
+        for schema in valued_schemas {
+            match (joined.take(), schema) {
+                (None, schema) => joined = schema,
+                (Some(previous), Some(schema)) if previous == schema => {
+                    joined = Some(schema);
+                }
+                _ => joined = Some(TypeSchema::Number),
+            }
+        }
+        let body_site = byte_span(body_span, self.base, self.source_id);
+        let body_line = line_at(self.source, body_site.lo);
+        let done_slot = self.alloc_hidden_local(body_span)?;
+        let mut prefix = vec![Stmt::Let {
+            index: done_slot,
+            declared_schema: Some(TypeSchema::Bool),
+            expr: Expr::Bool(false),
+            line: body_line,
+        }];
+        let ret_slot = if has_valued {
+            let schema = declared_return.or(joined).unwrap_or(TypeSchema::Number);
+            let slot = self.alloc_hidden_local(body_span)?;
+            prefix.push(Stmt::Let {
+                index: slot,
+                declared_schema: Some(schema.clone()),
+                expr: match schema {
+                    TypeSchema::Float => Expr::Float(0.0),
+                    TypeSchema::Int => Expr::Int(0),
+                    TypeSchema::Bool => Expr::Bool(false),
+                    TypeSchema::Null => Expr::Null,
+                    _ => Expr::Int(0),
+                },
+                line: body_line,
+            });
+            Some(slot)
+        } else {
+            None
+        };
+        let mut fix = EarlyReturnFix {
+            done: done_slot,
+            ret: ret_slot,
+            valued: has_valued,
+        };
+        let mut lowered = Vec::new();
+        let tail_is_valued_return = matches!(
+            stmts.last(),
+            Some(ast::Stmt::Return(ret)) if ret.arg.is_some()
+        );
+        self.lower_seq_with_returns(stmts, &mut fix, &mut lowered)?;
+        prefix.extend(lowered);
+        // A valued tail return always executes when reached, so no
+        // fallthrough value is possible and the cell reads directly;
+        // otherwise an unset flag honestly yields Null like before.
+        let line = last_return_span
+            .map(|span| {
+                let site = byte_span(span, self.base, self.source_id);
+                line_at(self.source, site.lo)
+            })
+            .unwrap_or(body_line);
+        let expr = match ret_slot {
+            Some(slot) if tail_is_valued_return => Expr::Var(slot),
+            Some(slot) => Expr::IfElse {
+                condition: Box::new(Expr::Var(done_slot)),
+                then_expr: Box::new(Expr::Var(slot)),
+                else_expr: Box::new(Expr::Null),
+            },
+            None => Expr::Null,
+        };
+        Ok((prefix, expr, line))
+    }
+
+    fn collect_body_returns(
+        lowerer: &mut Lowerer<'_>,
+        stmts: &[ast::Stmt],
+        in_loop: bool,
+        valued_schemas: &mut Vec<Option<TypeSchema>>,
+        bare_count: &mut usize,
+        last_span: &mut Option<swc_common::Span>,
+    ) -> Result<(), ParseError> {
+        for stmt in stmts {
+            match stmt {
+                ast::Stmt::Return(ret) => {
+                    if in_loop {
+                        return Err(unsupported(
+                            ret.span,
+                            lowerer.base,
+                            lowerer.source_id,
+                            "return inside a loop in ordinary function bodies",
+                        ));
+                    }
+                    *last_span = Some(ret.span);
+                    match &ret.arg {
+                        Some(value) => {
+                            valued_schemas.push(lowerer.expression_schema(value));
+                        }
+                        None => *bare_count += 1,
+                    }
+                }
+                ast::Stmt::Block(block) => Self::collect_body_returns(
+                    lowerer,
+                    &block.stmts,
+                    in_loop,
+                    valued_schemas,
+                    bare_count,
+                    last_span,
+                )?,
+                ast::Stmt::If(if_stmt) => {
+                    Self::collect_body_returns(
+                        lowerer,
+                        std::slice::from_ref(if_stmt.cons.as_ref()),
+                        in_loop,
+                        valued_schemas,
+                        bare_count,
+                        last_span,
+                    )?;
+                    if let Some(alt) = &if_stmt.alt {
+                        Self::collect_body_returns(
+                            lowerer,
+                            std::slice::from_ref(alt.as_ref()),
+                            in_loop,
+                            valued_schemas,
+                            bare_count,
+                            last_span,
+                        )?;
+                    }
+                }
+                ast::Stmt::While(while_stmt) => Self::collect_body_returns(
+                    lowerer,
+                    std::slice::from_ref(while_stmt.body.as_ref()),
+                    true,
+                    valued_schemas,
+                    bare_count,
+                    last_span,
+                )?,
+                ast::Stmt::For(for_stmt) => Self::collect_body_returns(
+                    lowerer,
+                    std::slice::from_ref(for_stmt.body.as_ref()),
+                    true,
+                    valued_schemas,
+                    bare_count,
+                    last_span,
+                )?,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Sequence ordinary statements with early-return guards. The list
+    /// splits at the first return-containing statement: the prefix lowers
+    /// exactly as before, the return statement itself becomes one atomic
+    /// done-guarded unit, and the whole remainder runs under a single done
+    /// guard (recursively transformed). Declarations therefore always
+    /// dominate their uses within one guard branch, which the existing
+    /// availability analysis accepts; a direct non-final `return` keeps the
+    /// historical rejection. Blocks open lexical scopes like before; guard
+    /// wrappers themselves never introduce scopes. Guards branch on the
+    /// Bool cell directly to preserve native lowering.
+    fn lower_seq_with_returns(
+        &mut self,
+        stmts: Vec<ast::Stmt>,
+        fix: &mut EarlyReturnFix,
+        output: &mut Vec<Stmt>,
+    ) -> Result<(), ParseError> {
+        let mut split = stmts.len();
+        for (index, stmt) in stmts.iter().enumerate() {
+            if Self::stmt_has_non_tail_return(stmt, false) {
+                split = index;
+                break;
+            }
+        }
+        let mut rest = stmts;
+        let mut tail = rest.split_off(split);
+        for stmt in rest {
+            let mut buffer = Vec::new();
+            self.with_consumed_stmt_values(|this| this.lower_stmt(stmt, &mut buffer))?;
+            output.extend(buffer);
+        }
+        if tail.is_empty() {
+            return Ok(());
+        }
+        let stmt = tail.remove(0);
+        match stmt {
+            ast::Stmt::Return(ret) => {
+                // A direct non-final return keeps the historical rejection;
+                // nested returns become atomic guarded units below.
+                if !tail.is_empty() {
+                    return Err(unsupported(
+                        ret.span,
+                        self.base,
+                        self.source_id,
+                        "non-final return",
+                    ));
+                }
+                self.push_atomic_return(ret, fix, output)?;
+            }
+            ast::Stmt::If(if_stmt) => {
+                let span = byte_span(if_stmt.span, self.base, self.source_id);
+                let line = line_at(self.source, span.lo);
+                let condition = self.lower_expr(*if_stmt.test)?;
+                let mut then_branch = Vec::new();
+                self.lower_seq_with_returns(vec![*if_stmt.cons], fix, &mut then_branch)?;
+                let mut else_branch = Vec::new();
+                if let Some(alt) = if_stmt.alt {
+                    self.lower_seq_with_returns(vec![*alt], fix, &mut else_branch)?;
+                }
+                output.push(Stmt::IfElse {
+                    condition,
+                    then_branch,
+                    else_branch,
+                    line,
+                });
+                self.stmt_spans.push(StmtSpanSite { line, span });
+            }
+            ast::Stmt::Block(block) => {
+                let block_span = block.span;
+                let parent_scope = self.scope_id;
+                let previous_locals = self.locals.clone();
+                let previous_local_types = self.local_types.clone();
+                let previous_mutable = self.mutable_locals.clone();
+                let scope_id = self.next_scope_id;
+                self.next_scope_id = self.next_scope_id.checked_add(1).ok_or_else(|| {
+                    ParseError::at_span(
+                        byte_span(block_span, self.base, self.source_id),
+                        "TypeScript lexical scope count exceeded".to_owned(),
+                    )
+                })?;
+                self.scope_id = scope_id;
+                let declaration_start = self.local_decls.len();
+                let mut buffer = Vec::new();
+                let result = self.lower_seq_with_returns(block.stmts, fix, &mut buffer);
+                let declarations = self.local_decls[declaration_start..]
+                    .iter()
+                    .filter(|site| site.scope_id == scope_id)
+                    .map(|site| site.slot)
+                    .collect();
+                self.function_scopes.push(ParsedLexicalScope {
+                    id: scope_id,
+                    parent: Some(parent_scope),
+                    range: byte_span(block_span, self.base, self.source_id),
+                    declarations,
+                    functions: Vec::new(),
+                });
+                self.scope_id = parent_scope;
+                self.locals = previous_locals;
+                self.local_types = previous_local_types;
+                self.mutable_locals = previous_mutable;
+                result?;
+                output.extend(buffer);
+            }
+            other => {
+                // Loops were cleared of returns by collection; anything else
+                // reaching the split position lowers historically (any return
+                // inside still fails there exactly as before).
+                let mut buffer = Vec::new();
+                self.with_consumed_stmt_values(|this| this.lower_stmt(other, &mut buffer))?;
+                output.extend(buffer);
+            }
+        }
+        if !tail.is_empty() {
+            let rest_span = tail
+                .first()
+                .map(|stmt| stmt.span())
+                .expect("guarded remainder is non-empty");
+            let mut rest_lowered = Vec::new();
+            self.lower_seq_with_returns(tail, fix, &mut rest_lowered)?;
+            let site = byte_span(rest_span, self.base, self.source_id);
+            let line = line_at(self.source, site.lo);
+            output.push(Stmt::IfElse {
+                condition: Expr::Var(fix.done),
+                then_branch: Vec::new(),
+                else_branch: rest_lowered,
+                line,
+            });
+            self.stmt_spans.push(StmtSpanSite { line, span: site });
+        }
+        Ok(())
+    }
+
+    /// Emit one return as a single atomic done-guarded unit: when the flag
+    /// is unset the value cell and the flag update together; when set (an
+    /// earlier return won) the whole unit is skipped, so later returns can
+    /// never clobber earlier ones.
+    fn push_atomic_return(
+        &mut self,
+        ret: ast::ReturnStmt,
+        fix: &EarlyReturnFix,
+        output: &mut Vec<Stmt>,
+    ) -> Result<(), ParseError> {
+        let span = byte_span(ret.span, self.base, self.source_id);
+        let line = line_at(self.source, span.lo);
+        let mut unit = Vec::new();
+        if fix.valued {
+            let Some(value) = ret.arg else {
+                return Err(ParseError::at_span(
+                    span,
+                    "bare return with valued returns in function body".to_owned(),
+                ));
+            };
+            let lowered = self.lower_expr(*value)?;
+            let slot = fix.ret.expect("valued mode allocates a result cell");
+            unit.push(Stmt::Assign {
+                kind: AssignmentKind::Set,
+                index: slot,
+                expr: lowered,
+                line,
+            });
+        } else if ret.arg.is_some() {
+            return Err(ParseError::at_span(
+                span,
+                "valued return with bare returns in function body".to_owned(),
+            ));
+        }
+        unit.push(Stmt::Assign {
+            kind: AssignmentKind::Set,
+            index: fix.done,
+            expr: Expr::Bool(true),
+            line,
+        });
+        output.push(Stmt::IfElse {
+            condition: Expr::Var(fix.done),
+            then_branch: Vec::new(),
+            else_branch: unit,
+            line,
+        });
+        self.stmt_spans.push(StmtSpanSite { line, span });
+        Ok(())
+    }
+
+    /// Inline pure module-constant captures for an isolated function body.
+    ///
+    /// Function bodies lower in isolation and cannot observe module bindings,
+    /// but an explicitly-typed module arrow closing over module constants
+    /// (like the upstream formula arrow over `sqrt5`/`phi`/`psi`) is still
+    /// an ordinary exported function and must execute unchanged. For every
+    /// body-referenced name that is otherwise unresolvable and denotes a
+    /// previously lowered module `const` with a pure initializer, this
+    /// materializes a function-local copy from the fully expanded
+    /// initializer. Pure initializers recompute bit-identical values, so no
+    /// observation can distinguish the copy; impure, cyclic, mutable,
+    /// shadowed or later-declared bindings stay precisely rejected.
+    fn inline_module_consts(
+        &mut self,
+        body: &ast::FunctionBody,
+        arg_names: &[String],
+        output: &mut Vec<Stmt>,
+    ) -> Result<(), ParseError> {
+        if !self.ref_mode {
+            return Ok(());
+        }
+        let mut bound = HashSet::new();
+        let mut used = Vec::new();
+        for stmt in &body.stmts {
+            Self::collect_body_idents(stmt, false, &mut bound, &mut used);
+        }
+        let mut needed = Vec::new();
+        let mut seen = HashSet::new();
+        for name in used {
+            if bound.contains(&name) || arg_names.contains(&name) {
+                continue;
+            }
+            if self.function_indices.contains_key(&name)
+                || self.imported_functions.contains_key(&name)
+                || self.host_function_indices.contains_key(&name)
+            {
+                continue;
+            }
+            if !self.module_const_inits.contains_key(&name) {
+                continue;
+            }
+            if seen.insert(name.clone()) {
+                needed.push(name);
+            }
+        }
+        if needed.is_empty() {
+            return Ok(());
+        }
+        let line = line_at(
+            self.source,
+            byte_span(body.span, self.base, self.source_id).lo,
+        );
+        for name in needed {
+            let mut visiting = Vec::new();
+            let expanded = self.expand_const_init(&name, &mut visiting)?;
+            let schema = self
+                .module_const_inits
+                .get(&name)
+                .and_then(|(_, schema)| schema.clone())
+                .or_else(|| self.expression_schema(&expanded))
+                .ok_or_else(|| {
+                    ParseError::at_span(
+                        byte_span(body.span, self.base, self.source_id),
+                        format!("captured module constant '{name}' has no usable type"),
+                    )
+                })?;
+            let slot = self.alloc_hidden_local(body.span)?;
+            let lowered = self.lower_expr(expanded)?;
+            output.push(Stmt::Let {
+                index: slot,
+                declared_schema: Some(schema.clone()),
+                expr: lowered,
+                line,
+            });
+            self.locals.insert(name.clone(), slot);
+            self.local_types.insert(name, schema);
+        }
+        Ok(())
+    }
+
+    /// Collect identifier uses and body-local bindings in one walk. Bindings
+    /// inside nested closures never count as body bindings (they cannot
+    /// shadow the module scope from here); uses count everywhere so nested
+    /// closures capturing through the function scope keep working.
+    fn collect_body_idents(
+        stmt: &ast::Stmt,
+        in_closure: bool,
+        bound: &mut HashSet<String>,
+        used: &mut Vec<String>,
+    ) {
+        match stmt {
+            ast::Stmt::Expr(expr) => Self::collect_expr_idents(&expr.expr, in_closure, bound, used),
+            ast::Stmt::Decl(ast::Decl::Var(decl)) => {
+                for declarator in &decl.decls {
+                    if let ast::Pat::Ident(binding) = &declarator.name
+                        && !in_closure
+                    {
+                        bound.insert(binding.id.sym.to_string());
+                    }
+                    if let Some(init) = &declarator.init {
+                        Self::collect_expr_idents(init, in_closure, bound, used);
+                    }
+                }
+            }
+            ast::Stmt::Decl(_) => {}
+            ast::Stmt::Block(block) => {
+                for stmt in &block.stmts {
+                    Self::collect_body_idents(stmt, in_closure, bound, used);
+                }
+            }
+            ast::Stmt::If(if_stmt) => {
+                Self::collect_expr_idents(&if_stmt.test, in_closure, bound, used);
+                Self::collect_body_idents(&if_stmt.cons, in_closure, bound, used);
+                if let Some(alt) = &if_stmt.alt {
+                    Self::collect_body_idents(alt, in_closure, bound, used);
+                }
+            }
+            ast::Stmt::While(while_stmt) => {
+                Self::collect_expr_idents(&while_stmt.test, in_closure, bound, used);
+                Self::collect_body_idents(&while_stmt.body, in_closure, bound, used);
+            }
+            ast::Stmt::For(for_stmt) => {
+                if let Some(init) = &for_stmt.init {
+                    match init {
+                        ast::VarDeclOrExpr::VarDecl(decl) => {
+                            for declarator in &decl.decls {
+                                if let ast::Pat::Ident(binding) = &declarator.name
+                                    && !in_closure
+                                {
+                                    bound.insert(binding.id.sym.to_string());
+                                }
+                                if let Some(init) = &declarator.init {
+                                    Self::collect_expr_idents(init, in_closure, bound, used);
+                                }
+                            }
+                        }
+                        ast::VarDeclOrExpr::Expr(expr) => {
+                            Self::collect_expr_idents(expr, in_closure, bound, used);
+                        }
+                    }
+                }
+                if let Some(test) = &for_stmt.test {
+                    Self::collect_expr_idents(test, in_closure, bound, used);
+                }
+                if let Some(update) = &for_stmt.update {
+                    Self::collect_expr_idents(update, in_closure, bound, used);
+                }
+                Self::collect_body_idents(&for_stmt.body, in_closure, bound, used);
+            }
+            ast::Stmt::Return(ret) => {
+                if let Some(arg) = &ret.arg {
+                    Self::collect_expr_idents(arg, in_closure, bound, used);
+                }
+            }
+            ast::Stmt::Throw(throw) => {
+                Self::collect_expr_idents(&throw.arg, in_closure, bound, used);
+            }
+            _ => {}
+        }
+    }
+
+    /// Threaded for the closure-boundary flip; only read when collecting
+    /// body-level bindings, never inside pure expressions.
+    #[allow(clippy::only_used_in_recursion)]
+    fn collect_expr_idents(
+        expr: &ast::Expr,
+        in_closure: bool,
+        bound: &mut HashSet<String>,
+        used: &mut Vec<String>,
+    ) {
+        match expr {
+            ast::Expr::Ident(ident) => used.push(ident.sym.to_string()),
+            ast::Expr::Paren(paren) => {
+                Self::collect_expr_idents(&paren.expr, in_closure, bound, used);
+            }
+            ast::Expr::Array(array) => {
+                for element in array.elems.iter().flatten() {
+                    if element.spread.is_none() {
+                        Self::collect_expr_idents(&element.expr, in_closure, bound, used);
+                    }
+                }
+            }
+            ast::Expr::Object(object) => {
+                for property in &object.props {
+                    if let ast::PropOrSpread::Prop(property) = property {
+                        match property.as_ref() {
+                            ast::Prop::KeyValue(property) => {
+                                Self::collect_expr_idents(&property.value, in_closure, bound, used)
+                            }
+                            ast::Prop::Shorthand(ident) => {
+                                used.push(ident.sym.to_string());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            ast::Expr::Unary(unary) => {
+                Self::collect_expr_idents(&unary.arg, in_closure, bound, used);
+            }
+            ast::Expr::Update(update) => {
+                Self::collect_expr_idents(&update.arg, in_closure, bound, used);
+            }
+            ast::Expr::Bin(binary) => {
+                Self::collect_expr_idents(&binary.left, in_closure, bound, used);
+                Self::collect_expr_idents(&binary.right, in_closure, bound, used);
+            }
+            ast::Expr::Assign(assign) => {
+                Self::collect_expr_idents(&assign.right, in_closure, bound, used);
+            }
+            ast::Expr::Member(member) => {
+                Self::collect_expr_idents(&member.obj, in_closure, bound, used);
+                if let ast::MemberProp::Computed(property) = &member.prop {
+                    Self::collect_expr_idents(&property.expr, in_closure, bound, used);
+                }
+            }
+            ast::Expr::Cond(cond) => {
+                Self::collect_expr_idents(&cond.test, in_closure, bound, used);
+                Self::collect_expr_idents(&cond.cons, in_closure, bound, used);
+                Self::collect_expr_idents(&cond.alt, in_closure, bound, used);
+            }
+            ast::Expr::Call(call) => {
+                if let ast::Callee::Expr(callee) = &call.callee {
+                    Self::collect_expr_idents(callee, in_closure, bound, used);
+                }
+                for arg in &call.args {
+                    if arg.spread.is_none() {
+                        Self::collect_expr_idents(&arg.expr, in_closure, bound, used);
+                    }
+                }
+            }
+            ast::Expr::New(new_expr) => {
+                Self::collect_expr_idents(&new_expr.callee, in_closure, bound, used);
+                if let Some(args) = &new_expr.args {
+                    for arg in args {
+                        if arg.spread.is_none() {
+                            Self::collect_expr_idents(&arg.expr, in_closure, bound, used);
+                        }
+                    }
+                }
+            }
+            ast::Expr::Seq(seq) => {
+                for expr in &seq.exprs {
+                    Self::collect_expr_idents(expr, in_closure, bound, used);
+                }
+            }
+            ast::Expr::Arrow(arrow) => match arrow.body.as_ref() {
+                ast::ArrowFunctionBody::Expr(body) => {
+                    Self::collect_expr_idents(body, true, bound, used);
+                }
+                ast::ArrowFunctionBody::FunctionBody(block) => {
+                    for stmt in &block.stmts {
+                        Self::collect_body_idents(stmt, true, bound, used);
+                    }
+                }
+            },
+            ast::Expr::Yield(yield_expr) => {
+                if let Some(arg) = &yield_expr.arg {
+                    Self::collect_expr_idents(arg, in_closure, bound, used);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Fully expand one recorded module constant into a self-contained pure
+    /// expression, transitively inlining referenced constants. Anything
+    /// impure, cyclic or non-constant fails precisely.
+    fn expand_const_init(
+        &self,
+        name: &str,
+        visiting: &mut Vec<String>,
+    ) -> Result<ast::Expr, ParseError> {
+        if visiting.iter().any(|entry| entry == name) {
+            return Err(ParseError::new(format!(
+                "cyclic module constant capture '{name}'"
+            )));
+        }
+        let init = self
+            .module_const_inits
+            .get(name)
+            .map(|(init, _)| init.clone())
+            .ok_or_else(|| {
+                ParseError::new(format!(
+                    "captured module binding '{name}' is not a recorded module constant"
+                ))
+            })?;
+        visiting.push(name.to_owned());
+        let result = self.expand_pure_expr(&init, visiting);
+        visiting.pop();
+        result
+    }
+
+    fn expand_pure_expr(
+        &self,
+        expr: &ast::Expr,
+        visiting: &mut Vec<String>,
+    ) -> Result<ast::Expr, ParseError> {
+        match expr {
+            ast::Expr::Lit(_) => Ok(expr.clone()),
+            ast::Expr::Paren(paren) => {
+                let mut expanded = paren.clone();
+                expanded.expr = Box::new(self.expand_pure_expr(&paren.expr, visiting)?);
+                Ok(ast::Expr::Paren(expanded))
+            }
+            ast::Expr::Unary(unary)
+                if matches!(unary.op, ast::UnaryOp::Minus | ast::UnaryOp::Bang) =>
+            {
+                let mut expanded = unary.clone();
+                expanded.arg = Box::new(self.expand_pure_expr(&unary.arg, visiting)?);
+                Ok(ast::Expr::Unary(expanded))
+            }
+            ast::Expr::Bin(binary)
+                if matches!(
+                    binary.op,
+                    ast::BinaryOp::Add
+                        | ast::BinaryOp::Sub
+                        | ast::BinaryOp::Mul
+                        | ast::BinaryOp::Div
+                        | ast::BinaryOp::Mod
+                        | ast::BinaryOp::Exp
+                        | ast::BinaryOp::EqEq
+                        | ast::BinaryOp::NotEq
+                        | ast::BinaryOp::EqEqEq
+                        | ast::BinaryOp::NotEqEq
+                        | ast::BinaryOp::Lt
+                        | ast::BinaryOp::Gt
+                        | ast::BinaryOp::LtEq
+                        | ast::BinaryOp::GtEq
+                        | ast::BinaryOp::LogicalAnd
+                        | ast::BinaryOp::LogicalOr
+                ) =>
+            {
+                let mut expanded = binary.clone();
+                expanded.left = Box::new(self.expand_pure_expr(&binary.left, visiting)?);
+                expanded.right = Box::new(self.expand_pure_expr(&binary.right, visiting)?);
+                Ok(ast::Expr::Bin(expanded))
+            }
+            ast::Expr::Cond(cond) => {
+                let mut expanded = cond.clone();
+                expanded.test = Box::new(self.expand_pure_expr(&cond.test, visiting)?);
+                expanded.cons = Box::new(self.expand_pure_expr(&cond.cons, visiting)?);
+                expanded.alt = Box::new(self.expand_pure_expr(&cond.alt, visiting)?);
+                Ok(ast::Expr::Cond(expanded))
+            }
+            ast::Expr::Call(call) => {
+                let callee = match &call.callee {
+                    ast::Callee::Expr(callee) => match callee.as_ref() {
+                        ast::Expr::Ident(ident) => ident.sym.to_string(),
+                        ast::Expr::Member(member) => match (member.obj.as_ref(), &member.prop) {
+                            (ast::Expr::Ident(namespace), ast::MemberProp::Ident(property)) => {
+                                format!("{}::{}", namespace.sym, property.sym)
+                            }
+                            _ => String::new(),
+                        },
+                        _ => String::new(),
+                    },
+                    _ => String::new(),
+                };
+                if ![
+                    "Math::floor",
+                    "Math::sqrt",
+                    "Math::round",
+                    "isNaN",
+                    "Number::isNaN",
+                    "Number::isInteger",
+                ]
+                .contains(&callee.as_str())
+                {
+                    return Err(ParseError::new(format!(
+                        "captured module constant requires a pure initializer; call to '{callee}' is not allowed"
+                    )));
+                }
+                if call.type_args.is_some() {
+                    return Err(ParseError::new(
+                        "captured module constant requires a pure initializer; type arguments are not allowed"
+                            .to_owned(),
+                    ));
+                }
+                let mut expanded = call.clone();
+                let mut args = Vec::with_capacity(call.args.len());
+                for arg in &call.args {
+                    if arg.spread.is_some() {
+                        return Err(ParseError::new(
+                            "captured module constant requires a pure initializer; spread arguments are not allowed"
+                                .to_owned(),
+                        ));
+                    }
+                    let mut expanded_arg = arg.clone();
+                    expanded_arg.expr = Box::new(self.expand_pure_expr(&arg.expr, visiting)?);
+                    args.push(expanded_arg);
+                }
+                expanded.args = args;
+                Ok(ast::Expr::Call(expanded))
+            }
+            ast::Expr::Ident(ident) => {
+                let target = ident.sym.to_string();
+                self.expand_const_init(&target, visiting)
+            }
+            _ => Err(ParseError::new(
+                "captured module constant requires a pure initializer".to_owned(),
+            )),
+        }
+    }
+
     fn lower_function(
         &mut self,
         function: &ast::FnDecl,
@@ -2081,12 +3041,18 @@ impl<'a> Lowerer<'a> {
         let previous_generic_type_params =
             std::mem::replace(&mut self.generic_type_params, function_type_params);
         if function.function.is_async || function.function.is_generator {
-            return Err(unsupported(
-                function.function.span,
-                self.base,
-                self.source_id,
-                "async or generator function",
-            ));
+            // Reference-array mode lowers lazy numeric generators through
+            // the private continuation module; ordinary compilation and all
+            // async functions keep the historical refusal.
+            if !self.ref_mode || function.function.is_async {
+                return Err(unsupported(
+                    function.function.span,
+                    self.base,
+                    self.source_id,
+                    "async or generator function",
+                ));
+            }
+            return self.lower_generator_function(function, exported, output);
         }
 
         let mut arg_names = Vec::new();
@@ -2208,43 +3174,62 @@ impl<'a> Lowerer<'a> {
             }
         }
         let mut body_stmts = Vec::new();
+        // Pure module-constant capture: materialize function-locals for
+        // otherwise unresolvable pure module consts before body lowering.
+        // Bodies without such references emit nothing here.
+        self.inline_module_consts(body, &arg_names, &mut body_stmts)?;
         let mut body_expr = Expr::Null;
         let mut body_expr_line = line_at(
             self.source,
             byte_span(body.span, self.base, self.source_id).lo,
         );
-        let mut returned = false;
-        for (position, statement) in body.stmts.iter().enumerate() {
-            if let ast::Stmt::Return(ret) = statement {
-                if returned || position + 1 != body.stmts.len() {
-                    return Err(unsupported(
-                        ret.span,
-                        self.base,
-                        self.source_id,
-                        "non-final return",
-                    ));
+        // Bodies with early returns lower through the guarded transform in
+        // the explicit mode; every other body keeps the exact historical
+        // path in both modes.
+        if self.ref_mode && Self::body_has_early_return(&body.stmts) {
+            let (stmts, expr, line) = self.lower_body_with_early_returns(
+                body.stmts.clone(),
+                body.span,
+                return_schema.clone(),
+            )?;
+            // The prologue (module-constant captures) stays first.
+            body_stmts.extend(stmts);
+            body_expr = expr;
+            body_expr_line = line;
+        } else {
+            let mut returned = false;
+            for (position, statement) in body.stmts.iter().enumerate() {
+                if let ast::Stmt::Return(ret) = statement {
+                    if returned || position + 1 != body.stmts.len() {
+                        return Err(unsupported(
+                            ret.span,
+                            self.base,
+                            self.source_id,
+                            "non-final return",
+                        ));
+                    }
+                    body_expr_line = line_at(
+                        self.source,
+                        byte_span(ret.span, self.base, self.source_id).lo,
+                    );
+                    body_expr = match ret.arg.as_ref() {
+                        Some(value) => self.lower_expr((**value).clone())?,
+                        None => Expr::Null,
+                    };
+                    returned = true;
+                } else {
+                    if returned {
+                        return Err(unsupported(
+                            statement.span(),
+                            self.base,
+                            self.source_id,
+                            "statement after return",
+                        ));
+                    }
+                    self.with_consumed_stmt_values(|this| {
+                        this.lower_stmt(statement.clone(), &mut body_stmts)
+                    })?;
                 }
-                body_expr_line = line_at(
-                    self.source,
-                    byte_span(ret.span, self.base, self.source_id).lo,
-                );
-                body_expr = match ret.arg.as_ref() {
-                    Some(value) => self.lower_expr((**value).clone())?,
-                    None => Expr::Null,
-                };
-                returned = true;
-            } else {
-                if returned {
-                    return Err(unsupported(
-                        statement.span(),
-                        self.base,
-                        self.source_id,
-                        "statement after return",
-                    ));
-                }
-                self.with_consumed_stmt_values(|this| {
-                    this.lower_stmt(statement.clone(), &mut body_stmts)
-                })?;
             }
         }
 
@@ -3240,6 +4225,13 @@ impl<'a> Lowerer<'a> {
                 local_type.map(|schema| self.ref_map_number_array(schema, binding.id.span));
             // Reserve the binding while lowering an arrow so recursive references resolve.
             let is_arrow_initializer = matches!(init.as_ref(), ast::Expr::Arrow(_));
+            // Module-level `const` initializers are recorded for pure-constant
+            // capture by isolated function bodies (source order enforced by
+            // lowering sequence; purity and shadowing enforced at use).
+            if self.scope_id == 0 && !mutable && !self.in_ref_prelude {
+                self.module_const_inits
+                    .insert(name.clone(), (init.as_ref().clone(), local_type.clone()));
+            }
             let slot = if is_arrow_initializer {
                 let slot = self.next_slot;
                 self.next_slot = self.next_slot.checked_add(1).ok_or_else(|| {
@@ -3376,7 +4368,7 @@ impl<'a> Lowerer<'a> {
         result
     }
 
-    fn lower_assignment_statement(
+    pub(crate) fn lower_assignment_statement(
         &mut self,
         expr: ast::Expr,
         output: &mut Vec<Stmt>,
@@ -3835,7 +4827,7 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
-    fn lower_throw(
+    pub(crate) fn lower_throw(
         &mut self,
         statement: ast::ThrowStmt,
         output: &mut Vec<Stmt>,
@@ -4021,13 +5013,13 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
-    fn own_closure_local(&mut self, slot: u16) {
+    pub(crate) fn own_closure_local(&mut self, slot: u16) {
         if let Some(context) = self.closure_captures.last_mut() {
             context.local_slots.insert(slot);
         }
     }
 
-    fn capture_slot(
+    pub(crate) fn capture_slot(
         &mut self,
         source_slot: u16,
         name: &str,
@@ -4075,13 +5067,23 @@ impl<'a> Lowerer<'a> {
     fn lower_arrow_body(&mut self, block: ast::FunctionBody) -> Result<Expr, ParseError> {
         let block_span = block.span;
         let mut statements = block.stmts;
-        let return_value = match statements.pop() {
-            Some(ast::Stmt::Return(return_statement)) => return_statement.arg.map(|value| *value),
-            Some(statement) => {
-                statements.push(statement);
-                None
+        // Bodies with early returns lower through the guarded transform
+        // (tail included) in the explicit mode; all other bodies keep the
+        // exact historical path in both modes.
+        let early = self.ref_mode && Self::body_has_early_return(&statements);
+        let return_value = if early {
+            None
+        } else {
+            match statements.pop() {
+                Some(ast::Stmt::Return(return_statement)) => {
+                    return_statement.arg.map(|value| *value)
+                }
+                Some(statement) => {
+                    statements.push(statement);
+                    None
+                }
+                None => None,
             }
-            None => None,
         };
         let parent_scope = self.scope_id;
         let previous_locals = self.locals.clone();
@@ -4097,20 +5099,29 @@ impl<'a> Lowerer<'a> {
         self.scope_id = scope_id;
         let declaration_start = self.local_decls.len();
         let result = (|| {
-            let mut lowered_statements = Vec::new();
-            for statement in statements {
-                self.with_consumed_stmt_values(|this| {
-                    this.lower_stmt(statement, &mut lowered_statements)
-                })?;
+            if early {
+                let (stmts, expr, _) =
+                    self.lower_body_with_early_returns(statements, block_span, None)?;
+                Ok(Expr::Block {
+                    stmts,
+                    expr: Box::new(expr),
+                })
+            } else {
+                let mut lowered_statements = Vec::new();
+                for statement in statements {
+                    self.with_consumed_stmt_values(|this| {
+                        this.lower_stmt(statement, &mut lowered_statements)
+                    })?;
+                }
+                let expr = match return_value {
+                    Some(value) => self.lower_expr(value)?,
+                    None => Expr::Null,
+                };
+                Ok(Expr::Block {
+                    stmts: lowered_statements,
+                    expr: Box::new(expr),
+                })
             }
-            let expr = match return_value {
-                Some(value) => self.lower_expr(value)?,
-                None => Expr::Null,
-            };
-            Ok(Expr::Block {
-                stmts: lowered_statements,
-                expr: Box::new(expr),
-            })
         })();
         let declarations = self.local_decls[declaration_start..]
             .iter()
@@ -4359,7 +5370,7 @@ impl<'a> Lowerer<'a> {
         )
     }
 
-    fn expression_schema(&self, expression: &ast::Expr) -> Option<TypeSchema> {
+    pub(crate) fn expression_schema(&self, expression: &ast::Expr) -> Option<TypeSchema> {
         match expression {
             ast::Expr::Lit(ast::Lit::Num(value)) => Some(Self::numeric_literal_schema(value.value)),
             ast::Expr::Lit(ast::Lit::Str(_)) => Some(TypeSchema::String),
@@ -4377,11 +5388,18 @@ impl<'a> Lowerer<'a> {
                 {
                     return None;
                 }
-                let declaration = if let Some((index, _)) = self.function_indices.get(name) {
-                    self.functions.iter().find(|decl| decl.index == *index)
-                } else {
-                    self.imported_functions.get(name).map(|(_, decl)| decl)
-                }?;
+                // Module functions resolve through the lowered declaration
+                // once present, else the predeclared annotation facts
+                // (recursive and forward references lower against the same
+                // declared schemas as later calls). Generics stay unresolved.
+                if self.function_indices.contains_key(name) {
+                    let (arg_schemas, return_schema) = self.module_function_schemas(name)?;
+                    return Some(TypeSchema::Callable {
+                        params: arg_schemas.into_iter().collect::<Option<Vec<_>>>()?,
+                        result: Box::new(return_schema?),
+                    });
+                }
+                let (_, declaration) = self.imported_functions.get(name)?;
                 if !declaration.type_params.is_empty() {
                     return None;
                 }
@@ -4467,7 +5485,35 @@ impl<'a> Lowerer<'a> {
                     | ast::BinaryOp::Mul
                     | ast::BinaryOp::Div
                     | ast::BinaryOp::Mod
+                        if self.in_gen_body
+                            && left
+                                .as_ref()
+                                .is_some_and(|schema| matches!(schema, TypeSchema::Int))
+                            && right
+                                .as_ref()
+                                .is_some_and(|schema| matches!(schema, TypeSchema::Int)) =>
+                    {
+                        // Generator bodies track integer precision: the
+                        // backend keeps pure integer arithmetic exact, so the
+                        // schema agrees. Other contexts keep `number`.
+                        Some(TypeSchema::Int)
+                    }
+                    ast::BinaryOp::Add
+                    | ast::BinaryOp::Sub
+                    | ast::BinaryOp::Mul
+                    | ast::BinaryOp::Div
+                    | ast::BinaryOp::Mod
                         if left.as_ref().is_some_and(Self::is_numeric_schema)
+                            && right.as_ref().is_some_and(Self::is_numeric_schema) =>
+                    {
+                        Some(TypeSchema::Number)
+                    }
+                    // Explicit reference-array mode only: statically proven
+                    // numeric `**` (the lowered Core power builtin returns a
+                    // float, a numeric). Ordinary mode keeps `None`.
+                    ast::BinaryOp::Exp
+                        if self.ref_mode
+                            && left.as_ref().is_some_and(Self::is_numeric_schema)
                             && right.as_ref().is_some_and(Self::is_numeric_schema) =>
                     {
                         Some(TypeSchema::Number)
@@ -4478,6 +5524,16 @@ impl<'a> Lowerer<'a> {
                     | ast::BinaryOp::NotEqEq
                     | ast::BinaryOp::Lt
                     | ast::BinaryOp::Gt => Some(TypeSchema::Bool),
+                    // Explicit reference-array mode only: statically proven
+                    // numeric `<=`/`>=` (lowered without new IR below).
+                    // Ordinary mode keeps `None`.
+                    ast::BinaryOp::LtEq | ast::BinaryOp::GtEq
+                        if self.ref_mode
+                            && left.as_ref().is_some_and(Self::is_numeric_schema)
+                            && right.as_ref().is_some_and(Self::is_numeric_schema) =>
+                    {
+                        Some(TypeSchema::Bool)
+                    }
                     _ => None,
                 }
             }
@@ -4549,7 +5605,7 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    fn is_numeric_schema(schema: &TypeSchema) -> bool {
+    pub(crate) fn is_numeric_schema(schema: &TypeSchema) -> bool {
         matches!(
             schema,
             TypeSchema::Int | TypeSchema::Float | TypeSchema::Number
@@ -4608,7 +5664,18 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    fn call_result_schema(&self, call: &ast::CallExpr) -> Option<TypeSchema> {
+    pub(crate) fn call_result_schema(&self, call: &ast::CallExpr) -> Option<TypeSchema> {
+        // Generator protocol: a `.next()` call on a locally known iterator
+        // carries the private result nominal, so `.value`/`.done` member
+        // reads resolve to their honest field schemas.
+        if let ast::Callee::Expr(callee) = &call.callee
+            && let ast::Expr::Member(member) = callee.as_ref()
+            && let ast::MemberProp::Ident(property) = &member.prop
+            && property.sym.as_ref() == "next"
+            && let Some(info) = self.generator_iterator_of(&member.obj)
+        {
+            return Some(info.result_schema());
+        }
         let callee = match &call.callee {
             ast::Callee::Expr(callee) => match callee.as_ref() {
                 ast::Expr::Ident(ident) => ident.sym.to_string(),
@@ -4631,16 +5698,14 @@ impl<'a> Lowerer<'a> {
                 _ => None,
             };
         }
-        let declaration = if let Some((index, _)) = self.function_indices.get(&callee) {
-            // Index search, not positional access: predeclare assigns table
-            // indices with function declarations first and scope-0 arrow
-            // functions second, while lowering pushes declarations in module
-            // order. Positional access returns the wrong declaration (or
-            // nothing) whenever those orders differ.
-            self.functions
-                .iter()
-                .find(|function| function.index == *index)
-        } else if let Some((_, declaration)) = self.imported_functions.get(&callee) {
+        if self.function_indices.contains_key(&callee) {
+            // Lowered declaration once the body is lowered, else the
+            // predeclared annotation facts (recursive and forward calls
+            // observe the same declared return as later calls).
+            let (_, return_schema) = self.module_function_schemas(&callee)?;
+            return return_schema;
+        }
+        let declaration = if let Some((_, declaration)) = self.imported_functions.get(&callee) {
             Some(declaration)
         } else {
             let arity = u8::try_from(call.args.len()).ok()?;
@@ -4676,7 +5741,11 @@ impl<'a> Lowerer<'a> {
     /// Maps a logical `number[]` binding schema to the physical carrier in
     /// the user region. Every other schema (including prelude-region
     /// staging arrays) passes through unchanged.
-    fn ref_map_number_array(&self, schema: TypeSchema, site: swc_common::Span) -> TypeSchema {
+    pub(crate) fn ref_map_number_array(
+        &self,
+        schema: TypeSchema,
+        site: swc_common::Span,
+    ) -> TypeSchema {
         if self.ref_is_user_span(site)
             && super::array_lowering::is_logical_number_array(schema.clone())
         {
@@ -4879,6 +5948,79 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
+    /// Explicit reference-array mode only: statically proven numeric
+    /// `<=`/`>=` as once-only hoisted `<`/`>`-or-typed-`===`, reusing only
+    /// existing IR. Guards stay in the Bool domain for native lowering.
+    /// Carrier-indexed operands stay precisely rejected (presence-aware
+    /// non-strict comparison has no honest lowering here); ordinary mode
+    /// and non-numeric operands fall through to the historical rejection.
+    fn lower_non_strict_comparison(
+        &mut self,
+        value: &ast::BinExpr,
+    ) -> Result<Option<Expr>, ParseError> {
+        if !self.ref_mode {
+            return Ok(None);
+        }
+        let strict = match value.op {
+            ast::BinaryOp::LtEq => true,
+            ast::BinaryOp::GtEq => false,
+            _ => return Ok(None),
+        };
+        let left_schema = self.expression_schema(&value.left);
+        let right_schema = self.expression_schema(&value.right);
+        if !left_schema.as_ref().is_some_and(Self::is_numeric_schema)
+            || !right_schema.as_ref().is_some_and(Self::is_numeric_schema)
+        {
+            return Ok(None);
+        }
+        if self.ref_index_access(&value.left).is_some()
+            || self.ref_index_access(&value.right).is_some()
+        {
+            return Err(unsupported(
+                value.span,
+                self.base,
+                self.source_id,
+                "guarded non-strict comparison over reference arrays",
+            ));
+        }
+        let site = byte_span(value.span, self.base, self.source_id);
+        let line = line_at(self.source, site.lo);
+        let left = self.lower_expr((*value.left).clone())?;
+        let right = self.lower_expr((*value.right).clone())?;
+        let left_slot = self.alloc_hidden_local(value.span)?;
+        let right_slot = self.alloc_hidden_local(value.span)?;
+        let ordering = if strict {
+            Expr::Lt(
+                Box::new(Expr::Var(left_slot)),
+                Box::new(Expr::Var(right_slot)),
+            )
+        } else {
+            Expr::Gt(
+                Box::new(Expr::Var(left_slot)),
+                Box::new(Expr::Var(right_slot)),
+            )
+        };
+        let equality =
+            Self::lower_numeric_strict_equality(Expr::Var(left_slot), Expr::Var(right_slot));
+        Ok(Some(Expr::Block {
+            stmts: vec![
+                Stmt::Let {
+                    index: left_slot,
+                    declared_schema: left_schema,
+                    expr: left,
+                    line,
+                },
+                Stmt::Let {
+                    index: right_slot,
+                    declared_schema: right_schema,
+                    expr: right,
+                    line,
+                },
+            ],
+            expr: Box::new(Expr::Or(Box::new(ordering), Box::new(equality))),
+        }))
+    }
+
     /// Lowers a guarded relational comparison with an absent-aware numeric
     /// element. A guarded comparison evaluates to false when an integral
     /// index is missing instead of presenting a fabricated element value;
@@ -4973,7 +6115,10 @@ impl<'a> Lowerer<'a> {
     /// the receiver and index each evaluate exactly once. Uses the
     /// existing `Expr::Block` with typed hidden locals; no IR or opcode
     /// changes and no hoisting across short-circuit boundaries.
-    fn lower_update_expr(&mut self, update: ast::UpdateExpr) -> Result<Expr, ParseError> {
+    pub(crate) fn lower_update_expr(
+        &mut self,
+        update: ast::UpdateExpr,
+    ) -> Result<Expr, ParseError> {
         let span = update.span;
         let site = byte_span(span, self.base, self.source_id);
         let line = line_at(self.source, site.lo);
@@ -5124,7 +6269,7 @@ impl<'a> Lowerer<'a> {
 
     /// Runs `body` with expression-statement values bound to hidden
     /// locals (see `stmt_value_depth`).
-    fn with_consumed_stmt_values<T>(
+    pub(crate) fn with_consumed_stmt_values<T>(
         &mut self,
         body: impl FnOnce(&mut Self) -> Result<T, ParseError>,
     ) -> Result<T, ParseError> {
@@ -5159,7 +6304,7 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
-    fn alloc_hidden_local(&mut self, span: swc_common::Span) -> Result<u16, ParseError> {
+    pub(crate) fn alloc_hidden_local(&mut self, span: swc_common::Span) -> Result<u16, ParseError> {
         let slot = self.next_slot;
         self.next_slot = self.next_slot.checked_add(1).ok_or_else(|| {
             unsupported(span, self.base, self.source_id, "function local slot limit")
@@ -5319,6 +6464,33 @@ impl<'a> Lowerer<'a> {
         };
         let property_name = property.sym.to_string();
         let receiver_schema = self.expression_schema(&object);
+        // Generator nominals expose exactly their protocol fields. Any other
+        // field access fails precisely instead of projecting a conflicting
+        // record protocol; ordinary receivers are untouched.
+        if let Some(TypeSchema::Named(nominal, args)) = receiver_schema.clone()
+            && args.is_empty()
+        {
+            if self.gen_iterators.contains_key(&nominal) {
+                if property_name != "next" {
+                    return Err(ParseError::at_span(
+                        byte_span(member_span, self.base, self.source_id),
+                        format!(
+                            "generator iterator has no field '{property_name}'; only next is supported"
+                        ),
+                    ));
+                }
+            } else if self.gen_results.contains_key(&nominal)
+                && property_name != "value"
+                && property_name != "done"
+            {
+                return Err(ParseError::at_span(
+                    byte_span(member_span, self.base, self.source_id),
+                    format!(
+                        "generator result has no field '{property_name}'; only value and done are supported"
+                    ),
+                ));
+            }
+        }
         if property_name == "length" && self.ref_carrier_of(&object) {
             let container = self.lower_expr(*object)?;
             return self.syn_call(
@@ -5412,7 +6584,7 @@ impl<'a> Lowerer<'a> {
         ))
     }
 
-    fn builtin_call(builtin: vm::BuiltinFunction, args: Vec<Expr>) -> Expr {
+    pub(crate) fn builtin_call(builtin: vm::BuiltinFunction, args: Vec<Expr>) -> Expr {
         Expr::Call(builtin.call_index(), Vec::new(), args, None, None)
     }
 
@@ -5500,7 +6672,7 @@ impl<'a> Lowerer<'a> {
         Ok(result)
     }
 
-    fn lower_expr(&mut self, expr: ast::Expr) -> Result<Expr, ParseError> {
+    pub(crate) fn lower_expr(&mut self, expr: ast::Expr) -> Result<Expr, ParseError> {
         match expr {
             ast::Expr::Lit(ast::Lit::Str(value)) => {
                 Ok(Expr::String(value.value.to_string_lossy().into_owned()))
@@ -5580,6 +6752,39 @@ impl<'a> Lowerer<'a> {
                     ast::Callee::Expr(callee) => match *callee {
                         ast::Expr::Ident(ident) => (ident.sym.to_string(), ident.span, false),
                         ast::Expr::Member(member) => {
+                            let member_span = member.span;
+                            // Reference-array generator protocol: `it.next()`
+                            // on a locally known iterator lowers through the
+                            // captured `next` closure with once-only receiver
+                            // evaluation. Any other method shape on an
+                            // iterator or result record fails precisely;
+                            // ordinary receivers keep the historical path.
+                            if let ast::MemberProp::Ident(property) = &member.prop
+                                && property.sym.as_ref() == "next"
+                                && self.generator_iterator_of(&member.obj).is_some()
+                            {
+                                let receiver = member.obj;
+                                let arguments = call.args;
+                                let target_span = call.span;
+                                return self.lower_generator_next_call(
+                                    receiver,
+                                    member_span,
+                                    target_span,
+                                    arguments,
+                                );
+                            }
+                            if self.generator_iterator_of(&member.obj).is_some() {
+                                return Err(ParseError::at_span(
+                                    byte_span(member_span, self.base, self.source_id),
+                                    "generator iterator methods other than next() are not supported".to_owned(),
+                                ));
+                            }
+                            if self.generator_result_of(&member.obj).is_some() {
+                                return Err(ParseError::at_span(
+                                    byte_span(member_span, self.base, self.source_id),
+                                    "generator result methods are not supported".to_owned(),
+                                ));
+                            }
                             let ast::Expr::Ident(object) = *member.obj else {
                                 return Err(unsupported(
                                     member.span,
@@ -5753,11 +6958,11 @@ impl<'a> Lowerer<'a> {
                 // arguments pass through untouched.
                 let ref_carrier_params: Vec<bool> = if self.ref_mode {
                     if let Some((index, _)) = local_function {
-                        self.functions
-                            .iter()
-                            .find(|declaration| declaration.index == index)
-                            .map(|declaration| declaration.arg_schemas.clone())
-                            .unwrap_or_default()
+                        // Lowered declaration once present, else the
+                        // predeclared annotation facts (recursive and forward
+                        // calls convert against the same formals as later
+                        // calls).
+                        self.module_function_arg_schemas(&callee, index)
                     } else if let Some((_, declaration)) = imported_function.as_ref() {
                         declaration.arg_schemas.clone()
                     } else if local_slot.is_some() {
@@ -5785,11 +6990,11 @@ impl<'a> Lowerer<'a> {
                 // Ordinary mode is untouched.
                 let ref_number_params: Vec<bool> = if self.ref_mode && !self.in_ref_prelude {
                     if let Some((index, _)) = local_function {
-                        self.functions
-                            .iter()
-                            .find(|declaration| declaration.index == index)
-                            .map(|declaration| declaration.arg_schemas.clone())
-                            .unwrap_or_default()
+                        // Lowered declaration once present, else the
+                        // predeclared annotation facts, so recursive Int and
+                        // Float flows share one Float inference with later
+                        // calls.
+                        self.module_function_arg_schemas(&callee, index)
                     } else if let Some((_, declaration)) = imported_function.as_ref() {
                         declaration.arg_schemas.clone()
                     } else if let Some(slot) = local_slot {
@@ -5804,12 +7009,9 @@ impl<'a> Lowerer<'a> {
                         match self.const_callable_origins.get(&slot).cloned() {
                             Some(origin) if self.callable_origin_is_current(&origin) => {
                                 match origin {
-                                    ConstCallableOrigin::Local { index, .. } => self
-                                        .functions
-                                        .iter()
-                                        .find(|declaration| declaration.index == index)
-                                        .map(|declaration| declaration.arg_schemas.clone())
-                                        .unwrap_or_default(),
+                                    ConstCallableOrigin::Local { index, name, .. } => {
+                                        self.module_function_arg_schemas(&name, index)
+                                    }
                                     ConstCallableOrigin::Imported { name, .. } => self
                                         .imported_functions
                                         .get(&name)
@@ -6439,6 +7641,24 @@ impl<'a> Lowerer<'a> {
                 }
             }
             ast::Expr::Bin(value) => {
+                // Generator results compare by identity in JavaScript but
+                // lower to structural records here: their equality operations
+                // fail precisely instead of exposing conflicting semantics.
+                // Iterator identity itself is exact and stays available.
+                if matches!(
+                    value.op,
+                    ast::BinaryOp::EqEq
+                        | ast::BinaryOp::NotEq
+                        | ast::BinaryOp::EqEqEq
+                        | ast::BinaryOp::NotEqEq
+                ) && (self.generator_result_of(&value.left).is_some()
+                    || self.generator_result_of(&value.right).is_some())
+                {
+                    return Err(ParseError::at_span(
+                        byte_span(value.span, self.base, self.source_id),
+                        "generator result identity comparison is not supported".to_owned(),
+                    ));
+                }
                 let numeric_strict_equality =
                     matches!(value.op, ast::BinaryOp::EqEqEq | ast::BinaryOp::NotEqEq)
                         && self
@@ -6454,6 +7674,13 @@ impl<'a> Lowerer<'a> {
                     && let Some(guarded) = self.lower_guarded_comparison(&value)?
                 {
                     return Ok(guarded);
+                }
+                // Explicit reference-array mode only: statically proven
+                // numeric `<=`/`>=` without new IR (see helper).
+                if matches!(value.op, ast::BinaryOp::LtEq | ast::BinaryOp::GtEq)
+                    && let Some(lowered) = self.lower_non_strict_comparison(&value)?
+                {
+                    return Ok(lowered);
                 }
                 let left_schema_for_add = self.expression_schema(&value.left);
                 let right_schema_for_add = self.expression_schema(&value.right);
@@ -6492,6 +7719,26 @@ impl<'a> Lowerer<'a> {
                     ast::BinaryOp::Mul => Ok(Expr::Mul(left, right)),
                     ast::BinaryOp::Div => Ok(Expr::Div(left, right)),
                     ast::BinaryOp::Mod => Ok(Expr::Mod(left, right)),
+                    // Explicit reference-array mode only: numeric `**`
+                    // lowers to the existing Core floating power builtin.
+                    // Ordinary mode keeps the historical rejection.
+                    ast::BinaryOp::Exp
+                        if self.ref_mode
+                            && left_schema_for_add
+                                .as_ref()
+                                .is_some_and(Self::is_numeric_schema)
+                            && right_schema_for_add
+                                .as_ref()
+                                .is_some_and(Self::is_numeric_schema) =>
+                    {
+                        Ok(Expr::Call(
+                            vm::BuiltinFunction::MathPowF.call_index(),
+                            Vec::new(),
+                            vec![*left, *right],
+                            None,
+                            None,
+                        ))
+                    }
                     ast::BinaryOp::EqEq | ast::BinaryOp::EqEqEq => Ok(Expr::Eq(left, right)),
                     ast::BinaryOp::NotEq | ast::BinaryOp::NotEqEq => {
                         Ok(Expr::Not(Box::new(Expr::Eq(left, right))))
@@ -6517,7 +7764,7 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    fn lower_type(&self, ty: &ast::TsType) -> Result<TypeSchema, ParseError> {
+    pub(crate) fn lower_type(&self, ty: &ast::TsType) -> Result<TypeSchema, ParseError> {
         match ty {
             ast::TsType::TsKeywordType(keyword) => match keyword.kind {
                 ast::TsKeywordTypeKind::TsStringKeyword => Ok(TypeSchema::String),
@@ -6964,6 +8211,7 @@ fn lower_impl_merged(
         function_indices: HashMap::new(),
         function_parameters: HashMap::new(),
         generic_function_indices: HashSet::new(),
+        predeclared_signatures: HashMap::new(),
         functions: host_imports.functions,
         function_impls: HashMap::new(),
         function_sites: Vec::new(),
@@ -6973,6 +8221,10 @@ fn lower_impl_merged(
         local_decls: Vec::new(),
         local_refs: Vec::new(),
         stmt_spans: Vec::new(),
+        gen_iterators: HashMap::new(),
+        gen_results: HashMap::new(),
+        module_const_inits: HashMap::new(),
+        in_gen_body: false,
     }
     .lower(module)
 }
