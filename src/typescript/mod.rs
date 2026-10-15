@@ -121,7 +121,7 @@ impl SourcePlugin for TypeScriptReferenceArrayPlugin {
         _path: &Path,
         context: &SourceFrontendContext<'_>,
     ) -> Result<Vec<vm::ModuleImport>, SourcePathError> {
-        parser::parse_imports_for_plugin(source, context)
+        parser::parse_reference_array_imports_for_plugin(source, context)
     }
 
     fn strip_import_directives(&self, source: &str) -> String {

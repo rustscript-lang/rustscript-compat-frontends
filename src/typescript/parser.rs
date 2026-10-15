@@ -1205,6 +1205,41 @@ struct ClosureCaptureContext {
     capture_copies: Vec<(u16, u16)>,
 }
 
+#[derive(Clone)]
+enum ConstCallableOrigin {
+    Local {
+        name: String,
+        index: u16,
+        arity: u8,
+    },
+    Imported {
+        name: String,
+        symbol: vm::SymbolId,
+        arity: u8,
+    },
+}
+
+impl ConstCallableOrigin {
+    fn name(&self) -> &str {
+        match self {
+            Self::Local { name, .. } | Self::Imported { name, .. } => name,
+        }
+    }
+
+    fn arity(&self) -> u8 {
+        match self {
+            Self::Local { arity, .. } | Self::Imported { arity, .. } => *arity,
+        }
+    }
+
+    fn reference(&self) -> Expr {
+        match self {
+            Self::Local { index, .. } => Expr::FunctionRef(*index, Vec::new()),
+            Self::Imported { symbol, .. } => Expr::ModuleFunctionRef(*symbol, Vec::new()),
+        }
+    }
+}
+
 struct Lowerer<'a> {
     source: &'a str,
     source_id: u32,
@@ -1237,6 +1272,9 @@ struct Lowerer<'a> {
     locals: HashMap<String, u16>,
     local_types: HashMap<String, TypeSchema>,
     mutable_locals: HashSet<u16>,
+    // Source slots are globally unique before Core compaction. Only immutable
+    // guest bindings acquire facts; runtime identity is checked before routing.
+    const_callable_origins: HashMap<u16, ConstCallableOrigin>,
     closure_captures: Vec<ClosureCaptureContext>,
     imported_functions: HashMap<String, (vm::SymbolId, FunctionDecl)>,
     host_function_indices: HashMap<String, HashMap<u8, u16>>,
@@ -1267,6 +1305,67 @@ struct Lowerer<'a> {
 }
 
 impl<'a> Lowerer<'a> {
+    fn callable_origin_is_current(&self, origin: &ConstCallableOrigin) -> bool {
+        match origin {
+            ConstCallableOrigin::Local { name, index, arity } => {
+                self.function_indices.get(name) == Some(&(*index, *arity))
+            }
+            ConstCallableOrigin::Imported {
+                name,
+                symbol,
+                arity,
+            } => self
+                .imported_functions
+                .get(name)
+                .is_some_and(|(actual, decl)| actual == symbol && decl.arity == *arity),
+        }
+    }
+
+    fn immutable_guest_callable_origin(
+        &self,
+        expression: &ast::Expr,
+    ) -> Option<ConstCallableOrigin> {
+        if !self.ref_mode || self.in_ref_prelude {
+            return None;
+        }
+        let ident = match expression {
+            ast::Expr::Ident(ident) => ident,
+            ast::Expr::Paren(paren) => return self.immutable_guest_callable_origin(&paren.expr),
+            _ => return None,
+        };
+        let name = ident.sym.to_string();
+        if let Some(slot) = self.locals.get(&name) {
+            if self.mutable_locals.contains(slot) {
+                return None;
+            }
+            return self
+                .const_callable_origins
+                .get(slot)
+                .filter(|origin| self.callable_origin_is_current(origin))
+                .cloned();
+        }
+        // Private protocol functions and host values must never obtain guest
+        // argument/default adaptations through a value alias.
+        if name.starts_with("__compat_") || self.host_function_indices.contains_key(&name) {
+            return None;
+        }
+        if let Some(&(index, arity)) = self.function_indices.get(&name) {
+            return (!self.generic_function_indices.contains(&index))
+                .then_some(ConstCallableOrigin::Local { name, index, arity });
+        }
+        self.imported_functions
+            .get(&name)
+            .and_then(|(symbol, decl)| {
+                decl.type_params
+                    .is_empty()
+                    .then_some(ConstCallableOrigin::Imported {
+                        name: name.clone(),
+                        symbol: *symbol,
+                        arity: decl.arity,
+                    })
+            })
+    }
+
     fn alloc_node_id(&mut self) -> SemanticNodeId {
         let id = SemanticNodeId(self.next_node_id);
         self.next_node_id = self
@@ -2258,11 +2357,12 @@ impl<'a> Lowerer<'a> {
     /// arity and each accepted supplied arity; getters return carriers.
     /// Hygienic collisions fail precisely as duplicates.
     fn generate_default_callables(&mut self, output: &mut Vec<Stmt>) -> Result<(), ParseError> {
-        // Generate for both modes so synthetic getter/carrier imports always
-        // resolve; call-site use of the getter path stays ref_mode-gated to
-        // keep ordinary mode unchanged. Plain schemas stay plain (ref_map is
-        // itself ref_mode-gated), numeric default projection inside thunks is
-        // also ref_mode-gated.
+        // The producer and import scanner must use the same explicit mode.
+        // Plain compilation must not inspect unused default initializers or
+        // materialize new callable identities for exported functions.
+        if !self.ref_mode {
+            return Ok(());
+        }
         // Snapshot candidates to avoid borrowing issues. Only top-level user
         // functions with defaults (non-generic, non-synthetic, non-prelude).
         // Prelude helpers use `__compat_ref_` and have no defaults; our own
@@ -3117,6 +3217,9 @@ impl<'a> Lowerer<'a> {
                 }
             }
             let local_type = declared_schema.clone().or(inferred_schema.clone());
+            let callable_origin = (!mutable)
+                .then(|| self.immutable_guest_callable_origin(&init))
+                .flatten();
             // Reference-array mode: a user-region logical `number[]`
             // binding takes the physical carrier, and a plain staging
             // array initializer converts through the owning factory. An
@@ -3181,6 +3284,9 @@ impl<'a> Lowerer<'a> {
             };
             self.own_closure_local(slot);
             self.locals.insert(name.clone(), slot);
+            if let Some(origin) = callable_origin {
+                self.const_callable_origins.insert(slot, origin);
+            }
             if let Some(schema) = &local_type {
                 self.local_types.insert(name.clone(), schema.clone());
             }
@@ -3952,6 +4058,9 @@ impl<'a> Lowerer<'a> {
             context.captures.insert(slot, capture_slot);
             context.capture_copies.push((slot, capture_slot));
             context.local_slots.insert(capture_slot);
+            if let Some(origin) = self.const_callable_origins.get(&slot).cloned() {
+                self.const_callable_origins.insert(capture_slot, origin);
+            }
             if self.mutable_locals.contains(&slot) {
                 self.mutable_locals.insert(capture_slot);
             }
@@ -4256,7 +4365,35 @@ impl<'a> Lowerer<'a> {
             ast::Expr::Lit(ast::Lit::Str(_)) => Some(TypeSchema::String),
             ast::Expr::Lit(ast::Lit::Bool(_)) => Some(TypeSchema::Bool),
             ast::Expr::Lit(ast::Lit::Null(_)) => Some(TypeSchema::Null),
-            ast::Expr::Ident(ident) => self.local_types.get(ident.sym.as_ref()).cloned(),
+            ast::Expr::Ident(ident) => {
+                let name = ident.sym.as_ref();
+                if let Some(schema) = self.local_types.get(name) {
+                    return Some(schema.clone());
+                }
+                if !self.ref_mode
+                    || self.in_ref_prelude
+                    || self.locals.contains_key(name)
+                    || self.host_function_indices.contains_key(name)
+                {
+                    return None;
+                }
+                let declaration = if let Some((index, _)) = self.function_indices.get(name) {
+                    self.functions.iter().find(|decl| decl.index == *index)
+                } else {
+                    self.imported_functions.get(name).map(|(_, decl)| decl)
+                }?;
+                if !declaration.type_params.is_empty() {
+                    return None;
+                }
+                Some(TypeSchema::Callable {
+                    params: declaration
+                        .arg_schemas
+                        .iter()
+                        .cloned()
+                        .collect::<Option<Vec<_>>>()?,
+                    result: Box::new(declaration.return_schema.clone()?),
+                })
+            }
             ast::Expr::Array(array) => {
                 // Reference-array mode only: infer a staging array so
                 // `number[]` bindings convert through the factory. Plain
@@ -4365,12 +4502,29 @@ impl<'a> Lowerer<'a> {
                         return None;
                     }
                     let annotation = binding.type_ann.as_ref()?;
-                    params.push(self.lower_type(&annotation.type_ann).ok()?);
+                    params.push(self.ref_map_number_array(
+                        self.lower_type(&annotation.type_ann).ok()?,
+                        binding.id.span,
+                    ));
                 }
-                let return_type = arrow.return_type.as_ref()?;
+                let result = if let Some(return_type) = arrow.return_type.as_ref() {
+                    self.ref_map_number_array(
+                        self.lower_type(&return_type.type_ann).ok()?,
+                        arrow.span,
+                    )
+                } else if self.ref_mode && !self.in_ref_prelude && arrow.params.is_empty() {
+                    // No parameter bindings can shadow the current lexical
+                    // environment: an expression body has its actual schema.
+                    match arrow.body.as_ref() {
+                        ast::ArrowFunctionBody::Expr(body) => self.expression_schema(body)?,
+                        _ => return None,
+                    }
+                } else {
+                    return None;
+                };
                 Some(TypeSchema::Callable {
                     params,
-                    result: Box::new(self.lower_type(&return_type.type_ann).ok()?),
+                    result: Box::new(result),
                 })
             }
             ast::Expr::Member(member) => {
@@ -5475,11 +5629,38 @@ impl<'a> Lowerer<'a> {
                         ));
                     }
                 };
-                let local_slot = if is_namespace_call {
+                let source_local_slot = if is_namespace_call {
                     None
                 } else {
                     self.locals.get(&callee).copied()
                 };
+                let source_callee = callee.clone();
+                let alias_origin = source_local_slot
+                    .and_then(|slot| self.const_callable_origins.get(&slot))
+                    .filter(|origin| {
+                        self.ref_mode
+                            && !self.in_ref_prelude
+                            && call.args.len() < usize::from(origin.arity())
+                            && self.callable_origin_is_current(origin)
+                    })
+                    .cloned();
+                let alias_slot = if alias_origin.is_some() {
+                    Some(self.capture_slot(
+                        source_local_slot.expect("alias origin has a source slot"),
+                        &source_callee,
+                        callee_span,
+                    )?)
+                } else {
+                    None
+                };
+                let local_slot = if alias_origin.is_some() {
+                    None
+                } else {
+                    source_local_slot
+                };
+                let callee = alias_origin
+                    .as_ref()
+                    .map_or(callee, |origin| origin.name().to_owned());
                 // Reference-array mode resolves `Math.random()` through the
                 // prelude randomness helper. Plain mode keeps the historical
                 // rejection: no new global is introduced there.
@@ -5488,14 +5669,21 @@ impl<'a> Lowerer<'a> {
                 } else {
                     callee
                 };
-                let local_function = local_slot
-                    .is_none()
-                    .then(|| self.function_indices.get(&callee).copied())
-                    .flatten();
-                let imported_function = local_slot
-                    .is_none()
-                    .then(|| self.imported_functions.get(&callee).cloned())
-                    .flatten();
+                let local_function = match alias_origin.as_ref() {
+                    Some(ConstCallableOrigin::Local { index, arity, .. }) => Some((*index, *arity)),
+                    Some(ConstCallableOrigin::Imported { .. }) => None,
+                    None => local_slot
+                        .is_none()
+                        .then(|| self.function_indices.get(&callee).copied())
+                        .flatten(),
+                };
+                let imported_function = match alias_origin.as_ref() {
+                    Some(ConstCallableOrigin::Local { .. }) => None,
+                    _ => local_slot
+                        .is_none()
+                        .then(|| self.imported_functions.get(&callee).cloned())
+                        .flatten(),
+                };
                 let call_arity = u8::try_from(call.args.len()).ok();
                 if call_arity.is_none() {
                     return Err(ParseError::at_span(
@@ -5604,10 +5792,30 @@ impl<'a> Lowerer<'a> {
                             .unwrap_or_default()
                     } else if let Some((_, declaration)) = imported_function.as_ref() {
                         declaration.arg_schemas.clone()
-                    } else if local_slot.is_some() {
-                        match self.local_types.get(&callee).cloned() {
-                            Some(TypeSchema::Callable { params, .. }) => {
-                                params.into_iter().map(Some).collect()
+                    } else if let Some(slot) = local_slot {
+                        // A bare local Callable(Number) schema alone proves no
+                        // guest provenance: the slot can hold a host function
+                        // value with a compatible typed annotation. Only a
+                        // current immutable guest origin keeps the numeric
+                        // computational-domain projection; otherwise the
+                        // physical Number ABI passes through untouched so
+                        // typed host aliases observe Int vs Float exactly
+                        // like direct host calls.
+                        match self.const_callable_origins.get(&slot).cloned() {
+                            Some(origin) if self.callable_origin_is_current(&origin) => {
+                                match origin {
+                                    ConstCallableOrigin::Local { index, .. } => self
+                                        .functions
+                                        .iter()
+                                        .find(|declaration| declaration.index == index)
+                                        .map(|declaration| declaration.arg_schemas.clone())
+                                        .unwrap_or_default(),
+                                    ConstCallableOrigin::Imported { name, .. } => self
+                                        .imported_functions
+                                        .get(&name)
+                                        .map(|(_, declaration)| declaration.arg_schemas.clone())
+                                        .unwrap_or_default(),
+                                }
                             }
                             _ => Vec::new(),
                         }
@@ -5772,95 +5980,177 @@ impl<'a> Lowerer<'a> {
                         "generic host function type arguments",
                     ));
                 }
-                let args = call
-                    .args
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, argument)| {
-                        let argument_span = argument.span();
-                        if argument.spread.is_some() {
-                            return Err(unsupported(
-                                argument_span,
-                                self.base,
-                                self.source_id,
-                                "spread call argument",
-                            ));
-                        }
-                        let needs_factory = ref_carrier_params.get(index).copied().unwrap_or(false)
-                            && (matches!(&*argument.expr, ast::Expr::Array(_))
-                                || self
-                                    .expression_schema(&argument.expr)
-                                    .is_some_and(|schema| {
-                                        super::array_lowering::is_logical_number_array(schema)
-                                    }));
-                        // Numeric projection predicate is computed before
-                        // lowering (statically justified from the guest AST);
-                        // the wrap itself applies after lowering so the
-                        // argument still evaluates exactly once, in order.
-                        let needs_number_projection = !needs_factory
-                            && ref_number_params.get(index).copied().unwrap_or(false)
-                            && self
+                let guarded_alias = alias_origin.is_some();
+                let mut alias_number_flags: Vec<bool> = Vec::new();
+                let mut lowered_args: Vec<Expr> = Vec::new();
+                for (index, argument) in call.args.into_iter().enumerate() {
+                    let argument_span = argument.span();
+                    if argument.spread.is_some() {
+                        return Err(unsupported(
+                            argument_span,
+                            self.base,
+                            self.source_id,
+                            "spread call argument",
+                        ));
+                    }
+                    let needs_factory = ref_carrier_params.get(index).copied().unwrap_or(false)
+                        && (matches!(&*argument.expr, ast::Expr::Array(_))
+                            || self
                                 .expression_schema(&argument.expr)
-                                .as_ref()
-                                .is_some_and(Self::is_numeric_schema);
-                        let expression = self.lower_expr(*argument.expr)?;
-                        // Reference-array call boundary conversion: a plain
-                        // staging array (including an empty literal) becomes
-                        // an owned carrier wherever the callee parameter is
-                        // physically the carrier.
-                        let expression = if needs_factory {
-                            self.syn_call(
-                                super::array_lowering::HELPER_MAKE,
-                                vec![expression],
-                                argument_span,
-                            )?
-                        } else {
-                            expression
-                        };
+                                .is_some_and(|schema| {
+                                    super::array_lowering::is_logical_number_array(schema)
+                                }));
+                    // Numeric projection predicate is computed before
+                    // lowering (statically justified from the guest AST);
+                    // the wrap itself applies after lowering so the
+                    // argument still evaluates exactly once, in order.
+                    let needs_number_projection = !needs_factory
+                        && ref_number_params.get(index).copied().unwrap_or(false)
+                        && self
+                            .expression_schema(&argument.expr)
+                            .as_ref()
+                            .is_some_and(Self::is_numeric_schema);
+                    let expression = self.lower_expr(*argument.expr)?;
+                    // Reference-array call boundary conversion: a plain
+                    // staging array (including an empty literal) becomes
+                    // an owned carrier wherever the callee parameter is
+                    // physically the carrier. Carriers stay guest-physical
+                    // and apply before staging (existing behavior); only
+                    // the numeric domain projection is deferred for guarded
+                    // aliases so a host fallback observes the original
+                    // physical Number variant.
+                    let expression = if needs_factory {
+                        self.syn_call(
+                            super::array_lowering::HELPER_MAKE,
+                            vec![expression],
+                            argument_span,
+                        )?
+                    } else {
+                        expression
+                    };
+                    // Guarded aliases stage the once-evaluated (possibly
+                    // carrier-converted) value; the guest numeric projection
+                    // applies only to the taken guest branch below, so an
+                    // actual-value fallback after a public slot replacement
+                    // observes the original Number ABI.
+                    let expression = if guarded_alias {
+                        alias_number_flags.push(needs_number_projection);
+                        expression
+                    } else {
                         // Numeric computational-domain projection: a declared
                         // `number` formal with a statically numeric actual
                         // runs through the existing floating coercion so Int
                         // and Float call sites share one Float inference.
-                        let expression = if needs_number_projection {
+                        if needs_number_projection {
                             Self::project_numeric_call_arg(expression)
                         } else {
                             expression
-                        };
-                        match host_passings.get(index) {
-                            Some(vm::HostParamPassing::Borrow) => match expression {
-                                variable @ Expr::Var(_) => Ok(Expr::Borrow(Box::new(variable))),
-                                Expr::Borrow(inner) if matches!(inner.as_ref(), Expr::Var(_)) => {
-                                    Ok(Expr::Borrow(inner))
-                                }
-                                _ => Err(unsupported(
+                        }
+                    };
+                    let expression: Expr = match host_passings.get(index) {
+                        Some(vm::HostParamPassing::Borrow) => match expression {
+                            variable @ Expr::Var(_) => Expr::Borrow(Box::new(variable)),
+                            Expr::Borrow(inner) if matches!(inner.as_ref(), Expr::Var(_)) => {
+                                Expr::Borrow(inner)
+                            }
+                            _ => {
+                                return Err(unsupported(
                                     argument_span,
                                     self.base,
                                     self.source_id,
                                     "borrowed host argument must be a local binding",
-                                )),
-                            },
-                            Some(vm::HostParamPassing::BorrowMut) => match expression {
-                                variable @ Expr::Var(_) => Ok(Expr::BorrowMut(Box::new(variable))),
-                                Expr::Borrow(inner) if matches!(inner.as_ref(), Expr::Var(_)) => {
-                                    Ok(Expr::BorrowMut(inner))
-                                }
-                                _ => Err(unsupported(
+                                ));
+                            }
+                        },
+                        Some(vm::HostParamPassing::BorrowMut) => match expression {
+                            variable @ Expr::Var(_) => Expr::BorrowMut(Box::new(variable)),
+                            Expr::Borrow(inner) if matches!(inner.as_ref(), Expr::Var(_)) => {
+                                Expr::BorrowMut(inner)
+                            }
+                            _ => {
+                                return Err(unsupported(
                                     argument_span,
                                     self.base,
                                     self.source_id,
                                     "mutable-borrow host argument must be a local binding",
-                                )),
-                            },
-                            Some(vm::HostParamPassing::TakeOwned) => match expression {
-                                Expr::Borrow(inner) if matches!(inner.as_ref(), Expr::Var(_)) => {
-                                    Ok(*inner)
-                                }
-                                other => Ok(other),
-                            },
-                            _ => Ok(expression),
+                                ));
+                            }
+                        },
+                        Some(vm::HostParamPassing::TakeOwned) => match expression {
+                            Expr::Borrow(inner) if matches!(inner.as_ref(), Expr::Var(_)) => *inner,
+                            other => other,
+                        },
+                        _ => expression,
+                    };
+                    lowered_args.push(expression);
+                }
+                let args = lowered_args;
+                // Stage the actual callee first, then each provided argument,
+                // before selecting a default adapter. Neither branch duplicates
+                // guest evaluation or relies on a stale physical slot value.
+                let mut alias_statements = Vec::new();
+                let (args, alias_fallback, alias_condition) =
+                    if let (Some(origin), Some(slot)) = (alias_origin.as_ref(), alias_slot) {
+                        let line = line_at(self.source, call_span.lo);
+                        let snapshot = self.alloc_hidden_local(call.span)?;
+                        // The snapshot holds the actual runtime callable for the
+                        // identity guard and fallback. It must stay
+                        // schema-free so the fallback's original physical
+                        // arguments are not statically forced through the
+                        // guest numeric projection; the guest branch below
+                        // carries its own converted types.
+                        alias_statements.push(Stmt::Let {
+                            index: snapshot,
+                            declared_schema: None,
+                            expr: Expr::Var(slot),
+                            line,
+                        });
+                        let mut staged = Vec::with_capacity(args.len());
+                        for argument in args {
+                            let temporary = self.alloc_hidden_local(call.span)?;
+                            alias_statements.push(Stmt::Let {
+                                index: temporary,
+                                declared_schema: None,
+                                expr: argument,
+                                line,
+                            });
+                            staged.push(Expr::Var(temporary));
                         }
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
+                        // Guest numeric projection applies to the staged
+                        // temporaries only, preserving single evaluation and
+                        // left-to-right order while keeping the fallback's
+                        // original physical Number arguments intact. Carriers
+                        // were already converted before staging.
+                        let mut then_args = Vec::with_capacity(staged.len());
+                        for (position, staged_var) in staged.iter().enumerate() {
+                            let mut converted = staged_var.clone();
+                            if alias_number_flags.get(position).copied().unwrap_or(false) {
+                                converted = Self::project_numeric_call_arg(converted);
+                            }
+                            then_args.push(converted);
+                        }
+                        let fallback_id = self.alloc_node_id();
+                        self.call_sites.push(ParsedCallSite {
+                            id: fallback_id,
+                            callee_span: byte_span(callee_span, self.base, self.source_id),
+                            expr_span: call_span,
+                            target: ParsedCallTarget::Local(snapshot),
+                            name: source_callee.clone(),
+                            scope_id: self.scope_id,
+                            is_namespace_call: false,
+                        });
+                        let fallback = Expr::LocalCall(
+                            snapshot,
+                            explicit_type_args.clone(),
+                            staged.clone(),
+                            Some(fallback_id),
+                        );
+                        let condition =
+                            Expr::Eq(Box::new(Expr::Var(snapshot)), Box::new(origin.reference()));
+                        (then_args, Some(fallback), Some(condition))
+                    } else {
+                        (args, None, None)
+                    };
                 let id = self.alloc_node_id();
                 let (target, expression) = if let Some(slot) = local_slot {
                     (
@@ -6100,11 +6390,25 @@ impl<'a> Lowerer<'a> {
                     callee_span: byte_span(callee_span, self.base, self.source_id),
                     expr_span: call_span,
                     target,
-                    name: callee,
+                    name: if alias_origin.is_some() {
+                        source_callee
+                    } else {
+                        callee
+                    },
                     scope_id: self.scope_id,
                     is_namespace_call,
                 });
-                Ok(expression)
+                match (alias_condition, alias_fallback) {
+                    (Some(condition), Some(fallback)) => Ok(Expr::Block {
+                        stmts: alias_statements,
+                        expr: Box::new(Expr::IfElse {
+                            condition: Box::new(condition),
+                            then_expr: Box::new(expression),
+                            else_expr: Box::new(fallback),
+                        }),
+                    }),
+                    _ => Ok(expression),
+                }
             }
             ast::Expr::Cond(conditional) => Ok(Expr::IfElse {
                 condition: Box::new(self.lower_expr(*conditional.test)?),
@@ -6641,6 +6945,7 @@ fn lower_impl_merged(
         locals: HashMap::new(),
         local_types: HashMap::new(),
         mutable_locals: HashSet::new(),
+        const_callable_origins: HashMap::new(),
         closure_captures: Vec::new(),
         imported_functions,
         host_function_indices: host_imports.by_local_name,
@@ -6762,6 +7067,14 @@ pub(crate) fn module_imports(
     source: &str,
     source_id: u32,
 ) -> Result<Vec<vm::ModuleImport>, ParseError> {
+    module_imports_with_reference_defaults(source, source_id, false)
+}
+
+fn module_imports_with_reference_defaults(
+    source: &str,
+    source_id: u32,
+    reference_defaults: bool,
+) -> Result<Vec<vm::ModuleImport>, ParseError> {
     let parsed = parse_module(source)?;
     let mut imports = Vec::new();
     for item in parsed.module.body {
@@ -6827,14 +7140,15 @@ pub(crate) fn module_imports(
         // derivation; existence is verified via actual imports at lowering
         // (no broad prefix authority, no filename reading). Skips synthetic
         // themselves to avoid recursion. Generated getters/carriers exist for
-        // all user functions (both modes) so these always resolve; call-site
-        // use stays ref_mode-gated to keep ordinary mode unchanged.
+        // exported user functions in reference mode. Plain imports retain
+        // their original clauses without private metadata dependencies.
         // Only for file imports (user modules with defaults); host imports
         // (arrays, proof, compat_math, etc.) never have defaults and must not
         // gain synthetic requests (would fail resolution + broaden authority).
         // Also only for TypeScript file imports (.ts/.mts); RSS/Lua/etc.
         // modules never have default carriers (would fail with missing type).
-        if !is_host_import_spec(&source_name)
+        if reference_defaults
+            && !is_host_import_spec(&source_name)
             && (source_name.ends_with(".ts") || source_name.ends_with(".mts"))
         {
             for (imported, local) in value_pairs {
@@ -6870,5 +7184,13 @@ pub(crate) fn parse_imports_for_plugin(
     context: &SourceFrontendContext<'_>,
 ) -> Result<Vec<vm::ModuleImport>, vm::SourcePathError> {
     module_imports(source, context.source_id)
+        .map_err(|error| vm::SourcePathError::Source(vm::SourceError::Parse(error)))
+}
+
+pub(crate) fn parse_reference_array_imports_for_plugin(
+    source: &str,
+    context: &SourceFrontendContext<'_>,
+) -> Result<Vec<vm::ModuleImport>, vm::SourcePathError> {
+    module_imports_with_reference_defaults(source, context.source_id, true)
         .map_err(|error| vm::SourcePathError::Source(vm::SourceError::Parse(error)))
 }

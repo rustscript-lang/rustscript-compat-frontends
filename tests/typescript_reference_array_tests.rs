@@ -1480,3 +1480,482 @@ fn b2_normal_mode_omitted_import_still_rejects() {
         "plain should keep historical arity error, got: {err}"
     );
 }
+
+#[test]
+fn b2r3_value_alias_omitted_call_sorts() {
+    let (_project, main) = wrapper_project(
+        "quick_sort.ts",
+        QUICK_SORT_FIXTURE.as_bytes(),
+        "import { QuickSort as sort } from \"./quick_sort.ts\";\nconst alias = sort;\nconst data = [3, 1, 2];\nconst sorted = alias(data);\nconst eq = sorted === data && data[0] === 1 && data[2] === 3;\neq ? 1 : 0;\n",
+    );
+    let (mut machine, _) = ref_file_vm(&main, default_limits(), false);
+    machine.set_fuel(1_000_000);
+    assert_eq!(run_value(&mut machine), Value::Int(1));
+}
+
+#[test]
+fn b2r3_lexical_value_default_remains_unsupported_boundary() {
+    // Honest boundary control (was desired-success `b2r3_local_default_reads_lexical_value`).
+    // Desired source: `let base: number = 10; function f(a: number = base): number { return a; } f();`
+    // expected 10. Actual on 6641 and current source, both modes: compile rejects
+    // `unresolved TypeScript value 'base'` (see runtime-supplement.md and
+    // b2r3-current-boundary-observations-02 receipts). Ambient lexical-value
+    // defaults are a pre-existing unsupported boundary, not a new regression;
+    // this control pins the current rejection instead of claiming the semantics.
+    let source = "let base: number = 10;\nfunction f(a: number = base): number { return a; }\nconst result = f();\nresult === 10 ? 1 : 0;\n";
+    let catalog = ref_catalog();
+    let result = vm::compile_source_with_flavor_and_options_with_capture_certification(
+        source,
+        pd_vm_compat_frontends::typescript_flavor(),
+        ref_options(&catalog),
+    );
+    let err = format!(
+        "{:?}",
+        result
+            .err()
+            .expect("lexical-value default must still reject")
+    );
+    assert!(
+        err.contains("unresolved TypeScript value 'base'"),
+        "lexical default boundary must report unresolved base, got: {err}"
+    );
+}
+
+#[test]
+fn b2r3_extensionless_import_remains_resolver_boundary() {
+    // Honest boundary control (was desired-success `b2r3_extensionless_omitted_import_sorts`).
+    // Desired source imported `./quick_sort` (no extension) and expected a sorted
+    // in-place result. Actual on 6641 and current source, both modes: file
+    // resolution fails Io NotFound before default transport (see
+    // runtime-supplement.md and b2r3-current-boundary-observations-02; scalar
+    // `./add` full-arity control fails identically). Extensionless resolution
+    // is a pre-existing loader boundary; this control pins the rejection.
+    let (_project, main) = wrapper_project(
+        "quick_sort.ts",
+        QUICK_SORT_FIXTURE.as_bytes(),
+        "import { QuickSort as sort } from \"./quick_sort\";\nconst data = [3, 1, 2];\nconst sorted = sort(data);\nconst eq = sorted === data && data[0] === 1 && data[2] === 3;\neq ? 1 : 0;\n",
+    );
+    let catalog = ref_catalog();
+    let result = vm::compile_source_file_with_capture_certification_and_options(
+        &main,
+        ref_options(&catalog),
+    );
+    let err = format!(
+        "{:?}",
+        result
+            .err()
+            .expect("extensionless import must still reject")
+    );
+    assert!(
+        err.contains("NotFound") || err.contains("No such file"),
+        "extensionless boundary must report resolver NotFound, got: {err}"
+    );
+}
+
+#[test]
+fn b2r3_observe_supported_import_and_lexical_boundaries() {
+    // Observation harness only. Its pass status does not establish that any
+    // desired guest case succeeded; inspect each recorded compile/run result.
+    let cases = [
+        (
+            "scalar_export",
+            "counter.ts",
+            "export const count: number = 5;\n",
+            "import { count } from \"./counter.ts\";\ncount;\n",
+        ),
+        (
+            "extensionless_full_arity",
+            "add.ts",
+            "export function add(a: number, b: number = 0): number { return a + b; }\n",
+            "import { add as sum } from \"./add\";\nsum(3, 4);\n",
+        ),
+        (
+            "ordinary_full_argument_unused_capture_default",
+            "unused.ts",
+            "0;\n",
+            "let base: number = 10;\nexport function f(a: number = base): number { return a; }\nf(7);\n",
+        ),
+        (
+            "lexical_local_default",
+            "unused.ts",
+            "0;\n",
+            "let base: number = 10;\nfunction f(a: number = base): number { return a; }\nf();\n",
+        ),
+    ];
+    for (case, file, dependency, source) in cases {
+        let (_project, main) = wrapper_project(file, dependency.as_bytes(), source);
+        for reference_mode in [false, true] {
+            let catalog = ref_catalog();
+            let options = if reference_mode {
+                ref_options(&catalog)
+            } else {
+                pd_vm_compat_frontends::compile_options()
+                    .with_host_api_catalog(Arc::clone(&catalog))
+            };
+            let compilation = match vm::compile_source_file_with_capture_certification_and_options(
+                &main, options,
+            ) {
+                Ok(compilation) => compilation,
+                Err(error) => {
+                    println!(
+                        "B2R3_OBSERVATION case={case} ref={reference_mode} stage=compile error={error:?}"
+                    );
+                    continue;
+                }
+            };
+            let mut machine = compilation
+                .into_vm()
+                .expect("observed source should create VM");
+            if reference_mode {
+                pd_vm_compat_frontends::runtime::array::initialize_typescript_owned_arrays(
+                    &mut machine,
+                    default_limits(),
+                )
+                .expect("observation runtime initialization should succeed");
+            }
+            let mut registry = HostFunctionRegistry::restricted();
+            install_ref_production(&mut registry, &catalog);
+            registry
+                .bind_vm_cached(&mut machine)
+                .expect("observation handlers should bind");
+            machine.set_fuel(1_000_000);
+            match machine.run() {
+                Ok(status) => println!(
+                    "B2R3_OBSERVATION case={case} ref={reference_mode} stage=run status={status:?} value={:?}",
+                    machine.stack().last()
+                ),
+                Err(error) => println!(
+                    "B2R3_OBSERVATION case={case} ref={reference_mode} stage=run error={error:?} ip={} stack_len={} frames={:?}",
+                    machine.ip(),
+                    machine.stack().len(),
+                    machine.execution_frames()
+                ),
+            }
+        }
+    }
+}
+
+#[test]
+fn b2r3_plain_export_full_call_does_not_lower_unused_default() {
+    let source = "let base: number = 10;\nexport function f(a: number = base): number { return a; }\nf(7);\n";
+    let compilation = vm::compile_source_with_flavor_and_options_with_capture_certification(
+        source,
+        pd_vm_compat_frontends::typescript_flavor(),
+        pd_vm_compat_frontends::compile_options(),
+    )
+    .expect("ordinary full-arity call must not compile unused reference-default thunks");
+    let mut machine = compilation
+        .into_vm()
+        .expect("plain source should create VM");
+    machine.set_fuel(1_000_000);
+    assert_eq!(run_value(&mut machine), Value::Int(7));
+}
+
+#[test]
+fn b2r3_const_alias_chain_preserves_argument_order() {
+    let source = "const log = [0];\nfunction tick(c: number[]): number { c[0] = c[0] + 1; return c[0]; }\nfunction f(c: number[], a: number, b: number = tick(c)): number { return a * 10 + b; }\nconst first = f;\nconst second = (first);\nconst result = second(log, tick(log));\nconst eq = result === 12 && log[0] === 2;\neq ? 1 : 0;\n";
+    let (mut machine, _) = ref_vm(source, default_limits(), false);
+    machine.set_fuel(1_000_000);
+    assert_eq!(run_value(&mut machine), Value::Int(1));
+}
+
+#[test]
+fn b2r3_shadowed_alias_uses_its_actual_declaration() {
+    let source = "function f(a: number = 1): number { return a; }\nfunction g(a: number = 2): number { return a; }\nconst alias = f;\nlet inner: number = 0;\n{ const alias = g; inner = alias(); }\nconst result = inner * 10 + alias();\nresult === 21 ? 1 : 0;\n";
+    let (mut machine, _) = ref_vm(source, default_limits(), false);
+    machine.set_fuel(1_000_000);
+    assert_eq!(run_value(&mut machine), Value::Int(1));
+}
+
+#[test]
+fn b2r3_imported_alias_captured_by_nested_closure() {
+    let (_project, main) = wrapper_project(
+        "quick_sort.ts",
+        QUICK_SORT_FIXTURE.as_bytes(),
+        "import { QuickSort as sort } from \"./quick_sort.ts\";\nfunction apply(): number {\nconst alias = sort;\nconst nested = () => alias([3, 1, 2]);\nconst sorted = nested();\nreturn sorted[0];\n}\napply() === 1 ? 1 : 0;\n",
+    );
+    let (mut machine, _) = ref_file_vm(&main, default_limits(), false);
+    machine.set_fuel(1_000_000);
+    assert_eq!(run_value(&mut machine), Value::Int(1));
+}
+
+#[test]
+fn b2r3_imported_value_alias_omitted_call_native() {
+    let (_project, main) = wrapper_project(
+        "quick_sort.ts",
+        QUICK_SORT_FIXTURE.as_bytes(),
+        "import { QuickSort as sort } from \"./quick_sort.ts\";\nconst alias = sort;\nconst data = [3, 1, 2];\nconst sorted = alias(data);\nconst eq = sorted === data && data[0] === 1 && data[2] === 3;\neq ? 1 : 0;\n",
+    );
+    let (mut machine, _) = ref_file_vm(&main, default_limits(), false);
+    eprintln!("B2R3_NATIVE_PHASE source_and_handlers_ready");
+    let native_start = std::time::Instant::now();
+    machine
+        .compile_aot()
+        .expect("value-alias native compilation should succeed");
+    eprintln!(
+        "B2R3_NATIVE_PHASE aot_ready elapsed={:?}",
+        native_start.elapsed()
+    );
+    assert_eq!(machine.aot_exec_count(), 0);
+    assert_eq!(run_value(&mut machine), Value::Int(1));
+    eprintln!(
+        "B2R3_NATIVE_PHASE guest_halted native_count={}",
+        machine.aot_exec_count()
+    );
+    assert!(
+        machine.aot_exec_count() > 1,
+        "alias default call must execute native work"
+    );
+    assert!(machine.dump_aot_info().contains("lowering=ssa"));
+}
+
+mod r3_number_kind_probe {
+    use pd_host_function::pd_host_function;
+    use vm::{HostFunctionDescriptor, HostModuleDescriptor, HostResourceTypeMeta, Value, VmResult};
+
+    fn schema() -> vm::HostFunctionSchema {
+        vm::HostFunctionSchema::with_return(
+            "r3probe::kind",
+            vec![vm::HostParamSchema::value(
+                "value",
+                vm::HostTypeSchema::Number,
+            )],
+            vm::HostTypeSchema::Number,
+        )
+    }
+
+    mod generated {
+        use super::*;
+        #[allow(unused_imports)]
+        pub use vm::{arg, borrow_arg, take_arg};
+        pub mod number_kind_host {
+            use super::*;
+            /// Reports the physical numeric variant supplied by the caller.
+            #[pd_host_function(name = "r3probe::kind", contract = super::super::schema)]
+            fn kind(value: Value) -> VmResult<Value> {
+                match value {
+                    Value::Int(_) => Ok(Value::Int(1)),
+                    Value::Float(_) => Ok(Value::Int(2)),
+                    _ => Err(vm::VmError::HostError(
+                        "expected a numeric argument".to_owned(),
+                    )),
+                }
+            }
+        }
+    }
+
+    pub fn module() -> HostModuleDescriptor {
+        const FUNCTIONS: &[fn() -> HostFunctionDescriptor] =
+            &[generated::number_kind_host::kind_descriptor];
+        const RESOURCES: &[fn() -> HostResourceTypeMeta] = &[];
+        HostModuleDescriptor {
+            name: "r3probe",
+            functions: FUNCTIONS,
+            resources: RESOURCES,
+        }
+    }
+}
+
+#[test]
+fn b2r3_typed_host_value_alias_preserves_number_abi() {
+    let base = ref_catalog();
+    let probe = r3_number_kind_probe::module()
+        .catalog()
+        .expect("probe catalog");
+    let mut builder = vm::HostApiCatalog::builder();
+    for resource in base.resources() {
+        builder.resource(resource.clone());
+    }
+    for function in base.functions().iter().chain(probe.functions()) {
+        builder.function(function.clone());
+    }
+    let catalog = Arc::new(builder.build().expect("composed numeric ABI catalog"));
+    let source = "import { kind } from \"r3probe\";\nconst alias: (x: number) => number = kind;\nconst direct = kind(5);\nconst throughAlias = alias(5);\nconst fraction = alias(5.5);\nconst eq = direct === 1 && throughAlias === 1 && fraction === 2;\neq ? 1 : 0;\n";
+    let compilation = vm::compile_source_with_flavor_and_options_with_capture_certification(
+        source,
+        pd_vm_compat_frontends::typescript_flavor(),
+        ref_options(&catalog),
+    )
+    .expect("typed host function values should compile");
+    let mut machine = compilation.into_vm().expect("certified numeric ABI VM");
+    pd_vm_compat_frontends::runtime::array::initialize_typescript_owned_arrays(
+        &mut machine,
+        default_limits(),
+    )
+    .expect("array scope initialization");
+    let mut registry = HostFunctionRegistry::restricted();
+    install_ref_production(&mut registry, &catalog);
+    r3_number_kind_probe::module()
+        .install_from_catalog(&mut registry, &catalog)
+        .expect("numeric ABI probe should install");
+    registry
+        .bind_vm_cached(&mut machine)
+        .expect("numeric ABI handlers bind");
+    machine.set_fuel(1_000_000);
+    assert_eq!(
+        run_value(&mut machine),
+        Value::Int(1),
+        "typed host value aliases must preserve Int and Float arguments just like direct calls"
+    );
+}
+
+#[test]
+fn b2r3_guarded_alias_fallback_preserves_original_number_abi() {
+    // TDD regression for the guarded-alias fallback: supplied arguments are
+    // evaluated once into temporaries, and a public slot replacement by a
+    // compatible host callable must observe the original physical Number
+    // variant (Int stays Int), not the guest Float projection used only on
+    // the taken guest branch. The guest body returns its parameter without
+    // param-Add so the strict Add-type merge does not conflate this ABI
+    // check with an unrelated call-site uniformity rule; RED on the prior
+    // source was Int(2) vs Int(1) (fallback saw Float).
+    let base = ref_catalog();
+    let probe = r3_number_kind_probe::module()
+        .catalog()
+        .expect("probe catalog");
+    let mut builder = vm::HostApiCatalog::builder();
+    for resource in base.resources() {
+        builder.resource(resource.clone());
+    }
+    for function in base.functions().iter().chain(probe.functions()) {
+        builder.function(function.clone());
+    }
+    let catalog = Arc::new(builder.build().expect("composed fallback ABI catalog"));
+    let source = "import { kind } from \"r3probe\";\nexport function f(a: number, b: number = 1): number { return a; }\nconst alias = f;\nconst hostCopy: (x: number) => number = kind;\nconst direct = kind(5);\ndirect;\nconst result = alias(5);\nresult;\n";
+    let compilation = vm::compile_source_with_flavor_and_options_with_capture_certification(
+        source,
+        pd_vm_compat_frontends::typescript_flavor(),
+        ref_options(&catalog),
+    )
+    .expect("guarded alias fallback probe should compile");
+    let mut machine = compilation.into_vm().expect("certified fallback VM");
+    pd_vm_compat_frontends::runtime::array::initialize_typescript_owned_arrays(
+        &mut machine,
+        default_limits(),
+    )
+    .expect("array scope initialization");
+    let mut registry = HostFunctionRegistry::restricted();
+    install_ref_production(&mut registry, &catalog);
+    r3_number_kind_probe::module()
+        .install_from_catalog(&mut registry, &catalog)
+        .expect("fallback ABI probe should install");
+    registry
+        .bind_vm_cached(&mut machine)
+        .expect("fallback handlers bind");
+    machine
+        .set_fuel_check_interval(1)
+        .expect("single-instruction fuel interval should be supported");
+    let exported_slots: Vec<_> = machine
+        .program()
+        .exported_callables
+        .iter()
+        .map(|item| item.local_slot as usize)
+        .collect();
+    let mut replaced = false;
+    for _ in 0..1000 {
+        machine.set_fuel(1);
+        match machine.run() {
+            Err(vm::VmError::OutOfFuel { .. }) | Ok(VmStatus::Yielded) => {}
+            other => panic!("program finished before guarded alias replacement: {other:?}"),
+        }
+        let Ok(original) = machine.resolve_exported_callable("f") else {
+            continue;
+        };
+        let alias_slot = machine
+            .locals()
+            .iter()
+            .enumerate()
+            .find(|(slot, value)| !exported_slots.contains(slot) && *value == &original)
+            .map(|(slot, _)| slot);
+        let host_value = machine
+            .locals()
+            .iter()
+            .enumerate()
+            .find(|(slot, value)| {
+                !exported_slots.contains(slot)
+                    && *value != &original
+                    && matches!(value, Value::Callable(_))
+            })
+            .map(|(_, value)| value.clone());
+        if let (Some(slot), Some(host)) = (alias_slot, host_value) {
+            machine
+                .set_local(
+                    u8::try_from(slot).expect("fallback alias should fit public slot API"),
+                    host,
+                )
+                .expect("guarded alias replacement should succeed");
+            replaced = true;
+            break;
+        }
+    }
+    assert!(
+        replaced,
+        "must locate initialized guest alias and host copy before the guarded call"
+    );
+    machine.set_fuel(1_000_000);
+    assert_eq!(
+        run_value(&mut machine),
+        Value::Int(1),
+        "guarded alias fallback must receive the original Int argument, not the guest Float projection"
+    );
+}
+
+#[test]
+fn b2r3_public_slot_replacement_does_not_use_stale_defaults() {
+    let source = "export function f(a: number = 1): number { return a; }\nexport function g(a: number = 2): number { return a + 100; }\nconst alias = f;\nalias();\n";
+    let (mut machine, _) = ref_vm(source, default_limits(), false);
+    machine
+        .set_fuel_check_interval(1)
+        .expect("single-instruction fuel interval should be supported");
+    let exported_slots: Vec<_> = machine
+        .program()
+        .exported_callables
+        .iter()
+        .map(|item| item.local_slot as usize)
+        .collect();
+    let mut replaced = false;
+    for _ in 0..1000 {
+        machine.set_fuel(1);
+        match machine.run() {
+            Err(vm::VmError::OutOfFuel { .. }) | Ok(VmStatus::Yielded) => {}
+            other => panic!("program finished before alias replacement: {other:?}"),
+        }
+        if let (Ok(original), Ok(replacement)) = (
+            machine.resolve_exported_callable("f"),
+            machine.resolve_exported_callable("g"),
+        ) {
+            let alias_slot = machine
+                .locals()
+                .iter()
+                .enumerate()
+                .find(|(slot, value)| !exported_slots.contains(slot) && *value == &original)
+                .map(|(slot, _)| slot);
+            if let Some(slot) = alias_slot {
+                machine
+                    .set_local(
+                        u8::try_from(slot).expect("test alias should fit public slot API"),
+                        replacement,
+                    )
+                    .expect("public callable replacement should succeed");
+                replaced = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        replaced,
+        "must locate actual initialized non-export alias before its call"
+    );
+    machine.set_fuel(1_000_000);
+    assert!(
+        matches!(
+            machine.run(),
+            Err(vm::VmError::CallableArityMismatch {
+                expected: 1,
+                got: 0,
+                ..
+            })
+        ),
+        "a replaced callable must retain its actual arity refusal, never use the old f default"
+    );
+}
