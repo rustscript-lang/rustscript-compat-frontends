@@ -32,6 +32,7 @@ mod lowerer;
 mod parser;
 mod representation;
 mod source_map;
+mod string_literal;
 #[cfg(test)]
 mod syntax_tests;
 

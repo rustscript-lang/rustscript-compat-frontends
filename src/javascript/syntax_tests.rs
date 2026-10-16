@@ -8,6 +8,9 @@
 //! `parse error` (raw SWC lexer/parser rejections that agree with ES5).
 
 use super::parser::parse_script;
+use super::string_literal::{
+    StringCodecErrorKind, StringStrictness, decode_string_literal, narrowed_span,
+};
 use vm::ParseError;
 
 const SOURCE_ID: u32 = 7;
@@ -268,17 +271,32 @@ fn legacy_octal_numeric_pair() {
     admitted("3.14; .5; 5.; 1e3; 1E-3;");
 }
 
-/// Legacy octal string escapes: `\0` alone is legal everywhere; real octal
-/// escapes are strict-only errors (the locked lexer fires first once it
-/// tracks strictness, so those refusals stay layer-agnostic).
+/// Legacy octal string escapes: `\0` alone is legal everywhere; every
+/// other legacy octal spelling is a strict-mode early error, and decimal
+/// `8`/`9` plus invalid octal lookaheads have no ES5/Annex-B derivation in
+/// either mode (the locked lexer fires first on strict legacy octals once
+/// it tracks strictness, so those refusals stay layer-agnostic).
 #[test]
 fn legacy_octal_string_escape_pair() {
     admitted("var s = \"\\0\";");
     admitted("\"use strict\"; var s = \"\\0\";");
-    admitted("var s = \"\\8\\9\\01\";");
+    // Genuine Annex-B derivations stay admitted in sloppy code.
+    admitted("var s = \"\\01\";");
+    admitted("var s = \"\\1\";");
+    admitted("var s = \"\\12\";");
+    admitted("var s = \"\\123\";");
+    admitted("var s = \"\\40\";");
+    admitted("var s = \"\\400\";");
+    refused("var s = \"\\8\";");
+    refused("var s = \"\\9\";");
+    refused("var s = \"\\08\";");
+    refused("var s = \"\\09\";");
+    refused("var s = \"\\118\";");
+    refused("var s = \"\\48\";");
     refused("\"use strict\"; var s = \"\\01\";");
     refused("\"use strict\"; var s = \"\\8\";");
     refused("\"use strict\"; var s = \"\\00\";");
+    refused("\"use strict\"; var s = \"\\08\";");
     // Identity and Unicode escapes are valid ES5 in both modes.
     admitted("var s = \"\\a\\q\";");
     admitted("\"use strict\"; var s = \"\\a\\q\";");
@@ -686,4 +704,322 @@ fn audit_seed_fixture_matches_parser_stage() {
     assert_eq!(primary, 91, "frozen primary count");
     assert_eq!(supplemental, 12, "frozen supplemental count");
     assert!(strict_negative_seen);
+}
+
+/// Decode one raw token with the shared codec (test helper).
+fn decode(raw: &str, strict: bool) -> Result<Vec<u16>, super::string_literal::StringCodecError> {
+    decode_string_literal(
+        raw,
+        if strict {
+            StringStrictness::Strict
+        } else {
+            StringStrictness::Sloppy
+        },
+    )
+}
+
+fn decoded_ok(raw: &str, strict: bool) -> Vec<u16> {
+    decode(raw, strict)
+        .unwrap_or_else(|error| panic!("codec must accept {raw:?}: {}", error.message))
+}
+
+fn decoded_err_kind(raw: &str, strict: bool) -> (StringCodecErrorKind, usize, String) {
+    match decode(raw, strict) {
+        Ok(units) => panic!("codec must reject {raw:?}, got {units:?}"),
+        Err(error) => (error.kind, error.relative_offset, error.message),
+    }
+}
+
+/// Direct decoder coverage: ordinary characters, empty literals and the
+/// ES5.1 section 7.8.4 single-escape table (no normalization involved).
+#[test]
+fn codec_plain_characters_and_single_escapes() {
+    assert_eq!(decoded_ok("\"\"", false), Vec::<u16>::new());
+    assert_eq!(decoded_ok("''", true), Vec::<u16>::new());
+    assert_eq!(decoded_ok("\"abc\"", false), vec![0x61, 0x62, 0x63]);
+    assert_eq!(decoded_ok("'abc'", false), vec![0x61, 0x62, 0x63]);
+    // Raw non-BMP scalars encode to surrogate pairs without normalization.
+    assert_eq!(decoded_ok("\"\u{1D11E}\"", false), vec![0xD834, 0xDD1E]);
+    // Table 4, both quote styles.
+    assert_eq!(
+        decoded_ok("\"\\b\\t\\n\\v\\f\\r\"", false),
+        vec![8, 9, 10, 11, 12, 13]
+    );
+    assert_eq!(decoded_ok("\"\\'\\\"\\\\\"", false), vec![0x27, 0x22, 0x5C]);
+    assert_eq!(decoded_ok("'\\'\"\\\\'", false), vec![0x27, 0x22, 0x5C]);
+    // NonEscapeCharacter identity escapes contribute the character itself.
+    assert_eq!(
+        decoded_ok("\"\\a\\q\\/\\$\\-\\_\\ \"", false),
+        vec![0x61, 0x71, 0x2F, 0x24, 0x2D, 0x5F, 0x20]
+    );
+    // Escaped non-ASCII source characters contribute themselves.
+    assert_eq!(decoded_ok("\"\\\u{00E9}\"", false), vec![0xE9]);
+}
+
+/// Decimal `8`/`9` are EscapeCharacters, never NonEscapeCharacters: no
+/// ES5.1 or Annex-B derivation exists, in either mode.
+#[test]
+fn codec_decimal_escapes_rejected_in_both_modes() {
+    for strict in [false, true] {
+        for raw in ["\"\\8\"", "\"\\9\"", "\"a\\8b\""] {
+            let (kind, offset, _) = decoded_err_kind(raw, strict);
+            assert_eq!(kind, StringCodecErrorKind::Lexical, "for {raw:?}");
+            assert_eq!(
+                offset,
+                raw.find('\\').unwrap(),
+                "offset points at the backslash"
+            );
+        }
+    }
+}
+
+/// Normative escape-zero plus the exact Annex B.1.2 octal productions with
+/// their DecimalDigit lookaheads.
+#[test]
+fn codec_nul_and_sloppy_octal_productions() {
+    // Normative `\0` (lookahead is not a DecimalDigit) in both modes.
+    assert_eq!(decoded_ok("\"\\0\"", false), vec![0]);
+    assert_eq!(decoded_ok("\"\\0\"", true), vec![0]);
+    // Sloppy Annex-B derivations with exact values.
+    assert_eq!(decoded_ok("\"\\1\"", false), vec![1]);
+    assert_eq!(decoded_ok("\"\\7\"", false), vec![7]);
+    assert_eq!(decoded_ok("\"\\01\"", false), vec![1]);
+    assert_eq!(decoded_ok("\"\\00\"", false), vec![0]);
+    assert_eq!(decoded_ok("\"\\12\"", false), vec![10]);
+    assert_eq!(decoded_ok("\"\\123\"", false), vec![83]);
+    assert_eq!(decoded_ok("\"\\40\"", false), vec![32]);
+    // `\400` is the two-digit FourToSeven production plus ordinary `0`.
+    assert_eq!(decoded_ok("\"\\400\"", false), vec![32, 48]);
+    assert_eq!(decoded_ok("\"\\70\"", false), vec![56]);
+    assert_eq!(decoded_ok("\"\\000\"", false), vec![0]);
+    // Strict code rejects every legacy octal except normative `\0`.
+    for raw in ["\"\\1\"", "\"\\01\"", "\"\\00\"", "\"\\12\"", "\"\\400\""] {
+        let (kind, _, message) = decoded_err_kind(raw, true);
+        assert_eq!(kind, StringCodecErrorKind::Lexical, "for {raw:?}");
+        assert!(
+            message.contains("strict mode"),
+            "strict octal diagnostic, got: {message}"
+        );
+    }
+    let (kind, _, _) = decoded_err_kind("\"\\08\"", true);
+    assert_eq!(kind, StringCodecErrorKind::Lexical);
+}
+
+/// Forms without a permitted ES5/B.1.2 derivation: `\08`, `\09`, `\118`,
+/// `\48` and friends are rejected, never given modern greedy-octal values.
+#[test]
+fn codec_invalid_octal_lookaheads_rejected() {
+    for raw in [
+        "\"\\08\"",
+        "\"\\09\"",
+        "\"\\118\"",
+        "\"\\48\"",
+        "\"\\78\"",
+        "\"\\079\"",
+    ] {
+        let (kind, offset, _) = decoded_err_kind(raw, false);
+        assert_eq!(kind, StringCodecErrorKind::Lexical, "for {raw:?}");
+        assert_eq!(
+            offset,
+            raw.find('\\').unwrap(),
+            "offset points at the backslash"
+        );
+    }
+}
+
+/// Hex and Unicode escapes consume exactly 2/4 hex digits and emit the u16
+/// directly, preserving lone surrogates; braced escapes are post-ES5.
+#[test]
+fn codec_hex_and_unicode_escapes() {
+    assert_eq!(decoded_ok("\"\\x41\"", false), vec![0x41]);
+    assert_eq!(decoded_ok("\"\\x00\"", true), vec![0]);
+    assert_eq!(decoded_ok("\"\\u0041\"", false), vec![0x41]);
+    assert_eq!(decoded_ok("\"\\uD800\"", false), vec![0xD800]);
+    assert_eq!(decoded_ok("\"\\uDC00\"", true), vec![0xDC00]);
+    assert_eq!(decoded_ok("\"\\uFFFD\"", false), vec![0xFFFD]);
+    assert_eq!(
+        decoded_ok("\"\\uD834\\uDD1E\"", false),
+        vec![0xD834, 0xDD1E]
+    );
+    for raw in [
+        "\"\\x4\"",
+        "\"\\xZZ\"",
+        "\"\\x\"",
+        "\"\\u123\"",
+        "\"\\uZZZZ\"",
+        "\"\\u\"",
+    ] {
+        let (kind, _, _) = decoded_err_kind(raw, false);
+        assert_eq!(kind, StringCodecErrorKind::Lexical, "for {raw:?}");
+    }
+    for strict in [false, true] {
+        let (kind, offset, message) = decoded_err_kind("\"\\u{41}\"", strict);
+        assert_eq!(kind, StringCodecErrorKind::PostEs5, "braced is post-ES5");
+        assert_eq!(offset, 1);
+        assert!(
+            message.contains("braced"),
+            "braced guard wording, got: {message}"
+        );
+    }
+    // An escaped backslash stays ordinary text: `\\u{...}` is six text units.
+    assert_eq!(
+        decoded_ok("\"\\\\u{41}\"", false),
+        vec![0x5C, 0x75, 0x7B, 0x34, 0x31, 0x7D]
+    );
+}
+
+/// Line continuations contribute nothing; unescaped line terminators and
+/// raw separators reject; escaped `\u2028` stays a valid escape.
+#[test]
+fn codec_line_continuations_and_terminators() {
+    assert_eq!(decoded_ok("\"a\\\nb\"", false), vec![0x61, 0x62]);
+    assert_eq!(decoded_ok("\"a\\\rb\"", false), vec![0x61, 0x62]);
+    assert_eq!(decoded_ok("\"a\\\r\nb\"", false), vec![0x61, 0x62]);
+    assert_eq!(decoded_ok("\"a\\\u{2028}b\"", false), vec![0x61, 0x62]);
+    assert_eq!(decoded_ok("\"a\\\u{2029}b\"", false), vec![0x61, 0x62]);
+    assert_eq!(
+        decoded_ok("\"\\\\u2028\"", false),
+        vec![0x5C, 0x75, 0x32, 0x30, 0x32, 0x38]
+    );
+    assert_eq!(decoded_ok("\"\\u2028\"", false), vec![0x2028]);
+    let (kind, _, message) = decoded_err_kind("\"a\u{2028}b\"", false);
+    assert_eq!(kind, StringCodecErrorKind::Lexical);
+    assert!(
+        message.contains("2028"),
+        "separator wording, got: {message}"
+    );
+    let (kind, _, message) = decoded_err_kind("\"a\u{2029}b\"", true);
+    assert_eq!(kind, StringCodecErrorKind::Lexical);
+    assert!(
+        message.contains("2029"),
+        "separator wording, got: {message}"
+    );
+    let (kind, _, _) = decoded_err_kind("\"a\nb\"", false);
+    assert_eq!(kind, StringCodecErrorKind::Lexical);
+}
+
+/// Mixed single/hex/Unicode/identity escapes plus NUL decode to exact units.
+#[test]
+fn codec_mixed_escape_payload() {
+    assert_eq!(
+        decoded_ok("\"A\\0\\u00E9\\x42\\u0043\\q\"", false),
+        vec![0x41, 0x00, 0xE9, 0x42, 0x43, 0x71]
+    );
+    // Mismatched delimiters and missing quotes are lexical errors.
+    let (kind, _, _) = decoded_err_kind("\"abc'", false);
+    assert_eq!(kind, StringCodecErrorKind::Lexical);
+}
+
+/// The unit bound stops decoding one past the limit as a resource error,
+// distinct from lexical errors.
+#[test]
+fn codec_unit_bound_is_a_resource_error() {
+    let bound = "a".repeat(super::string_literal::MAX_LITERAL_UTF16_UNITS);
+    assert_eq!(
+        decoded_ok(&format!("\"{bound}\""), false).len(),
+        super::string_literal::MAX_LITERAL_UTF16_UNITS
+    );
+    let over = "a".repeat(super::string_literal::MAX_LITERAL_UTF16_UNITS + 1);
+    let (kind, _, message) = decoded_err_kind(&format!("\"{over}\""), false);
+    assert_eq!(kind, StringCodecErrorKind::Oversize);
+    assert!(message.contains("16384"), "bound wording, got: {message}");
+}
+
+/// Codec offsets narrow to the offending escape inside the token span.
+#[test]
+fn codec_span_narrowing_stays_inside_the_token() {
+    use swc_common::{BytePos, Span};
+    let span = Span::new(BytePos(100), BytePos(110));
+    let narrowed = narrowed_span(span, 3);
+    assert_eq!((narrowed.lo.0, narrowed.hi.0), (103, 104));
+    let clamped = narrowed_span(span, 500);
+    assert!(clamped.lo.0 < clamped.hi.0 && clamped.hi.0 <= 110);
+}
+
+/// Post-ES5 braced escapes are rejected in every string token position the
+/// admission walk visits, with the grammar-stage unsupported category.
+#[test]
+fn braced_escapes_rejected_in_all_string_positions() {
+    for source in [
+        "var s = \"\\u{41}\";",
+        "\"\\u{41}\";",
+        "function f(){ \"\\u{41}\"; }",
+        "if (1) { \"\\u{41}\"; }",
+        "while (1) { \"\\u{41}\"; }",
+        "({\"\\u{41}\":1});",
+        "var o = {a:1}; o[\"\\u{41}\"];",
+        "var o = {a:1}; o[\"\\u{41}\"] = 2;",
+        "switch (1) { case \"\\u{41}\": 2; }",
+    ] {
+        let error = refused_unsupported(source);
+        assert!(
+            error.message.contains("braced"),
+            "braced guard wording for {source:?}, got: {error:?}"
+        );
+        check_span(source, &error);
+    }
+}
+
+/// Forms without an ES5 derivation are SyntaxErrors in value, directive,
+/// property-name, member-key and unlowered-body positions alike.
+#[test]
+fn lexical_string_errors_cover_all_positions() {
+    for source in [
+        "var s = \"\\8\";",
+        "\"\\8\";",
+        "function f(){ \"\\9\"; }",
+        "if (1) { \"\\08\"; }",
+        "({\"\\8\":1});",
+        "var o = {a:1}; o[\"\\118\"];",
+    ] {
+        let error = refused_syntax(source);
+        check_span(source, &error);
+    }
+    for source in [
+        "var s = \"a\u{2028}b\";",
+        "({\"a\u{2028}b\":1});",
+        "var o = {a:1}; o[\"a\u{2029}b\"];",
+    ] {
+        let error = refused_syntax(source);
+        assert!(
+            error.message.contains("2028") || error.message.contains("2029"),
+            "separator wording for {source:?}, got: {error:?}"
+        );
+        check_span(source, &error);
+    }
+}
+
+/// Truncated hex/Unicode escapes are owned by the locked lexer
+/// (`BadCharacterEscapeSequence` parse errors before admission runs). The
+/// codec independently rejects the same spellings as lexical errors (see
+/// `codec_hex_and_unicode_escapes`); these pins record the actual producer
+/// layer so a future parser change fails loudly instead of silently
+/// re-categorizing.
+#[test]
+fn truncated_hex_unicode_escapes_are_parser_owned() {
+    for source in ["var s = \"\\x4\";", "var s = \"\\u12\";", "({\"\\x4\":1});"] {
+        let error = refused(source);
+        assert!(
+            error.message.contains("parse error"),
+            "locked lexer must own truncated escapes for {source:?}, got: {error:?}"
+        );
+        check_span(source, &error);
+    }
+}
+
+/// Strictness is the whole containing code's resolved strictness: an early
+/// legacy string plus a later exact directive still rejects, strictness
+/// inherits into nested code, and a nested directive never leaks outward.
+#[test]
+fn string_strictness_follows_resolved_code() {
+    refused("\"\\01\"; \"use strict\";");
+    refused("\"use strict\"; function f(){ return \"\\01\"; }");
+    refused("function f(){ \"\\01\"; \"use strict\"; }");
+    refused("\"use strict\"; ({get a(){ return \"\\01\"; }});");
+    // Escaped or parenthesized lookalikes never activate strict mode, so
+    // the sloppy legacy spelling stays admitted around them.
+    admitted("\"\\u0073trict\"; var s = \"\\01\";");
+    admitted("(\"use strict\"); var s = \"\\01\";");
+    admitted("1; \"use strict\"; var s = \"\\01\";");
+    admitted("function f(){ \"use strict\"; } var s = \"\\01\";");
 }

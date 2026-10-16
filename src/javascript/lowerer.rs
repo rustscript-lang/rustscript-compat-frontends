@@ -9,6 +9,9 @@
 //! of the same emission site observe fresh extents on every engine. No host
 //! evaluator, no source substring matching.
 use super::representation as value;
+use super::string_literal::{
+    MAX_LITERAL_UTF16_UNITS, StringStrictness, decode_string_literal, narrowed_span,
+};
 use std::collections::HashMap;
 use swc_common::Spanned;
 use swc_ecma_ast as ast;
@@ -75,8 +78,6 @@ const REF_GET_HELPER: &str = "__compat_es5_ref_get";
 /// Completion`. Decodes the function heap code ID and calls the
 /// statically compiled source function; never interprets AST.
 const DISPATCH_HELPER: &str = "__compat_es5_dispatch";
-/// Bounded literal emission: at most this many UTF-16 units per literal.
-const MAX_LITERAL_UTF16_UNITS: usize = 16384;
 /// Bounded initialization: total header+payload cells reserved across the
 /// whole source before large IR emission, for strings and numeric arrays.
 const MAX_REALM_INITIAL_CELLS: u64 = 65536;
@@ -742,46 +743,22 @@ impl Lowerer<'_> {
             .ok_or_else(|| self.error(span, "JavaScript ES5 string literal span is out of range"))
     }
 
-    /// Escape-aware ES5 literal guard over the original lexeme. Rejects real
-    /// post-ES5 braced Unicode escapes and unescaped raw U+2028/U+2029. An
-    /// escaped backslash consumes both bytes, so `\\u{...}` ordinary text is
-    /// never mistaken for a Unicode escape; ES5 line continuations, escaped
-    /// `\\u2028`/`\\u2029` and valid `\uXXXX` stay admitted.
-    fn check_string_lexeme(&self, span: swc_common::Span, lexeme: &str) -> Result<(), ParseError> {
-        let bytes = lexeme.as_bytes();
-        let mut index = 0;
-        while index < bytes.len() {
-            if bytes[index] == b'\\' {
-                let Some(next) = bytes.get(index + 1) else {
-                    break;
-                };
-                if *next == b'u' {
-                    if bytes.get(index + 2) == Some(&b'{') {
-                        return Err(self.error(
-                            span,
-                            "JavaScript ES5 string literals reject post-ES5 braced Unicode escapes",
-                        ));
-                    }
-                    index += 2;
-                } else if *next < 0x80 {
-                    index += 2;
-                } else {
-                    index += 1;
-                }
-                continue;
-            }
-            if bytes[index] == 0xE2
-                && bytes.get(index + 1) == Some(&0x80)
-                && matches!(bytes.get(index + 2), Some(0xA8 | 0xA9))
-            {
-                return Err(self.error(
-                    span,
-                    "JavaScript ES5 string literals reject raw U+2028/U+2029 separators",
-                ));
-            }
-            index += 1;
-        }
-        Ok(())
+    /// Decode one string token through the shared original-source codec.
+    /// Runs over the literal's own span bytes with the actual resolved
+    /// strictness of this lowering scope (script prologue, or the enclosing
+    /// admitted source function via save/restore) — never the physical
+    /// typing policy. Lexical failures keep the codec message with the span
+    /// narrowed to the offending escape; the unit bound stays enforced here
+    /// before any node/IR emission.
+    fn decode_string_token(&self, span: swc_common::Span) -> Result<Vec<u16>, ParseError> {
+        let lexeme = self.lexeme(span)?;
+        let policy = if self.enclosing_strict {
+            StringStrictness::Strict
+        } else {
+            StringStrictness::Sloppy
+        };
+        decode_string_literal(lexeme, policy)
+            .map_err(|codec| self.error(narrowed_span(span, codec.relative_offset), &codec.message))
     }
 
     /// Reserve one runtime allocation of `need` header+payload cells.
@@ -826,21 +803,14 @@ impl Lowerer<'_> {
         Ok(base_slot)
     }
 
-    /// Lower a string literal to an immutable realm value. Decodes with the
-    /// proven lossless `as_wtf8().to_ill_formed_utf16()` iterator (unpaired
-    /// surrogates preserved, no normalization or lossy round-trip), capped at
-    /// one unit past the bound so oversized literals reject before emission.
+    /// Lower a string literal to an immutable realm value. Units come from
+    /// the shared original-source codec over the literal's own span bytes
+    /// (never the parser cooked payload), capped by the codec at one unit
+    /// past the bound so oversized literals reject before emission.
     /// The logical binding copies this value by alias without payload copy.
     fn lower_string_literal(&mut self, literal: &ast::Str) -> Result<Lowered, ParseError> {
         let span = literal.span;
-        let lexeme = self.lexeme(span)?;
-        self.check_string_lexeme(span, lexeme)?;
-        let units: Vec<u16> = literal
-            .value
-            .as_wtf8()
-            .to_ill_formed_utf16()
-            .take(MAX_LITERAL_UTF16_UNITS + 1)
-            .collect();
+        let units = self.decode_string_token(span)?;
         if units.len() > MAX_LITERAL_UTF16_UNITS {
             return Err(self.error(
                 span,
@@ -1003,14 +973,7 @@ impl Lowerer<'_> {
                 Ok((units.clone(), units))
             }
             ast::PropName::Str(s) => {
-                let lexeme = self.lexeme(s.span)?;
-                self.check_string_lexeme(s.span, lexeme)?;
-                let units: Vec<u16> = s
-                    .value
-                    .as_wtf8()
-                    .to_ill_formed_utf16()
-                    .take(MAX_LITERAL_UTF16_UNITS + 1)
-                    .collect();
+                let units = self.decode_string_token(s.span)?;
                 if units.len() > MAX_LITERAL_UTF16_UNITS {
                     return Err(self.error(
                         s.span,
@@ -1037,14 +1000,7 @@ impl Lowerer<'_> {
             ast::MemberProp::Ident(id) => Ok(Self::ident_key_units(id.sym.as_str())),
             ast::MemberProp::Computed(c) => match c.expr.as_ref() {
                 ast::Expr::Lit(ast::Lit::Str(s)) => {
-                    let lexeme = self.lexeme(s.span)?;
-                    self.check_string_lexeme(s.span, lexeme)?;
-                    let units: Vec<u16> = s
-                        .value
-                        .as_wtf8()
-                        .to_ill_formed_utf16()
-                        .take(MAX_LITERAL_UTF16_UNITS + 1)
-                        .collect();
+                    let units = self.decode_string_token(s.span)?;
                     if units.len() > MAX_LITERAL_UTF16_UNITS {
                         return Err(self.error(
                             s.span,

@@ -38,7 +38,10 @@ use swc_common::{Span as SwcSpan, Spanned};
 use swc_ecma_ast as ast;
 use vm::ParseError;
 
-use super::source_map::{syntax_error, unsupported_error};
+use super::source_map::{parse_error, syntax_error, unsupported_error};
+use super::string_literal::{
+    StringCodecError, StringCodecErrorKind, StringStrictness, decode_string_literal, narrowed_span,
+};
 
 /// ES5 strict-only future reserved words (ES5.1 section 7.6.1.2). These are
 /// ordinary identifiers in sloppy code (`var let` is legal) but cannot name
@@ -1094,41 +1097,49 @@ impl<'source> Checker<'source> {
         }
     }
 
-    /// String lexical forms. Only legacy octal escapes are strictness-gated
-    /// here; every other spelling (identity escapes, hex/Unicode escapes
-    /// including `\u{...}`, lone surrogates preserved by the parser, raw
-    /// separators) passes grammar admission. Post-ES5 braced escapes and raw
-    /// U+2028/U+2029 reach the lowerer guard, whose diagnostics stay pinned
-    /// by the bridge tests, so admission deliberately does not pre-empt them.
+    /// String lexical forms through the shared original-source codec. The
+    /// whole containing code's resolved strictness governs the
+    /// strict/sloppy-AnnexB policy, including strings before a later exact
+    /// directive in the same prologue (checker strictness is resolved
+    /// upfront) and inherited strict function code. Every string token
+    /// position the admission walk visits is validated here: directives,
+    /// unlowered statement/function bodies, values and computed member
+    /// expressions (property names route through `canonical_key`).
     fn admit_string(&self, value: &ast::Str) -> Result<(), ParseError> {
         let Some(raw) = &value.raw else {
-            return Ok(());
+            return Err(self.syntax(
+                value.span,
+                "string literal is missing its original source spelling",
+            ));
         };
-        let bytes = raw.as_bytes();
-        let mut index = 0;
-        while index < bytes.len() {
-            if bytes[index] != b'\\' {
-                index += 1;
-                continue;
-            }
-            index += 1;
-            if index >= bytes.len() {
-                break;
-            }
-            let escaped = bytes[index];
-            let is_octal = matches!(escaped, b'1'..=b'9')
-                || (escaped == b'0' && bytes.get(index + 1).is_some_and(u8::is_ascii_digit));
-            if is_octal && self.strict {
-                // Sloppy legacy octal escapes are an Annex-B-style extension:
-                // admitted, labeled in tests, never a normative claim.
-                return Err(self.syntax(
-                    value.span,
-                    "legacy octal escapes are not allowed in strict mode code",
-                ));
-            }
-            index += 1;
+        match decode_string_literal(raw.as_str(), self.string_policy()) {
+            Ok(_) => Ok(()),
+            Err(codec) => Err(self.string_codec_error(value.span, codec)),
         }
-        Ok(())
+    }
+
+    /// Current strictness as the shared codec policy.
+    fn string_policy(&self) -> StringStrictness {
+        if self.strict {
+            StringStrictness::Strict
+        } else {
+            StringStrictness::Sloppy
+        }
+    }
+
+    /// Map a codec failure to its truthful grammar-stage layer: ES5
+    /// violations are SyntaxErrors, post-ES5 spellings are unsupported
+    /// syntax, and the unit bound stays a resource diagnostic. The span is
+    /// narrowed to the offending escape with the caller source id kept.
+    fn string_codec_error(&self, span: SwcSpan, codec: StringCodecError) -> ParseError {
+        let span = narrowed_span(span, codec.relative_offset);
+        match codec.kind {
+            StringCodecErrorKind::Lexical => self.syntax(span, codec.message),
+            StringCodecErrorKind::PostEs5 => self.unsupported(span, codec.message),
+            StringCodecErrorKind::Oversize => {
+                parse_error(self.source_id, self.base, span, codec.message)
+            }
+        }
     }
 
     /// Numeric lexical forms. Explicit `0b`/`0o` prefixes and separators are
@@ -1293,9 +1304,21 @@ impl<'source> Checker<'source> {
                 self.check_ident_raw(name.span, "a property name")?;
                 Ok(name.sym.encode_utf16().collect())
             }
-            // Raw lexical data is preserved losslessly: lone surrogates ride
-            // the WTF-8 value through without any lossy conversion.
-            ast::PropName::Str(value) => Ok(value.value.as_wtf8().to_ill_formed_utf16().collect()),
+            // Property names decode through the same shared codec over the
+            // original token bytes, so admission spelling checks and
+            // duplicate-key canonicalization observe identical units.
+            ast::PropName::Str(value) => {
+                let Some(raw) = &value.raw else {
+                    return Err(self.syntax(
+                        value.span(),
+                        "property name is missing its original source spelling",
+                    ));
+                };
+                match decode_string_literal(raw.as_str(), self.string_policy()) {
+                    Ok(units) => Ok(units),
+                    Err(codec) => Err(self.string_codec_error(value.span(), codec)),
+                }
+            }
             ast::PropName::Num(value) => Ok(number_to_string(value.value).encode_utf16().collect()),
             ast::PropName::Computed(computed) => {
                 Err(self.unsupported(computed.span, "computed property names are post-ES5"))
