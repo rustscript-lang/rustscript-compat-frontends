@@ -176,6 +176,25 @@ pub fn reference_array_effective_catalog() -> Arc<vm::HostApiCatalog> {
     array_lowering::reference_array_effective_catalog()
 }
 
+/// Fixed accepted B1 prelude for the JS numeric-array realm.
+///
+/// Parses only the fixed accepted prelude plus empty generated user input;
+/// raw user JS never enters the TypeScript parser. The returned IR keeps its
+/// real function declarations, implementations, host metadata, schemas,
+/// resource provenance and catalog identity; JS appends generated IR, fresh
+/// slots and root statements without rebuilding host candidate metadata.
+pub(crate) fn js_realm_prelude_ir(
+    context: &vm::SourceFrontendContext<'_>,
+) -> Result<vm::FrontendIr, vm::ParseError> {
+    parser::lower_reference_array("", context)
+}
+
+/// Prelude helper identities reused by the JS realm. Indices are resolved
+/// from the generated `ir.functions` table, never from user identifier text.
+pub(crate) use array_lowering::{
+    HELPER_LENGTH, HELPER_MAKE, HELPER_READ, HELPER_RESIZE, HELPER_WRITE,
+};
+
 /// Compile options for the explicit reference-array mode: the alternative
 /// same-identity TypeScript plugin plus Lua, with the exact effective
 /// catalog. Ordinary options are unchanged.

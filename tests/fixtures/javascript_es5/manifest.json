@@ -1,0 +1,22 @@
+{
+  "scope": "ES5.1 Script parser/admission audit seed (grammar stage only)",
+  "frozen_source": "TMP audit-seed-original.jsonl: 103 rows = 91 primary + 12 supplemental diagnostic copies",
+  "frozen_counts": {
+    "rows": 103,
+    "primary": 91,
+    "supplemental": 12
+  },
+  "generation": "programmatic exact copy of id/category/supplemental/source plus measured parser outcomes; no retyped strings, no oracle_source substitution",
+  "phases": {
+    "parser_admitted": "measured grammar/admission outcome",
+    "admission_kind": "syntax|unsupported|parse|null",
+    "compiled": "deferred (null)",
+    "executed": "deferred (null)",
+    "native": "deferred (null)"
+  },
+  "rules": [
+    "supplemental rows stay diagnostic negatives outside primary totals",
+    "parser admission success is not lowering or execution success",
+    "no percentage or profile completion claim"
+  ]
+}

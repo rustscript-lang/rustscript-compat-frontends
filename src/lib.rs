@@ -1,9 +1,14 @@
+pub mod javascript;
 #[path = "frontends/lua/mod.rs"]
 mod lua;
 pub mod runtime;
 mod source_loader;
 mod typescript;
 
+pub use javascript::{
+    JAVASCRIPT_ES5_PLUGIN, JavaScriptEs5Plugin, javascript_es5_compile_options,
+    javascript_es5_flavor,
+};
 pub use typescript::{
     LUA_PLUGIN, TYPESCRIPT_PLUGIN, TYPESCRIPT_REFERENCE_ARRAY_PLUGIN,
     collect_reference_array_type_hints_at_path_with_options,
