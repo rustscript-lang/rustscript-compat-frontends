@@ -22,20 +22,20 @@ impl vm::SourcePlugin for PrimitiveHistoryPlugin {
         let mut ctx = heap_cycle_ctx(&ir)?;
         ctx.carrier = heap_cycle_carrier(&ir)?;
         let binding = heap_binding_index(&ir, "o")?;
+        // The call block is flattened into ANF Lets plus the hoisted store.
+        // Replay those Lets, not the predeclare Let of undefined.
         let at = ir
             .stmts
             .iter()
-            .position(|s| matches!(s,vm::Stmt::Let{index,..} if *index==binding))
+            .position(|s| matches!(s, vm::Stmt::Assign { index, .. } if *index == binding))
             .ok_or_else(|| heap_rejection("actual primitive result".to_owned()))?;
-        let vm::Stmt::Let {
-            expr: vm::Expr::Block { stmts, expr },
-            ..
-        } = &ir.stmts[at]
-        else {
-            return Err(heap_rejection("actual dispatch block".to_owned()));
+        let vm::Stmt::Assign { expr: stored, .. } = &ir.stmts[at] else {
+            unreachable!("position matched Assign")
         };
+        let stored = stored.clone();
+        let (run_start, run_end) = heap_call_replay_bounds(&ir, at)?;
         let mut replay = Vec::new();
-        for stmt in stmts {
+        for stmt in &ir.stmts[run_start..at] {
             let vm::Stmt::Let {
                 index, expr, line, ..
             } = stmt
@@ -52,13 +52,16 @@ impl vm::SourcePlugin for PrimitiveHistoryPlugin {
         replay.push(vm::Stmt::Assign {
             kind: vm::AssignmentKind::Set,
             index: binding,
-            expr: *expr.clone(),
+            expr: stored,
             line: 1,
         });
-        if let vm::Stmt::Let {
-            index, expr, line, ..
-        } = &ir.stmts[at + 1]
-        {
+        for stmt in &ir.stmts[at + 1..run_end] {
+            let vm::Stmt::Let {
+                index, expr, line, ..
+            } = stmt
+            else {
+                return Err(heap_rejection("actual handoff/cleanup ack".to_owned()));
+            };
             replay.push(vm::Stmt::Assign {
                 kind: vm::AssignmentKind::Set,
                 index: *index,

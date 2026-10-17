@@ -32,7 +32,9 @@ pub(super) mod heap;
 mod lowerer;
 mod parser;
 mod prelude;
+mod reference;
 mod representation;
+mod scope;
 mod source_map;
 mod string_literal;
 #[cfg(test)]

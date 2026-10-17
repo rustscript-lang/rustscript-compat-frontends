@@ -134,7 +134,13 @@ fn p2_forced_every_allocation_preserves_source_payloads() {
 }
 #[test]
 fn p2_forced_every_allocation_preserves_source_payloads_native() {
-    forced_run(true);
+    // This native fixture requires an explicit local host execution stack.
+    std::thread::Builder::new()
+        .stack_size(33_554_432)
+        .spawn(|| forced_run(true))
+        .expect("spawn forced-GC native worker")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
 #[test]

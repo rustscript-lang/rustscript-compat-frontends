@@ -11,7 +11,9 @@
 use super::heap as layout;
 use super::prelude::heap as heap_emitters;
 use super::prelude::values as value_emitters;
+use super::reference;
 use super::representation as value;
+use super::scope;
 use super::string_literal::{
     MAX_LITERAL_UTF16_UNITS, StringStrictness, decode_string_literal, narrowed_span,
 };
@@ -25,7 +27,7 @@ use vm::{
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Kind {
+pub(super) enum Kind {
     Undefined,
     Null,
     Boolean,
@@ -78,9 +80,18 @@ pub(super) struct Newborn {
     pub base: u16,
 }
 
-struct Lowered {
-    expr: Expr,
-    kind: Kind,
+pub(super) type ObjectEntry = (Vec<u16>, Box<ast::Expr>, swc_common::Span);
+
+pub(super) struct Lowered {
+    pub(super) expr: Expr,
+    pub(super) kind: Kind,
+    /// Exact numeric-array length when this value is a known array.
+    /// `None` is unknown, never a fabricated zero.
+    pub(super) array_length: Option<usize>,
+    /// Compiler temps whose root entries this value owns until a rooted
+    /// destination takes the payload. Source bindings and activation
+    /// caches are not listed here.
+    pub(super) owned_roots: Vec<u16>,
 }
 
 /// One admitted closed strict source function in code-ID order. The AST
@@ -99,10 +110,11 @@ pub(super) struct Lowerer<'a> {
     pub(super) source_id: u32,
     pub(super) base: u32,
     pub(super) next_slot: u16,
-    bindings: HashMap<String, (u16, Kind)>,
-    array_lengths: HashMap<String, usize>,
-    source_bindings: Vec<(String, u16)>,
-    heap: Option<Heap>,
+    pub(super) bindings: HashMap<String, (u16, Kind)>,
+    pub(super) array_lengths: HashMap<String, usize>,
+    pub(super) array_length_ids: HashMap<scope::BindingId, usize>,
+    pub(super) source_bindings: Vec<(String, u16)>,
+    pub(super) heap: Option<Heap>,
     /// Total header+payload cells reserved by literals so far. This static
     /// running total remains a whole-source budget cap: overflow/excess
     /// rejects before large emission. It never supplies runtime IDs; every
@@ -130,11 +142,11 @@ pub(super) struct Lowerer<'a> {
     /// Dense root layout of the activation currently being lowered.
     /// Saved and restored around nested source functions; absent on the
     /// heap-free scalar path, where no frame exists.
-    root_scope: Option<RootScope>,
+    pub(super) root_scope: Option<RootScope>,
     /// Flat indices of the private object/function helpers. Set on the
     /// realm path once appended; used by inline object/call lowering and
     /// by nested function bodies.
-    helper_decode: Option<u16>,
+    pub(super) helper_decode: Option<u16>,
     helper_ref_get: Option<u16>,
     helper_dispatch: Option<u16>,
     /// Finite static code IDs for every admitted source-function AST node,
@@ -142,6 +154,11 @@ pub(super) struct Lowerer<'a> {
     function_code_ids: HashMap<(u32, u32), i64>,
     /// Collected admitted functions in code-ID order for predeclaration.
     collected_functions: Vec<CollectedFunction>,
+    pub(super) graph: scope::ScopeGraph,
+    pub(super) active_scope: scope::ScopeId,
+    pub(super) binding_slots: HashMap<scope::BindingId, u16>,
+    pub(super) binding_kinds: HashMap<scope::BindingId, Kind>,
+    pub(super) type_names: Option<reference::TypeNames>,
 }
 
 impl Lowerer<'_> {
@@ -173,7 +190,19 @@ impl Lowerer<'_> {
         Ok(slot)
     }
 
-    fn bind_temp(
+    /// Dedup root-token identity only. Two entries for one box both stay
+    /// when they are distinct slots; a slot listed twice is one token.
+    pub(super) fn compose_owned(parts: impl IntoIterator<Item = u16>) -> Vec<u16> {
+        let mut owned = Vec::new();
+        for slot in parts {
+            if !owned.contains(&slot) {
+                owned.push(slot);
+            }
+        }
+        owned
+    }
+
+    pub(super) fn bind_temp(
         &mut self,
         expr: Expr,
         span: swc_common::Span,
@@ -181,10 +210,29 @@ impl Lowerer<'_> {
         self.bind_rooted(expr, value::schema(), span)
     }
 
+    /// Proven primitive boxes need physical storage for evaluation order,
+    /// but have no heap edge to register or clear.
+    pub(super) fn bind_evaluation(
+        &mut self,
+        expr: Expr,
+        kind: Kind,
+        span: swc_common::Span,
+    ) -> Result<(u16, Vec<Stmt>), ParseError> {
+        if matches!(
+            kind,
+            Kind::Undefined | Kind::Null | Kind::Boolean | Kind::Number
+        ) {
+            let (slot, stmt) = self.bind_temp_bare(expr, span)?;
+            Ok((slot, vec![stmt]))
+        } else {
+            self.bind_temp(expr, span)
+        }
+    }
+
     /// Bind a boxed value with NO root entry: dropped statement temporaries
     /// and synthetic primitive boxes whose lifetime the surrounding roots
     /// already cover. Unrooted newborns stay collectable by design.
-    fn bind_temp_bare(
+    pub(super) fn bind_temp_bare(
         &mut self,
         expr: Expr,
         span: swc_common::Span,
@@ -204,6 +252,113 @@ impl Lowerer<'_> {
     /// Bind a boxed value followed immediately by its no-allocation root
     /// write into this activation's frame. The heap-free scalar path has no
     /// frame and binds bare.
+    pub(super) fn has_root(&self, slot: u16) -> bool {
+        self.root_scope
+            .as_ref()
+            .is_some_and(|scope| scope.entries.contains_key(&slot))
+    }
+
+    /// Refresh an existing binding/temp root. Heap-free activations have no
+    /// frame, so this is a no-op there. The caller must place this immediately
+    /// after the Assign that stored the new box.
+    pub(super) fn refresh_root(
+        &mut self,
+        slot: u16,
+        span: swc_common::Span,
+        stmts: &mut Vec<Stmt>,
+    ) -> Result<(), ParseError> {
+        self.write_root_value(slot, Expr::Var(slot), span, stmts)
+    }
+
+    /// Drop only the logical edge. The physical box may remain as an
+    /// intentionally unrooted value; no later semantic use may depend on it.
+    pub(super) fn clear_root(
+        &mut self,
+        slot: u16,
+        span: swc_common::Span,
+        stmts: &mut Vec<Stmt>,
+    ) -> Result<(), ParseError> {
+        if !self.has_root(slot) {
+            return Ok(());
+        }
+        self.write_root_value(slot, value::undefined(), span, stmts)
+    }
+
+    fn write_root_value(
+        &mut self,
+        slot: u16,
+        boxed: Expr,
+        span: swc_common::Span,
+        stmts: &mut Vec<Stmt>,
+    ) -> Result<(), ParseError> {
+        if self.root_scope.is_none() {
+            return Ok(());
+        }
+        let carrier = self.active_carrier(span)?;
+        let root_write = self.heap_ref(span)?.helpers.root_write;
+        let frame = self.active_frame(span)?;
+        let entry = self.entry_for(slot, span)?;
+        let ack = self.slot(span)?;
+        let line = self.line(span);
+        stmts.push(Stmt::Let {
+            index: ack,
+            declared_schema: Some(TypeSchema::Int),
+            expr: Self::guest_call(
+                root_write,
+                vec![
+                    Expr::Var(carrier),
+                    Expr::Var(frame),
+                    Expr::Int(i64::from(entry)),
+                    boxed,
+                ],
+            ),
+            line,
+        });
+        Ok(())
+    }
+
+    /// Publish a newborn into an already-instantiated binding slot so the
+    /// predeclared root entry is reused instead of retaining a second object.
+    pub(super) fn publish_into(
+        &mut self,
+        dest: u16,
+        carrier: u16,
+        newborn: &Newborn,
+        span: swc_common::Span,
+        line: u32,
+        stmts: &mut Vec<Stmt>,
+    ) -> Result<(), ParseError> {
+        let helpers = self.heap_ref(span)?.helpers;
+        let frame = self.active_frame(span)?;
+        let entry = self.entry_for(dest, span)?;
+        // Materialize the publish call in a Let. Assigning a host call
+        // directly is a shape this native backend does not terminate on.
+        let published = self.slot(span)?;
+        stmts.push(Stmt::Let {
+            index: published,
+            declared_schema: Some(value::schema()),
+            expr: Self::guest_call(
+                helpers.node_publish,
+                vec![
+                    Expr::Var(carrier),
+                    Expr::Var(newborn.slot),
+                    Expr::Var(newborn.generation),
+                    Expr::Var(newborn.base),
+                    Expr::Var(frame),
+                    Expr::Int(i64::from(entry)),
+                ],
+            ),
+            line,
+        });
+        stmts.push(Stmt::Assign {
+            kind: vm::AssignmentKind::Set,
+            index: dest,
+            expr: Expr::Var(published),
+            line,
+        });
+        self.refresh_root(dest, span, stmts)
+    }
+
     fn bind_rooted(
         &mut self,
         expr: Expr,
@@ -444,7 +599,7 @@ impl Lowerer<'_> {
         Expr::Div(Box::new(expr), Box::new(Expr::Float(1.0)))
     }
 
-    fn heap_ref(&self, span: swc_common::Span) -> Result<&Heap, ParseError> {
+    pub(super) fn heap_ref(&self, span: swc_common::Span) -> Result<&Heap, ParseError> {
         self.heap
             .as_ref()
             .ok_or_else(|| self.error(span, "JavaScript ES5 numeric arrays require the realm heap"))
@@ -452,7 +607,7 @@ impl Lowerer<'_> {
 
     /// Active owning carrier slot: the function-body parameter inside
     /// source functions, otherwise the root realm carrier.
-    fn active_carrier(&self, span: swc_common::Span) -> Result<u16, ParseError> {
+    pub(super) fn active_carrier(&self, span: swc_common::Span) -> Result<u16, ParseError> {
         if let Some(carrier) = self.carrier_override {
             return Ok(carrier);
         }
@@ -475,7 +630,7 @@ impl Lowerer<'_> {
     /// Only the two exact spellings admit; escaped lookalikes
     /// (`"\u0075se strict"`, `"\\u2028"` text, braced escapes) reject
     /// because their raw bytes differ.
-    fn is_exact_use_strict_lexeme(&self, span: swc_common::Span) -> bool {
+    pub(super) fn is_exact_use_strict_lexeme(&self, span: swc_common::Span) -> bool {
         let lo = span.lo.0.saturating_sub(self.base) as usize;
         let hi = span.hi.0.saturating_sub(self.base) as usize;
         let Some(lexeme) = self.source.get(lo..hi) else {
@@ -535,7 +690,7 @@ impl Lowerer<'_> {
         }
     }
 
-    fn member_index_literal(property: &ast::Expr) -> Option<i64> {
+    pub(super) fn member_index_literal(property: &ast::Expr) -> Option<i64> {
         match property {
             ast::Expr::Lit(ast::Lit::Num(n)) => Self::literal_index(n.value),
             ast::Expr::Paren(p) => Self::member_index_literal(&p.expr),
@@ -543,45 +698,38 @@ impl Lowerer<'_> {
         }
     }
 
-    fn expr(&mut self, expression: &ast::Expr) -> Result<Lowered, ParseError> {
+    pub(super) fn expr(&mut self, expression: &ast::Expr) -> Result<Lowered, ParseError> {
         match expression {
             ast::Expr::Lit(ast::Lit::Num(n)) => Ok(Lowered {
                 expr: value::number(Expr::Float(n.value)),
                 kind: Kind::Number,
+                array_length: None,
+                owned_roots: Vec::new(),
             }),
             ast::Expr::Lit(ast::Lit::Null(_)) => Ok(Lowered {
                 expr: value::null(),
                 kind: Kind::Null,
+                array_length: None,
+                owned_roots: Vec::new(),
             }),
             ast::Expr::Lit(ast::Lit::Bool(b)) => Ok(Lowered {
                 expr: value::boolean(Expr::Bool(b.value)),
                 kind: Kind::Boolean,
+                array_length: None,
+                owned_roots: Vec::new(),
             }),
             ast::Expr::Lit(ast::Lit::Str(s)) => self.lower_string_literal(s),
             ast::Expr::Paren(p) => self.expr(&p.expr),
-            ast::Expr::Ident(i) => {
-                if let Some(&(slot, kind)) = self.bindings.get(i.sym.as_str()) {
-                    Ok(Lowered {
-                        expr: Expr::Var(slot),
-                        kind,
-                    })
-                } else if i.sym.as_str() == "undefined" {
-                    Ok(Lowered {
-                        expr: value::undefined(),
-                        kind: Kind::Undefined,
-                    })
-                } else {
-                    Err(self.error(i.span, &format!("unknown local '{}'", i.sym)))
-                }
+            ast::Expr::Ident(i) => reference::lower_get(self, i),
+            ast::Expr::Assign(assign) if assign.op == ast::AssignOp::Assign => {
+                reference::lower_assign_expr(self, assign)
             }
+            ast::Expr::Unary(u) if u.op == ast::UnaryOp::TypeOf => reference::lower_typeof(self, u),
+            ast::Expr::Array(literal) => self.lower_array_expr(literal),
             ast::Expr::Unary(u) if u.op == ast::UnaryOp::Minus => {
                 let operand = self.expr(&u.arg)?;
-                if operand.kind != Kind::Number {
-                    return Err(
-                        self.error(u.span, "P0 arithmetic currently requires numeric operands")
-                    );
-                }
-                let (slot, statement) = self.bind_temp(operand.expr, u.span)?;
+                reference::admit_numeric_operand(self, u.span, operand.kind)?;
+                let (slot, statement) = self.bind_evaluation(operand.expr, operand.kind, u.span)?;
                 Ok(Lowered {
                     expr: Expr::Block {
                         stmts: statement,
@@ -590,6 +738,8 @@ impl Lowerer<'_> {
                         ))))),
                     },
                     kind: Kind::Number,
+                    array_length: None,
+                    owned_roots: operand.owned_roots,
                 })
             }
             ast::Expr::Bin(b) => {
@@ -607,13 +757,16 @@ impl Lowerer<'_> {
                 let left = self.expr(&b.left)?;
                 let right = self.expr(&b.right)?;
                 let equality = matches!(b.op, ast::BinaryOp::EqEqEq | ast::BinaryOp::NotEqEq);
-                if !equality && (left.kind != Kind::Number || right.kind != Kind::Number) {
-                    return Err(
-                        self.error(b.span, "P0 arithmetic currently requires numeric operands")
-                    );
+                if !equality {
+                    reference::admit_numeric_operand(self, b.span, left.kind)?;
+                    reference::admit_numeric_operand(self, b.span, right.kind)?;
                 }
-                let (l, ls) = self.bind_temp(left.expr, b.left.span())?;
-                let (r, rs) = self.bind_temp(right.expr, b.right.span())?;
+                let mut owned_roots = left.owned_roots;
+                owned_roots.extend(right.owned_roots);
+                let (l, ls) = self.bind_evaluation(left.expr, left.kind, b.left.span())?;
+                let (r, rs) = self.bind_evaluation(right.expr, right.kind, b.right.span())?;
+                owned_roots.extend([l, r].into_iter().filter(|slot| self.has_root(*slot)));
+                let owned_roots = Self::compose_owned(owned_roots);
                 let result = if equality {
                     let carrier = self.active_carrier(b.span).ok();
                     let strings = match (carrier, self.string_eq) {
@@ -654,6 +807,8 @@ impl Lowerer<'_> {
                                 ))))),
                             },
                             kind: Kind::Boolean,
+                            array_length: None,
+                            owned_roots,
                         });
                     }
                     equal
@@ -679,6 +834,8 @@ impl Lowerer<'_> {
                     } else {
                         Kind::Number
                     },
+                    array_length: None,
+                    owned_roots,
                 })
             }
             ast::Expr::Member(m) => self.lower_member_read(m),
@@ -704,12 +861,15 @@ impl Lowerer<'_> {
             && kind == Kind::Array
         {
             let name = object.sym.as_str();
-            let length = self.array_lengths.get(name).copied().unwrap_or(0);
+            let length = self.array_lengths.get(name).copied();
+            reference::admit_member_read(self, member, kind, length)?;
             let position = usize::try_from(index).unwrap_or(usize::MAX);
-            if position >= length {
+            if length.is_some_and(|length| position >= length) {
                 return Ok(Lowered {
                     expr: value::undefined(),
                     kind: Kind::Undefined,
+                    array_length: None,
+                    owned_roots: Vec::new(),
                 });
             }
             let carrier = self.active_carrier(member.span)?;
@@ -796,6 +956,8 @@ impl Lowerer<'_> {
                     expr: Box::new(value::number(Self::as_number(read))),
                 },
                 kind: Kind::Number,
+                array_length: None,
+                owned_roots: vec![receiver],
             });
         }
         // If this is a computed integer subscript but the base is not an
@@ -885,21 +1047,16 @@ impl Lowerer<'_> {
         // result or parenthesized form). Static admission requires an
         // object-like base; runtime guards handle the rest.
         let base = self.expr(&member.obj)?;
-        match base.kind {
-            Kind::Object | Kind::Function => {}
-            _ => {
-                return Err(self.error(
-                    member.span,
-                    "P0 plain-object member reads require an object receiver",
-                ));
-            }
-        }
+        reference::admit_member_read(self, member, base.kind, base.array_length)?;
+        let mut owned_roots = base.owned_roots;
         let (base_slot, base_stmt) = self.bind_temp(base.expr, member.obj.span())?;
+        owned_roots.push(base_slot);
         let key_units = self.member_key_units(member)?;
         let mut stmts = base_stmt;
         // The receiver root precedes the member key allocation; the key
         // publishes into its own entry before GetValue can run.
         let key_box = self.emit_utf16_node(&key_units, member.span, &mut stmts)?;
+        owned_roots.push(key_box);
         let strict = Expr::Bool(self.enclosing_strict);
         let reference = value::reference(
             Expr::Var(base_slot),
@@ -916,6 +1073,7 @@ impl Lowerer<'_> {
         let got = Self::guest_call(ref_get, vec![Expr::Var(carrier), Expr::Var(ref_slot)]);
         let (value_slot, mut value_stmt) = self.bind_temp(got, member.span)?;
         stmts.append(&mut value_stmt);
+        owned_roots.push(value_slot);
         Ok(Lowered {
             expr: Expr::Block {
                 stmts,
@@ -925,6 +1083,8 @@ impl Lowerer<'_> {
             // covers objects/functions; numbers/strings arrive with their
             // real runtime tags). Callers use runtime tags, never this Kind.
             kind: Kind::Object,
+            array_length: None,
+            owned_roots: Self::compose_owned(owned_roots),
         })
     }
 
@@ -951,6 +1111,7 @@ impl Lowerer<'_> {
                 "P0 source functions admit only zero-argument calls",
             ));
         }
+        reference::admit_call_callee(self, call)?;
         if call.type_args.is_some() {
             return Err(self.error(call.span, "P0 source functions reject type arguments"));
         }
@@ -993,18 +1154,16 @@ impl Lowerer<'_> {
             .ok_or_else(|| self.error(span, "P0 method calls require the realm dispatch helper"))?;
         let carrier = self.active_carrier(span)?;
         let base = self.expr(&member.obj)?;
-        match base.kind {
-            Kind::Object | Kind::Function => {}
-            _ => {
-                return Err(self.error(member.span, "P0 method calls require an object receiver"));
-            }
-        }
+        reference::admit_object_receiver(self, member.span, base.kind)?;
+        let mut owned_roots = base.owned_roots;
         let (base_slot, base_stmt) = self.bind_temp(base.expr, member.obj.span())?;
+        owned_roots.push(base_slot);
         let key_units = self.member_key_units(member)?;
         let mut stmts = base_stmt;
         // Callee and receiver root before the nested call: the key publishes
         // into its own entry, then both constituents are re-affirmed.
         let key_box = self.emit_utf16_node(&key_units, member.span, &mut stmts)?;
+        owned_roots.push(key_box);
         let strict = Expr::Bool(self.enclosing_strict);
         let reference = value::reference(
             Expr::Var(base_slot),
@@ -1041,12 +1200,17 @@ impl Lowerer<'_> {
         let (value_slot, mut value_stmt) =
             self.bind_temp(value::field(comp_slot, "value"), span)?;
         stmts.append(&mut value_stmt);
+        owned_roots.push(func_slot);
+        owned_roots.push(this_slot);
+        owned_roots.push(value_slot);
         Ok(Lowered {
             expr: Expr::Block {
                 stmts,
                 expr: Box::new(Expr::Var(value_slot)),
             },
             kind: Kind::Object,
+            array_length: None,
+            owned_roots: Self::compose_owned(owned_roots),
         })
     }
 
@@ -1062,26 +1226,34 @@ impl Lowerer<'_> {
         })?;
         let carrier = self.active_carrier(span)?;
         let name = ident.sym.as_str();
-        let Some(&(slot, kind)) = self.bindings.get(name) else {
-            if name == "undefined" {
+        let (slot, kind) = match reference::resolve(self, name) {
+            reference::NameHit::Local(id) => {
+                let slot = *self.binding_slots.get(&id).ok_or_else(|| {
+                    self.error(ident.span, "P3 binding was collected but not instantiated")
+                })?;
+                let kind = self
+                    .binding_kinds
+                    .get(&id)
+                    .copied()
+                    .unwrap_or(Kind::Undefined);
+                (slot, kind)
+            }
+            reference::NameHit::Outer(_) => {
                 return Err(self.error(
                     ident.span,
-                    "P0 calls admit only identifier and member callees",
+                    &format!("P4 free-variable capture of '{name}' is outside this closed subset"),
                 ));
             }
-            return Err(self.error(ident.span, &format!("unknown local '{name}'")));
-        };
-        match kind {
-            Kind::Function | Kind::Object => {}
-            _ => {
-                return Err(self.error(ident.span, "P0 bare calls require a function binding"));
+            reference::NameHit::BuiltinUndefined | reference::NameHit::Missing => {
+                return Err(self.error(ident.span, &format!("unknown local '{name}'")));
             }
-        }
+        };
+        reference::admit_callable_kind(self, ident.span, kind)?;
         let mut stmts = Vec::new();
         let (func_slot, mut func_stmt) = self.bind_temp(Expr::Var(slot), ident.span)?;
         stmts.append(&mut func_stmt);
-        let (this_slot, mut this_stmt) = self.bind_temp(value::undefined(), span)?;
-        stmts.append(&mut this_stmt);
+        let (this_slot, this_stmt) = self.bind_temp_bare(value::undefined(), span)?;
+        stmts.push(this_stmt);
         let empty_args = Self::builtin_call(BuiltinFunction::ArrayNew.call_index(), Vec::new());
         let completed = Self::guest_call(
             dispatch,
@@ -1104,6 +1276,8 @@ impl Lowerer<'_> {
                 expr: Box::new(Expr::Var(value_slot)),
             },
             kind: Kind::Object,
+            array_length: None,
+            owned_roots: vec![func_slot, value_slot],
         })
     }
 
@@ -1208,6 +1382,8 @@ impl Lowerer<'_> {
                 expr: Box::new(Expr::Var(boxed)),
             },
             kind: Kind::String,
+            array_length: None,
+            owned_roots: vec![boxed],
         })
     }
 
@@ -1216,7 +1392,7 @@ impl Lowerer<'_> {
     /// by object/member key nodes so keys are real guest strings. Kind and
     /// generation are stamped by reservation; only length plus units are
     /// initialized here, then the node publishes into its frame entry.
-    fn emit_utf16_node(
+    pub(super) fn emit_utf16_node(
         &mut self,
         units: &[u16],
         span: swc_common::Span,
@@ -1272,6 +1448,8 @@ impl Lowerer<'_> {
         Ok(Lowered {
             expr: Expr::Var(slot),
             kind: Kind::Object,
+            array_length: None,
+            owned_roots: Vec::new(),
         })
     }
 
@@ -1284,7 +1462,7 @@ impl Lowerer<'_> {
     /// Extract an object key as UTF-16 units plus an exact duplicate-check key.
     /// Admits identifier and string-literal keys only; numeric/computed
     /// keys are explicit capability rejections.
-    fn object_key_units(
+    pub(super) fn object_key_units(
         &self,
         key: &ast::PropName,
         span: swc_common::Span,
@@ -1317,7 +1495,10 @@ impl Lowerer<'_> {
     /// Extract a member-expression key as UTF-16 units. Admits `obj.key`
     /// identifiers and `obj["key"]` string literals; integer subscripts
     /// belong to the numeric-array path and anything else rejects.
-    fn member_key_units(&self, member: &ast::MemberExpr) -> Result<Vec<u16>, ParseError> {
+    pub(super) fn member_key_units(
+        &self,
+        member: &ast::MemberExpr,
+    ) -> Result<Vec<u16>, ParseError> {
         match &member.prop {
             ast::MemberProp::Ident(id) => Ok(Self::ident_key_units(id.sym.as_str())),
             ast::MemberProp::Computed(c) => match c.expr.as_ref() {
@@ -1343,7 +1524,10 @@ impl Lowerer<'_> {
         }
     }
 
-    fn lower_object_literal(&mut self, literal: &ast::ObjectLit) -> Result<Lowered, ParseError> {
+    pub(super) fn object_literal_entries(
+        &self,
+        literal: &ast::ObjectLit,
+    ) -> Result<Vec<ObjectEntry>, ParseError> {
         use std::collections::HashSet;
         if literal.props.len() > MAX_OBJECT_PROPERTIES {
             return Err(self.error(
@@ -1378,17 +1562,26 @@ impl Lowerer<'_> {
                 }
             }
         }
+        Ok(entries)
+    }
+
+    fn lower_object_literal(&mut self, literal: &ast::ObjectLit) -> Result<Lowered, ParseError> {
+        let entries = self.object_literal_entries(literal)?;
         let count = entries.len() as i64;
         let line = self.line(literal.span);
         let mut stmts: Vec<Stmt> = Vec::new();
         // Allocate key string nodes first so every property key is a real
         // UTF-16 guest string compared by content at runtime. Each key
         // publishes into its own entry before the containing allocation.
+        let mut owned_roots = Vec::new();
         let mut key_boxes: Vec<u16> = Vec::new();
         for (units, _, key_span) in &entries {
             // Keys borrow the literal span for resource diagnostics.
             let boxed = self.emit_utf16_node(units, *key_span, &mut stmts)?;
             key_boxes.push(boxed);
+            // Key publication joins owned roots before the parent is assembled.
+            // Parent edges keep the key after binding handoff clears this token.
+            owned_roots.push(boxed);
         }
         // Lower values (numbers, strings, objects, functions, member
         // reads, aliases). Closed-function bodies were prevalidated; free
@@ -1398,22 +1591,12 @@ impl Lowerer<'_> {
         let mut value_slots: Vec<(u16, Kind)> = Vec::new();
         for (_, value_expr, value_span) in &entries {
             let value = self.expr(value_expr)?;
-            match value.kind {
-                Kind::Undefined
-                | Kind::Null
-                | Kind::Boolean
-                | Kind::Number
-                | Kind::String
-                | Kind::Object
-                | Kind::Function => {}
-                Kind::Array => {
-                    return Err(self.error(
-                        *value_span,
-                        "P0 plain-object values admit primitives, strings, objects and functions; numeric arrays stay separate bindings",
-                    ));
-                }
+            reference::admit_object_value(self, *value_span, value.kind)?;
+            let (slot, mut stmt) = self.bind_evaluation(value.expr, value.kind, *value_span)?;
+            owned_roots.extend(value.owned_roots);
+            if self.has_root(slot) {
+                owned_roots.push(slot);
             }
-            let (slot, mut stmt) = self.bind_temp(value.expr, *value_span)?;
             stmts.append(&mut stmt);
             value_slots.push((slot, value.kind));
         }
@@ -1513,16 +1696,39 @@ impl Lowerer<'_> {
             }
         }
         let boxed = self.publish_node(carrier, &newborn, literal.span, line, &mut stmts)?;
+        owned_roots.push(boxed);
         Ok(Lowered {
             expr: Expr::Block {
                 stmts,
                 expr: Box::new(Expr::Var(boxed)),
             },
             kind: Kind::Object,
+            array_length: None,
+            owned_roots,
         })
     }
 
-    fn lower_function_expr(&mut self, function: &ast::FnExpr) -> Result<Lowered, ParseError> {
+    fn lower_array_expr(&mut self, literal: &ast::ArrayLit) -> Result<Lowered, ParseError> {
+        let mut stmts = Vec::new();
+        let published = lower_array_binding(self, "", literal, literal.span, &mut stmts, true)?;
+        let (slot, length) = published.ok_or_else(|| {
+            self.error(literal.span, "P3 array expression did not publish a value")
+        })?;
+        Ok(Lowered {
+            expr: Expr::Block {
+                stmts,
+                expr: Box::new(Expr::Var(slot)),
+            },
+            kind: Kind::Array,
+            array_length: Some(length),
+            owned_roots: vec![slot],
+        })
+    }
+
+    pub(super) fn lower_function_expr(
+        &mut self,
+        function: &ast::FnExpr,
+    ) -> Result<Lowered, ParseError> {
         let span = function.function.span;
         let key = (span.lo.0, span.hi.0);
         let Some(&code_id) = self.function_code_ids.get(&key) else {
@@ -1572,6 +1778,8 @@ impl Lowerer<'_> {
                 expr: Box::new(Expr::Var(boxed)),
             },
             kind: Kind::Function,
+            array_length: None,
+            owned_roots: vec![boxed],
         })
     }
 }
@@ -1606,7 +1814,14 @@ fn stmt_needs_heap(statement: &ast::Stmt) -> bool {
             .decls
             .iter()
             .any(|d| d.init.as_deref().is_some_and(expr_needs_heap)),
+        ast::Stmt::Decl(ast::Decl::Fn(_)) => true,
         ast::Stmt::Expr(e) => expr_needs_heap(&e.expr),
+        ast::Stmt::Block(block) => block.stmts.iter().any(stmt_needs_heap),
+        ast::Stmt::If(if_stmt) => {
+            expr_needs_heap(&if_stmt.test)
+                || stmt_needs_heap(&if_stmt.cons)
+                || if_stmt.alt.as_ref().is_some_and(|alt| stmt_needs_heap(alt))
+        }
         _ => false,
     }
 }
@@ -1630,7 +1845,7 @@ fn expr_needs_heap(expression: &ast::Expr) -> bool {
         }
         ast::Expr::Paren(p) => expr_needs_heap(&p.expr),
         ast::Expr::Bin(b) => expr_needs_heap(&b.left) || expr_needs_heap(&b.right),
-        ast::Expr::Unary(u) => expr_needs_heap(&u.arg),
+        ast::Expr::Unary(u) => u.op == ast::UnaryOp::TypeOf || expr_needs_heap(&u.arg),
         _ => false,
     }
 }
@@ -1648,6 +1863,7 @@ fn lower_primitive(
         next_slot: 0,
         bindings: HashMap::new(),
         array_lengths: HashMap::new(),
+        array_length_ids: HashMap::new(),
         source_bindings: Vec::new(),
         heap: None,
         init_cells: 0,
@@ -1663,54 +1879,15 @@ fn lower_primitive(
         helper_dispatch: None,
         function_code_ids: HashMap::new(),
         collected_functions: Vec::new(),
+        graph: scope::build(script, source, source_id, base)?,
+        active_scope: scope::ScopeId(0),
+        binding_slots: HashMap::new(),
+        binding_kinds: HashMap::new(),
+        type_names: None,
     };
+    lower.active_scope = lower.graph.script;
     let mut statements = Vec::new();
-    for statement in &script.body {
-        match statement {
-            ast::Stmt::Decl(ast::Decl::Var(declaration)) => {
-                if declaration.kind != ast::VarDeclKind::Var {
-                    return Err(lower.error(
-                        declaration.span,
-                        "JavaScript ES5 supports var declarations; let and const are rejected",
-                    ));
-                }
-                for declarator in &declaration.decls {
-                    let ast::Pat::Ident(binding) = &declarator.name else {
-                        return Err(
-                            lower.error(declarator.span, "P0 requires an identifier binding")
-                        );
-                    };
-                    let name = binding.id.sym.to_string();
-                    if lower.bindings.contains_key(&name) || name == "undefined" {
-                        return Err(lower.error(binding.id.span, "P0 does not yet support redeclaration or binding the global undefined name"));
-                    }
-                    let Some(initializer) = declarator.init.as_deref() else {
-                        return Err(lower.error(declarator.span, "P0 requires a var initializer"));
-                    };
-                    let initial = lower.expr(initializer)?;
-                    let (slot, mut stmt) = lower.bind_temp(initial.expr, declarator.span)?;
-                    lower.bindings.insert(name.clone(), (slot, initial.kind));
-                    lower.source_bindings.push((name, slot));
-                    statements.append(&mut stmt);
-                }
-            }
-            ast::Stmt::Expr(e) => {
-                let lowered = lower.expr(&e.expr)?;
-                let (slot, mut stmt) = lower.bind_temp(lowered.expr, e.span)?;
-                statements.append(&mut stmt);
-                statements.push(Stmt::Expr {
-                    expr: Expr::Var(slot),
-                    line: lower.line(e.span),
-                });
-            }
-            ast::Stmt::Empty(_) => {}
-            _ => {
-                return Err(
-                    lower.error(statement.span(), "unsupported JavaScript ES5 P0 statement")
-                );
-            }
-        }
-    }
+    reference::lower_script_statements(&mut lower, &script.body, &mut statements)?;
     let mut ir = LocalIrBuilder::new().finish(statements);
     ir.locals = usize::from(lower.next_slot);
     ir.local_bindings = lower.source_bindings;
@@ -1763,6 +1940,29 @@ fn collect_from_stmt(
                 if let Some(init) = declarator.init.as_deref() {
                     collect_from_expr(init, lower, enclosing_strict)?;
                 }
+            }
+            Ok(())
+        }
+        ast::Stmt::Decl(ast::Decl::Fn(decl)) => {
+            collect_function_decl(decl, lower, enclosing_strict)
+        }
+        ast::Stmt::Block(block) => {
+            for statement in &block.stmts {
+                collect_from_stmt(statement, lower, enclosing_strict)?;
+            }
+            Ok(())
+        }
+        ast::Stmt::If(if_stmt) => {
+            collect_from_expr(&if_stmt.test, lower, enclosing_strict)?;
+            collect_from_stmt(&if_stmt.cons, lower, enclosing_strict)?;
+            if let Some(alt) = &if_stmt.alt {
+                collect_from_stmt(alt, lower, enclosing_strict)?;
+            }
+            Ok(())
+        }
+        ast::Stmt::Return(ret) => {
+            if let Some(arg) = ret.arg.as_deref() {
+                collect_from_expr(arg, lower, enclosing_strict)?;
             }
             Ok(())
         }
@@ -1888,31 +2088,6 @@ fn collect_function(
             "P0 source functions require an exact \"use strict\" directive or inherited strictness",
         ));
     }
-    // Body shape: leading string directives, then Return/Empty only.
-    let mut in_prologue = true;
-    for statement in &body.stmts {
-        match statement {
-            ast::Stmt::Expr(e) => {
-                if in_prologue && matches!(e.expr.as_ref(), ast::Expr::Lit(ast::Lit::Str(_))) {
-                    continue;
-                }
-                return Err(lower.error(
-                    statement.span(),
-                    "P0 source-function bodies admit only directives plus Return or empty completion",
-                ));
-            }
-            ast::Stmt::Return(_) => {
-                in_prologue = false;
-            }
-            ast::Stmt::Empty(_) => {}
-            _ => {
-                return Err(lower.error(
-                    statement.span(),
-                    "P0 source-function bodies admit only directives plus Return or empty completion",
-                ));
-            }
-        }
-    }
     if lower.collected_functions.len() >= MAX_SOURCE_FUNCTIONS {
         return Err(lower.error(span, "P0 source functions exceed the 256 function bound"));
     }
@@ -1924,15 +2099,28 @@ fn collect_function(
         span,
         strict,
     });
-    // Recurse for nested closed functions with inherited strictness.
+    // Closed declaration subset: directives, var/function declarations,
+    // expression statements, declaration-only if, and one return. Unsupported
+    // statements still fail at lowering; collection must see nested functions.
     for statement in &body.stmts {
-        if let ast::Stmt::Return(ret) = statement
-            && let Some(arg) = ret.arg.as_deref()
-        {
-            collect_from_expr(arg, lower, strict)?;
-        }
+        collect_from_stmt(statement, lower, strict)?;
     }
     Ok(())
+}
+
+fn collect_function_decl(
+    decl: &ast::FnDecl,
+    lower: &mut Lowerer<'_>,
+    enclosing_strict: bool,
+) -> Result<(), ParseError> {
+    collect_function(
+        &ast::FnExpr {
+            ident: None,
+            function: decl.function.clone(),
+        },
+        lower,
+        enclosing_strict,
+    )
 }
 
 /// Whether the script needs the operational Reference helpers: any plain
@@ -1974,14 +2162,29 @@ fn script_needs_ref_helpers(script: &ast::Script) -> bool {
             _ => false,
         }
     }
-    script.body.iter().any(|statement| match statement {
-        ast::Stmt::Decl(ast::Decl::Var(decl)) => decl
-            .decls
-            .iter()
-            .any(|d| d.init.as_deref().is_some_and(expr_needs)),
-        ast::Stmt::Expr(e) => expr_needs(&e.expr),
-        _ => false,
-    })
+    fn stmt_needs(statement: &ast::Stmt) -> bool {
+        match statement {
+            ast::Stmt::Decl(ast::Decl::Var(decl)) => decl
+                .decls
+                .iter()
+                .any(|d| d.init.as_deref().is_some_and(expr_needs)),
+            ast::Stmt::Decl(ast::Decl::Fn(decl)) => decl
+                .function
+                .body
+                .as_ref()
+                .is_some_and(|body| body.stmts.iter().any(stmt_needs)),
+            ast::Stmt::Expr(e) => expr_needs(&e.expr),
+            ast::Stmt::Block(block) => block.stmts.iter().any(stmt_needs),
+            ast::Stmt::If(if_stmt) => {
+                expr_needs(&if_stmt.test)
+                    || stmt_needs(&if_stmt.cons)
+                    || if_stmt.alt.as_ref().is_some_and(|alt| stmt_needs(alt))
+            }
+            ast::Stmt::Return(ret) => ret.arg.as_deref().is_some_and(expr_needs),
+            _ => false,
+        }
+    }
+    script.body.iter().any(stmt_needs)
 }
 
 fn lower_with_realm(
@@ -2014,6 +2217,7 @@ fn lower_with_realm(
         })?,
         bindings: HashMap::new(),
         array_lengths: HashMap::new(),
+        array_length_ids: HashMap::new(),
         source_bindings: Vec::new(),
         heap: None,
         init_cells: 0,
@@ -2029,7 +2233,13 @@ fn lower_with_realm(
         helper_dispatch: None,
         function_code_ids: HashMap::new(),
         collected_functions: Vec::new(),
+        graph: scope::build(script, source, source_id, base)?,
+        active_scope: scope::ScopeId(0),
+        binding_slots: HashMap::new(),
+        binding_kinds: HashMap::new(),
+        type_names: None,
     };
+    lower.active_scope = lower.graph.script;
     let script_strict = lower.script_strict(script);
     lower.enclosing_strict = script_strict;
     lower.preflight_binding_literals(script)?;
@@ -2189,104 +2399,7 @@ fn lower_with_realm(
         next_entry: 0,
     });
     let mut body = Vec::new();
-    for statement in &script.body {
-        // Skip exact `"use strict"` directives: they set caller strictness
-        // above and produce no value.
-        if let ast::Stmt::Expr(e) = statement
-            && let ast::Expr::Lit(ast::Lit::Str(s)) = e.expr.as_ref()
-            && lower.is_exact_use_strict_lexeme(s.span)
-        {
-            continue;
-        }
-        match statement {
-            ast::Stmt::Decl(ast::Decl::Var(declaration)) => {
-                if declaration.kind != ast::VarDeclKind::Var {
-                    return Err(lower.error(
-                        declaration.span,
-                        "JavaScript ES5 supports var declarations; let and const are rejected",
-                    ));
-                }
-                for declarator in &declaration.decls {
-                    let ast::Pat::Ident(binding) = &declarator.name else {
-                        return Err(
-                            lower.error(declarator.span, "P0 requires an identifier binding")
-                        );
-                    };
-                    let name = binding.id.sym.to_string();
-                    if lower.bindings.contains_key(&name) || name == "undefined" {
-                        return Err(lower.error(binding.id.span, "P0 does not yet support redeclaration or binding the global undefined name"));
-                    }
-                    let Some(initializer) = declarator.init.as_deref() else {
-                        return Err(lower.error(declarator.span, "P0 requires a var initializer"));
-                    };
-                    if let ast::Expr::Array(literal) = initializer {
-                        lower_array_binding(
-                            &mut lower,
-                            &name,
-                            literal,
-                            declarator.span,
-                            &mut body,
-                        )?;
-                        continue;
-                    }
-                    if let ast::Expr::Ident(alias) = initializer
-                        && let Some(&(src_slot, Kind::Array)) =
-                            lower.bindings.get(alias.sym.as_str())
-                    {
-                        let length = lower
-                            .array_lengths
-                            .get(alias.sym.as_str())
-                            .copied()
-                            .unwrap_or(0);
-                        let (slot, mut stmt) =
-                            lower.bind_temp(Expr::Var(src_slot), declarator.span)?;
-                        lower.bindings.insert(name.clone(), (slot, Kind::Array));
-                        lower.array_lengths.insert(name.clone(), length);
-                        lower.source_bindings.push((name, slot));
-                        body.append(&mut stmt);
-                        continue;
-                    }
-                    let initial = lower.expr(initializer)?;
-                    if initial.kind == Kind::Array {
-                        return Err(lower.error(
-                            declarator.span,
-                            "P0 array bindings require an array literal or array alias",
-                        ));
-                    }
-                    let (slot, mut stmt) = lower.bind_temp(initial.expr, declarator.span)?;
-                    lower.bindings.insert(name.clone(), (slot, initial.kind));
-                    lower.source_bindings.push((name, slot));
-                    body.append(&mut stmt);
-                }
-            }
-            ast::Stmt::Expr(e) => {
-                if let ast::Expr::Assign(assign) = e.expr.as_ref()
-                    && assign.op == ast::AssignOp::Assign
-                    && let ast::AssignTarget::Simple(ast::SimpleAssignTarget::Member(member)) =
-                        &assign.left
-                {
-                    lower_member_write_stmt(&mut lower, member, &assign.right, e.span, &mut body)?;
-                    continue;
-                }
-                // Dropped statement values take no root entry: their nodes
-                // stay collectable by design while every named binding keeps
-                // its own entry through final observation.
-                let lowered = lower.expr(&e.expr)?;
-                let (slot, stmt) = lower.bind_temp_bare(lowered.expr, e.span)?;
-                body.push(stmt);
-                body.push(Stmt::Expr {
-                    expr: Expr::Var(slot),
-                    line: lower.line(e.span),
-                });
-            }
-            ast::Stmt::Empty(_) => {}
-            _ => {
-                return Err(
-                    lower.error(statement.span(), "unsupported JavaScript ES5 P0 statement")
-                );
-            }
-        }
-    }
+    reference::lower_script_statements(&mut lower, &script.body, &mut body)?;
     // Prefix the script frame entry with the full capacity now known, then
     // the lowered body. The frame stays active through the final result and
     // any appended in-realm observations; teardown owns its release.
@@ -2525,91 +2638,34 @@ fn append_source_function(
         .as_ref()
         .ok_or_else(|| lower.error(collected.span, "P0 source functions require a body"))?;
     let mut body_stmts: Vec<Stmt> = Vec::new();
-    let mut completion: Option<Expr> = None;
-    let mut in_prologue = true;
-    for statement in &body.stmts {
-        match statement {
-            ast::Stmt::Expr(e) => {
-                if in_prologue && matches!(e.expr.as_ref(), ast::Expr::Lit(ast::Lit::Str(_))) {
-                    continue;
-                }
-                let err = lower.error(
-                    statement.span(),
-                    "P0 source-function bodies admit only directives plus Return or empty completion",
-                );
-                lower.bindings = saved_bindings;
-                lower.function_this = saved_this;
-                lower.carrier_override = saved_carrier;
-                lower.frame_override = saved_frame;
-                lower.root_scope = saved_scope;
-                lower.enclosing_strict = saved_strict;
-                return Err(err);
-            }
-            ast::Stmt::Empty(_) => {}
-            ast::Stmt::Return(ret) => {
-                in_prologue = false;
-                if completion.is_some() {
-                    let err = lower.error(
-                        ret.span,
-                        "P0 source-function bodies admit only a single Return",
-                    );
-                    lower.bindings = saved_bindings;
-                    lower.function_this = saved_this;
-                    lower.carrier_override = saved_carrier;
-                    lower.frame_override = saved_frame;
-                    lower.root_scope = saved_scope;
-                    lower.enclosing_strict = saved_strict;
-                    return Err(err);
-                }
-                match ret.arg.as_deref() {
-                    Some(arg) => {
-                        let val = match lower.expr(arg) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                lower.bindings = saved_bindings;
-                                lower.function_this = saved_this;
-                                lower.carrier_override = saved_carrier;
-                                lower.frame_override = saved_frame;
-                                lower.root_scope = saved_scope;
-                                lower.enclosing_strict = saved_strict;
-                                return Err(e);
-                            }
-                        };
-                        let (val_slot, mut val_stmt) = match lower.bind_temp(val.expr, ret.span) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                lower.bindings = saved_bindings;
-                                lower.function_this = saved_this;
-                                lower.carrier_override = saved_carrier;
-                                lower.frame_override = saved_frame;
-                                lower.root_scope = saved_scope;
-                                lower.enclosing_strict = saved_strict;
-                                return Err(e);
-                            }
-                        };
-                        body_stmts.append(&mut val_stmt);
-                        completion = Some(value::completion_return(Expr::Var(val_slot)));
-                    }
-                    None => {
-                        completion = Some(value::completion_return(value::undefined()));
-                    }
-                }
-            }
-            _ => {
-                let err = lower.error(
-                    statement.span(),
-                    "P0 source-function bodies admit only directives plus Return or empty completion",
-                );
-                lower.bindings = saved_bindings;
-                lower.function_this = saved_this;
-                lower.carrier_override = saved_carrier;
-                lower.frame_override = saved_frame;
-                lower.root_scope = saved_scope;
-                lower.enclosing_strict = saved_strict;
-                return Err(err);
-            }
+    let fn_key = (collected.span.lo.0, collected.span.hi.0);
+    let fn_scope = lower
+        .graph
+        .function_scopes
+        .get(&fn_key)
+        .copied()
+        .ok_or_else(|| lower.error(collected.span, "P3 function scope was not collected"))?;
+    let saved_active = lower.active_scope;
+    let saved_lengths = std::mem::take(&mut lower.array_lengths);
+    let saved_type_names = lower.type_names.take();
+    lower.active_scope = fn_scope;
+    let lowered = reference::lower_function_body(lower, &body.stmts, &mut body_stmts);
+    lower.active_scope = saved_active;
+    lower.array_lengths = saved_lengths;
+    lower.type_names = saved_type_names;
+    let completion = match lowered {
+        Ok(value) => value,
+        Err(err) => {
+            lower.bindings = saved_bindings;
+            lower.function_this = saved_this;
+            lower.carrier_override = saved_carrier;
+            lower.frame_override = saved_frame;
+            lower.root_scope = saved_scope;
+            lower.enclosing_strict = saved_strict;
+            lower.type_names = saved_type_names;
+            return Err(err);
         }
-    }
+    };
     lower.bindings = saved_bindings;
     lower.function_this = saved_this;
     lower.carrier_override = saved_carrier;
@@ -2710,13 +2766,14 @@ fn append_source_function(
     Ok(())
 }
 
-fn lower_array_binding(
+pub(super) fn lower_array_binding(
     lower: &mut Lowerer<'_>,
     name: &str,
     literal: &ast::ArrayLit,
     span: swc_common::Span,
     statements: &mut Vec<Stmt>,
-) -> Result<(), ParseError> {
+    anonymous: bool,
+) -> Result<Option<(u16, usize)>, ParseError> {
     let carrier = lower.active_carrier(span)?;
     let line = lower.line(span);
     // Static pre-check from the syntactic element count (holes and spread
@@ -2749,16 +2806,18 @@ fn lower_array_binding(
             return Err(lower.error(element.span(), "P0 numeric arrays reject spread elements"));
         }
         let value = lower.expr(&element.expr)?;
-        if value.kind != Kind::Number {
-            return Err(lower.error(
-                element.span(),
-                "P0 numeric arrays admit only numeric elements",
-            ));
-        }
+        reference::admit_numeric_element(lower, element.span(), value.kind)?;
         // Kind::Number was checked above: this boxed scalar has no heap
         // edge, so numeric payload length must not consume root entries.
         let (slot, stmt) = lower.bind_temp_bare(value.expr, element.span())?;
         statements.push(stmt);
+        reference::release_consumed_roots(
+            lower,
+            &value.owned_roots,
+            slot,
+            element.span(),
+            statements,
+        )?;
         element_slots.push(slot);
     }
     let length = element_slots.len();
@@ -2801,81 +2860,62 @@ fn lower_array_binding(
             statements,
         )?;
     }
+    if anonymous {
+        let boxed = lower.publish_node(carrier, &newborn, span, line, statements)?;
+        return Ok(Some((boxed, length)));
+    }
+    if let Some(id) = lower
+        .graph
+        .scope(lower.active_scope)
+        .by_name
+        .get(name)
+        .copied()
+        && let Some(&slot) = lower.binding_slots.get(&id)
+    {
+        lower.publish_into(slot, carrier, &newborn, span, line, statements)?;
+        lower.bindings.insert(name.to_owned(), (slot, Kind::Array));
+        lower.binding_kinds.insert(id, Kind::Array);
+        lower.array_lengths.insert(name.to_owned(), length);
+        lower.array_length_ids.insert(id, length);
+        return Ok(None);
+    }
     let boxed = lower.publish_node(carrier, &newborn, span, line, statements)?;
     lower.bindings.insert(name.to_owned(), (boxed, Kind::Array));
     lower.array_lengths.insert(name.to_owned(), length);
     lower.source_bindings.push((name.to_owned(), boxed));
-    Ok(())
+    Ok(None)
 }
 
-fn lower_member_write_stmt(
+pub(super) fn lower_member_write_stmt(
     lower: &mut Lowerer<'_>,
     member: &ast::MemberExpr,
     right: &ast::Expr,
     span: swc_common::Span,
     statements: &mut Vec<Stmt>,
 ) -> Result<(), ParseError> {
-    // Plain-object property assignment is an explicit P7 capability
-    // rejection: do not invent put semantics. Detect object-like receivers
-    // first so `obj.x = v` reports the object diagnostic, not the array one.
-    if !matches!(member.prop, ast::MemberProp::Computed(_)) {
-        return Err(lower.error(
-            member.span,
-            "P0 plain objects reject property assignment until P7 descriptors",
-        ));
-    }
-    if let ast::Expr::Ident(object) = member.obj.as_ref()
-        && let Some(&(_, kind)) = lower.bindings.get(object.sym.as_str())
-        && matches!(kind, Kind::Object | Kind::Function)
-    {
-        return Err(lower.error(
-            member.span,
-            "P0 plain objects reject property assignment until P7 descriptors",
-        ));
-    }
-    // `this.x = v` inside a source function is the same deferred path.
-    if matches!(member.obj.as_ref(), ast::Expr::This(_)) && lower.function_this.is_some() {
-        return Err(lower.error(
-            member.span,
-            "P0 plain objects reject property assignment until P7 descriptors",
-        ));
-    }
+    let kind = match member.obj.as_ref() {
+        ast::Expr::Ident(object) => lower
+            .bindings
+            .get(object.sym.as_str())
+            .map(|(_, kind)| *kind)
+            .unwrap_or(Kind::Undefined),
+        ast::Expr::This(_) => Kind::Object,
+        _ => Kind::Undefined,
+    };
+    let length = if let ast::Expr::Ident(object) = member.obj.as_ref() {
+        lower.array_lengths.get(object.sym.as_str()).copied()
+    } else {
+        None
+    };
+    reference::admit_member_write(lower, member, kind, length)?;
     let ast::MemberProp::Computed(property) = &member.prop else {
-        return Err(lower.error(
-            member.span,
-            "P0 numeric arrays admit only computed integer literal subscripts",
-        ));
+        unreachable!()
     };
-    let Some(index) = Lowerer::member_index_literal(&property.expr) else {
-        return Err(lower.error(
-            property.span(),
-            "P0 numeric arrays admit only integer literal subscripts",
-        ));
-    };
+    let index = Lowerer::member_index_literal(&property.expr).expect("validated numeric index");
     let ast::Expr::Ident(object) = member.obj.as_ref() else {
-        return Err(lower.error(
-            member.span,
-            "P0 numeric array writes require a local array binding",
-        ));
+        unreachable!()
     };
-    let name = object.sym.as_str();
-    let Some(&(slot, kind)) = lower.bindings.get(name) else {
-        return Err(lower.error(object.span, &format!("unknown local '{name}'")));
-    };
-    if kind != Kind::Array {
-        return Err(lower.error(
-            member.span,
-            "P0 indexed writes require a numeric-array binding",
-        ));
-    }
-    let length = lower.array_lengths.get(name).copied().unwrap_or(0);
-    let position = usize::try_from(index).unwrap_or(usize::MAX);
-    if position >= length {
-        return Err(lower.error(
-            property.span(),
-            "P0 numeric arrays reject length-changing writes",
-        ));
-    }
+    let (slot, _) = lower.bindings[object.sym.as_str()];
     // Receiver evaluation/rooting precedes the RHS and does not consume
     // identity fields from the reusable source binding.
     let (receiver, mut receiver_bound) = lower.bind_temp(Expr::Var(slot), member.obj.span())?;
@@ -2884,7 +2924,9 @@ fn lower_member_write_stmt(
     if value.kind != Kind::Number {
         return Err(lower.error(right.span(), "P0 numeric arrays store only numbers"));
     }
-    let (value_slot, mut value_bound) = lower.bind_temp(value.expr, right.span())?;
+    let mut value_roots = value.owned_roots;
+    let (value_slot, mut value_bound) =
+        lower.bind_evaluation(value.expr, value.kind, right.span())?;
     statements.append(&mut value_bound);
     let carrier = lower.active_carrier(span)?;
     let checked_base = lower.heap_ref(span)?.helpers.checked_base;
@@ -2962,5 +3004,10 @@ fn lower_member_write_stmt(
         line,
         statements,
     )?;
+    value_roots.push(receiver);
+    if lower.has_root(value_slot) {
+        value_roots.push(value_slot);
+    }
+    reference::release_consumed_roots(lower, &value_roots, slot, span, statements)?;
     Ok(())
 }

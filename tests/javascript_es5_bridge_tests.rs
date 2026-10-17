@@ -793,10 +793,8 @@ fn append_distinctness_driver(ir: &mut vm::FrontendIr) -> Result<(), vm::ParseEr
     let boxed_at = ir
         .stmts
         .iter()
-        .position(|stmt| matches!(stmt, vm::Stmt::Let { index, .. } if *index == binding))
-        .ok_or_else(|| {
-            stress_rejection("stress fixture requires the real `a` definition".to_owned())
-        })?;
+        .position(|stmt| matches!(stmt, vm::Stmt::Assign { index, .. } if *index == binding))
+        .ok_or_else(|| stress_rejection("stress fixture requires the real `a` store".to_owned()))?;
     let helper = |name: &str| -> Result<u16, vm::ParseError> {
         ir.functions
             .iter()
@@ -913,9 +911,20 @@ fn append_distinctness_driver(ir: &mut vm::FrontendIr) -> Result<(), vm::ParseEr
                 expr: expr.clone(),
                 line: *line,
             }),
+            vm::Stmt::Assign {
+                kind,
+                index,
+                expr,
+                line,
+            } => replay.push(vm::Stmt::Assign {
+                kind: kind.clone(),
+                index: *index,
+                expr: expr.clone(),
+                line: *line,
+            }),
             other => {
                 return Err(stress_rejection(format!(
-                    "stress fixture supports only Let/Expr replay, got {other:?}"
+                    "stress fixture supports only Let/Expr/Assign replay, got {other:?}"
                 )));
             }
         }

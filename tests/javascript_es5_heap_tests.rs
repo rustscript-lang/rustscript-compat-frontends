@@ -76,6 +76,47 @@ struct HeapHistoryPlugin {
     iters: u64,
 }
 
+/// The real bare-call sequence starts at its callee snapshot and ends
+/// after binding refresh and both metadata-only owned-root clears.
+fn heap_call_replay_bounds(
+    ir: &vm::FrontendIr,
+    store: usize,
+) -> Result<(usize, usize), vm::ParseError> {
+    let dispatch = heap_helper_index(ir, "__compat_es5_dispatch")?;
+    let root_write = heap_helper_index(ir, HEAP_ROOT_WRITE_NAME)?;
+    let callee = ir.stmts[..store]
+        .iter()
+        .rev()
+        .find_map(|stmt| match stmt {
+            vm::Stmt::Let {
+                expr: vm::Expr::Call(target, _, args, _, _),
+                ..
+            } if *target == dispatch => match args.get(1) {
+                Some(vm::Expr::Var(slot)) => Some(*slot),
+                _ => None,
+            },
+            _ => None,
+        })
+        .ok_or_else(|| heap_rejection("actual call dispatch and callee".to_owned()))?;
+    let start = ir.stmts[..store]
+        .iter()
+        .rposition(|stmt| matches!(stmt, vm::Stmt::Let { index, .. } if *index == callee))
+        .ok_or_else(|| heap_rejection("actual callee snapshot".to_owned()))?;
+    let mut end = store + 1;
+    while matches!(ir.stmts.get(end), Some(vm::Stmt::Let {
+        expr: vm::Expr::Call(target, _, _, _, _), ..
+    }) if *target == root_write)
+    {
+        end += 1;
+    }
+    if end < store + 4 {
+        return Err(heap_rejection(
+            "binding refresh and callee/result cleanup required".to_owned(),
+        ));
+    }
+    Ok((start, end))
+}
+
 fn append_heap_history_driver(ir: &mut vm::FrontendIr, iters: u64) -> Result<(), vm::ParseError> {
     let make = heap_helper_index(ir, HEAP_MAKE_NAME)?;
     let length = heap_helper_index(ir, HEAP_LENGTH_NAME)?;
@@ -140,21 +181,18 @@ fn append_heap_history_driver(ir: &mut vm::FrontendIr, iters: u64) -> Result<(),
     let boxed_at = ir
         .stmts
         .iter()
-        .position(|stmt| matches!(stmt, vm::Stmt::Let { index, .. } if *index == binding))
-        .ok_or_else(|| {
-            heap_rejection("heap fixture requires the real `o` definition".to_owned())
-        })?;
-    let (inner, tail) = match &ir.stmts[boxed_at] {
-        vm::Stmt::Let {
-            expr: vm::Expr::Block { stmts, expr },
-            ..
-        } => (stmts.clone(), expr.clone()),
+        .position(|stmt| matches!(stmt, vm::Stmt::Assign { index, .. } if *index == binding))
+        .ok_or_else(|| heap_rejection("heap fixture requires the real `o` store".to_owned()))?;
+    let tail = match &ir.stmts[boxed_at] {
+        vm::Stmt::Assign { expr, .. } => expr.clone(),
         other => {
             return Err(heap_rejection(format!(
-                "heap fixture requires the dispatched `o` block, got {other:?}"
+                "heap fixture requires the dispatched `o` store, got {other:?}"
             )));
         }
     };
+    let (run_start, suffix_start) = heap_call_replay_bounds(ir, boxed_at)?;
+    let inner = ir.stmts[run_start..boxed_at].to_vec();
     let mut replay = Vec::with_capacity(inner.len() + 2);
     for stmt in &inner {
         match stmt {
@@ -176,27 +214,23 @@ fn append_heap_history_driver(ir: &mut vm::FrontendIr, iters: u64) -> Result<(),
     replay.push(vm::Stmt::Assign {
         kind: vm::AssignmentKind::Set,
         index: binding,
-        expr: *tail,
+        expr: tail,
         line: 1,
     });
-    let root_write = heap_helper_index(ir, HEAP_ROOT_WRITE_NAME)?;
-    let suffix_start = if let Some(vm::Stmt::Let {
-        index, expr, line, ..
-    }) = ir.stmts.get(boxed_at + 1)
-        && matches!(expr, vm::Expr::Call(target, _, _, _, _) if *target == root_write)
-    {
+    for stmt in &ir.stmts[boxed_at + 1..suffix_start] {
+        let vm::Stmt::Let {
+            index, expr, line, ..
+        } = stmt
+        else {
+            return Err(heap_rejection("actual handoff/cleanup ack".to_owned()));
+        };
         replay.push(vm::Stmt::Assign {
             kind: vm::AssignmentKind::Set,
             index: *index,
             expr: expr.clone(),
             line: *line,
         });
-        boxed_at + 2
-    } else {
-        return Err(heap_rejection(
-            "factory binding must have its actual root ack".to_owned(),
-        ));
-    };
+    }
     let suffix = ir.stmts.split_off(suffix_start);
     let mut fresh = || -> Result<u16, vm::ParseError> {
         let slot = u16::try_from(ir.locals)
@@ -334,15 +368,28 @@ fn heap_history_run(iters: u64, native: bool) -> HeapHistoryEvidence {
     machine.set_fuel(1_000_000_000);
     if native {
         eprintln!("P2_HEAP_NATIVE_PHASE compile_start iters={iters}");
+        let started = std::time::Instant::now();
         machine
             .compile_aot()
             .expect("real history native compilation");
+        eprintln!(
+            "P2_HEAP_NATIVE_PHASE compile_done iters={iters} elapsed={:?}",
+            started.elapsed()
+        );
+    }
+    let run_started = std::time::Instant::now();
+    if native {
+        eprintln!("P2_HEAP_NATIVE_PHASE run_start iters={iters}");
     }
     assert_eq!(
         machine.run().expect("real history must execute"),
         VmStatus::Halted
     );
     if native {
+        eprintln!(
+            "P2_HEAP_NATIVE_PHASE run_done iters={iters} elapsed={:?}",
+            run_started.elapsed()
+        );
         let count = machine.aot_exec_count();
         let info = machine.dump_aot_info();
         eprintln!("P2_HEAP_HISTORY_NATIVE iters={iters} count={count}\n{info}");
@@ -803,114 +850,74 @@ fn heap_replay_binding(
     let boxed_at = ir
         .stmts
         .iter()
-        .position(|stmt| matches!(stmt, vm::Stmt::Let { index, .. } if *index == binding))
-        .ok_or_else(|| {
-            heap_rejection("heap fixture requires the real binding definition".to_owned())
-        })?;
-    // The binding root has TWO entries: the publish call writes the newborn
-    // entry and the following ack re-affirms the binding slot entry. Both
-    // must be replayed or the original box stays rooted through the ack.
-    let replay_ack_at = boxed_at + 1;
-    match &ir.stmts[boxed_at].clone() {
-        vm::Stmt::Let {
-            expr: vm::Expr::Block { stmts, expr },
-            ..
-        } => {
-            for stmt in stmts {
-                match stmt {
-                    vm::Stmt::Let {
-                        index, expr, line, ..
-                    } => ir.stmts.push(vm::Stmt::Assign {
-                        kind: vm::AssignmentKind::Set,
-                        index: *index,
-                        expr: expr.clone(),
-                        line: *line,
-                    }),
-                    other => {
-                        return Err(heap_rejection(format!(
-                            "heap fixture replays only Let bindings, got {other:?}"
-                        )));
-                    }
-                }
-            }
-            ir.stmts.push(vm::Stmt::Assign {
-                kind: vm::AssignmentKind::Set,
-                index: binding,
-                expr: (**expr).clone(),
-                line: 1,
-            });
-        }
-        vm::Stmt::Let { expr, line, .. } => {
-            // Array bindings lower to a bare publish call with the whole
-            // emission as preceding sibling Lets: replay the maximal
-            // contiguous plain-Let run (stopping before the frame entry),
-            // then re-issue the publish call itself.
-            let mut run_start = boxed_at;
-            while run_start > 0 {
-                match &ir.stmts[run_start - 1] {
-                    vm::Stmt::Let { expr: prev, .. } => {
-                        if let vm::Expr::Call(target, _, _, _, _) = prev
-                            && *target == root_enter
-                        {
-                            break;
-                        }
-                        run_start -= 1;
-                    }
-                    _ => break,
-                }
-            }
-            let run: Vec<vm::Stmt> = ir.stmts[run_start..boxed_at].to_vec();
-            let mut saw_begin = false;
-            for stmt in &run {
-                match stmt {
-                    vm::Stmt::Let {
-                        index, expr, line, ..
-                    } => {
-                        if let vm::Expr::Call(target, _, _, _, _) = expr
-                            && *target == node_begin
-                        {
-                            saw_begin = true;
-                        }
-                        ir.stmts.push(vm::Stmt::Assign {
-                            kind: vm::AssignmentKind::Set,
-                            index: *index,
-                            expr: expr.clone(),
-                            line: *line,
-                        });
-                    }
-                    other => {
-                        return Err(heap_rejection(format!(
-                            "heap fixture replays only Let bindings, got {other:?}"
-                        )));
-                    }
-                }
-            }
-            if !saw_begin {
-                return Err(heap_rejection(
-                    "heap fixture replay must span a node reservation".to_owned(),
-                ));
-            }
-            ir.stmts.push(vm::Stmt::Assign {
-                kind: vm::AssignmentKind::Set,
-                index: binding,
-                expr: expr.clone(),
-                line: *line,
-            });
-        }
+        .position(|stmt| matches!(stmt, vm::Stmt::Assign { index, .. } if *index == binding))
+        .ok_or_else(|| heap_rejection("heap fixture requires the real binding store".to_owned()))?;
+    let publish_expr = match &ir.stmts[boxed_at] {
+        vm::Stmt::Assign { expr, .. } => expr.clone(),
         other => {
             return Err(heap_rejection(format!(
-                "heap fixture requires the replayable binding definition, got {other:?}"
+                "heap fixture requires the replayable binding store, got {other:?}"
             )));
         }
+    };
+    // Hoisted bindings are predeclared, then stored by Assign. Replay the
+    // contiguous reservation Lets immediately before that store, then the
+    // store and its production root-write ack.
+    let mut run_start = boxed_at;
+    while run_start > 0 {
+        match &ir.stmts[run_start - 1] {
+            vm::Stmt::Let { expr: prev, .. } => {
+                if let vm::Expr::Call(target, _, _, _, _) = prev
+                    && *target == root_enter
+                {
+                    break;
+                }
+                run_start -= 1;
+            }
+            _ => break,
+        }
     }
-    // Re-affirm the binding-slot entry with the newest box, but only when
-    // the definition is genuinely followed by its production root-write
-    // ack (array bindings publish bare with no ack; blindly replaying the
-    // next fixture stmt would duplicate a field read and trip the
-    // move checker).
+    let run: Vec<vm::Stmt> = ir.stmts[run_start..boxed_at].to_vec();
+    let ack = ir.stmts.get(boxed_at + 1).cloned();
+    let mut saw_begin = false;
+    for stmt in &run {
+        match stmt {
+            vm::Stmt::Let {
+                index, expr, line, ..
+            } => {
+                if let vm::Expr::Call(target, _, _, _, _) = expr
+                    && *target == node_begin
+                {
+                    saw_begin = true;
+                }
+                ir.stmts.push(vm::Stmt::Assign {
+                    kind: vm::AssignmentKind::Set,
+                    index: *index,
+                    expr: expr.clone(),
+                    line: *line,
+                });
+            }
+            other => {
+                return Err(heap_rejection(format!(
+                    "heap fixture replays only Let bindings, got {other:?}"
+                )));
+            }
+        }
+    }
+    if !saw_begin {
+        return Err(heap_rejection(
+            "heap fixture replay must span a node reservation".to_owned(),
+        ));
+    }
+    ir.stmts.push(vm::Stmt::Assign {
+        kind: vm::AssignmentKind::Set,
+        index: binding,
+        expr: publish_expr,
+        line: 1,
+    });
     if let Some(vm::Stmt::Let {
         index, expr, line, ..
-    }) = ir.stmts.get(replay_ack_at).cloned()
+    }) = ack
         && let vm::Expr::Call(target, _, _, _, _) = &expr
         && *target == root_write
     {

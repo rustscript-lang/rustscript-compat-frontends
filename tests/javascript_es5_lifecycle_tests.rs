@@ -1410,7 +1410,9 @@ fn run_fresh_aot_fixture(vmbc: &std::path::Path, aot: &std::path::Path) -> std::
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn fresh AOT fixture process");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    // Companion loading recompiles native code; keep its host deadline finite
+    // and distinct from the VMBC-only fixture's deadline.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);
     let status = loop {
         if let Some(status) = child.try_wait().expect("poll fixture process") {
             break status;
@@ -1878,7 +1880,9 @@ fn cost_extend_managed_array(
     let publish_at = ir
         .stmts
         .iter()
-        .position(|statement| matches!(statement, vm::Stmt::Let { index, .. } if *index == binding))
+        .position(
+            |statement| matches!(statement, vm::Stmt::Assign { index, .. } if *index == binding),
+        )
         .ok_or_else(|| {
             lifecycle_rejection("managed cost fixture requires array publication".to_owned())
         })?;

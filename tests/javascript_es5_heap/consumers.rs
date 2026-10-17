@@ -23,10 +23,12 @@ impl vm::SourcePlugin for ConsumerPlugin {
         let mut ctx = heap_cycle_ctx(&ir)?;
         ctx.carrier = heap_cycle_carrier(&ir)?;
         let binding = heap_binding_index(&ir, self.binding)?;
+        // Hoisted bindings are predeclared by Let, then stored by Assign.
+        // Anchor on that store so the suffix keeps the real publication.
         let at = ir
             .stmts
             .iter()
-            .position(|s| matches!(s,vm::Stmt::Let{index,..} if *index==binding))
+            .position(|s| matches!(s, vm::Stmt::Assign { index, .. } if *index == binding))
             .ok_or_else(|| heap_rejection("consumer binding".to_owned()))?;
         let ack = matches!(ir.stmts.get(at+1),Some(vm::Stmt::Let{expr:vm::Expr::Call(target,_,_,_,_),..}) if *target==ctx.root_write);
         let suffix = ir.stmts.split_off(at + 1 + usize::from(ack));
