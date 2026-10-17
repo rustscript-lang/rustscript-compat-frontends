@@ -1361,17 +1361,12 @@ impl<'source> Checker<'source> {
             Setter => roles.setter = true,
         };
         match conflict {
-            None => {
+            Some(label) if self.strict => {
+                Err(self.syntax(span, format!("{label} is not allowed in strict mode code")))
+            }
+            _ => {
                 record(roles);
                 Ok(())
-            }
-            Some(label) => {
-                if self.strict {
-                    Err(self.syntax(span, format!("{label} is not allowed in strict mode code")))
-                } else {
-                    record(roles);
-                    Ok(())
-                }
             }
         }
     }
