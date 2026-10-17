@@ -520,28 +520,33 @@ impl vm::SourcePlugin for LifecycleAbortPlugin {
         context: &vm::SourceFrontendContext<'_>,
     ) -> Result<vm::FrontendIr, vm::ParseError> {
         let mut ir = JAVASCRIPT_ES5_PLUGIN.parse_source(source, context)?;
-        let mut target = None;
+        let make = lifecycle_helper_index(&ir, LIFECYCLE_MAKE_NAME)?;
+        let begin = lifecycle_helper_index(&ir, "__compat_es5_node_begin")?;
+        let mut carriers = Vec::new();
         for stmt in &ir.stmts {
             if let vm::Stmt::Let {
-                declared_schema: Some(vm::TypeSchema::Int),
-                expr: vm::Expr::Call(index, _, args, _, _),
+                index,
+                declared_schema: None,
+                expr: vm::Expr::Call(target, _, args, _, _),
                 ..
             } = stmt
-                && args.len() == 2
-                && let (vm::Expr::Var(carrier), vm::Expr::Int(_)) = (&args[0], &args[1])
+                && *target == make
+                && args.len() == 1
             {
-                target = Some((*index, *carrier));
-                break;
+                carriers.push(*index);
             }
         }
-        let (index, carrier) = target.ok_or_else(|| {
-            lifecycle_rejection("abort fixture requires the real allocator call".to_owned())
-        })?;
+        let [carrier] = carriers.as_slice() else {
+            return Err(lifecycle_rejection(format!(
+                "abort fixture requires exactly one realm carrier, found {}",
+                carriers.len()
+            )));
+        };
         ir.stmts.push(vm::Stmt::Expr {
             expr: vm::Expr::Call(
-                index,
+                begin,
                 Vec::new(),
-                vec![vm::Expr::Var(carrier), vm::Expr::Int(0)],
+                vec![vm::Expr::Var(*carrier), vm::Expr::Int(0), vm::Expr::Int(1)],
                 None,
                 None,
             ),
@@ -604,6 +609,7 @@ impl vm::SourcePlugin for LifecycleQuotaPlugin {
         let mut ir = JAVASCRIPT_ES5_PLUGIN.parse_source(source, context)?;
         let make = lifecycle_helper_index(&ir, LIFECYCLE_MAKE_NAME)?;
         let resize = lifecycle_helper_index(&ir, "__compat_ref_resize")?;
+        let length = lifecycle_helper_index(&ir, LIFECYCLE_LENGTH_NAME)?;
         let mut carriers = Vec::new();
         for stmt in &ir.stmts {
             if let vm::Stmt::Let {
@@ -626,6 +632,20 @@ impl vm::SourcePlugin for LifecycleQuotaPlugin {
         };
         ir.stmts.push(vm::Stmt::Expr {
             expr: vm::Expr::Call(
+                length,
+                Vec::new(),
+                vec![vm::Expr::Var(*carrier)],
+                None,
+                None,
+            ),
+            line: 1,
+        });
+        ir.stmts.push(vm::Stmt::Expr {
+            expr: vm::Expr::String("lifecycle-resize-ready".to_owned()),
+            line: 1,
+        });
+        ir.stmts.push(vm::Stmt::Expr {
+            expr: vm::Expr::Call(
                 resize,
                 Vec::new(),
                 vec![vm::Expr::Var(*carrier), vm::Expr::Int(200_000)],
@@ -640,6 +660,22 @@ impl vm::SourcePlugin for LifecycleQuotaPlugin {
 
 #[test]
 fn js_tight_quota_refuses_resize_transactionally() {
+    // Independent completed-source control supplies the actual pre-resize
+    // capacity accounting; quotas are unchanged, not tuned after refusal.
+    let (mut control, _) = lifecycle_vm("var a=[1];a[0];", false);
+    assert_eq!(
+        control.run().expect("quota control should finish"),
+        VmStatus::Halted
+    );
+    assert_eq!(
+        boxed_float_at(&control, control.stack().len() - 1),
+        Value::Float(1.0)
+    );
+    let before = pd_vm_compat_frontends::runtime::array::owned_array_runtime_stats(&mut control)
+        .expect("completed-source directory");
+    assert_eq!((before.pending, before.registered), (0, 1));
+    control.reset_for_reuse().expect("reset quota control");
+    assert_eq!(control.host_context().resource_count(), 0);
     let catalog = lifecycle_catalog();
     let compilation = vm::compile_source_with_flavor_and_options_with_capture_certification(
         "var a=[1];a[0];",
@@ -666,11 +702,43 @@ fn js_tight_quota_refuses_resize_transactionally() {
         text.contains("quota"),
         "refusal must cite quota transactionally, got {text}"
     );
+    // Failed host-call operands remain above earlier source results.
+    let phase = machine
+        .stack()
+        .iter()
+        .position(|value| *value == Value::string("lifecycle-resize-ready"))
+        .expect("quota probe must finish its source and reach the intended resize");
+    assert!(
+        phase >= 2,
+        "source result and actual B1 length precede the phase"
+    );
+    assert_eq!(boxed_float_at(&machine, phase - 2), Value::Float(1.0));
+    let length = match &machine.stack()[phase - 1] {
+        Value::Float(length) => *length,
+        Value::Int(length) => *length as f64,
+        other => {
+            panic!("quota phase must contain the actual numeric backing length, got {other:?}")
+        }
+    };
+    // Initial layout, derived independently of the failing request:
+    // prefix80 + script frame(4+2*3) + page(3+64*7) + array(3+5+1).
+    const INITIAL_CELLS: usize = 80 + (4 + 2 * 3) + (3 + 64 * 7) + (3 + 5 + 1);
+    assert_eq!(length, INITIAL_CELLS as f64);
+    assert!(before.reserved_bytes >= INITIAL_CELLS * std::mem::size_of::<Value>());
+    assert!(before.reserved_bytes <= 1 << 16);
     // The pre-existing owner survives with old accounting intact.
     assert_eq!(machine.host_context().resource_count(), 1);
     let stats = pd_vm_compat_frontends::runtime::array::owned_array_runtime_stats(&mut machine)
         .expect("directory must survive the refused resize");
     assert_eq!((stats.pending, stats.registered), (0, 1));
+    assert_eq!(
+        stats.reserved_bytes, before.reserved_bytes,
+        "refused resize must preserve independently observed capacity accounting"
+    );
+    eprintln!(
+        "QUOTA_TRANSACTION length={length} before_bytes={} after_bytes={}",
+        before.reserved_bytes, stats.reserved_bytes
+    );
     machine
         .reset_for_reuse()
         .expect("reset after quota refusal");
@@ -1787,9 +1855,151 @@ fn install_cost_registry(registry: &mut HostFunctionRegistry) -> CostInstall {
 static ROUTE_SNAPSHOT_CALLS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-struct CostRouteProbePlugin;
+struct CostRouteProbePlugin {
+    managed_payload: usize,
+}
 
-static COST_ROUTE_PROBE_PLUGIN: CostRouteProbePlugin = CostRouteProbePlugin;
+// Explicit private IR fixture: enlarge the real pending array reservation,
+// initialize its additional numeric cells and length before real publication.
+// This does not claim source loop syntax or successful 8192-literal codegen.
+fn cost_extend_managed_array(
+    ir: &mut vm::FrontendIr,
+    payload: usize,
+) -> Result<(), vm::ParseError> {
+    let begin = lifecycle_helper_index(ir, "__compat_es5_node_begin")?;
+    let write = lifecycle_helper_index(ir, "__compat_ref_write")?;
+    let get = vm::BuiltinFunction::Get.call_index();
+    let binding = ir
+        .local_bindings
+        .iter()
+        .rfind(|(name, _)| name == "a")
+        .map(|(_, slot)| *slot)
+        .ok_or_else(|| lifecycle_rejection("managed cost fixture requires a".to_owned()))?;
+    let publish_at = ir
+        .stmts
+        .iter()
+        .position(|statement| matches!(statement, vm::Stmt::Let { index, .. } if *index == binding))
+        .ok_or_else(|| {
+            lifecycle_rejection("managed cost fixture requires array publication".to_owned())
+        })?;
+    let mut reservation = None;
+    for statement in &mut ir.stmts[..publish_at] {
+        if let vm::Stmt::Let {
+            index,
+            expr: vm::Expr::Call(target, _, args, _, _),
+            ..
+        } = statement
+            && *target == begin
+            && args.len() == 3
+        {
+            let (vm::Expr::Var(carrier), vm::Expr::Int(cells), vm::Expr::Int(1)) =
+                (&args[0], &args[1], &args[2])
+            else {
+                return Err(lifecycle_rejection(
+                    "cost fixture requires a real array reservation".to_owned(),
+                ));
+            };
+            let old_payload = usize::try_from(*cells - 5)
+                .map_err(|_| lifecycle_rejection("cost fixture array layout".to_owned()))?;
+            if payload < old_payload || payload > 8192 || reservation.is_some() {
+                return Err(lifecycle_rejection(
+                    "cost fixture requires one bounded managed array".to_owned(),
+                ));
+            }
+            reservation = Some((*index, *carrier, old_payload));
+            args[1] = vm::Expr::Int(5 + payload as i64);
+        }
+    }
+    let (allocation, carrier, old_payload) = reservation
+        .ok_or_else(|| lifecycle_rejection("cost fixture requires node-begin".to_owned()))?;
+    if payload == old_payload {
+        return Ok(());
+    }
+    let base = ir.stmts[..publish_at].iter().find_map(|statement| match statement {
+        vm::Stmt::Let { index, expr: vm::Expr::Call(target, _, args, _, _), .. }
+            if *target == get && matches!(args.as_slice(),
+                [vm::Expr::Var(owner), vm::Expr::String(field)] if *owner == allocation && field == "base") => Some(*index),
+        _ => None,
+    }).ok_or_else(|| lifecycle_rejection("cost fixture requires the real allocation base".to_owned()))?;
+    let iter = u16::try_from(ir.locals)
+        .map_err(|_| lifecycle_rejection("cost fixture slot space".to_owned()))?;
+    let ack = iter
+        .checked_add(1)
+        .ok_or_else(|| lifecycle_rejection("cost fixture slot space".to_owned()))?;
+    ir.locals += 2;
+    let as_number =
+        |expression| vm::Expr::Div(Box::new(expression), Box::new(vm::Expr::Float(1.0)));
+    let store = |offset, number| {
+        vm::Expr::Call(
+            write,
+            Vec::new(),
+            vec![
+                vm::Expr::Var(carrier),
+                as_number(vm::Expr::Add(
+                    Box::new(vm::Expr::Var(base)),
+                    Box::new(offset),
+                )),
+                number,
+            ],
+            None,
+            None,
+        )
+    };
+    ir.stmts.splice(
+        publish_at..publish_at,
+        vec![
+            vm::Stmt::Let {
+                index: iter,
+                declared_schema: Some(vm::TypeSchema::Int),
+                expr: vm::Expr::Int(old_payload as i64),
+                line: 1,
+            },
+            vm::Stmt::Let {
+                index: ack,
+                declared_schema: Some(vm::TypeSchema::Number),
+                expr: vm::Expr::Float(0.0),
+                line: 1,
+            },
+            vm::Stmt::While {
+                condition: vm::Expr::Lt(
+                    Box::new(as_number(vm::Expr::Var(iter))),
+                    Box::new(vm::Expr::Float(payload as f64)),
+                ),
+                body: vec![
+                    vm::Stmt::Assign {
+                        kind: vm::AssignmentKind::Set,
+                        index: ack,
+                        expr: store(
+                            vm::Expr::Add(
+                                Box::new(vm::Expr::Int(5)),
+                                Box::new(vm::Expr::Var(iter)),
+                            ),
+                            vm::Expr::Float(0.0),
+                        ),
+                        line: 1,
+                    },
+                    vm::Stmt::Assign {
+                        kind: vm::AssignmentKind::Set,
+                        index: iter,
+                        expr: vm::Expr::Add(
+                            Box::new(vm::Expr::Var(iter)),
+                            Box::new(vm::Expr::Int(1)),
+                        ),
+                        line: 1,
+                    },
+                ],
+                line: 1,
+            },
+            vm::Stmt::Assign {
+                kind: vm::AssignmentKind::Set,
+                index: ack,
+                expr: store(vm::Expr::Int(2), vm::Expr::Float(payload as f64)),
+                line: 1,
+            },
+        ],
+    );
+    Ok(())
+}
 
 fn route_count_snapshot(expr: &vm::Expr, snapshot: Option<u16>) -> usize {
     let Some(target) = snapshot else {
@@ -1882,7 +2092,8 @@ impl vm::SourcePlugin for CostRouteProbePlugin {
         source: &str,
         context: &vm::SourceFrontendContext<'_>,
     ) -> Result<vm::FrontendIr, vm::ParseError> {
-        let ir = JAVASCRIPT_ES5_PLUGIN.parse_source(source, context)?;
+        let mut ir = JAVASCRIPT_ES5_PLUGIN.parse_source(source, context)?;
+        cost_extend_managed_array(&mut ir, self.managed_payload)?;
         let snapshot = ir
             .functions
             .iter()
@@ -1898,16 +2109,85 @@ impl vm::SourcePlugin for CostRouteProbePlugin {
         // prelude function bodies, i.e. top-level stmts) matter, and the
         // top-level scan above covers exactly those.
         ROUTE_SNAPSHOT_CALLS.store(calls, std::sync::atomic::Ordering::SeqCst);
+        // Test-only readback: actual checked physical base and current
+        // backing length, rather than a retired fixed address/layout.
+        let make = lifecycle_helper_index(&ir, LIFECYCLE_MAKE_NAME)?;
+        let checked = lifecycle_helper_index(&ir, "__compat_es5_checked_base")?;
+        let length = lifecycle_helper_index(&ir, LIFECYCLE_LENGTH_NAME)?;
+        let binding = ir
+            .local_bindings
+            .iter()
+            .rfind(|(name, _)| name == "a")
+            .map(|(_, slot)| *slot)
+            .ok_or_else(|| lifecycle_rejection("cost fixture requires array a".to_owned()))?;
+        let carriers: Vec<u16> = ir
+            .stmts
+            .iter()
+            .filter_map(|statement| match statement {
+                vm::Stmt::Let {
+                    index,
+                    expr: vm::Expr::Call(target, _, args, _, _),
+                    ..
+                } if *target == make && args.len() == 1 => Some(*index),
+                _ => None,
+            })
+            .collect();
+        let [carrier] = carriers.as_slice() else {
+            return Err(lifecycle_rejection(
+                "cost fixture requires one real carrier".to_owned(),
+            ));
+        };
+        let carrier = *carrier;
+        let base = u16::try_from(ir.locals)
+            .map_err(|_| lifecycle_rejection("cost observer slot space exhausted".to_owned()))?;
+        ir.locals += 1;
+        let get = vm::BuiltinFunction::Get.call_index();
+        let field = |name: &str| {
+            vm::Expr::Call(
+                get,
+                Vec::new(),
+                vec![vm::Expr::Var(binding), vm::Expr::String(name.to_owned())],
+                None,
+                None,
+            )
+        };
+        ir.stmts.push(vm::Stmt::Let {
+            index: base,
+            declared_schema: Some(vm::TypeSchema::Int),
+            expr: vm::Expr::Call(
+                checked,
+                Vec::new(),
+                vec![
+                    vm::Expr::Var(carrier),
+                    field("ref_slot"),
+                    field("generation"),
+                ],
+                None,
+                None,
+            ),
+            line: 1,
+        });
+        ir.stmts.push(vm::Stmt::Expr {
+            expr: vm::Expr::Var(base),
+            line: 1,
+        });
+        ir.stmts.push(vm::Stmt::Expr {
+            expr: vm::Expr::Call(length, Vec::new(), vec![vm::Expr::Var(carrier)], None, None),
+            line: 1,
+        });
         Ok(ir)
     }
 }
 
-fn cost_vm(source: &str) -> (Vm, CostInstall) {
+fn cost_vm(source: &str, payload: usize) -> (Vm, CostInstall) {
     let catalog = lifecycle_catalog();
+    let plugin: &'static CostRouteProbePlugin = Box::leak(Box::new(CostRouteProbePlugin {
+        managed_payload: payload,
+    }));
     let compilation = vm::compile_source_with_flavor_and_options_with_capture_certification(
         source,
         lifecycle_flavor("javascript-es5-cost-route"),
-        lifecycle_options_for(&COST_ROUTE_PROBE_PLUGIN, &catalog),
+        lifecycle_options_for(plugin, &catalog),
     )
     .expect("cost workload compilation should succeed");
     let mut machine = compilation
@@ -1923,6 +2203,7 @@ fn cost_vm(source: &str) -> (Vm, CostInstall) {
     registry
         .bind_vm_cached(&mut machine)
         .expect("cost adapters should bind to this VM");
+    machine.set_fuel(100_000_000);
     (machine, install)
 }
 
@@ -1962,18 +2243,17 @@ fn cost_ordinary_writes_do_not_copy_backing() {
         .collect();
     let mut summary: Vec<(usize, u64, u64, u64, usize)> = Vec::new();
     let mut variants = Vec::new();
-    for backing in [32usize, 8192usize] {
+    for payload in [32usize, 8192usize] {
         WRITE_OBS.with(|seen| seen.borrow_mut().clear());
         SNAPSHOT_TRIPS.with(|trips| trips.set(0));
-        // a=[0] reserves 4 cells; the padding string (header 3) of length
-        // backing-7 grows the SAME realm backing to exactly `backing` cells.
-        let pad = "a".repeat(backing - 7);
-        let mut source = format!("var a=[0];var s=\"{pad}\";var b=a;");
+        // Both cases delegate this same admitted source. The large array
+        // is an explicitly IR-initialized real managed node, not raw padding.
+        let mut source = format!("var a=[{}];var b=a;", vec!["0"; 32].join(","));
         for i in 0..WORKLOAD_WRITES {
             source.push_str(&format!("b[0]={};", FIRST_SENTINEL + i as i64));
         }
         source.push_str("a[0];");
-        let (mut machine, install) = cost_vm(&source);
+        let (mut machine, install) = cost_vm(&source, payload);
         assert!(
             install.fingerprint_matches_production,
             "adapter swap must stay invisible to the guest contract"
@@ -1984,10 +2264,16 @@ fn cost_ordinary_writes_do_not_copy_backing() {
             VmStatus::Halted
         );
         assert_eq!(
-            boxed_float_at(&machine, machine.stack().len() - 1),
+            boxed_float_at(&machine, machine.stack().len() - 3),
             Value::Float((FIRST_SENTINEL + WORKLOAD_WRITES as i64 - 1) as f64),
             "final alias read must observe the last sentinel"
         );
+        let stack = machine.stack();
+        let base = cost_number(stack.get(stack.len() - 2)).expect("checked managed array base");
+        let backing = cost_number(stack.last()).expect("actual metadata-inclusive backing length");
+        let expected_index = base + 5.0;
+        assert!(base >= 80.0);
+        assert!(backing >= expected_index + payload as f64);
         let seen = WRITE_OBS.with(|obs| obs.borrow().clone());
         let trips = SNAPSHOT_TRIPS.with(|trips| trips.get());
         let routed = ROUTE_SNAPSHOT_CALLS.load(std::sync::atomic::Ordering::SeqCst);
@@ -2000,7 +2286,7 @@ fn cost_ordinary_writes_do_not_copy_backing() {
             .filter(|obs| !obs.value.is_some_and(|v| sentinels.contains(&v)))
             .collect();
         eprintln!(
-            "COST backing={backing} total_write_callbacks={} init={} workload={} snapshot_trips={trips} route_scan={routed} variant={}",
+            "COST payload={payload} backing={backing} expected_index={expected_index} total_write_callbacks={} init={} workload={} snapshot_trips={trips} route_scan={routed} variant={}",
             seen.len(),
             init.len(),
             workload.len(),
@@ -2018,7 +2304,7 @@ fn cost_ordinary_writes_do_not_copy_backing() {
         for write in &workload {
             assert_eq!(
                 write.index,
-                Some(3.0),
+                Some(expected_index),
                 "workload targets the first payload cell, got {write:?}"
             );
             assert!(write.ok, "original handler must succeed, got {write:?}");
@@ -2053,12 +2339,14 @@ fn cost_ordinary_writes_do_not_copy_backing() {
         let total_allocs: u64 = workload.iter().map(|w| w.allocs).sum();
         let max_bytes: u64 = workload.iter().map(|w| w.bytes).max().unwrap_or(0);
         let init_bytes: u64 = init.iter().map(|w| w.bytes).sum();
+        let capacity_cells = reserved[0] / std::mem::size_of::<Value>();
+        assert!(capacity_cells >= backing as usize);
         eprintln!(
-            "COST backing={backing} workload_bytes_total={total_bytes} workload_allocs_total={total_allocs} max_per_write={max_bytes} reserved={} init_callbacks={} init_bytes={init_bytes}",
+            "COST payload={payload} backing={backing} capacity_cells={capacity_cells} workload_bytes_total={total_bytes} workload_allocs_total={total_allocs} max_per_write={max_bytes} reserved={} init_callbacks={} init_bytes={init_bytes}",
             reserved[0],
             init.len(),
         );
-        summary.push((backing, total_bytes, total_allocs, max_bytes, reserved[0]));
+        summary.push((payload, total_bytes, total_allocs, max_bytes, reserved[0]));
     }
     assert_eq!(
         variants[0], variants[1],
@@ -2070,6 +2358,6 @@ fn cost_ordinary_writes_do_not_copy_backing() {
     // ~backing-sized bytes and fail here honestly).
     assert!(
         summary[1].3 <= summary[0].3,
-        "8192-cell write cost must not exceed 32-cell write cost, got {summary:?}"
+        "8192-element managed-array write cost must not exceed 32-element cost, got {summary:?}"
     );
 }

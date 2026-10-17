@@ -329,14 +329,16 @@ fn p2_immediate_infinities_carry_sign() {
 // Delegates the original real JS source to the REAL JS plugin (real B1
 // prelude, carrier, source policy, catalog and certification) and appends
 // guest reads of the ACTUAL generated string node through the EXISTING B1
-// read helper while the carrier is still live. The string base and carrier
-// are discovered structurally from the real binding's emitted allocation;
+// read helper while the carrier is still live. The string's logical slot
+// and generation resolve through the production checked-base helper;
+// the carrier is discovered structurally from its real emitted allocation;
 // the helper index comes from the generated `ir.functions` table, never
 // from user identifier text. No public observer API, no host JS callback,
 // no product readback after teardown.
 
 const P2_READ_NAME: &str = "__compat_ref_read";
 const P2_MAKE_NAME: &str = "__compat_ref_make";
+const P2_CHECKED_BASE_NAME: &str = "__compat_es5_checked_base";
 
 fn p2_rejection(message: String) -> vm::ParseError {
     vm::ParseError::at_span(vm::compiler::source_map::Span::new(0, 0, 0), message)
@@ -391,30 +393,48 @@ fn append_p2_observer(ir: &mut vm::FrontendIr, units: usize) -> Result<(), vm::P
     };
     let carrier = *carrier;
     let read = p2_helper_index(ir, P2_READ_NAME)?;
+    let checked_base = p2_helper_index(ir, P2_CHECKED_BASE_NAME)?;
     let mut fresh = || -> Result<u16, vm::ParseError> {
         let slot = u16::try_from(ir.locals)
             .map_err(|_| p2_rejection("observer fixture slot space exhausted".to_owned()))?;
         ir.locals += 1;
         Ok(slot)
     };
-    // Base reads mirror the product numeric-array read shape bit for bit: a
-    // field Get on the tracked binding slot plus one flat constant offset,
-    // normalized through the same divide-by-one path. Nested allocation
-    // temporaries are never referenced: they live inside the binding Block
-    // and stay outside top-level type tracking.
+    // Resolve this rooted live string once using its complete logical
+    // identity. A logical slot is never a physical backing address.
+    // Nested allocation temporaries stay outside top-level type tracking.
     let get = vm::BuiltinFunction::Get.call_index();
-    let read_cell = |offset: i64| -> vm::Expr {
-        let base = vm::Expr::Call(
+    let field = |name: &str| -> vm::Expr {
+        vm::Expr::Call(
             get,
             Vec::new(),
+            vec![vm::Expr::Var(binding), vm::Expr::String(name.to_owned())],
+            None,
+            None,
+        )
+    };
+    let base_slot = fresh()?;
+    ir.stmts.push(vm::Stmt::Let {
+        index: base_slot,
+        declared_schema: Some(vm::TypeSchema::Int),
+        expr: vm::Expr::Call(
+            checked_base,
+            Vec::new(),
             vec![
-                vm::Expr::Var(binding),
-                vm::Expr::String("ref_slot".to_owned()),
+                vm::Expr::Var(carrier),
+                field("ref_slot"),
+                field("generation"),
             ],
             None,
             None,
+        ),
+        line: 1,
+    });
+    let read_cell = |offset: i64| -> vm::Expr {
+        let physical = vm::Expr::Add(
+            Box::new(vm::Expr::Var(base_slot)),
+            Box::new(vm::Expr::Int(offset)),
         );
-        let physical = vm::Expr::Add(Box::new(base), Box::new(vm::Expr::Int(offset)));
         p2_as_number(vm::Expr::Call(
             read,
             Vec::new(),

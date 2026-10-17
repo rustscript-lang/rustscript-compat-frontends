@@ -272,6 +272,67 @@ fn js_realm_alias_mutation_is_visible_through_one_owner() {
     assert_eq!(stats.registered, 1, "one shared owner for the alias pair");
 }
 
+#[test]
+fn js_realm_repeated_writes_keep_alias_payload() {
+    let (mut machine, _) = js_realm_vm(
+        "var a=[1,2];var alias=a;a[0]=7;a[1]=9;alias[1];",
+        pd_vm_compat_frontends::runtime::array::OwnedArrayLimits::default(),
+        false,
+    );
+    assert_eq!(js_realm_unboxed_number(&mut machine), Value::Float(9.0));
+    assert_eq!(machine.host_context().resource_count(), 1);
+}
+
+#[test]
+fn js_numeric_array_root_plan_ignores_primitive_payload_count() {
+    fn root_capacity(payload: usize) -> i64 {
+        let source = format!("var a=[{}];a[0];", vec!["0"; payload].join(","));
+        let catalog = js_realm_catalog();
+        let context = vm::SourceFrontendContext {
+            source_id: 0,
+            original_path: None,
+            phase: vm::compiler::ParsePhase::Standalone,
+            host_api_catalog: Some(&catalog),
+            imports: &[],
+        };
+        let ir = vm::SourcePlugin::parse_source(
+            &pd_vm_compat_frontends::JAVASCRIPT_ES5_PLUGIN,
+            &source,
+            &context,
+        )
+        .expect("numeric-array root plan must lower real source");
+        let enter = ir
+            .functions
+            .iter()
+            .find(|function| function.name == "__compat_es5_root_enter")
+            .expect("production root-enter helper")
+            .index;
+        let capacities: Vec<i64> = ir
+            .stmts
+            .iter()
+            .filter_map(|statement| match statement {
+                vm::Stmt::Let {
+                    expr: vm::Expr::Call(target, _, args, _, _),
+                    ..
+                } if *target == enter => match args.get(1) {
+                    Some(vm::Expr::Int(capacity)) => Some(*capacity),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(capacities.len(), 1, "one actual script frame");
+        capacities[0]
+    }
+    let small = root_capacity(32);
+    let large = root_capacity(8192);
+    eprintln!("ARRAY_ROOT_PLAN small={small} large={large}");
+    assert_eq!(
+        small, large,
+        "numeric elements contain no heap edges; root capacity must depend on the receiver code, not payload length"
+    );
+}
+
 fn js_realm_unboxed_bool(machine: &mut Vm) -> Value {
     assert_eq!(
         machine.run().expect("JS realm run should finish"),
@@ -715,66 +776,11 @@ fn stress_rejection(message: String) -> vm::ParseError {
     vm::ParseError::at_span(vm::compiler::source_map::Span::new(0, 0, 0), message)
 }
 
-fn expr_contains_var(expr: &vm::Expr, slot: u16) -> bool {
-    match expr {
-        vm::Expr::Var(other) => *other == slot,
-        vm::Expr::Call(_, _, args, _, _) => args.iter().any(|arg| expr_contains_var(arg, slot)),
-        vm::Expr::Block { stmts, expr } => {
-            stmts.iter().any(|stmt| stmt_contains_var(stmt, slot)) || expr_contains_var(expr, slot)
-        }
-        vm::Expr::Add(left, right)
-        | vm::Expr::Sub(left, right)
-        | vm::Expr::Mul(left, right)
-        | vm::Expr::Div(left, right)
-        | vm::Expr::Eq(left, right)
-        | vm::Expr::Lt(left, right)
-        | vm::Expr::Gt(left, right)
-        | vm::Expr::And(left, right)
-        | vm::Expr::Or(left, right) => {
-            expr_contains_var(left, slot) || expr_contains_var(right, slot)
-        }
-        vm::Expr::Not(inner) | vm::Expr::Neg(inner) | vm::Expr::ToOwned(inner) => {
-            expr_contains_var(inner, slot)
-        }
-        vm::Expr::IfElse {
-            condition,
-            then_expr,
-            else_expr,
-        } => {
-            expr_contains_var(condition, slot)
-                || expr_contains_var(then_expr, slot)
-                || expr_contains_var(else_expr, slot)
-        }
-        _ => false,
-    }
-}
-
-fn stmt_contains_var(stmt: &vm::Stmt, slot: u16) -> bool {
-    match stmt {
-        vm::Stmt::Let { expr, .. } | vm::Stmt::Expr { expr, .. } => expr_contains_var(expr, slot),
-        vm::Stmt::Assign { expr, .. } => expr_contains_var(expr, slot),
-        vm::Stmt::IfElse {
-            condition,
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            expr_contains_var(condition, slot)
-                || then_branch.iter().any(|s| stmt_contains_var(s, slot))
-                || else_branch.iter().any(|s| stmt_contains_var(s, slot))
-        }
-        vm::Stmt::While {
-            condition, body, ..
-        } => expr_contains_var(condition, slot) || body.iter().any(|s| stmt_contains_var(s, slot)),
-        _ => false,
-    }
-}
-
-/// Append the test-owned distinctness driver to real production IR. Resolves
-/// the carrier allocation region structurally: the `a` box (from real
-/// `local_bindings`) references its Int base slot, and the region spans from
-/// that base definition through the writes preceding the box. Lets replay as
-/// Assigns so the bounded loop re-executes the same emission code.
+/// Replay the actual node initialization/publication at the same code site.
+/// Resolve physical bases through checked logical identities, pin both
+/// products in a real root frame, collect between iterations, then compare
+/// their distinct extents and actual payloads. Source loop syntax stays
+/// outside this explicitly test-owned IR driver.
 fn append_distinctness_driver(ir: &mut vm::FrontendIr) -> Result<(), vm::ParseError> {
     let binding = ir
         .local_bindings
@@ -791,34 +797,88 @@ fn append_distinctness_driver(ir: &mut vm::FrontendIr) -> Result<(), vm::ParseEr
         .ok_or_else(|| {
             stress_rejection("stress fixture requires the real `a` definition".to_owned())
         })?;
-    let boxed_expr = match &ir.stmts[boxed_at] {
-        vm::Stmt::Let { expr, .. } => expr.clone(),
-        _ => unreachable!("boxed position is a Let"),
+    let helper = |name: &str| -> Result<u16, vm::ParseError> {
+        ir.functions
+            .iter()
+            .find(|function| function.name == name)
+            .map(|function| function.index)
+            .ok_or_else(|| stress_rejection(format!("stress fixture requires '{name}'")))
     };
-    let mut base_slot = None;
-    for stmt in &ir.stmts {
-        if let vm::Stmt::Let {
-            index,
-            declared_schema: Some(vm::TypeSchema::Int),
-            ..
-        } = stmt
-            && expr_contains_var(&boxed_expr, *index)
-        {
-            base_slot = Some(*index);
-            break;
-        }
-    }
-    let base_slot = base_slot
-        .ok_or_else(|| stress_rejection("stress fixture requires the real Int base".to_owned()))?;
-    let base_at = ir
+    let make = helper("__compat_ref_make")?;
+    let begin = helper("__compat_es5_node_begin")?;
+    let root_enter = helper("__compat_es5_root_enter")?;
+    let root_write = helper("__compat_es5_root_write")?;
+    let checked_base = helper("__compat_es5_checked_base")?;
+    let collect = helper("__compat_es5_heap_collect")?;
+    let read = helper("__compat_ref_read")?;
+    let carrier = ir
         .stmts
         .iter()
-        .position(|stmt| matches!(stmt, vm::Stmt::Let { index, .. } if *index == base_slot))
-        .ok_or_else(|| {
-            stress_rejection("stress fixture requires the real base definition".to_owned())
-        })?;
-    assert!(base_at < boxed_at, "allocation must precede its box");
-    let region: Vec<vm::Stmt> = ir.stmts[base_at..boxed_at].to_vec();
+        .find_map(|statement| match statement {
+            vm::Stmt::Let {
+                index,
+                expr: vm::Expr::Call(target, _, args, _, _),
+                ..
+            } if *target == make && args.len() == 1 => Some(*index),
+            _ => None,
+        })
+        .ok_or_else(|| stress_rejection("stress fixture requires the real carrier".to_owned()))?;
+    // Replay the actual node initialization and publication, stopping at
+    // the script frame entry. A frame pointer is not a node allocation.
+    let mut run_start = boxed_at;
+    while run_start > 0 {
+        match &ir.stmts[run_start - 1] {
+            vm::Stmt::Let { expr, .. } => {
+                if matches!(expr, vm::Expr::Call(target, _, _, _, _) if *target == root_enter) {
+                    break;
+                }
+                run_start -= 1;
+            }
+            _ => break,
+        }
+    }
+    let mut region: Vec<vm::Stmt> = ir.stmts[run_start..=boxed_at].to_vec();
+    if !region.iter().any(|statement| {
+        matches!(statement,
+        vm::Stmt::Let { expr: vm::Expr::Call(target, _, _, _, _), .. } if *target == begin)
+    }) {
+        return Err(stress_rejection(
+            "stress replay must include actual node-begin".to_owned(),
+        ));
+    }
+    if let Some(
+        statement @ vm::Stmt::Let {
+            expr: vm::Expr::Call(target, _, _, _, _),
+            ..
+        },
+    ) = ir.stmts.get(boxed_at + 1)
+        && *target == root_write
+    {
+        region.push(statement.clone());
+    }
+    let get = vm::BuiltinFunction::Get.call_index();
+    let field = |name: &str| {
+        vm::Expr::Call(
+            get,
+            Vec::new(),
+            vec![vm::Expr::Var(binding), vm::Expr::String(name.to_owned())],
+            None,
+            None,
+        )
+    };
+    let resolve = || {
+        vm::Expr::Call(
+            checked_base,
+            Vec::new(),
+            vec![
+                vm::Expr::Var(carrier),
+                field("ref_slot"),
+                field("generation"),
+            ],
+            None,
+            None,
+        )
+    };
     let fresh = |ir: &mut vm::FrontendIr| -> Result<u16, vm::ParseError> {
         let slot = u16::try_from(ir.locals)
             .map_err(|_| stress_rejection("stress fixture slot space exhausted".to_owned()))?;
@@ -863,7 +923,71 @@ fn append_distinctness_driver(ir: &mut vm::FrontendIr) -> Result<(), vm::ParseEr
     let iter = fresh(ir)?;
     let first = fresh(ir)?;
     let second = fresh(ir)?;
+    let frame = fresh(ir)?;
+    let base_slot = fresh(ir)?;
+    let ack = fresh(ir)?;
+    ir.stmts.push(vm::Stmt::Let {
+        index: frame,
+        declared_schema: Some(vm::TypeSchema::Int),
+        expr: vm::Expr::Call(
+            root_enter,
+            Vec::new(),
+            vec![vm::Expr::Var(carrier), vm::Expr::Int(2)],
+            None,
+            None,
+        ),
+        line: 1,
+    });
+    ir.stmts.push(vm::Stmt::Let {
+        index: base_slot,
+        declared_schema: Some(vm::TypeSchema::Int),
+        expr: vm::Expr::Int(0),
+        line: 1,
+    });
+    ir.stmts.push(vm::Stmt::Let {
+        index: ack,
+        declared_schema: Some(vm::TypeSchema::Int),
+        expr: vm::Expr::Int(0),
+        line: 1,
+    });
     let mut body = replay;
+    // Both replay products remain logical roots across a real collection;
+    // a retained scalar address alone would not keep a node alive.
+    body.push(vm::Stmt::Assign {
+        kind: vm::AssignmentKind::Set,
+        index: ack,
+        expr: vm::Expr::Call(
+            root_write,
+            Vec::new(),
+            vec![
+                vm::Expr::Var(carrier),
+                vm::Expr::Var(frame),
+                vm::Expr::Var(iter),
+                vm::Expr::Var(binding),
+            ],
+            None,
+            None,
+        ),
+        line: 1,
+    });
+    body.push(vm::Stmt::Assign {
+        kind: vm::AssignmentKind::Set,
+        index: base_slot,
+        expr: resolve(),
+        line: 1,
+    });
+    body.push(vm::Stmt::Assign {
+        kind: vm::AssignmentKind::Set,
+        index: ack,
+        expr: vm::Expr::Call(
+            collect,
+            Vec::new(),
+            vec![vm::Expr::Var(carrier)],
+            None,
+            None,
+        ),
+        line: 1,
+    });
     body.push(vm::Stmt::Assign {
         kind: vm::AssignmentKind::Set,
         index: first,
@@ -918,11 +1042,42 @@ fn append_distinctness_driver(ir: &mut vm::FrontendIr) -> Result<(), vm::ParseEr
         body,
         line: 1,
     });
+    let distinct = vm::Expr::Not(Box::new(vm::Expr::Eq(
+        Box::new(vm::Expr::Var(first)),
+        Box::new(vm::Expr::Var(second)),
+    )));
+    let payload_matches = |base: u16| {
+        vm::Expr::Eq(
+            Box::new(vm::Expr::Div(
+                Box::new(vm::Expr::Call(
+                    read,
+                    Vec::new(),
+                    vec![
+                        vm::Expr::Var(carrier),
+                        vm::Expr::Div(
+                            Box::new(vm::Expr::Add(
+                                Box::new(vm::Expr::Var(base)),
+                                Box::new(vm::Expr::Int(5)),
+                            )),
+                            Box::new(vm::Expr::Float(1.0)),
+                        ),
+                    ],
+                    None,
+                    None,
+                )),
+                Box::new(vm::Expr::Float(1.0)),
+            )),
+            Box::new(vm::Expr::Float(1.0)),
+        )
+    };
     ir.stmts.push(vm::Stmt::Expr {
-        expr: vm::Expr::Not(Box::new(vm::Expr::Eq(
-            Box::new(vm::Expr::Var(first)),
-            Box::new(vm::Expr::Var(second)),
-        ))),
+        expr: vm::Expr::And(
+            Box::new(distinct),
+            Box::new(vm::Expr::And(
+                Box::new(payload_matches(first)),
+                Box::new(payload_matches(second)),
+            )),
+        ),
         line: 1,
     });
     Ok(())
@@ -1116,28 +1271,51 @@ fn utf16_multiunit_mismatch_at_tail_is_false_native() {
 // in B1 quota enforcement instead. The asserted error text discriminates
 // both orderings.
 fn append_guard_probe(ir: &mut vm::FrontendIr, count: i64) -> Result<(), vm::ParseError> {
-    let mut target = None;
+    let make = ir
+        .functions
+        .iter()
+        .find(|function| function.name == "__compat_ref_make")
+        .map(|function| function.index)
+        .ok_or_else(|| {
+            stress_rejection("guard fixture requires the real make helper".to_owned())
+        })?;
+    let begin = ir
+        .functions
+        .iter()
+        .find(|function| function.name == "__compat_es5_node_begin")
+        .map(|function| function.index)
+        .ok_or_else(|| {
+            stress_rejection("guard fixture requires the real node-begin helper".to_owned())
+        })?;
+    let mut carriers = Vec::new();
     for stmt in &ir.stmts {
         if let vm::Stmt::Let {
-            declared_schema: Some(vm::TypeSchema::Int),
-            expr: vm::Expr::Call(index, _, args, _, _),
+            index,
+            declared_schema: None,
+            expr: vm::Expr::Call(target, _, args, _, _),
             ..
         } = stmt
-            && args.len() == 2
-            && let (vm::Expr::Var(carrier), vm::Expr::Int(_)) = (&args[0], &args[1])
+            && *target == make
+            && args.len() == 1
         {
-            target = Some((*index, *carrier));
-            break;
+            carriers.push(*index);
         }
     }
-    let (index, carrier) = target.ok_or_else(|| {
-        stress_rejection("guard fixture requires the real allocator call".to_owned())
-    })?;
+    let [carrier] = carriers.as_slice() else {
+        return Err(stress_rejection(format!(
+            "guard fixture requires exactly one real carrier, found {}",
+            carriers.len()
+        )));
+    };
     ir.stmts.push(vm::Stmt::Expr {
         expr: vm::Expr::Call(
-            index,
+            begin,
             Vec::new(),
-            vec![vm::Expr::Var(carrier), vm::Expr::Int(count)],
+            vec![
+                vm::Expr::Var(*carrier),
+                vm::Expr::Int(count),
+                vm::Expr::Int(1),
+            ],
             None,
             None,
         ),

@@ -28,8 +28,10 @@
 //! with lossless UTF-16 storage and content equality; see [`lowerer`].
 
 mod admission;
+pub(super) mod heap;
 mod lowerer;
 mod parser;
+mod prelude;
 mod representation;
 mod source_map;
 mod string_literal;

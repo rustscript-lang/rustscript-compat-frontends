@@ -38,10 +38,44 @@ pub(super) fn reference_declaration() -> StructDecl {
             ("kind".to_owned(), TypeSchema::Int),
             ("base".to_owned(), schema()),
             ("key_slot".to_owned(), TypeSchema::Int),
+            ("key_generation".to_owned(), TypeSchema::Int),
             ("strict".to_owned(), TypeSchema::Bool),
         ])),
         origin: StructDeclOrigin::Guest,
     }
+}
+
+/// Private pending-allocation handle `{slot, generation, base}` returned by
+/// the node reservation helper. The physical base is compiler-internal and
+/// never becomes a user value field.
+pub(super) fn allocation_declaration() -> StructDecl {
+    StructDecl {
+        name: super::heap::TYPE_ALLOCATION.to_owned(),
+        type_params: Vec::new(),
+        body_schema: TypeSchema::Object(HashMap::from([
+            ("slot".to_owned(), TypeSchema::Int),
+            ("generation".to_owned(), TypeSchema::Int),
+            ("base".to_owned(), TypeSchema::Int),
+        ])),
+        origin: StructDeclOrigin::Guest,
+    }
+}
+
+pub(super) fn allocation_schema() -> TypeSchema {
+    TypeSchema::Named(super::heap::TYPE_ALLOCATION.to_owned(), Vec::new())
+}
+
+/// Build a pending-allocation handle record from dynamic Int fields (used
+/// for the reservation helper's return value).
+pub(super) fn allocation(slot: Expr, generation: Expr, base: Expr) -> Expr {
+    let mut result = call(BuiltinFunction::MapNew, Vec::new());
+    for (key, value) in [("slot", slot), ("generation", generation), ("base", base)] {
+        result = call(
+            BuiltinFunction::Set,
+            vec![result, Expr::String(key.to_owned()), value],
+        );
+    }
+    result
 }
 
 pub(super) fn completion_declaration() -> StructDecl {
@@ -110,23 +144,6 @@ pub(super) fn boolean(value: Expr) -> Expr {
     record(BOOLEAN, Expr::Float(0.0), value)
 }
 
-pub(super) fn array(base: Expr, generation: Expr) -> Expr {
-    let mut result = call(BuiltinFunction::MapNew, Vec::new());
-    for (key, value) in [
-        ("tag", Expr::Int(OBJECT)),
-        ("number", Expr::Float(0.0)),
-        ("flag", Expr::Bool(false)),
-        ("ref_slot", base),
-        ("generation", generation),
-    ] {
-        result = call(
-            BuiltinFunction::Set,
-            vec![result, Expr::String(key.to_owned()), value],
-        );
-    }
-    result
-}
-
 pub(super) fn field(slot: u16, key: &str) -> Expr {
     call(
         BuiltinFunction::Get,
@@ -141,30 +158,6 @@ pub(super) fn field_of(record: Expr, key: &str) -> Expr {
         BuiltinFunction::Get,
         vec![record, Expr::String(key.to_owned())],
     )
-}
-
-/// A boxed plain-object or function value: tag OBJECT with the logical
-/// realm base in `ref_slot`. The heap header kind (3 plain object, 4
-/// function) distinguishes them; identity compares base+generation.
-pub(super) fn object_value(base: Expr, generation: Expr) -> Expr {
-    let mut result = call(BuiltinFunction::MapNew, Vec::new());
-    for (key, value) in [
-        ("tag", Expr::Int(OBJECT)),
-        ("number", Expr::Float(0.0)),
-        ("flag", Expr::Bool(false)),
-        ("ref_slot", base),
-        ("generation", generation),
-    ] {
-        result = call(
-            BuiltinFunction::Set,
-            vec![result, Expr::String(key.to_owned()), value],
-        );
-    }
-    result
-}
-
-pub(super) fn function_value(base: Expr, generation: Expr) -> Expr {
-    object_value(base, generation)
 }
 
 /// Build a JsValue record from dynamic field expressions (used when
@@ -192,15 +185,17 @@ pub(super) fn dynamic_value(
     result
 }
 
-/// Operational member Reference `{kind, base, key_slot, strict}`. `base`
-/// is the evaluated receiver JsValue, `key_slot` the Int base of the
-/// UTF-16 key string node, `strict` the caller-code strictness.
-pub(super) fn reference(base: Expr, key_slot: Expr, strict: Expr) -> Expr {
+/// Operational member Reference `{kind, base, key_slot, key_generation,
+/// strict}`. `base` is the evaluated receiver JsValue, `key_slot` plus
+/// `key_generation` name the UTF-16 key string node, `strict` the
+/// caller-code strictness.
+pub(super) fn reference(base: Expr, key_slot: Expr, key_generation: Expr, strict: Expr) -> Expr {
     let mut result = call(BuiltinFunction::MapNew, Vec::new());
     for (key, value) in [
         ("kind", Expr::Int(0)),
         ("base", base),
         ("key_slot", key_slot),
+        ("key_generation", key_generation),
         ("strict", strict),
     ] {
         result = call(
@@ -236,25 +231,6 @@ pub(super) fn completion_normal() -> Expr {
 
 pub(super) fn completion_return(value: Expr) -> Expr {
     completion(COMPLETION_RETURN, value, Expr::Bool(true))
-}
-
-/// A boxed JS string: tag 4 with the logical realm base in `ref_slot`.
-/// Payload lives in the shared realm heap, never in this record.
-pub(super) fn string(base: Expr, generation: Expr) -> Expr {
-    let mut result = call(BuiltinFunction::MapNew, Vec::new());
-    for (key, value) in [
-        ("tag", Expr::Int(STRING)),
-        ("number", Expr::Float(0.0)),
-        ("flag", Expr::Bool(false)),
-        ("ref_slot", base),
-        ("generation", generation),
-    ] {
-        result = call(
-            BuiltinFunction::Set,
-            vec![result, Expr::String(key.to_owned()), value],
-        );
-    }
-    result
 }
 
 /// Guest string-equality helper target: the owning carrier plus the flat

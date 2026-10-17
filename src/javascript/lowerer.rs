@@ -4,10 +4,13 @@
 //! actual parsed AST requires array or string storage, the lowerer
 //! bootstraps one real B1 realm (fixed accepted prelude, single owning
 //! carrier with headers) and lowers literal/alias/read/mutate through the
-//! same carrier. Allocation bases come from a private static guest function
-//! that reads the actual backing length at runtime, so repeated executions
-//! of the same emission site observe fresh extents on every engine. No host
+//! same carrier. Private generated guest helpers reserve managed nodes,
+//! register compiler roots and reclaim reusable extents. Logical slot plus
+//! generation remains distinct from the physical backing address. No host
 //! evaluator, no source substring matching.
+use super::heap as layout;
+use super::prelude::heap as heap_emitters;
+use super::prelude::values as value_emitters;
 use super::representation as value;
 use super::string_literal::{
     MAX_LITERAL_UTF16_UNITS, StringStrictness, decode_string_literal, narrowed_span,
@@ -33,62 +36,46 @@ enum Kind {
     Function,
 }
 
-/// Private realm header layout: [object-kind, generation, logical-length]
-/// followed by numeric payload. Constants are generated metadata, never
-/// user-accessible names.
-const REALM_HEADER_CELLS: i64 = 3;
-const REALM_OBJECT_KIND: i64 = 1;
-const REALM_GENERATION: i64 = 1;
-/// String heap layout mirrors the numeric layout: [kind 2, generation 1,
-/// UTF-16 length, code units...]. Units are exact u16 values in numeric
-/// cells; logical IDs stay Int, never resource handles.
-const REALM_STRING_KIND: i64 = 2;
-const REALM_STRING_HEADER_CELLS: i64 = 3;
-/// Plain-object heap layout (kind 3): `[3, gen 1, property_count]` then
-/// seven cells per own data property:
-/// `[key_ref, key_gen, value_tag, value_number, value_flag01, value_ref,
-/// value_gen]`. Keys are real UTF-16 string nodes compared by content;
-/// values are complete tagged payloads.
-const REALM_PLAIN_OBJECT_KIND: i64 = 3;
-const REALM_OBJECT_HEADER_CELLS: i64 = 3;
-const REALM_OBJECT_CELLS_PER_PROPERTY: i64 = 7;
-/// Function heap layout (kind 4):
-/// `[4, gen 1, 0, code_id, closed_env 0, strict 1]`. The code ID is a
-/// finite compile-time identity into the static source-function table;
-/// every INSTANCE base comes from the runtime allocator.
-const REALM_FUNCTION_KIND: i64 = 4;
-const REALM_FUNCTION_CELLS: i64 = 6;
 /// Bounded object/function admission: at most this many own properties per
 /// literal and this many source functions per compilation unit.
 const MAX_OBJECT_PROPERTIES: usize = 256;
 const MAX_SOURCE_FUNCTIONS: usize = 256;
-/// Private runtime allocation helper appended to realm IR.
-const REALM_ALLOC_HELPER: &str = "__compat_es5_alloc";
-/// Private static guest string-equality helper appended to realm IR.
-const STRING_EQUALITY_HELPER: &str = "__compat_es5_string_equal";
 /// Private exact-Int decode helper `(Number) -> Int` factored from the
 /// proven allocator bit logic. Converts bounded guest metadata cells
-/// (tags, bases, generations, code IDs) without invented casts.
+/// (tags, bases, code IDs) without invented casts; generations use the
+/// separate UInt32-domain decoder.
 const DECODE_INT_HELPER: &str = "__compat_es5_decode_int";
-/// Private operational GetValue helper `(Carrier, Reference) -> JsValue`.
-/// Reads the actual own data property through the real heap.
-const REF_GET_HELPER: &str = "__compat_es5_ref_get";
-/// Private finite dispatch helper
-/// `(Carrier, func: JsValue, this: JsValue, args: Array<JsValue>) ->
-/// Completion`. Decodes the function heap code ID and calls the
-/// statically compiled source function; never interprets AST.
-const DISPATCH_HELPER: &str = "__compat_es5_dispatch";
 /// Bounded initialization: total header+payload cells reserved across the
-/// whole source before large IR emission, for strings and numeric arrays.
+/// whole source before large IR emission, including the known fixed
+/// managed-layout prefix, known directory pages and compiler root frames.
+/// Dynamic activation depth and repeated allocations remain runtime quotas.
 const MAX_REALM_INITIAL_CELLS: u64 = 65536;
 
-struct Heap {
-    carrier: u16,
-    helper_read: u16,
-    helper_write: u16,
-    /// Private runtime allocation function index. Every literal calls it
-    /// with the owning carrier and its cell count; bases are fresh extents.
-    alloc: u16,
+pub(super) struct Heap {
+    pub carrier: u16,
+    pub helper_read: u16,
+    pub helper_write: u16,
+    /// Flat indices of the managed heap core shared by every producer and
+    /// consumer in this scope.
+    pub helpers: heap_emitters::HeapHelpers,
+}
+
+/// One compiler-managed root scope per script/source-function activation:
+/// the runtime frame slot plus the dense temp-to-entry layout. Metadata
+/// scalars, label/code IDs and primitive boxes never take entries.
+#[derive(Default)]
+pub(super) struct RootScope {
+    pub frame_slot: u16,
+    pub entries: HashMap<u16, u16>,
+    pub next_entry: u16,
+}
+
+/// One compiler-side pending allocation: the guest handle slot plus the
+/// extracted Int fields the initializer writes through.
+pub(super) struct Newborn {
+    pub slot: u16,
+    pub generation: u16,
+    pub base: u16,
 }
 
 struct Lowered {
@@ -107,11 +94,11 @@ struct CollectedFunction {
     strict: bool,
 }
 
-struct Lowerer<'a> {
-    source: &'a str,
-    source_id: u32,
-    base: u32,
-    next_slot: u16,
+pub(super) struct Lowerer<'a> {
+    pub(super) source: &'a str,
+    pub(super) source_id: u32,
+    pub(super) base: u32,
+    pub(super) next_slot: u16,
     bindings: HashMap<String, (u16, Kind)>,
     array_lengths: HashMap<String, usize>,
     source_bindings: Vec<(String, u16)>,
@@ -122,6 +109,8 @@ struct Lowerer<'a> {
     /// literal base comes from the runtime allocator reading live backing
     /// length instead.
     init_cells: u64,
+    /// Static allocation sites charged to the conservative initial budget.
+    init_nodes: u64,
     /// Flat index of the appended guest string-equality helper. Always set
     /// on the realm path; absent on the heap-free scalar path, where string
     /// values cannot occur.
@@ -135,6 +124,13 @@ struct Lowerer<'a> {
     /// Active carrier override inside function bodies (the carrier
     /// parameter slot). When `None`, the root realm carrier is used.
     carrier_override: Option<u16>,
+    /// Active root-frame override inside function bodies (the frame base
+    /// slot reserved for the activation). Mirrors the carrier override.
+    frame_override: Option<u16>,
+    /// Dense root layout of the activation currently being lowered.
+    /// Saved and restored around nested source functions; absent on the
+    /// heap-free scalar path, where no frame exists.
+    root_scope: Option<RootScope>,
     /// Flat indices of the private object/function helpers. Set on the
     /// realm path once appended; used by inline object/call lowering and
     /// by nested function bodies.
@@ -149,7 +145,7 @@ struct Lowerer<'a> {
 }
 
 impl Lowerer<'_> {
-    fn line(&self, span: swc_common::Span) -> u32 {
+    pub(super) fn line(&self, span: swc_common::Span) -> u32 {
         let offset = span.lo.0.saturating_sub(self.base) as usize;
         u32::try_from(
             self.source[..offset.min(self.source.len())]
@@ -160,7 +156,7 @@ impl Lowerer<'_> {
         .unwrap_or(u32::MAX)
     }
 
-    fn error(&self, span: swc_common::Span, message: &str) -> ParseError {
+    pub(super) fn error(&self, span: swc_common::Span, message: &str) -> ParseError {
         let lo = span.lo.0.saturating_sub(self.base) as usize;
         let hi = span.hi.0.saturating_sub(self.base) as usize;
         ParseError::at_span(
@@ -169,7 +165,7 @@ impl Lowerer<'_> {
         )
     }
 
-    fn slot(&mut self, span: swc_common::Span) -> Result<u16, ParseError> {
+    pub(super) fn slot(&mut self, span: swc_common::Span) -> Result<u16, ParseError> {
         let slot = self.next_slot;
         self.next_slot = slot
             .checked_add(1)
@@ -177,8 +173,245 @@ impl Lowerer<'_> {
         Ok(slot)
     }
 
-    fn bind_temp(&mut self, expr: Expr, span: swc_common::Span) -> Result<(u16, Stmt), ParseError> {
-        self.bind_typed(expr, value::schema(), span)
+    fn bind_temp(
+        &mut self,
+        expr: Expr,
+        span: swc_common::Span,
+    ) -> Result<(u16, Vec<Stmt>), ParseError> {
+        self.bind_rooted(expr, value::schema(), span)
+    }
+
+    /// Bind a boxed value with NO root entry: dropped statement temporaries
+    /// and synthetic primitive boxes whose lifetime the surrounding roots
+    /// already cover. Unrooted newborns stay collectable by design.
+    fn bind_temp_bare(
+        &mut self,
+        expr: Expr,
+        span: swc_common::Span,
+    ) -> Result<(u16, Stmt), ParseError> {
+        let slot = self.slot(span)?;
+        Ok((
+            slot,
+            Stmt::Let {
+                index: slot,
+                declared_schema: Some(value::schema()),
+                expr,
+                line: self.line(span),
+            },
+        ))
+    }
+
+    /// Bind a boxed value followed immediately by its no-allocation root
+    /// write into this activation's frame. The heap-free scalar path has no
+    /// frame and binds bare.
+    fn bind_rooted(
+        &mut self,
+        expr: Expr,
+        schema: TypeSchema,
+        span: swc_common::Span,
+    ) -> Result<(u16, Vec<Stmt>), ParseError> {
+        let slot = self.slot(span)?;
+        let line = self.line(span);
+        let mut stmts = vec![Stmt::Let {
+            index: slot,
+            declared_schema: Some(schema),
+            expr,
+            line,
+        }];
+        if self.root_scope.is_some() {
+            let carrier = self.active_carrier(span)?;
+            let root_write = self.heap_ref(span)?.helpers.root_write;
+            let frame = self.active_frame(span)?;
+            let entry = self.entry_for(slot, span)?;
+            let ack = self.slot(span)?;
+            stmts.push(Stmt::Let {
+                index: ack,
+                declared_schema: Some(TypeSchema::Int),
+                expr: Self::guest_call(
+                    root_write,
+                    vec![
+                        Expr::Var(carrier),
+                        Expr::Var(frame),
+                        Expr::Int(i64::from(entry)),
+                        Expr::Var(slot),
+                    ],
+                ),
+                line,
+            });
+        }
+        Ok((slot, stmts))
+    }
+
+    /// Reserve one root entry for a temp slot in the current activation.
+    fn entry_for(&mut self, slot: u16, span: swc_common::Span) -> Result<u16, ParseError> {
+        let source_id = self.source_id;
+        if self.root_scope.is_none() {
+            return Err(self.error(span, "JavaScript ES5 roots require an activation frame"));
+        }
+        let scope = self.root_scope.as_mut().expect("scope checked above");
+        if let Some(&entry) = scope.entries.get(&slot) {
+            return Ok(entry);
+        }
+        let entry = scope.next_entry;
+        scope.next_entry = entry.checked_add(1).ok_or_else(|| {
+            ParseError::at_span(
+                vm::compiler::source_map::Span::new(source_id, 0, 0),
+                "JavaScript ES5 root entry space exhausted",
+            )
+        })?;
+        scope.entries.insert(slot, entry);
+        self.charge_initial_cells(layout::FRAME_CELLS_PER_ENTRY as u64, span)?;
+        Ok(entry)
+    }
+
+    fn charge_initial_cells(
+        &mut self,
+        cells: u64,
+        span: swc_common::Span,
+    ) -> Result<(), ParseError> {
+        self.init_cells = self
+            .init_cells
+            .checked_add(cells)
+            .filter(|end| *end <= MAX_REALM_INITIAL_CELLS)
+            .ok_or_else(|| {
+                self.error(
+                    span,
+                    "JavaScript ES5 realm initialization exceeds the 65536 cell budget",
+                )
+            })?;
+        Ok(())
+    }
+
+    /// Reserve one node allocation: static budget charge plus the runtime
+    /// reservation call. The caller initializes header/payload cells with
+    /// numeric writes only, then publishes before any nested allocation.
+    pub(super) fn begin_node(
+        &mut self,
+        carrier: u16,
+        count: i64,
+        kind: i64,
+        span: swc_common::Span,
+        line: u32,
+        stmts: &mut Vec<Stmt>,
+    ) -> Result<Newborn, ParseError> {
+        let helpers = self.heap_ref(span)?.helpers;
+        let cells = u64::try_from(count)
+            .map_err(|_| self.error(span, "JavaScript ES5 realm allocation count overflow"))?;
+        let need = cells
+            .checked_add(layout::RAW_HEADER_CELLS as u64)
+            .ok_or_else(|| self.error(span, "JavaScript ES5 realm allocation count overflow"))?;
+        let page_cells = if self.init_nodes.is_multiple_of(layout::PAGE_ROWS as u64) {
+            layout::DIR_PAGE_CELLS as u64
+        } else {
+            0
+        };
+        self.charge_initial_cells(
+            need.checked_add(page_cells).ok_or_else(|| {
+                self.error(
+                    span,
+                    "JavaScript ES5 realm initialization cell count overflow",
+                )
+            })?,
+            span,
+        )?;
+        self.init_nodes = self.init_nodes.checked_add(1).ok_or_else(|| {
+            self.error(span, "JavaScript ES5 realm allocation site count overflow")
+        })?;
+        let alloc = self.slot(span)?;
+        stmts.push(Stmt::Let {
+            index: alloc,
+            declared_schema: Some(value::allocation_schema()),
+            expr: Self::guest_call(
+                helpers.node_begin,
+                vec![Expr::Var(carrier), Expr::Int(count), Expr::Int(kind)],
+            ),
+            line,
+        });
+        let slot = self.slot(span)?;
+        stmts.push(Stmt::Let {
+            index: slot,
+            declared_schema: Some(TypeSchema::Int),
+            expr: value::field_of(Expr::Var(alloc), "slot"),
+            line,
+        });
+        let generation = self.slot(span)?;
+        stmts.push(Stmt::Let {
+            index: generation,
+            declared_schema: Some(TypeSchema::Int),
+            expr: value::field_of(Expr::Var(alloc), "generation"),
+            line,
+        });
+        let base = self.slot(span)?;
+        stmts.push(Stmt::Let {
+            index: base,
+            declared_schema: Some(TypeSchema::Int),
+            expr: value::field_of(Expr::Var(alloc), "base"),
+            line,
+        });
+        Ok(Newborn {
+            slot,
+            generation,
+            base,
+        })
+    }
+
+    /// Publish one initialized node: validates the pending allocation,
+    /// writes the newborn root directly into a fresh frame entry, activates
+    /// and returns the real boxed value already rooted.
+    pub(super) fn publish_node(
+        &mut self,
+        carrier: u16,
+        newborn: &Newborn,
+        span: swc_common::Span,
+        line: u32,
+        stmts: &mut Vec<Stmt>,
+    ) -> Result<u16, ParseError> {
+        let helpers = self.heap_ref(span)?.helpers;
+        let frame = self.active_frame(span)?;
+        let boxed = self.slot(span)?;
+        let entry = self.entry_for(boxed, span)?;
+        stmts.push(Stmt::Let {
+            index: boxed,
+            declared_schema: Some(value::schema()),
+            expr: Self::guest_call(
+                helpers.node_publish,
+                vec![
+                    Expr::Var(carrier),
+                    Expr::Var(newborn.slot),
+                    Expr::Var(newborn.generation),
+                    Expr::Var(newborn.base),
+                    Expr::Var(frame),
+                    Expr::Int(i64::from(entry)),
+                ],
+            ),
+            line,
+        });
+        Ok(boxed)
+    }
+
+    /// Emit one consumed numeric cell write through the realm write helper.
+    fn emit_cell_write(
+        &mut self,
+        carrier: u16,
+        addr: Expr,
+        payload: Expr,
+        span: swc_common::Span,
+        line: u32,
+        stmts: &mut Vec<Stmt>,
+    ) -> Result<(), ParseError> {
+        let heap = self.heap_ref(span)?;
+        let helper_write = heap.helper_write;
+        let ack = self.slot(span)?;
+        stmts.push(Stmt::Let {
+            index: ack,
+            declared_schema: Some(TypeSchema::Number),
+            expr: Self::guest_call(
+                helper_write,
+                vec![Expr::Var(carrier), Self::as_number(addr), payload],
+            ),
+            line,
+        });
+        Ok(())
     }
 
     fn bind_typed(
@@ -199,15 +432,15 @@ impl Lowerer<'_> {
         ))
     }
 
-    fn builtin_call(index: u16, args: Vec<Expr>) -> Expr {
+    pub(super) fn builtin_call(index: u16, args: Vec<Expr>) -> Expr {
         Expr::Call(index, Vec::new(), args, None, None)
     }
 
-    fn guest_call(index: u16, args: Vec<Expr>) -> Expr {
+    pub(super) fn guest_call(index: u16, args: Vec<Expr>) -> Expr {
         Expr::Call(index, Vec::new(), args, None, None)
     }
 
-    fn as_number(expr: Expr) -> Expr {
+    pub(super) fn as_number(expr: Expr) -> Expr {
         Expr::Div(Box::new(expr), Box::new(Expr::Float(1.0)))
     }
 
@@ -224,6 +457,18 @@ impl Lowerer<'_> {
             return Ok(carrier);
         }
         Ok(self.heap_ref(span)?.carrier)
+    }
+
+    /// Active root-frame slot: the function-body frame inside source
+    /// functions, otherwise the script frame reserved for the activation.
+    fn active_frame(&self, span: swc_common::Span) -> Result<u16, ParseError> {
+        if let Some(frame) = self.frame_override {
+            return Ok(frame);
+        }
+        self.root_scope
+            .as_ref()
+            .map(|scope| scope.frame_slot)
+            .ok_or_else(|| self.error(span, "JavaScript ES5 roots require an activation frame"))
     }
 
     /// Exact raw `"use strict"` directive check over the literal lexeme.
@@ -339,7 +584,7 @@ impl Lowerer<'_> {
                 let (slot, statement) = self.bind_temp(operand.expr, u.span)?;
                 Ok(Lowered {
                     expr: Expr::Block {
-                        stmts: vec![statement],
+                        stmts: statement,
                         expr: Box::new(value::number(Expr::Neg(Box::new(value::field(
                             slot, "number",
                         ))))),
@@ -399,7 +644,11 @@ impl Lowerer<'_> {
                         )?;
                         return Ok(Lowered {
                             expr: Expr::Block {
-                                stmts: vec![ls, rs, flag_stmt],
+                                stmts: {
+                                    let mut combined = [ls, rs].concat();
+                                    combined.push(flag_stmt);
+                                    combined
+                                },
                                 expr: Box::new(value::boolean(Expr::Not(Box::new(Expr::Var(
                                     flag_slot,
                                 ))))),
@@ -422,7 +671,7 @@ impl Lowerer<'_> {
                 };
                 Ok(Lowered {
                     expr: Expr::Block {
-                        stmts: vec![ls, rs],
+                        stmts: [ls, rs].concat(),
                         expr: Box::new(result),
                     },
                     kind: if equality {
@@ -446,7 +695,8 @@ impl Lowerer<'_> {
 
     fn lower_member_read(&mut self, member: &ast::MemberExpr) -> Result<Lowered, ParseError> {
         // Numeric-array fast path: computed integer literal on an array
-        // binding preserves the accepted behavior exactly.
+        // binding preserves the accepted behavior exactly, now through the
+        // checked generation/kind/length gate before the element is read.
         if let ast::MemberProp::Computed(property) = &member.prop
             && let Some(index) = Self::member_index_literal(&property.expr)
             && let ast::Expr::Ident(object) = member.obj.as_ref()
@@ -464,18 +714,87 @@ impl Lowerer<'_> {
             }
             let carrier = self.active_carrier(member.span)?;
             let heap = self.heap_ref(member.span)?;
-            let helper_read = heap.helper_read;
-            let base = value::field(slot, "ref_slot");
+            let (helper_read, checked_base) = (heap.helper_read, heap.helpers.checked_base);
+            let decode = self.helper_decode.ok_or_else(|| {
+                self.error(
+                    member.span,
+                    "P0 array reads require the realm decode helper",
+                )
+            })?;
+            let line = self.line(member.span);
+            // Preserve the source binding for subsequent accesses; each
+            // access reads its identity fields once from a rooted copy.
+            let (receiver, mut stmts) = self.bind_temp(Expr::Var(slot), member.obj.span())?;
+            let base_tmp = self.slot(member.span)?;
+            stmts.push(Stmt::Let {
+                index: base_tmp,
+                declared_schema: Some(TypeSchema::Int),
+                expr: Self::guest_call(
+                    checked_base,
+                    vec![
+                        Expr::Var(carrier),
+                        value::field(receiver, "ref_slot"),
+                        value::field(receiver, "generation"),
+                    ],
+                ),
+                line,
+            });
+            let kind_tmp = self.slot(member.span)?;
+            stmts.push(Stmt::Let {
+                index: kind_tmp,
+                declared_schema: Some(TypeSchema::Int),
+                expr: Self::guest_call(
+                    decode,
+                    vec![Self::guest_call(
+                        helper_read,
+                        vec![Expr::Var(carrier), Self::as_number(Expr::Var(base_tmp))],
+                    )],
+                ),
+                line,
+            });
+            stmts.push(assert_stmt(
+                Expr::Eq(
+                    Box::new(Expr::Var(kind_tmp)),
+                    Box::new(Expr::Int(layout::KIND_ARRAY)),
+                ),
+                line,
+            ));
+            let len_tmp = self.slot(member.span)?;
+            stmts.push(Stmt::Let {
+                index: len_tmp,
+                declared_schema: Some(TypeSchema::Int),
+                expr: Self::guest_call(
+                    decode,
+                    vec![Self::guest_call(
+                        helper_read,
+                        vec![
+                            Expr::Var(carrier),
+                            Self::as_number(Expr::Add(
+                                Box::new(Expr::Var(base_tmp)),
+                                Box::new(Expr::Int(2)),
+                            )),
+                        ],
+                    )],
+                ),
+                line,
+            });
+            stmts.push(assert_stmt(
+                Expr::Lt(Box::new(Expr::Int(index)), Box::new(Expr::Var(len_tmp))),
+                line,
+            ));
             let physical = Expr::Add(
-                Box::new(base),
-                Box::new(Expr::Int(REALM_HEADER_CELLS + index)),
+                Box::new(Expr::Var(base_tmp)),
+                Box::new(Expr::Int(layout::ARRAY_HEADER_CELLS + index)),
             );
             let read = Self::guest_call(
                 helper_read,
                 vec![Expr::Var(carrier), Self::as_number(physical)],
             );
             return Ok(Lowered {
-                expr: value::number(Self::as_number(read)),
+                expr: Expr::Block {
+                    stmts,
+                    expr: Box::new(value::number(Self::as_number(read))),
+                },
                 kind: Kind::Number,
             });
         }
@@ -514,10 +833,43 @@ impl Lowerer<'_> {
         self.lower_object_member_read(member)
     }
 
+    /// Re-affirm one already-registered root entry with a no-allocation
+    /// write: used right after materializing a Reference so both the
+    /// receiver and the key are pinned by the same statement sequence that
+    /// consumes them.
+    fn reaffirm_root(
+        &mut self,
+        carrier: u16,
+        slot: u16,
+        span: swc_common::Span,
+        line: u32,
+        stmts: &mut Vec<Stmt>,
+    ) -> Result<(), ParseError> {
+        let helpers = self.heap_ref(span)?.helpers;
+        let frame = self.active_frame(span)?;
+        let entry = self.entry_for(slot, span)?;
+        let ack = self.slot(span)?;
+        stmts.push(Stmt::Let {
+            index: ack,
+            declared_schema: Some(TypeSchema::Int),
+            expr: Self::guest_call(
+                helpers.root_write,
+                vec![
+                    Expr::Var(carrier),
+                    Expr::Var(frame),
+                    Expr::Int(i64::from(entry)),
+                    Expr::Var(slot),
+                ],
+            ),
+            line,
+        });
+        Ok(())
+    }
+
     /// Operational own-data-property read through a real Reference:
     /// evaluate base once, allocate the UTF-16 key once, materialize
-    /// `{kind, base, key_slot, strict}` with caller strictness, then
-    /// GetValue through the actual heap object.
+    /// `{kind, base, key_slot, key_generation, strict}` with caller
+    /// strictness, then GetValue through the actual heap object.
     fn lower_object_member_read(
         &mut self,
         member: &ast::MemberExpr,
@@ -544,16 +896,26 @@ impl Lowerer<'_> {
         }
         let (base_slot, base_stmt) = self.bind_temp(base.expr, member.obj.span())?;
         let key_units = self.member_key_units(member)?;
-        let mut stmts = vec![base_stmt];
-        let key_base = self.emit_utf16_node(&key_units, member.span, &mut stmts)?;
+        let mut stmts = base_stmt;
+        // The receiver root precedes the member key allocation; the key
+        // publishes into its own entry before GetValue can run.
+        let key_box = self.emit_utf16_node(&key_units, member.span, &mut stmts)?;
         let strict = Expr::Bool(self.enclosing_strict);
-        let reference = value::reference(Expr::Var(base_slot), Expr::Var(key_base), strict);
+        let reference = value::reference(
+            Expr::Var(base_slot),
+            value::field(key_box, "ref_slot"),
+            value::field(key_box, "generation"),
+            strict,
+        );
         let (ref_slot, ref_stmt) =
             self.bind_typed(reference, value::reference_schema(), member.span)?;
         stmts.push(ref_stmt);
+        let line = self.line(member.span);
+        self.reaffirm_root(carrier, base_slot, member.span, line, &mut stmts)?;
+        self.reaffirm_root(carrier, key_box, member.span, line, &mut stmts)?;
         let got = Self::guest_call(ref_get, vec![Expr::Var(carrier), Expr::Var(ref_slot)]);
-        let (value_slot, value_stmt) = self.bind_temp(got, member.span)?;
-        stmts.push(value_stmt);
+        let (value_slot, mut value_stmt) = self.bind_temp(got, member.span)?;
+        stmts.append(&mut value_stmt);
         Ok(Lowered {
             expr: Expr::Block {
                 stmts,
@@ -639,20 +1001,30 @@ impl Lowerer<'_> {
         }
         let (base_slot, base_stmt) = self.bind_temp(base.expr, member.obj.span())?;
         let key_units = self.member_key_units(member)?;
-        let mut stmts = vec![base_stmt];
-        let key_base = self.emit_utf16_node(&key_units, member.span, &mut stmts)?;
+        let mut stmts = base_stmt;
+        // Callee and receiver root before the nested call: the key publishes
+        // into its own entry, then both constituents are re-affirmed.
+        let key_box = self.emit_utf16_node(&key_units, member.span, &mut stmts)?;
         let strict = Expr::Bool(self.enclosing_strict);
-        let reference = value::reference(Expr::Var(base_slot), Expr::Var(key_base), strict);
+        let reference = value::reference(
+            Expr::Var(base_slot),
+            value::field(key_box, "ref_slot"),
+            value::field(key_box, "generation"),
+            strict,
+        );
         let (ref_slot, ref_stmt) = self.bind_typed(reference, value::reference_schema(), span)?;
         stmts.push(ref_stmt);
+        let line = self.line(span);
+        self.reaffirm_root(carrier, base_slot, span, line, &mut stmts)?;
+        self.reaffirm_root(carrier, key_box, span, line, &mut stmts)?;
         // GetValue through the SAME reference, then call with the SAME
         // saved base as receiver.
         let got = Self::guest_call(ref_get, vec![Expr::Var(carrier), Expr::Var(ref_slot)]);
-        let (func_slot, func_stmt) = self.bind_temp(got, span)?;
-        stmts.push(func_stmt);
+        let (func_slot, mut func_stmt) = self.bind_temp(got, span)?;
+        stmts.append(&mut func_stmt);
         let receiver = value::field_of(Expr::Var(ref_slot), "base");
-        let (this_slot, this_stmt) = self.bind_temp(receiver, span)?;
-        stmts.push(this_stmt);
+        let (this_slot, mut this_stmt) = self.bind_temp(receiver, span)?;
+        stmts.append(&mut this_stmt);
         let empty_args = Self::builtin_call(BuiltinFunction::ArrayNew.call_index(), Vec::new());
         let completed = Self::guest_call(
             dispatch,
@@ -666,8 +1038,9 @@ impl Lowerer<'_> {
         let (comp_slot, comp_stmt) =
             self.bind_typed(completed, value::completion_schema(), span)?;
         stmts.push(comp_stmt);
-        let (value_slot, value_stmt) = self.bind_temp(value::field(comp_slot, "value"), span)?;
-        stmts.push(value_stmt);
+        let (value_slot, mut value_stmt) =
+            self.bind_temp(value::field(comp_slot, "value"), span)?;
+        stmts.append(&mut value_stmt);
         Ok(Lowered {
             expr: Expr::Block {
                 stmts,
@@ -705,10 +1078,10 @@ impl Lowerer<'_> {
             }
         }
         let mut stmts = Vec::new();
-        let (func_slot, func_stmt) = self.bind_temp(Expr::Var(slot), ident.span)?;
-        stmts.push(func_stmt);
-        let (this_slot, this_stmt) = self.bind_temp(value::undefined(), span)?;
-        stmts.push(this_stmt);
+        let (func_slot, mut func_stmt) = self.bind_temp(Expr::Var(slot), ident.span)?;
+        stmts.append(&mut func_stmt);
+        let (this_slot, mut this_stmt) = self.bind_temp(value::undefined(), span)?;
+        stmts.append(&mut this_stmt);
         let empty_args = Self::builtin_call(BuiltinFunction::ArrayNew.call_index(), Vec::new());
         let completed = Self::guest_call(
             dispatch,
@@ -722,8 +1095,9 @@ impl Lowerer<'_> {
         let (comp_slot, comp_stmt) =
             self.bind_typed(completed, value::completion_schema(), span)?;
         stmts.push(comp_stmt);
-        let (value_slot, value_stmt) = self.bind_temp(value::field(comp_slot, "value"), span)?;
-        stmts.push(value_stmt);
+        let (value_slot, mut value_stmt) =
+            self.bind_temp(value::field(comp_slot, "value"), span)?;
+        stmts.append(&mut value_stmt);
         Ok(Lowered {
             expr: Expr::Block {
                 stmts,
@@ -761,46 +1135,61 @@ impl Lowerer<'_> {
             .map_err(|codec| self.error(narrowed_span(span, codec.relative_offset), &codec.message))
     }
 
-    /// Reserve one runtime allocation of `need` header+payload cells.
-    /// Checked Rust arithmetic keeps the whole-source budget cap: the static
-    /// running total rejects overflow/excess with a spanned resource
-    /// diagnostic before large emission, but never supplies an ID. Emits a
-    /// call to the private runtime allocator, which reads the live backing
-    /// length, guards the extent and resizes before returning the fresh Int
-    /// base. Repeated executions of this same call site observe distinct
-    /// extents on every engine.
-    fn reserve_allocation(
-        &mut self,
-        carrier: u16,
-        alloc: u16,
-        span: swc_common::Span,
-        line: u32,
-        statements: &mut Vec<Stmt>,
-        need: u64,
-    ) -> Result<u16, ParseError> {
-        let end = self.init_cells.checked_add(need).ok_or_else(|| {
-            self.error(
-                span,
-                "JavaScript ES5 realm initialization cell count overflow",
-            )
-        })?;
-        if end > MAX_REALM_INITIAL_CELLS {
-            return Err(self.error(
-                span,
-                "JavaScript ES5 realm initialization exceeds the 65536 cell budget",
-            ));
+    /// Reject a provably excessive direct-binding literal total before any
+    /// large literal emits locals. This is a lower-bound preflight, not a
+    /// replacement for exact node/root/directory reservation checks.
+    fn preflight_binding_literals(&self, script: &ast::Script) -> Result<(), ParseError> {
+        let mut cells = (layout::PREFIX_CELLS + layout::FRAME_FIXED_CELLS) as u64;
+        let mut nodes = 0u64;
+        for statement in &script.body {
+            let ast::Stmt::Decl(ast::Decl::Var(declaration)) = statement else {
+                continue;
+            };
+            for binding in &declaration.decls {
+                let Some(mut expression) = binding.init.as_deref() else {
+                    continue;
+                };
+                while let ast::Expr::Paren(parenthesized) = expression {
+                    expression = &parenthesized.expr;
+                }
+                let data_cells = match expression {
+                    ast::Expr::Array(array) => {
+                        array.elems.len() as u64 + layout::ARRAY_HEADER_CELLS as u64
+                    }
+                    ast::Expr::Lit(ast::Lit::Str(string)) => {
+                        self.decode_string_token(string.span)?.len() as u64
+                            + layout::STRING_HEADER_CELLS as u64
+                    }
+                    _ => continue,
+                };
+                // Minimum known roots: one publication entry per node and
+                // an additional boxed binding entry for string expressions.
+                let roots = if matches!(expression, ast::Expr::Array(_)) {
+                    1
+                } else {
+                    2
+                };
+                let metadata = roots * layout::FRAME_CELLS_PER_ENTRY as u64
+                    + if nodes.is_multiple_of(layout::PAGE_ROWS as u64) {
+                        layout::DIR_PAGE_CELLS as u64
+                    } else {
+                        0
+                    };
+                nodes += 1;
+                cells = cells
+                    .checked_add(metadata)
+                    .and_then(|total| total.checked_add(data_cells))
+                    .and_then(|total| total.checked_add(layout::RAW_HEADER_CELLS as u64))
+                    .filter(|total| *total <= MAX_REALM_INITIAL_CELLS)
+                    .ok_or_else(|| {
+                        self.error(
+                            expression.span(),
+                            "JavaScript ES5 realm initialization exceeds the 65536 cell budget",
+                        )
+                    })?;
+            }
         }
-        self.init_cells = end;
-        let count = i64::try_from(need)
-            .map_err(|_| self.error(span, "JavaScript ES5 realm allocation count overflow"))?;
-        let base_slot = self.slot(span)?;
-        statements.push(Stmt::Let {
-            index: base_slot,
-            declared_schema: Some(TypeSchema::Int),
-            expr: Self::guest_call(alloc, vec![Expr::Var(carrier), Expr::Int(count)]),
-            line,
-        });
-        Ok(base_slot)
+        Ok(())
     }
 
     /// Lower a string literal to an immutable realm value. Units come from
@@ -811,74 +1200,22 @@ impl Lowerer<'_> {
     fn lower_string_literal(&mut self, literal: &ast::Str) -> Result<Lowered, ParseError> {
         let span = literal.span;
         let units = self.decode_string_token(span)?;
-        if units.len() > MAX_LITERAL_UTF16_UNITS {
-            return Err(self.error(
-                span,
-                "JavaScript ES5 string literal exceeds the 16384 UTF-16 unit bound",
-            ));
-        }
-        let length = units.len() as i64;
-        let total = REALM_STRING_HEADER_CELLS
-            .checked_add(length)
-            .ok_or_else(|| self.error(span, "JavaScript ES5 string length overflow"))?;
-        let need = u64::try_from(total)
-            .map_err(|_| self.error(span, "JavaScript ES5 string length overflow"))?;
-        let carrier = self.active_carrier(span)?;
-        let heap = self.heap_ref(span)?;
-        let (helper_write, alloc) = (heap.helper_write, heap.alloc);
-        let line = self.line(span);
         let mut stmts = Vec::new();
-        let base_slot = self.reserve_allocation(carrier, alloc, span, line, &mut stmts, need)?;
-        for (offset, marker) in [
-            (0i64, REALM_STRING_KIND),
-            (1i64, REALM_GENERATION),
-            (2i64, length),
-        ] {
-            let physical = Expr::Add(Box::new(Expr::Var(base_slot)), Box::new(Expr::Int(offset)));
-            let written = Self::guest_call(
-                helper_write,
-                vec![
-                    Expr::Var(carrier),
-                    Self::as_number(physical),
-                    Self::as_number(Expr::Int(marker)),
-                ],
-            );
-            stmts.push(Stmt::Expr {
-                expr: written,
-                line,
-            });
-        }
-        for (position, unit) in units.iter().enumerate() {
-            let offset = REALM_STRING_HEADER_CELLS + position as i64;
-            let physical = Expr::Add(Box::new(Expr::Var(base_slot)), Box::new(Expr::Int(offset)));
-            let written = Self::guest_call(
-                helper_write,
-                vec![
-                    Expr::Var(carrier),
-                    Self::as_number(physical),
-                    Self::as_number(Expr::Int(i64::from(*unit))),
-                ],
-            );
-            stmts.push(Stmt::Expr {
-                expr: written,
-                line,
-            });
-        }
+        let boxed = self.emit_utf16_node(&units, span, &mut stmts)?;
         Ok(Lowered {
             expr: Expr::Block {
                 stmts,
-                expr: Box::new(value::string(
-                    Expr::Var(base_slot),
-                    Expr::Int(REALM_GENERATION),
-                )),
+                expr: Box::new(Expr::Var(boxed)),
             },
             kind: Kind::String,
         })
     }
 
     /// Emit one UTF-16 string node (header + units) into `statements`,
-    /// returning the fresh Int base slot. Shared by string values and by
-    /// object/member key nodes so keys are real guest strings.
+    /// returning the rooted boxed value slot. Shared by string values and
+    /// by object/member key nodes so keys are real guest strings. Kind and
+    /// generation are stamped by reservation; only length plus units are
+    /// initialized here, then the node publishes into its frame entry.
     fn emit_utf16_node(
         &mut self,
         units: &[u16],
@@ -892,52 +1229,37 @@ impl Lowerer<'_> {
             ));
         }
         let length = units.len() as i64;
-        let total = REALM_STRING_HEADER_CELLS
+        let count = layout::STRING_HEADER_CELLS
             .checked_add(length)
             .ok_or_else(|| self.error(span, "JavaScript ES5 string length overflow"))?;
-        let need = u64::try_from(total)
-            .map_err(|_| self.error(span, "JavaScript ES5 string length overflow"))?;
         let carrier = self.active_carrier(span)?;
-        let heap = self.heap_ref(span)?;
-        let (helper_write, alloc) = (heap.helper_write, heap.alloc);
         let line = self.line(span);
-        let base_slot = self.reserve_allocation(carrier, alloc, span, line, statements, need)?;
-        for (offset, marker) in [
-            (0i64, REALM_STRING_KIND),
-            (1i64, REALM_GENERATION),
-            (2i64, length),
-        ] {
-            let physical = Expr::Add(Box::new(Expr::Var(base_slot)), Box::new(Expr::Int(offset)));
-            let written = Self::guest_call(
-                helper_write,
-                vec![
-                    Expr::Var(carrier),
-                    Self::as_number(physical),
-                    Self::as_number(Expr::Int(marker)),
-                ],
-            );
-            statements.push(Stmt::Expr {
-                expr: written,
-                line,
-            });
-        }
+        let newborn =
+            self.begin_node(carrier, count, layout::KIND_STRING, span, line, statements)?;
+        self.emit_cell_write(
+            carrier,
+            Expr::Add(Box::new(Expr::Var(newborn.base)), Box::new(Expr::Int(2))),
+            Self::as_number(Expr::Int(length)),
+            span,
+            line,
+            statements,
+        )?;
         for (position, unit) in units.iter().enumerate() {
-            let offset = REALM_STRING_HEADER_CELLS + position as i64;
-            let physical = Expr::Add(Box::new(Expr::Var(base_slot)), Box::new(Expr::Int(offset)));
-            let written = Self::guest_call(
-                helper_write,
-                vec![
-                    Expr::Var(carrier),
-                    Self::as_number(physical),
-                    Self::as_number(Expr::Int(i64::from(*unit))),
-                ],
-            );
-            statements.push(Stmt::Expr {
-                expr: written,
+            let offset = layout::STRING_HEADER_CELLS + position as i64;
+            self.emit_cell_write(
+                carrier,
+                Expr::Add(
+                    Box::new(Expr::Var(newborn.base)),
+                    Box::new(Expr::Int(offset)),
+                ),
+                Self::as_number(Expr::Int(i64::from(*unit))),
+                span,
                 line,
-            });
+                statements,
+            )?;
         }
-        Ok(base_slot)
+        let boxed = self.publish_node(carrier, &newborn, span, line, statements)?;
+        Ok(boxed)
     }
 
     fn lower_this(&mut self, span: swc_common::Span) -> Result<Lowered, ParseError> {
@@ -1060,16 +1382,19 @@ impl Lowerer<'_> {
         let line = self.line(literal.span);
         let mut stmts: Vec<Stmt> = Vec::new();
         // Allocate key string nodes first so every property key is a real
-        // UTF-16 guest string compared by content at runtime.
-        let mut key_bases: Vec<u16> = Vec::new();
+        // UTF-16 guest string compared by content at runtime. Each key
+        // publishes into its own entry before the containing allocation.
+        let mut key_boxes: Vec<u16> = Vec::new();
         for (units, _, key_span) in &entries {
             // Keys borrow the literal span for resource diagnostics.
-            let base = self.emit_utf16_node(units, *key_span, &mut stmts)?;
-            key_bases.push(base);
+            let boxed = self.emit_utf16_node(units, *key_span, &mut stmts)?;
+            key_boxes.push(boxed);
         }
         // Lower values (numbers, strings, objects, functions, member
         // reads, aliases). Closed-function bodies were prevalidated; free
         // names reject here through ordinary unknown-local diagnostics.
+        // Every value roots before the containing object begins, so the
+        // reservation safepoint keeps them all alive.
         let mut value_slots: Vec<(u16, Kind)> = Vec::new();
         for (_, value_expr, value_span) in &entries {
             let value = self.expr(value_expr)?;
@@ -1088,47 +1413,46 @@ impl Lowerer<'_> {
                     ));
                 }
             }
-            let (slot, stmt) = self.bind_temp(value.expr, *value_span)?;
-            stmts.push(stmt);
+            let (slot, mut stmt) = self.bind_temp(value.expr, *value_span)?;
+            stmts.append(&mut stmt);
             value_slots.push((slot, value.kind));
         }
         let carrier = self.active_carrier(literal.span)?;
-        let heap = self.heap_ref(literal.span)?;
-        let (helper_write, alloc) = (heap.helper_write, heap.alloc);
-        let total = REALM_OBJECT_HEADER_CELLS
+        let data_count = layout::OBJECT_HEADER_CELLS
             .checked_add(
-                REALM_OBJECT_CELLS_PER_PROPERTY
+                layout::OBJECT_CELLS_PER_PROPERTY
                     .checked_mul(count)
                     .ok_or_else(|| self.error(literal.span, "P0 plain-object size overflow"))?,
             )
             .ok_or_else(|| self.error(literal.span, "P0 plain-object size overflow"))?;
-        let need = u64::try_from(total)
-            .map_err(|_| self.error(literal.span, "P0 plain-object size overflow"))?;
-        let base_slot =
-            self.reserve_allocation(carrier, alloc, literal.span, line, &mut stmts, need)?;
-        for (offset, marker) in [
-            (0i64, REALM_PLAIN_OBJECT_KIND),
-            (1i64, REALM_GENERATION),
-            (2i64, count),
-        ] {
-            let physical = Expr::Add(Box::new(Expr::Var(base_slot)), Box::new(Expr::Int(offset)));
-            let written = Self::guest_call(
-                helper_write,
-                vec![
-                    Expr::Var(carrier),
-                    Self::as_number(physical),
-                    Self::as_number(Expr::Int(marker)),
-                ],
-            );
-            stmts.push(Stmt::Expr {
-                expr: written,
+        let newborn = self.begin_node(
+            carrier,
+            data_count,
+            layout::KIND_OBJECT,
+            literal.span,
+            line,
+            &mut stmts,
+        )?;
+        // Header remainder: property count plus the null prototype pair.
+        // Kind/generation are stamped by reservation.
+        for (offset, marker) in [(2i64, count), (3i64, 0), (4i64, 0)] {
+            self.emit_cell_write(
+                carrier,
+                Expr::Add(
+                    Box::new(Expr::Var(newborn.base)),
+                    Box::new(Expr::Int(offset)),
+                ),
+                Self::as_number(Expr::Int(marker)),
+                literal.span,
                 line,
-            });
+                &mut stmts,
+            )?;
         }
-        for (index, (key_base, (value_slot, _kind))) in
-            key_bases.iter().zip(value_slots.iter()).enumerate()
+        for (index, (key_box, (value_slot, _kind))) in
+            key_boxes.iter().zip(value_slots.iter()).enumerate()
         {
-            let row = REALM_OBJECT_HEADER_CELLS + REALM_OBJECT_CELLS_PER_PROPERTY * index as i64;
+            let row =
+                layout::OBJECT_HEADER_CELLS + layout::OBJECT_CELLS_PER_PROPERTY * index as i64;
             // Stored cells: key_ref, key_gen, value_tag, value_number,
             // value_flag01, value_ref, value_gen. Float payload is
             // preserved directly; Ints ride as Numbers via as_number.
@@ -1152,7 +1476,7 @@ impl Lowerer<'_> {
             // which native SSA rejects; a bare Tagged Get is likewise
             // rejected as a branch condition.
             let (true_slot, true_stmt) =
-                self.bind_temp(value::boolean(Expr::Bool(true)), literal.span)?;
+                self.bind_temp_bare(value::boolean(Expr::Bool(true)), literal.span)?;
             stmts.push(true_stmt);
             let flag_number = Expr::IfElse {
                 condition: Box::new(Expr::Eq(
@@ -1166,8 +1490,8 @@ impl Lowerer<'_> {
             let ref_number = Self::as_number(value::field(*value_slot, "ref_slot"));
             let gen_number = Self::as_number(value::field(*value_slot, "generation"));
             let cells: [(i64, Expr); 7] = [
-                (0, Self::as_number(Expr::Var(*key_base))),
-                (1, Self::as_number(Expr::Int(REALM_GENERATION))),
+                (0, Self::as_number(value::field(*key_box, "ref_slot"))),
+                (1, Self::as_number(value::field(*key_box, "generation"))),
                 (2, tag_number),
                 (3, value::field(*value_slot, "number")),
                 (4, flag_number),
@@ -1175,27 +1499,24 @@ impl Lowerer<'_> {
                 (6, gen_number),
             ];
             for (cell, payload) in cells {
-                let physical = Expr::Add(
-                    Box::new(Expr::Var(base_slot)),
-                    Box::new(Expr::Int(row + cell)),
-                );
-                let written = Self::guest_call(
-                    helper_write,
-                    vec![Expr::Var(carrier), Self::as_number(physical), payload],
-                );
-                stmts.push(Stmt::Expr {
-                    expr: written,
+                self.emit_cell_write(
+                    carrier,
+                    Expr::Add(
+                        Box::new(Expr::Var(newborn.base)),
+                        Box::new(Expr::Int(row + cell)),
+                    ),
+                    payload,
+                    literal.span,
                     line,
-                });
+                    &mut stmts,
+                )?;
             }
         }
+        let boxed = self.publish_node(carrier, &newborn, literal.span, line, &mut stmts)?;
         Ok(Lowered {
             expr: Expr::Block {
                 stmts,
-                expr: Box::new(value::object_value(
-                    Expr::Var(base_slot),
-                    Expr::Int(REALM_GENERATION),
-                )),
+                expr: Box::new(Expr::Var(boxed)),
             },
             kind: Kind::Object,
         })
@@ -1208,44 +1529,47 @@ impl Lowerer<'_> {
             return Err(self.error(span, "P0 source-function admission requires predeclaration"));
         };
         let carrier = self.active_carrier(span)?;
-        let heap = self.heap_ref(span)?;
-        let (helper_write, alloc) = (heap.helper_write, heap.alloc);
         let line = self.line(span);
         let mut stmts = Vec::new();
-        let need = u64::try_from(REALM_FUNCTION_CELLS)
-            .map_err(|_| self.error(span, "P0 function allocation overflow"))?;
-        let base_slot = self.reserve_allocation(carrier, alloc, span, line, &mut stmts, need)?;
-        // Header: [kind 4, gen 1, 0, code_id, closed_env 0, strict 1].
-        // The closed-env sentinel is explicitly empty, never a handle.
+        let newborn = self.begin_node(
+            carrier,
+            layout::FUNCTION_CELLS,
+            layout::KIND_FUNCTION,
+            span,
+            line,
+            &mut stmts,
+        )?;
+        // Header remainder: zero pad, null prototype pair, static code
+        // identity, empty environment pair, strict marker. The code ID is
+        // a finite compile-time identity into the static source-function
+        // table; the closed-env sentinel is explicitly empty, never a
+        // handle. Kind/generation are stamped by reservation.
         for (offset, marker) in [
-            (0i64, REALM_FUNCTION_KIND),
-            (1i64, REALM_GENERATION),
             (2i64, 0),
-            (3i64, code_id),
+            (3i64, 0),
             (4i64, 0),
-            (5i64, 1),
+            (5i64, code_id),
+            (6i64, 0),
+            (7i64, 0),
+            (8i64, 1),
         ] {
-            let physical = Expr::Add(Box::new(Expr::Var(base_slot)), Box::new(Expr::Int(offset)));
-            let written = Self::guest_call(
-                helper_write,
-                vec![
-                    Expr::Var(carrier),
-                    Self::as_number(physical),
-                    Self::as_number(Expr::Int(marker)),
-                ],
-            );
-            stmts.push(Stmt::Expr {
-                expr: written,
+            self.emit_cell_write(
+                carrier,
+                Expr::Add(
+                    Box::new(Expr::Var(newborn.base)),
+                    Box::new(Expr::Int(offset)),
+                ),
+                Self::as_number(Expr::Int(marker)),
+                span,
                 line,
-            });
+                &mut stmts,
+            )?;
         }
+        let boxed = self.publish_node(carrier, &newborn, span, line, &mut stmts)?;
         Ok(Lowered {
             expr: Expr::Block {
                 stmts,
-                expr: Box::new(value::function_value(
-                    Expr::Var(base_slot),
-                    Expr::Int(REALM_GENERATION),
-                )),
+                expr: Box::new(Expr::Var(boxed)),
             },
             kind: Kind::Function,
         })
@@ -1327,10 +1651,13 @@ fn lower_primitive(
         source_bindings: Vec::new(),
         heap: None,
         init_cells: 0,
+        init_nodes: 0,
         string_eq: None,
         enclosing_strict: false,
         function_this: None,
         carrier_override: None,
+        frame_override: None,
+        root_scope: None,
         helper_decode: None,
         helper_ref_get: None,
         helper_dispatch: None,
@@ -1361,16 +1688,16 @@ fn lower_primitive(
                         return Err(lower.error(declarator.span, "P0 requires a var initializer"));
                     };
                     let initial = lower.expr(initializer)?;
-                    let (slot, stmt) = lower.bind_temp(initial.expr, declarator.span)?;
+                    let (slot, mut stmt) = lower.bind_temp(initial.expr, declarator.span)?;
                     lower.bindings.insert(name.clone(), (slot, initial.kind));
                     lower.source_bindings.push((name, slot));
-                    statements.push(stmt);
+                    statements.append(&mut stmt);
                 }
             }
             ast::Stmt::Expr(e) => {
                 let lowered = lower.expr(&e.expr)?;
-                let (slot, stmt) = lower.bind_temp(lowered.expr, e.span)?;
-                statements.push(stmt);
+                let (slot, mut stmt) = lower.bind_temp(lowered.expr, e.span)?;
+                statements.append(&mut stmt);
                 statements.push(Stmt::Expr {
                     expr: Expr::Var(slot),
                     line: lower.line(e.span),
@@ -1690,16 +2017,22 @@ fn lower_with_realm(
         source_bindings: Vec::new(),
         heap: None,
         init_cells: 0,
+        init_nodes: 0,
         string_eq: None,
         enclosing_strict: false,
         function_this: None,
         carrier_override: None,
+        frame_override: None,
+        root_scope: None,
         helper_decode: None,
         helper_ref_get: None,
         helper_dispatch: None,
         function_code_ids: HashMap::new(),
         collected_functions: Vec::new(),
     };
+    let script_strict = lower.script_strict(script);
+    lower.enclosing_strict = script_strict;
+    lower.preflight_binding_literals(script)?;
     let helper_make = helper_index(&base_ir, crate::typescript::HELPER_MAKE, probe_span, &lower)?;
     let helper_read = helper_index(&base_ir, crate::typescript::HELPER_READ, probe_span, &lower)?;
     let helper_write = helper_index(
@@ -1721,37 +2054,61 @@ fn lower_with_realm(
         &lower,
     )?;
     let mut statements = Vec::new();
-    let alloc = append_realm_allocator(
+    // Fixed realm header plus zeroed page table through the existing
+    // factory; the static budget seeds the known fixed layout cost.
+    let carrier = heap_emitters::emit_bootstrap(
         &mut lower,
-        &mut base_ir,
         helper_make,
-        helper_length,
+        helper_write,
         helper_resize,
         probe_span,
         &mut statements,
     )?;
-    bootstrap_realm(
-        &mut lower,
-        helper_make,
-        helper_read,
-        helper_write,
-        alloc,
-        probe_span,
-        &mut statements,
-    )?;
-    let string_eq = append_string_equality(
+    lower.init_cells = (layout::PREFIX_CELLS + layout::FRAME_FIXED_CELLS) as u64;
+    let decode = append_decode_int(&mut lower, &mut base_ir, probe_span, &mut statements)?;
+    lower.helper_decode = Some(decode);
+    let helpers = heap_emitters::append_heap_core(
         &mut lower,
         &mut base_ir,
         helper_make,
         helper_read,
+        helper_write,
+        helper_length,
+        helper_resize,
+        decode,
+        probe_span,
+        &mut statements,
+    )?;
+    lower.heap = Some(Heap {
+        carrier,
+        helper_read,
+        helper_write,
+        helpers,
+    });
+    let carrier_schema = base_ir
+        .functions
+        .iter()
+        .find(|function| function.index == helper_make)
+        .and_then(|function| function.return_schema.clone())
+        .ok_or_else(|| {
+            lower.error(
+                probe_span,
+                "JS source-function table requires the carrier helper return schema",
+            )
+        })?;
+    let string_eq = value_emitters::append_string_equality(
+        &mut lower,
+        &mut base_ir,
+        &carrier_schema,
+        helper_read,
+        decode,
+        helpers.checked_base,
         probe_span,
         &mut statements,
     )?;
     lower.string_eq = Some(string_eq);
     // Script strictness from the exact raw prologue; inherited by every
     // admitted function without its own directive.
-    let script_strict = lower.script_strict(script);
-    lower.enclosing_strict = script_strict;
     collect_source_functions(script, &mut lower, script_strict)?;
     // Only append the object/function helpers when some source shape needs
     // them; pure numeric-array/string sources keep the accepted program
@@ -1759,32 +2116,20 @@ fn lower_with_realm(
     let need_ref = script_needs_ref_helpers(script);
     let function_count = lower.collected_functions.len();
     if need_ref || function_count > 0 {
-        // Private object/function helpers. Decode first (pure), then
-        // GetValue, then the finite static source-function table plus
-        // dispatch.
-        let decode = append_decode_int(&mut lower, &mut base_ir, probe_span, &mut statements)?;
-        lower.helper_decode = Some(decode);
-        let ref_get = append_ref_get(
+        // Operational GetValue through checked generation pairs, then the
+        // finite static source-function table plus dispatch.
+        let ref_get = value_emitters::append_ref_get(
             &mut lower,
             &mut base_ir,
-            helper_make,
+            &carrier_schema,
             helper_read,
             decode,
+            helpers.decode_u32,
+            helpers.checked_base,
             probe_span,
             &mut statements,
         )?;
         lower.helper_ref_get = Some(ref_get);
-        let carrier_schema = base_ir
-            .functions
-            .iter()
-            .find(|function| function.index == helper_make)
-            .and_then(|function| function.return_schema.clone())
-            .ok_or_else(|| {
-                lower.error(
-                    probe_span,
-                    "JS source-function table requires the carrier helper return schema",
-                )
-            })?;
         // Preassign finite flat indices so bodies can call dispatch before
         // it is appended; the dispatch branch table then targets these.
         let next_index = base_ir
@@ -1819,12 +2164,14 @@ fn lower_with_realm(
             )?;
         }
         if function_count > 0 {
-            let dispatch = append_dispatch(
+            let dispatch = value_emitters::append_dispatch(
                 &mut lower,
                 &mut base_ir,
-                helper_make,
+                &carrier_schema,
                 helper_read,
                 decode,
+                helpers.decode_u32,
+                helpers.checked_base,
                 &func_indices,
                 probe_span,
                 &mut statements,
@@ -1832,6 +2179,16 @@ fn lower_with_realm(
             debug_assert_eq!(dispatch, dispatch_index);
         }
     }
+    // Script activation frame: reserve the frame slot, lower the body into
+    // a side buffer under a fresh root scope, then prefix frame entry with
+    // the full capacity known only after lowering.
+    let frame_slot = lower.slot(probe_span)?;
+    lower.root_scope = Some(RootScope {
+        frame_slot,
+        entries: HashMap::new(),
+        next_entry: 0,
+    });
+    let mut body = Vec::new();
     for statement in &script.body {
         // Skip exact `"use strict"` directives: they set caller strictness
         // above and produce no value.
@@ -1868,7 +2225,7 @@ fn lower_with_realm(
                             &name,
                             literal,
                             declarator.span,
-                            &mut statements,
+                            &mut body,
                         )?;
                         continue;
                     }
@@ -1881,11 +2238,12 @@ fn lower_with_realm(
                             .get(alias.sym.as_str())
                             .copied()
                             .unwrap_or(0);
-                        let (slot, stmt) = lower.bind_temp(Expr::Var(src_slot), declarator.span)?;
+                        let (slot, mut stmt) =
+                            lower.bind_temp(Expr::Var(src_slot), declarator.span)?;
                         lower.bindings.insert(name.clone(), (slot, Kind::Array));
                         lower.array_lengths.insert(name.clone(), length);
                         lower.source_bindings.push((name, slot));
-                        statements.push(stmt);
+                        body.append(&mut stmt);
                         continue;
                     }
                     let initial = lower.expr(initializer)?;
@@ -1895,10 +2253,10 @@ fn lower_with_realm(
                             "P0 array bindings require an array literal or array alias",
                         ));
                     }
-                    let (slot, stmt) = lower.bind_temp(initial.expr, declarator.span)?;
+                    let (slot, mut stmt) = lower.bind_temp(initial.expr, declarator.span)?;
                     lower.bindings.insert(name.clone(), (slot, initial.kind));
                     lower.source_bindings.push((name, slot));
-                    statements.push(stmt);
+                    body.append(&mut stmt);
                 }
             }
             ast::Stmt::Expr(e) => {
@@ -1907,19 +2265,16 @@ fn lower_with_realm(
                     && let ast::AssignTarget::Simple(ast::SimpleAssignTarget::Member(member)) =
                         &assign.left
                 {
-                    lower_member_write_stmt(
-                        &mut lower,
-                        member,
-                        &assign.right,
-                        e.span,
-                        &mut statements,
-                    )?;
+                    lower_member_write_stmt(&mut lower, member, &assign.right, e.span, &mut body)?;
                     continue;
                 }
+                // Dropped statement values take no root entry: their nodes
+                // stay collectable by design while every named binding keeps
+                // its own entry through final observation.
                 let lowered = lower.expr(&e.expr)?;
-                let (slot, stmt) = lower.bind_temp(lowered.expr, e.span)?;
-                statements.push(stmt);
-                statements.push(Stmt::Expr {
+                let (slot, stmt) = lower.bind_temp_bare(lowered.expr, e.span)?;
+                body.push(stmt);
+                body.push(Stmt::Expr {
                     expr: Expr::Var(slot),
                     line: lower.line(e.span),
                 });
@@ -1932,6 +2287,25 @@ fn lower_with_realm(
             }
         }
     }
+    // Prefix the script frame entry with the full capacity now known, then
+    // the lowered body. The frame stays active through the final result and
+    // any appended in-realm observations; teardown owns its release.
+    let capacity = lower
+        .root_scope
+        .as_ref()
+        .map(|scope| scope.next_entry)
+        .unwrap_or(0);
+    let line = lower.line(probe_span);
+    statements.push(Stmt::Let {
+        index: frame_slot,
+        declared_schema: Some(TypeSchema::Int),
+        expr: Lowerer::guest_call(
+            helpers.root_enter,
+            vec![Expr::Var(carrier), Expr::Int(i64::from(capacity))],
+        ),
+        line,
+    });
+    statements.extend(body);
     base_ir.stmts.extend(statements);
     base_ir.locals = usize::from(lower.next_slot);
     base_ir.local_bindings.extend(lower.source_bindings);
@@ -1939,6 +2313,10 @@ fn lower_with_realm(
     base_ir
         .struct_schemas
         .insert(declaration.name.clone(), declaration);
+    let allocation = value::allocation_declaration();
+    base_ir
+        .struct_schemas
+        .insert(allocation.name.clone(), allocation);
     let reference = value::reference_declaration();
     base_ir
         .struct_schemas
@@ -1958,7 +2336,7 @@ fn dummy_span(base: u32) -> swc_common::Span {
 /// `assert` builtin: success pushes nothing (a control check, not a value),
 /// failure aborts with `HostError("assertion failed")`. This is private
 /// metadata/resource-budget enforcement, never a catchable JS throw.
-fn assert_stmt(condition: Expr, line: u32) -> Stmt {
+pub(super) fn assert_stmt(condition: Expr, line: u32) -> Stmt {
     Stmt::Expr {
         expr: Expr::Call(
             BuiltinFunction::Assert.call_index(),
@@ -1969,445 +2347,6 @@ fn assert_stmt(condition: Expr, line: u32) -> Stmt {
         ),
         line,
     }
-}
-
-/// Append the private static guest allocation function with the fixed typed
-/// `(Carrier, count: Int) -> Int` signature, a fresh function index, fresh
-/// slots, explicit schemas and no mutable captures. Every literal calls it
-/// at runtime with the owning carrier and its header+payload cell count. It
-/// reads the real backing length through the existing length helper,
-/// normalizes to Float on the proven as_number path and decodes the exact
-/// Int base with bounded binary decomposition: If steps for 2^16 down to
-/// 2^0 with Float remainder subtraction plus Int accumulation, then a zero
-/// remainder guard. Bounds on length, count and end abort before resize;
-/// only after the existing resize succeeds is the decoded Int base
-/// returned. The backing is an append-only arena: no captured cursor, no
-/// static bases, no extra resource, and logical ref_slot/generation stay
-/// Int. Prelude function indices, host metadata, schemas, origins and the
-/// source producer policy are untouched; the carrier schema comes from the
-/// existing make-helper return schema.
-fn append_realm_allocator(
-    lower: &mut Lowerer<'_>,
-    ir: &mut FrontendIr,
-    helper_make: u16,
-    helper_length: u16,
-    helper_resize: u16,
-    span: swc_common::Span,
-    statements: &mut Vec<Stmt>,
-) -> Result<u16, ParseError> {
-    let carrier_schema = ir
-        .functions
-        .iter()
-        .find(|function| function.index == helper_make)
-        .and_then(|function| function.return_schema.clone())
-        .ok_or_else(|| {
-            lower.error(
-                span,
-                "JS realm allocator requires the carrier helper return schema",
-            )
-        })?;
-    let index = ir
-        .functions
-        .iter()
-        .map(|function| function.index)
-        .max()
-        .unwrap_or(0)
-        .checked_add(1)
-        .ok_or_else(|| lower.error(span, "JS realm allocator function index space exhausted"))?;
-    let line = lower.line(span);
-    let param_carrier = lower.slot(span)?;
-    let param_count = lower.slot(span)?;
-    let length_number = lower.slot(span)?;
-    let remaining = lower.slot(span)?;
-    let decoded = lower.slot(span)?;
-    let extent_end = lower.slot(span)?;
-    let budget = MAX_REALM_INITIAL_CELLS as f64;
-    let budget_int = MAX_REALM_INITIAL_CELLS as i64;
-    let mut body = vec![
-        Stmt::Let {
-            index: length_number,
-            declared_schema: Some(TypeSchema::Number),
-            expr: Lowerer::guest_call(helper_length, vec![Expr::Var(param_carrier)]),
-            line,
-        },
-        Stmt::Let {
-            index: remaining,
-            declared_schema: Some(TypeSchema::Number),
-            expr: Lowerer::as_number(Expr::Var(length_number)),
-            line,
-        },
-        assert_stmt(
-            Expr::Not(Box::new(Expr::Lt(
-                Box::new(Expr::Var(remaining)),
-                Box::new(Expr::Float(0.0)),
-            ))),
-            line,
-        ),
-        assert_stmt(
-            Expr::Or(
-                Box::new(Expr::Lt(
-                    Box::new(Expr::Var(remaining)),
-                    Box::new(Expr::Float(budget)),
-                )),
-                Box::new(Expr::Eq(
-                    Box::new(Expr::Var(remaining)),
-                    Box::new(Expr::Float(budget)),
-                )),
-            ),
-            line,
-        ),
-        assert_stmt(
-            Expr::Gt(Box::new(Expr::Var(param_count)), Box::new(Expr::Int(0))),
-            line,
-        ),
-        assert_stmt(
-            Expr::Or(
-                Box::new(Expr::Lt(
-                    Box::new(Expr::Var(param_count)),
-                    Box::new(Expr::Int(budget_int)),
-                )),
-                Box::new(Expr::Eq(
-                    Box::new(Expr::Var(param_count)),
-                    Box::new(Expr::Int(budget_int)),
-                )),
-            ),
-            line,
-        ),
-        Stmt::Let {
-            index: decoded,
-            declared_schema: Some(TypeSchema::Int),
-            expr: Expr::Int(0),
-            line,
-        },
-    ];
-    for bit in (0..=16u32).rev() {
-        let threshold = f64::from(1u32 << bit);
-        let bit_value = 1i64 << bit;
-        body.push(Stmt::IfElse {
-            condition: Expr::Or(
-                Box::new(Expr::Gt(
-                    Box::new(Expr::Var(remaining)),
-                    Box::new(Expr::Float(threshold)),
-                )),
-                Box::new(Expr::Eq(
-                    Box::new(Expr::Var(remaining)),
-                    Box::new(Expr::Float(threshold)),
-                )),
-            ),
-            then_branch: vec![
-                Stmt::Assign {
-                    kind: vm::AssignmentKind::Set,
-                    index: remaining,
-                    expr: Expr::Sub(
-                        Box::new(Expr::Var(remaining)),
-                        Box::new(Expr::Float(threshold)),
-                    ),
-                    line,
-                },
-                Stmt::Assign {
-                    kind: vm::AssignmentKind::Set,
-                    index: decoded,
-                    expr: Expr::Add(Box::new(Expr::Var(decoded)), Box::new(Expr::Int(bit_value))),
-                    line,
-                },
-            ],
-            else_branch: Vec::new(),
-            line,
-        });
-    }
-    body.push(assert_stmt(
-        Expr::Eq(Box::new(Expr::Var(remaining)), Box::new(Expr::Float(0.0))),
-        line,
-    ));
-    body.push(Stmt::Let {
-        index: extent_end,
-        declared_schema: Some(TypeSchema::Int),
-        expr: Expr::Add(
-            Box::new(Expr::Var(decoded)),
-            Box::new(Expr::Var(param_count)),
-        ),
-        line,
-    });
-    body.push(assert_stmt(
-        Expr::Or(
-            Box::new(Expr::Lt(
-                Box::new(Expr::Var(extent_end)),
-                Box::new(Expr::Int(budget_int)),
-            )),
-            Box::new(Expr::Eq(
-                Box::new(Expr::Var(extent_end)),
-                Box::new(Expr::Int(budget_int)),
-            )),
-        ),
-        line,
-    ));
-    body.push(Stmt::Expr {
-        expr: Lowerer::guest_call(
-            helper_resize,
-            vec![
-                Expr::Var(param_carrier),
-                Lowerer::as_number(Expr::Var(extent_end)),
-            ],
-        ),
-        line,
-    });
-    let args = vec!["carrier".to_owned(), "count".to_owned()];
-    ir.functions.push(FunctionDecl {
-        name: REALM_ALLOC_HELPER.to_owned(),
-        arity: 2,
-        index,
-        args: args.clone(),
-        arg_schemas: vec![Some(carrier_schema), Some(TypeSchema::Int)],
-        return_schema: Some(TypeSchema::Int),
-        type_params: Vec::new(),
-        exported: false,
-        return_type: ValueType::Int,
-        symbol: None,
-    });
-    ir.function_impls.insert(
-        index,
-        FunctionImpl {
-            param_slots: vec![param_carrier, param_count],
-            capture_copies: Vec::new(),
-            body_stmts: body,
-            body_expr: Expr::Var(decoded),
-            body_expr_line: line,
-        },
-    );
-    statements.push(Stmt::FuncDecl {
-        name: REALM_ALLOC_HELPER.to_owned(),
-        index,
-        arity: 2,
-        args,
-        exported: false,
-        has_impl: true,
-        line,
-    });
-    Ok(index)
-}
-
-fn bootstrap_realm(
-    lower: &mut Lowerer<'_>,
-    helper_make: u16,
-    helper_read: u16,
-    helper_write: u16,
-    alloc: u16,
-    span: swc_common::Span,
-    statements: &mut Vec<Stmt>,
-) -> Result<(), ParseError> {
-    // Single owning carrier for the whole realm. Literal bases are fresh
-    // runtime extents from the allocator function below, so no compile-time
-    // cursor or allocator closure is needed here.
-    let carrier = lower.slot(span)?;
-    let empty = Lowerer::builtin_call(BuiltinFunction::ArrayNew.call_index(), Vec::new());
-    let made = Lowerer::guest_call(helper_make, vec![empty]);
-    statements.push(Stmt::Let {
-        index: carrier,
-        declared_schema: None,
-        expr: made,
-        line: lower.line(span),
-    });
-    lower.heap = Some(Heap {
-        carrier,
-        helper_read,
-        helper_write,
-        alloc,
-    });
-    Ok(())
-}
-
-/// Read one stored UTF-16 unit through the realm read helper: physical cell
-/// `base + 3 + index`, normalized to Number like every other realm read.
-fn read_string_unit(helper_read: u16, carrier: u16, base: u16, index: u16) -> Expr {
-    let physical = Expr::Add(
-        Box::new(Expr::Add(
-            Box::new(Expr::Var(base)),
-            Box::new(Expr::Int(REALM_STRING_HEADER_CELLS)),
-        )),
-        Box::new(Expr::Var(index)),
-    );
-    Lowerer::as_number(Lowerer::guest_call(
-        helper_read,
-        vec![Expr::Var(carrier), Lowerer::as_number(physical)],
-    ))
-}
-
-/// Append the private static guest string-equality function with the fixed
-/// typed `(Carrier, JsValue, JsValue) -> Bool` signature, a fresh function
-/// index and fresh local slots. It reads actual stored lengths and code
-/// units through the realm read helper: declared Float lengths compare
-/// first, then a declared Int index walks the units while a declared Bool
-/// result stays true; a mismatch terminates via the Bool condition. It
-/// allocates no new logical nodes. Mixed tags never reach it because the
-/// strict-equal STRING branch only invokes it for matching STRING tags.
-/// Prelude function indices, host metadata, schemas, origins and the source
-/// producer policy are untouched; the carrier schema comes from the
-/// existing make-helper return schema.
-fn append_string_equality(
-    lower: &mut Lowerer<'_>,
-    ir: &mut FrontendIr,
-    helper_make: u16,
-    helper_read: u16,
-    span: swc_common::Span,
-    statements: &mut Vec<Stmt>,
-) -> Result<u16, ParseError> {
-    let carrier_schema = ir
-        .functions
-        .iter()
-        .find(|function| function.index == helper_make)
-        .and_then(|function| function.return_schema.clone())
-        .ok_or_else(|| {
-            lower.error(
-                span,
-                "JS string realm requires the carrier helper return schema",
-            )
-        })?;
-    let js_schema = value::schema();
-    let index = ir
-        .functions
-        .iter()
-        .map(|function| function.index)
-        .max()
-        .unwrap_or(0)
-        .checked_add(1)
-        .ok_or_else(|| lower.error(span, "JS string helper function index space exhausted"))?;
-    let line = lower.line(span);
-    let param_carrier = lower.slot(span)?;
-    let param_left = lower.slot(span)?;
-    let param_right = lower.slot(span)?;
-    let base_left = lower.slot(span)?;
-    let base_right = lower.slot(span)?;
-    let length_left = lower.slot(span)?;
-    let length_right = lower.slot(span)?;
-    let cursor = lower.slot(span)?;
-    let result = lower.slot(span)?;
-    let length_operand = |slot: u16| -> Expr {
-        Lowerer::as_number(Lowerer::guest_call(
-            helper_read,
-            vec![
-                Expr::Var(param_carrier),
-                Lowerer::as_number(Expr::Add(Box::new(Expr::Var(slot)), Box::new(Expr::Int(2)))),
-            ],
-        ))
-    };
-    let body = vec![
-        Stmt::Let {
-            index: base_left,
-            declared_schema: Some(TypeSchema::Int),
-            expr: value::field(param_left, "ref_slot"),
-            line,
-        },
-        Stmt::Let {
-            index: base_right,
-            declared_schema: Some(TypeSchema::Int),
-            expr: value::field(param_right, "ref_slot"),
-            line,
-        },
-        Stmt::Let {
-            index: length_left,
-            declared_schema: Some(TypeSchema::Number),
-            expr: length_operand(base_left),
-            line,
-        },
-        Stmt::Let {
-            index: length_right,
-            declared_schema: Some(TypeSchema::Number),
-            expr: length_operand(base_right),
-            line,
-        },
-        Stmt::Let {
-            index: cursor,
-            declared_schema: Some(TypeSchema::Int),
-            expr: Expr::Int(0),
-            line,
-        },
-        Stmt::Let {
-            index: result,
-            declared_schema: Some(TypeSchema::Bool),
-            expr: Expr::Eq(
-                Box::new(Expr::Var(length_left)),
-                Box::new(Expr::Var(length_right)),
-            ),
-            line,
-        },
-        Stmt::While {
-            condition: Expr::And(
-                Box::new(Expr::Var(result)),
-                Box::new(Expr::Lt(
-                    Box::new(Lowerer::as_number(Expr::Var(cursor))),
-                    Box::new(Expr::Var(length_left)),
-                )),
-            ),
-            body: vec![
-                Stmt::Assign {
-                    kind: vm::AssignmentKind::Set,
-                    index: result,
-                    expr: Expr::And(
-                        Box::new(Expr::Var(result)),
-                        Box::new(Expr::Eq(
-                            Box::new(read_string_unit(
-                                helper_read,
-                                param_carrier,
-                                base_left,
-                                cursor,
-                            )),
-                            Box::new(read_string_unit(
-                                helper_read,
-                                param_carrier,
-                                base_right,
-                                cursor,
-                            )),
-                        )),
-                    ),
-                    line,
-                },
-                Stmt::Assign {
-                    kind: vm::AssignmentKind::Set,
-                    index: cursor,
-                    expr: Expr::Add(Box::new(Expr::Var(cursor)), Box::new(Expr::Int(1))),
-                    line,
-                },
-            ],
-            line,
-        },
-    ];
-    let args = vec!["carrier".to_owned(), "left".to_owned(), "right".to_owned()];
-    ir.functions.push(FunctionDecl {
-        name: STRING_EQUALITY_HELPER.to_owned(),
-        arity: 3,
-        index,
-        args: args.clone(),
-        arg_schemas: vec![
-            Some(carrier_schema),
-            Some(js_schema.clone()),
-            Some(js_schema),
-        ],
-        return_schema: Some(TypeSchema::Bool),
-        type_params: Vec::new(),
-        exported: false,
-        return_type: ValueType::Bool,
-        symbol: None,
-    });
-    ir.function_impls.insert(
-        index,
-        FunctionImpl {
-            param_slots: vec![param_carrier, param_left, param_right],
-            capture_copies: Vec::new(),
-            body_stmts: body,
-            body_expr: Expr::Var(result),
-            body_expr_line: line,
-        },
-    );
-    statements.push(Stmt::FuncDecl {
-        name: STRING_EQUALITY_HELPER.to_owned(),
-        index,
-        arity: 3,
-        args,
-        exported: false,
-        has_impl: true,
-        line,
-    });
-    Ok(index)
 }
 
 /// Append the private exact-Int decode helper `(Number) -> Int`, factored
@@ -2544,565 +2483,6 @@ fn append_decode_int(
     Ok(index)
 }
 
-/// Append the operational GetValue helper `(Carrier, Reference) -> JsValue`.
-/// Reads the actual own data property: validates the plain-object header,
-/// walks the seven-cell rows, compares UTF-16 keys by content (lengths
-/// then units through the realm read helper) and reconstructs the complete
-/// tagged payload with exact-Int decode. Missing keys and non-object bases
-/// are capability guards (assert), never semantic Undefined.
-fn append_ref_get(
-    lower: &mut Lowerer<'_>,
-    ir: &mut FrontendIr,
-    helper_make: u16,
-    helper_read: u16,
-    decode: u16,
-    span: swc_common::Span,
-    statements: &mut Vec<Stmt>,
-) -> Result<u16, ParseError> {
-    let carrier_schema = ir
-        .functions
-        .iter()
-        .find(|function| function.index == helper_make)
-        .and_then(|function| function.return_schema.clone())
-        .ok_or_else(|| {
-            lower.error(
-                span,
-                "JS reference helper requires the carrier helper return schema",
-            )
-        })?;
-    let index = ir
-        .functions
-        .iter()
-        .map(|function| function.index)
-        .max()
-        .unwrap_or(0)
-        .checked_add(1)
-        .ok_or_else(|| lower.error(span, "JS reference helper index space exhausted"))?;
-    let line = lower.line(span);
-    let param_carrier = lower.slot(span)?;
-    let param_ref = lower.slot(span)?;
-    let obj_val = lower.slot(span)?;
-    let key_base = lower.slot(span)?;
-    let obj_base = lower.slot(span)?;
-    let obj_tag = lower.slot(span)?;
-    let kind_num = lower.slot(span)?;
-    let gen_num = lower.slot(span)?;
-    let count_num = lower.slot(span)?;
-    let search_kind = lower.slot(span)?;
-    let search_len = lower.slot(span)?;
-    let found = lower.slot(span)?;
-    let prop_idx = lower.slot(span)?;
-    let res_tag = lower.slot(span)?;
-    let res_number = lower.slot(span)?;
-    let res_flag = lower.slot(span)?;
-    let res_ref = lower.slot(span)?;
-    let res_gen = lower.slot(span)?;
-    let cur_key_ref_num = lower.slot(span)?;
-    let cur_key_ref = lower.slot(span)?;
-    let cur_key_len = lower.slot(span)?;
-    let cur_tag_num = lower.slot(span)?;
-    let cur_number = lower.slot(span)?;
-    let cur_flag_num = lower.slot(span)?;
-    let cur_ref_num = lower.slot(span)?;
-    let cur_gen_num = lower.slot(span)?;
-    let unit_cursor = lower.slot(span)?;
-    let unit_match = lower.slot(span)?;
-    let key_match = lower.slot(span)?;
-    let search_unit = lower.slot(span)?;
-    let stored_unit = lower.slot(span)?;
-    let js_schema = value::schema();
-    let read_cell = |carrier: u16, base: Expr| -> Expr {
-        Lowerer::guest_call(
-            helper_read,
-            vec![Expr::Var(carrier), Lowerer::as_number(base)],
-        )
-    };
-    let mut body = vec![
-        Stmt::Let {
-            index: obj_val,
-            declared_schema: Some(js_schema.clone()),
-            expr: value::field_of(Expr::Var(param_ref), "base"),
-            line,
-        },
-        Stmt::Let {
-            index: key_base,
-            declared_schema: Some(TypeSchema::Int),
-            expr: value::field_of(Expr::Var(param_ref), "key_slot"),
-            line,
-        },
-        Stmt::Let {
-            index: obj_base,
-            declared_schema: Some(TypeSchema::Int),
-            expr: value::field(obj_val, "ref_slot"),
-            line,
-        },
-        Stmt::Let {
-            index: obj_tag,
-            declared_schema: Some(TypeSchema::Int),
-            expr: value::field(obj_val, "tag"),
-            line,
-        },
-        assert_stmt(
-            Expr::Eq(
-                Box::new(Expr::Var(obj_tag)),
-                Box::new(Expr::Int(value::OBJECT)),
-            ),
-            line,
-        ),
-        Stmt::Let {
-            index: kind_num,
-            declared_schema: Some(TypeSchema::Number),
-            expr: read_cell(
-                param_carrier,
-                Expr::Add(Box::new(Expr::Var(obj_base)), Box::new(Expr::Int(0))),
-            ),
-            line,
-        },
-        assert_stmt(
-            Expr::Eq(
-                Box::new(Lowerer::as_number(Expr::Var(kind_num))),
-                Box::new(Expr::Float(REALM_PLAIN_OBJECT_KIND as f64)),
-            ),
-            line,
-        ),
-        Stmt::Let {
-            index: gen_num,
-            declared_schema: Some(TypeSchema::Number),
-            expr: read_cell(
-                param_carrier,
-                Expr::Add(Box::new(Expr::Var(obj_base)), Box::new(Expr::Int(1))),
-            ),
-            line,
-        },
-        assert_stmt(
-            Expr::Eq(
-                Box::new(Lowerer::as_number(Expr::Var(gen_num))),
-                Box::new(Expr::Float(1.0)),
-            ),
-            line,
-        ),
-        Stmt::Let {
-            index: count_num,
-            declared_schema: Some(TypeSchema::Number),
-            expr: read_cell(
-                param_carrier,
-                Expr::Add(Box::new(Expr::Var(obj_base)), Box::new(Expr::Int(2))),
-            ),
-            line,
-        },
-        Stmt::Let {
-            index: search_kind,
-            declared_schema: Some(TypeSchema::Number),
-            expr: read_cell(
-                param_carrier,
-                Expr::Add(Box::new(Expr::Var(key_base)), Box::new(Expr::Int(0))),
-            ),
-            line,
-        },
-        assert_stmt(
-            Expr::Eq(
-                Box::new(Lowerer::as_number(Expr::Var(search_kind))),
-                Box::new(Expr::Float(REALM_STRING_KIND as f64)),
-            ),
-            line,
-        ),
-        Stmt::Let {
-            index: search_len,
-            declared_schema: Some(TypeSchema::Number),
-            expr: read_cell(
-                param_carrier,
-                Expr::Add(Box::new(Expr::Var(key_base)), Box::new(Expr::Int(2))),
-            ),
-            line,
-        },
-        Stmt::Let {
-            index: found,
-            declared_schema: Some(TypeSchema::Bool),
-            expr: Expr::Bool(false),
-            line,
-        },
-        Stmt::Let {
-            index: prop_idx,
-            declared_schema: Some(TypeSchema::Int),
-            expr: Expr::Int(0),
-            line,
-        },
-        Stmt::Let {
-            index: res_tag,
-            declared_schema: Some(TypeSchema::Int),
-            expr: Expr::Int(0),
-            line,
-        },
-        Stmt::Let {
-            index: res_number,
-            declared_schema: Some(TypeSchema::Float),
-            expr: Expr::Float(0.0),
-            line,
-        },
-        Stmt::Let {
-            index: res_flag,
-            declared_schema: Some(TypeSchema::Bool),
-            expr: Expr::Bool(false),
-            line,
-        },
-        Stmt::Let {
-            index: res_ref,
-            declared_schema: Some(TypeSchema::Int),
-            expr: Expr::Int(0),
-            line,
-        },
-        Stmt::Let {
-            index: res_gen,
-            declared_schema: Some(TypeSchema::Int),
-            expr: Expr::Int(0),
-            line,
-        },
-        Stmt::Let {
-            index: cur_key_ref_num,
-            declared_schema: Some(TypeSchema::Number),
-            expr: Expr::Float(0.0),
-            line,
-        },
-        Stmt::Let {
-            index: cur_key_ref,
-            declared_schema: Some(TypeSchema::Int),
-            expr: Expr::Int(0),
-            line,
-        },
-        Stmt::Let {
-            index: cur_key_len,
-            declared_schema: Some(TypeSchema::Number),
-            expr: Expr::Float(0.0),
-            line,
-        },
-        Stmt::Let {
-            index: cur_tag_num,
-            declared_schema: Some(TypeSchema::Number),
-            expr: Expr::Float(0.0),
-            line,
-        },
-        Stmt::Let {
-            index: cur_number,
-            declared_schema: Some(TypeSchema::Float),
-            expr: Expr::Float(0.0),
-            line,
-        },
-        Stmt::Let {
-            index: cur_flag_num,
-            declared_schema: Some(TypeSchema::Number),
-            expr: Expr::Float(0.0),
-            line,
-        },
-        Stmt::Let {
-            index: cur_ref_num,
-            declared_schema: Some(TypeSchema::Number),
-            expr: Expr::Float(0.0),
-            line,
-        },
-        Stmt::Let {
-            index: cur_gen_num,
-            declared_schema: Some(TypeSchema::Number),
-            expr: Expr::Float(0.0),
-            line,
-        },
-        Stmt::Let {
-            index: unit_cursor,
-            declared_schema: Some(TypeSchema::Int),
-            expr: Expr::Int(0),
-            line,
-        },
-        Stmt::Let {
-            index: unit_match,
-            declared_schema: Some(TypeSchema::Bool),
-            expr: Expr::Bool(true),
-            line,
-        },
-        Stmt::Let {
-            index: key_match,
-            declared_schema: Some(TypeSchema::Bool),
-            expr: Expr::Bool(false),
-            line,
-        },
-        Stmt::Let {
-            index: search_unit,
-            declared_schema: Some(TypeSchema::Number),
-            expr: Expr::Float(0.0),
-            line,
-        },
-        Stmt::Let {
-            index: stored_unit,
-            declared_schema: Some(TypeSchema::Number),
-            expr: Expr::Float(0.0),
-            line,
-        },
-    ];
-    // Row base for property `prop_idx`, cell `c`:
-    // `obj_base + 3 + 7 * prop_idx + c`.
-    let row_cell = |cell: i64| -> Expr {
-        Expr::Add(
-            Box::new(Expr::Add(
-                Box::new(Expr::Var(obj_base)),
-                Box::new(Expr::Add(
-                    Box::new(Expr::Int(REALM_OBJECT_HEADER_CELLS)),
-                    Box::new(Expr::Mul(
-                        Box::new(Expr::Var(prop_idx)),
-                        Box::new(Expr::Int(REALM_OBJECT_CELLS_PER_PROPERTY)),
-                    )),
-                )),
-            )),
-            Box::new(Expr::Int(cell)),
-        )
-    };
-    // Inner unit-compare loop over the candidate key.
-    let search_unit_read = read_cell(
-        param_carrier,
-        Expr::Add(
-            Box::new(Expr::Add(
-                Box::new(Expr::Var(key_base)),
-                Box::new(Expr::Int(REALM_STRING_HEADER_CELLS)),
-            )),
-            Box::new(Expr::Var(unit_cursor)),
-        ),
-    );
-    let stored_unit_read = read_cell(
-        param_carrier,
-        Expr::Add(
-            Box::new(Expr::Add(
-                Box::new(Expr::Var(cur_key_ref)),
-                Box::new(Expr::Int(REALM_STRING_HEADER_CELLS)),
-            )),
-            Box::new(Expr::Var(unit_cursor)),
-        ),
-    );
-    let unit_loop = Stmt::While {
-        condition: Expr::And(
-            Box::new(Expr::Var(unit_match)),
-            Box::new(Expr::Lt(
-                Box::new(Lowerer::as_number(Expr::Var(unit_cursor))),
-                Box::new(Expr::Var(search_len)),
-            )),
-        ),
-        body: vec![
-            Stmt::Assign {
-                kind: vm::AssignmentKind::Set,
-                index: search_unit,
-                expr: search_unit_read,
-                line,
-            },
-            Stmt::Assign {
-                kind: vm::AssignmentKind::Set,
-                index: stored_unit,
-                expr: stored_unit_read,
-                line,
-            },
-            Stmt::Assign {
-                kind: vm::AssignmentKind::Set,
-                index: unit_match,
-                expr: Expr::And(
-                    Box::new(Expr::Var(unit_match)),
-                    Box::new(Expr::Eq(
-                        Box::new(Expr::Var(search_unit)),
-                        Box::new(Expr::Var(stored_unit)),
-                    )),
-                ),
-                line,
-            },
-            Stmt::Assign {
-                kind: vm::AssignmentKind::Set,
-                index: unit_cursor,
-                expr: Expr::Add(Box::new(Expr::Var(unit_cursor)), Box::new(Expr::Int(1))),
-                line,
-            },
-        ],
-        line,
-    };
-    let decode_call = |input: u16| -> Expr { Lowerer::guest_call(decode, vec![Expr::Var(input)]) };
-    // Per-property body: read the seven cells, decode the stored key base,
-    // compare contents, and on a hit reconstruct the tagged payload.
-    let per_property: Vec<Stmt> = vec![
-        Stmt::Assign {
-            kind: vm::AssignmentKind::Set,
-            index: cur_key_ref_num,
-            expr: read_cell(param_carrier, row_cell(0)),
-            line,
-        },
-        Stmt::Assign {
-            kind: vm::AssignmentKind::Set,
-            index: cur_tag_num,
-            expr: read_cell(param_carrier, row_cell(2)),
-            line,
-        },
-        Stmt::Assign {
-            kind: vm::AssignmentKind::Set,
-            index: cur_number,
-            expr: Lowerer::as_number(read_cell(param_carrier, row_cell(3))),
-            line,
-        },
-        Stmt::Assign {
-            kind: vm::AssignmentKind::Set,
-            index: cur_flag_num,
-            expr: read_cell(param_carrier, row_cell(4)),
-            line,
-        },
-        Stmt::Assign {
-            kind: vm::AssignmentKind::Set,
-            index: cur_ref_num,
-            expr: read_cell(param_carrier, row_cell(5)),
-            line,
-        },
-        Stmt::Assign {
-            kind: vm::AssignmentKind::Set,
-            index: cur_gen_num,
-            expr: read_cell(param_carrier, row_cell(6)),
-            line,
-        },
-        Stmt::Assign {
-            kind: vm::AssignmentKind::Set,
-            index: cur_key_ref,
-            expr: decode_call(cur_key_ref_num),
-            line,
-        },
-        Stmt::Assign {
-            kind: vm::AssignmentKind::Set,
-            index: cur_key_len,
-            expr: read_cell(
-                param_carrier,
-                Expr::Add(Box::new(Expr::Var(cur_key_ref)), Box::new(Expr::Int(2))),
-            ),
-            line,
-        },
-        Stmt::Assign {
-            kind: vm::AssignmentKind::Set,
-            index: unit_cursor,
-            expr: Expr::Int(0),
-            line,
-        },
-        Stmt::Assign {
-            kind: vm::AssignmentKind::Set,
-            index: unit_match,
-            expr: Expr::Bool(true),
-            line,
-        },
-        unit_loop,
-        Stmt::Assign {
-            kind: vm::AssignmentKind::Set,
-            index: key_match,
-            expr: Expr::And(
-                Box::new(Expr::Eq(
-                    Box::new(Expr::Var(search_len)),
-                    Box::new(Expr::Var(cur_key_len)),
-                )),
-                Box::new(Expr::Var(unit_match)),
-            ),
-            line,
-        },
-        Stmt::IfElse {
-            condition: Expr::Var(key_match),
-            then_branch: vec![
-                Stmt::Assign {
-                    kind: vm::AssignmentKind::Set,
-                    index: res_tag,
-                    expr: decode_call(cur_tag_num),
-                    line,
-                },
-                Stmt::Assign {
-                    kind: vm::AssignmentKind::Set,
-                    index: res_number,
-                    expr: Expr::Var(cur_number),
-                    line,
-                },
-                Stmt::Assign {
-                    kind: vm::AssignmentKind::Set,
-                    index: res_flag,
-                    expr: Expr::Eq(
-                        Box::new(Lowerer::as_number(Expr::Var(cur_flag_num))),
-                        Box::new(Expr::Float(1.0)),
-                    ),
-                    line,
-                },
-                Stmt::Assign {
-                    kind: vm::AssignmentKind::Set,
-                    index: res_ref,
-                    expr: decode_call(cur_ref_num),
-                    line,
-                },
-                Stmt::Assign {
-                    kind: vm::AssignmentKind::Set,
-                    index: res_gen,
-                    expr: decode_call(cur_gen_num),
-                    line,
-                },
-                Stmt::Assign {
-                    kind: vm::AssignmentKind::Set,
-                    index: found,
-                    expr: Expr::Bool(true),
-                    line,
-                },
-            ],
-            else_branch: vec![Stmt::Assign {
-                kind: vm::AssignmentKind::Set,
-                index: prop_idx,
-                expr: Expr::Add(Box::new(Expr::Var(prop_idx)), Box::new(Expr::Int(1))),
-                line,
-            }],
-            line,
-        },
-    ];
-    body.push(Stmt::While {
-        condition: Expr::And(
-            Box::new(Expr::Not(Box::new(Expr::Var(found)))),
-            Box::new(Expr::Lt(
-                Box::new(Lowerer::as_number(Expr::Var(prop_idx))),
-                Box::new(Expr::Var(count_num)),
-            )),
-        ),
-        body: per_property,
-        line,
-    });
-    // Deferred capability guard: missing own property, prototype lookup and
-    // function-object standard members never produce semantic Undefined.
-    body.push(assert_stmt(Expr::Var(found), line));
-    let args = vec!["carrier".to_owned(), "reference".to_owned()];
-    ir.functions.push(FunctionDecl {
-        name: REF_GET_HELPER.to_owned(),
-        arity: 2,
-        index,
-        args: args.clone(),
-        arg_schemas: vec![Some(carrier_schema), Some(value::reference_schema())],
-        return_schema: Some(js_schema),
-        type_params: Vec::new(),
-        exported: false,
-        return_type: ValueType::Map,
-        symbol: None,
-    });
-    ir.function_impls.insert(
-        index,
-        FunctionImpl {
-            param_slots: vec![param_carrier, param_ref],
-            capture_copies: Vec::new(),
-            body_stmts: body,
-            body_expr: value::dynamic_value(
-                Expr::Var(res_tag),
-                Expr::Var(res_number),
-                Expr::Var(res_flag),
-                Expr::Var(res_ref),
-                Expr::Var(res_gen),
-            ),
-            body_expr_line: line,
-        },
-    );
-    statements.push(Stmt::FuncDecl {
-        name: REF_GET_HELPER.to_owned(),
-        index,
-        arity: 2,
-        args,
-        exported: false,
-        has_impl: true,
-        line,
-    });
-    Ok(index)
-}
-
 /// Lower one admitted source-function body into a real FunctionDecl/Impl
 /// with the fixed physical contract
 /// `(Carrier, env: Int, this: JsValue, args: Array<JsValue>, mode: Int) ->
@@ -3125,10 +2505,19 @@ fn append_source_function(
     let param_args = lower.slot(collected.span)?;
     let param_mode = lower.slot(collected.span)?;
     // Closed scope: stash the caller's bindings and lower with an empty
-    // map so free variables cannot fall back to root locals.
+    // map so free variables cannot fall back to root locals. The fresh
+    // root scope plus frame override route every newborn root into this
+    // activation's frame; capacity is prefixed after the body is known.
+    let frame_slot = lower.slot(collected.span)?;
     let saved_bindings = std::mem::take(&mut lower.bindings);
     let saved_this = lower.function_this.replace(param_this);
     let saved_carrier = lower.carrier_override.replace(param_carrier);
+    let saved_frame = lower.frame_override.replace(frame_slot);
+    let saved_scope = lower.root_scope.replace(RootScope {
+        frame_slot,
+        entries: HashMap::new(),
+        next_entry: 0,
+    });
     let saved_strict = std::mem::replace(&mut lower.enclosing_strict, collected.strict);
     let body = collected
         .function
@@ -3151,6 +2540,8 @@ fn append_source_function(
                 lower.bindings = saved_bindings;
                 lower.function_this = saved_this;
                 lower.carrier_override = saved_carrier;
+                lower.frame_override = saved_frame;
+                lower.root_scope = saved_scope;
                 lower.enclosing_strict = saved_strict;
                 return Err(err);
             }
@@ -3165,6 +2556,8 @@ fn append_source_function(
                     lower.bindings = saved_bindings;
                     lower.function_this = saved_this;
                     lower.carrier_override = saved_carrier;
+                    lower.frame_override = saved_frame;
+                    lower.root_scope = saved_scope;
                     lower.enclosing_strict = saved_strict;
                     return Err(err);
                 }
@@ -3176,21 +2569,25 @@ fn append_source_function(
                                 lower.bindings = saved_bindings;
                                 lower.function_this = saved_this;
                                 lower.carrier_override = saved_carrier;
+                                lower.frame_override = saved_frame;
+                                lower.root_scope = saved_scope;
                                 lower.enclosing_strict = saved_strict;
                                 return Err(e);
                             }
                         };
-                        let (val_slot, val_stmt) = match lower.bind_temp(val.expr, ret.span) {
+                        let (val_slot, mut val_stmt) = match lower.bind_temp(val.expr, ret.span) {
                             Ok(v) => v,
                             Err(e) => {
                                 lower.bindings = saved_bindings;
                                 lower.function_this = saved_this;
                                 lower.carrier_override = saved_carrier;
+                                lower.frame_override = saved_frame;
+                                lower.root_scope = saved_scope;
                                 lower.enclosing_strict = saved_strict;
                                 return Err(e);
                             }
                         };
-                        body_stmts.push(val_stmt);
+                        body_stmts.append(&mut val_stmt);
                         completion = Some(value::completion_return(Expr::Var(val_slot)));
                     }
                     None => {
@@ -3206,6 +2603,8 @@ fn append_source_function(
                 lower.bindings = saved_bindings;
                 lower.function_this = saved_this;
                 lower.carrier_override = saved_carrier;
+                lower.frame_override = saved_frame;
+                lower.root_scope = saved_scope;
                 lower.enclosing_strict = saved_strict;
                 return Err(err);
             }
@@ -3214,8 +2613,53 @@ fn append_source_function(
     lower.bindings = saved_bindings;
     lower.function_this = saved_this;
     lower.carrier_override = saved_carrier;
+    lower.frame_override = saved_frame;
     lower.enclosing_strict = saved_strict;
-    let body_expr = completion.unwrap_or_else(value::completion_normal);
+    lower.charge_initial_cells(layout::FRAME_FIXED_CELLS as u64, collected.span)?;
+    // Frame capacity is known only after the body lowered; prefix entry,
+    // then save the real Completion, leave the frame without allocating
+    // or collecting, and return. The caller pins Completion.value with
+    // its first no-allocation root write before another safepoint.
+    let capacity = lower
+        .root_scope
+        .as_ref()
+        .map(|scope| scope.next_entry)
+        .unwrap_or(0);
+    lower.root_scope = saved_scope;
+    let helpers = lower
+        .heap
+        .as_ref()
+        .map(|heap| heap.helpers)
+        .ok_or_else(|| lower.error(collected.span, "P0 source functions require the realm heap"))?;
+    let completion_expr = completion.unwrap_or_else(value::completion_normal);
+    let (comp_slot, comp_stmt) =
+        lower.bind_typed(completion_expr, value::completion_schema(), collected.span)?;
+    let mut prologue = vec![Stmt::Let {
+        index: frame_slot,
+        declared_schema: Some(TypeSchema::Int),
+        expr: Lowerer::guest_call(
+            helpers.root_enter,
+            vec![Expr::Var(param_carrier), Expr::Int(i64::from(capacity))],
+        ),
+        line,
+    }];
+    let leave_ack = lower.slot(collected.span)?;
+    let mut epilogue = vec![
+        comp_stmt,
+        Stmt::Let {
+            index: leave_ack,
+            declared_schema: Some(TypeSchema::Int),
+            expr: Lowerer::guest_call(
+                helpers.root_leave,
+                vec![Expr::Var(param_carrier), Expr::Var(frame_slot)],
+            ),
+            line,
+        },
+    ];
+    prologue.append(&mut body_stmts);
+    prologue.append(&mut epilogue);
+    body_stmts = prologue;
+    let body_expr = Expr::Var(comp_slot);
     let js_schema = value::schema();
     let args_schema = TypeSchema::Array(Box::new(js_schema.clone()));
     let args = vec![
@@ -3266,193 +2710,6 @@ fn append_source_function(
     Ok(())
 }
 
-/// Append the finite static dispatch helper
-/// `(Carrier, func: JsValue, this: JsValue, args: Array<JsValue>) ->
-/// Completion`. Decodes the function-instance code ID and calls the
-/// statically compiled source function; unknown IDs and non-function
-/// targets are capability guards, never silent Undefined.
-#[allow(clippy::too_many_arguments)]
-fn append_dispatch(
-    lower: &mut Lowerer<'_>,
-    ir: &mut FrontendIr,
-    helper_make: u16,
-    helper_read: u16,
-    decode: u16,
-    func_indices: &[u16],
-    span: swc_common::Span,
-    statements: &mut Vec<Stmt>,
-) -> Result<u16, ParseError> {
-    let carrier_schema = ir
-        .functions
-        .iter()
-        .find(|function| function.index == helper_make)
-        .and_then(|function| function.return_schema.clone())
-        .ok_or_else(|| {
-            lower.error(
-                span,
-                "JS dispatch helper requires the carrier helper return schema",
-            )
-        })?;
-    let index = ir
-        .functions
-        .iter()
-        .map(|function| function.index)
-        .max()
-        .unwrap_or(0)
-        .checked_add(1)
-        .ok_or_else(|| lower.error(span, "JS dispatch helper index space exhausted"))?;
-    let line = lower.line(span);
-    let param_carrier = lower.slot(span)?;
-    let param_func = lower.slot(span)?;
-    let param_this = lower.slot(span)?;
-    let param_args = lower.slot(span)?;
-    let func_base = lower.slot(span)?;
-    let func_tag = lower.slot(span)?;
-    let kind_num = lower.slot(span)?;
-    let code_num = lower.slot(span)?;
-    let code = lower.slot(span)?;
-    let result = lower.slot(span)?;
-    let js_schema = value::schema();
-    let args_schema = TypeSchema::Array(Box::new(js_schema.clone()));
-    let read_at = |base: u16, offset: i64| -> Expr {
-        Lowerer::guest_call(
-            helper_read,
-            vec![
-                Expr::Var(param_carrier),
-                Lowerer::as_number(Expr::Add(
-                    Box::new(Expr::Var(base)),
-                    Box::new(Expr::Int(offset)),
-                )),
-            ],
-        )
-    };
-    let mut body = vec![
-        Stmt::Let {
-            index: func_base,
-            declared_schema: Some(TypeSchema::Int),
-            expr: value::field(param_func, "ref_slot"),
-            line,
-        },
-        Stmt::Let {
-            index: func_tag,
-            declared_schema: Some(TypeSchema::Int),
-            expr: value::field(param_func, "tag"),
-            line,
-        },
-        assert_stmt(
-            Expr::Eq(
-                Box::new(Expr::Var(func_tag)),
-                Box::new(Expr::Int(value::OBJECT)),
-            ),
-            line,
-        ),
-        Stmt::Let {
-            index: kind_num,
-            declared_schema: Some(TypeSchema::Number),
-            expr: read_at(func_base, 0),
-            line,
-        },
-        assert_stmt(
-            Expr::Eq(
-                Box::new(Lowerer::as_number(Expr::Var(kind_num))),
-                Box::new(Expr::Float(REALM_FUNCTION_KIND as f64)),
-            ),
-            line,
-        ),
-        Stmt::Let {
-            index: code_num,
-            declared_schema: Some(TypeSchema::Number),
-            expr: read_at(func_base, 3),
-            line,
-        },
-        Stmt::Let {
-            index: code,
-            declared_schema: Some(TypeSchema::Int),
-            expr: Lowerer::guest_call(decode, vec![Expr::Var(code_num)]),
-            line,
-        },
-        Stmt::Let {
-            index: result,
-            declared_schema: Some(value::completion_schema()),
-            expr: value::completion_normal(),
-            line,
-        },
-    ];
-    // Finite branch table over static code IDs, last to first so the
-    // outermost IfElse tests code 0.
-    let mut tail: Vec<Stmt> = vec![assert_stmt(Expr::Bool(false), line)];
-    for (code_id, func_index) in func_indices.iter().enumerate().rev() {
-        let call = Lowerer::guest_call(
-            *func_index,
-            vec![
-                Expr::Var(param_carrier),
-                Expr::Int(0),
-                Expr::Var(param_this),
-                Expr::Var(param_args),
-                Expr::Int(0),
-            ],
-        );
-        tail = vec![Stmt::IfElse {
-            condition: Expr::Eq(
-                Box::new(Expr::Var(code)),
-                Box::new(Expr::Int(code_id as i64)),
-            ),
-            then_branch: vec![Stmt::Assign {
-                kind: vm::AssignmentKind::Set,
-                index: result,
-                expr: call,
-                line,
-            }],
-            else_branch: tail,
-            line,
-        }];
-    }
-    body.extend(tail);
-    let args = vec![
-        "carrier".to_owned(),
-        "func".to_owned(),
-        "this_value".to_owned(),
-        "args".to_owned(),
-    ];
-    ir.functions.push(FunctionDecl {
-        name: DISPATCH_HELPER.to_owned(),
-        arity: 4,
-        index,
-        args: args.clone(),
-        arg_schemas: vec![
-            Some(carrier_schema),
-            Some(js_schema.clone()),
-            Some(js_schema),
-            Some(args_schema),
-        ],
-        return_schema: Some(value::completion_schema()),
-        type_params: Vec::new(),
-        exported: false,
-        return_type: ValueType::Map,
-        symbol: None,
-    });
-    ir.function_impls.insert(
-        index,
-        FunctionImpl {
-            param_slots: vec![param_carrier, param_func, param_this, param_args],
-            capture_copies: Vec::new(),
-            body_stmts: body,
-            body_expr: Expr::Var(result),
-            body_expr_line: line,
-        },
-    );
-    statements.push(Stmt::FuncDecl {
-        name: DISPATCH_HELPER.to_owned(),
-        index,
-        arity: 4,
-        args,
-        exported: false,
-        has_impl: true,
-        line,
-    });
-    Ok(index)
-}
-
 fn lower_array_binding(
     lower: &mut Lowerer<'_>,
     name: &str,
@@ -3461,17 +2718,28 @@ fn lower_array_binding(
     statements: &mut Vec<Stmt>,
 ) -> Result<(), ParseError> {
     let carrier = lower.active_carrier(span)?;
-    let heap = lower.heap_ref(span)?;
-    let (helper_write, alloc) = (heap.helper_write, heap.alloc);
-    // Reserve up front from the syntactic element count (holes and spread
-    // still reject below) so budget excess fails before large emission.
-    let total = REALM_HEADER_CELLS
+    let line = lower.line(span);
+    // Static pre-check from the syntactic element count (holes and spread
+    // still reject below) so budget excess fails before large emission;
+    // the reservation charges the same extent again below.
+    let syntactic = layout::ARRAY_HEADER_CELLS
         .checked_add(literal.elems.len() as i64)
         .ok_or_else(|| lower.error(span, "P0 numeric array length overflow"))?;
-    let need =
-        u64::try_from(total).map_err(|_| lower.error(span, "P0 numeric array length overflow"))?;
-    let line = lower.line(span);
-    let base_slot = lower.reserve_allocation(carrier, alloc, span, line, statements, need)?;
+    let pre_need = (syntactic as u64)
+        .checked_add(layout::RAW_HEADER_CELLS as u64)
+        .ok_or_else(|| lower.error(span, "P0 numeric array length overflow"))?;
+    if lower
+        .init_cells
+        .checked_add(pre_need)
+        .is_none_or(|end| end > MAX_REALM_INITIAL_CELLS)
+    {
+        return Err(lower.error(
+            span,
+            "JavaScript ES5 realm initialization exceeds the 65536 cell budget",
+        ));
+    }
+    // Numeric elements evaluate first; they carry no heap edges, so the
+    // later reservation safepoint cannot strand them.
     let mut element_slots = Vec::new();
     for element in &literal.elems {
         let Some(element) = element else {
@@ -3487,52 +2755,56 @@ fn lower_array_binding(
                 "P0 numeric arrays admit only numeric elements",
             ));
         }
-        let (slot, stmt) = lower.bind_temp(value.expr, element.span())?;
+        // Kind::Number was checked above: this boxed scalar has no heap
+        // edge, so numeric payload length must not consume root entries.
+        let (slot, stmt) = lower.bind_temp_bare(value.expr, element.span())?;
         statements.push(stmt);
         element_slots.push(slot);
     }
     let length = element_slots.len();
-    for (offset, marker) in [
-        (0i64, REALM_OBJECT_KIND),
-        (1i64, REALM_GENERATION),
-        (2i64, length as i64),
-    ] {
-        let physical = Expr::Add(Box::new(Expr::Var(base_slot)), Box::new(Expr::Int(offset)));
-        let written = Lowerer::guest_call(
-            helper_write,
-            vec![
-                Expr::Var(carrier),
-                Lowerer::as_number(physical),
-                Lowerer::as_number(Expr::Int(marker)),
-            ],
-        );
-        statements.push(Stmt::Expr {
-            expr: written,
-            line: lower.line(span),
-        });
+    let data_count = layout::ARRAY_HEADER_CELLS
+        .checked_add(length as i64)
+        .ok_or_else(|| lower.error(span, "P0 numeric array length overflow"))?;
+    let newborn = lower.begin_node(
+        carrier,
+        data_count,
+        layout::KIND_ARRAY,
+        span,
+        line,
+        statements,
+    )?;
+    // Header remainder: length plus the null prototype pair.
+    for (offset, marker) in [(2i64, length as i64), (3i64, 0), (4i64, 0)] {
+        lower.emit_cell_write(
+            carrier,
+            Expr::Add(
+                Box::new(Expr::Var(newborn.base)),
+                Box::new(Expr::Int(offset)),
+            ),
+            Lowerer::as_number(Expr::Int(marker)),
+            span,
+            line,
+            statements,
+        )?;
     }
     for (position, element) in element_slots.iter().enumerate() {
-        let offset = REALM_HEADER_CELLS + position as i64;
-        let physical = Expr::Add(Box::new(Expr::Var(base_slot)), Box::new(Expr::Int(offset)));
-        let written = Lowerer::guest_call(
-            helper_write,
-            vec![
-                Expr::Var(carrier),
-                Lowerer::as_number(physical),
-                value::field(*element, "number"),
-            ],
-        );
-        statements.push(Stmt::Expr {
-            expr: written,
-            line: lower.line(span),
-        });
+        let offset = layout::ARRAY_HEADER_CELLS + position as i64;
+        lower.emit_cell_write(
+            carrier,
+            Expr::Add(
+                Box::new(Expr::Var(newborn.base)),
+                Box::new(Expr::Int(offset)),
+            ),
+            value::field(*element, "number"),
+            span,
+            line,
+            statements,
+        )?;
     }
-    let boxed = value::array(Expr::Var(base_slot), Expr::Int(REALM_GENERATION));
-    let (slot, stmt) = lower.bind_temp(boxed, span)?;
-    lower.bindings.insert(name.to_owned(), (slot, Kind::Array));
+    let boxed = lower.publish_node(carrier, &newborn, span, line, statements)?;
+    lower.bindings.insert(name.to_owned(), (boxed, Kind::Array));
     lower.array_lengths.insert(name.to_owned(), length);
-    lower.source_bindings.push((name.to_owned(), slot));
-    statements.push(stmt);
+    lower.source_bindings.push((name.to_owned(), boxed));
     Ok(())
 }
 
@@ -3604,30 +2876,91 @@ fn lower_member_write_stmt(
             "P0 numeric arrays reject length-changing writes",
         ));
     }
+    // Receiver evaluation/rooting precedes the RHS and does not consume
+    // identity fields from the reusable source binding.
+    let (receiver, mut receiver_bound) = lower.bind_temp(Expr::Var(slot), member.obj.span())?;
+    statements.append(&mut receiver_bound);
     let value = lower.expr(right)?;
     if value.kind != Kind::Number {
         return Err(lower.error(right.span(), "P0 numeric arrays store only numbers"));
     }
-    let (value_slot, value_stmt) = lower.bind_temp(value.expr, right.span())?;
-    statements.push(value_stmt);
+    let (value_slot, mut value_bound) = lower.bind_temp(value.expr, right.span())?;
+    statements.append(&mut value_bound);
     let carrier = lower.active_carrier(span)?;
-    let heap = lower.heap_ref(span)?;
-    let helper_write = heap.helper_write;
-    let physical = Expr::Add(
-        Box::new(value::field(slot, "ref_slot")),
-        Box::new(Expr::Int(REALM_HEADER_CELLS + index)),
-    );
-    let written = Lowerer::guest_call(
-        helper_write,
-        vec![
-            Expr::Var(carrier),
-            Lowerer::as_number(physical),
-            value::field(value_slot, "number"),
-        ],
-    );
-    statements.push(Stmt::Expr {
-        expr: written,
-        line: lower.line(span),
+    let checked_base = lower.heap_ref(span)?.helpers.checked_base;
+    let helper_read = lower.heap_ref(span)?.helper_read;
+    let decode = lower
+        .helper_decode
+        .ok_or_else(|| lower.error(span, "P0 array writes require the realm decode helper"))?;
+    let line = lower.line(span);
+    // Generation/kind/length gate before the element write lands.
+    let base_tmp = lower.slot(span)?;
+    statements.push(Stmt::Let {
+        index: base_tmp,
+        declared_schema: Some(TypeSchema::Int),
+        expr: Lowerer::guest_call(
+            checked_base,
+            vec![
+                Expr::Var(carrier),
+                value::field(receiver, "ref_slot"),
+                value::field(receiver, "generation"),
+            ],
+        ),
+        line,
     });
+    let kind_tmp = lower.slot(span)?;
+    statements.push(Stmt::Let {
+        index: kind_tmp,
+        declared_schema: Some(TypeSchema::Int),
+        expr: Lowerer::guest_call(
+            decode,
+            vec![Lowerer::guest_call(
+                helper_read,
+                vec![Expr::Var(carrier), Lowerer::as_number(Expr::Var(base_tmp))],
+            )],
+        ),
+        line,
+    });
+    statements.push(assert_stmt(
+        Expr::Eq(
+            Box::new(Expr::Var(kind_tmp)),
+            Box::new(Expr::Int(layout::KIND_ARRAY)),
+        ),
+        line,
+    ));
+    let len_tmp = lower.slot(span)?;
+    statements.push(Stmt::Let {
+        index: len_tmp,
+        declared_schema: Some(TypeSchema::Int),
+        expr: Lowerer::guest_call(
+            decode,
+            vec![Lowerer::guest_call(
+                helper_read,
+                vec![
+                    Expr::Var(carrier),
+                    Lowerer::as_number(Expr::Add(
+                        Box::new(Expr::Var(base_tmp)),
+                        Box::new(Expr::Int(2)),
+                    )),
+                ],
+            )],
+        ),
+        line,
+    });
+    statements.push(assert_stmt(
+        Expr::Lt(Box::new(Expr::Int(index)), Box::new(Expr::Var(len_tmp))),
+        line,
+    ));
+    lower.emit_cell_write(
+        carrier,
+        Expr::Add(
+            Box::new(Expr::Var(base_tmp)),
+            Box::new(Expr::Int(layout::ARRAY_HEADER_CELLS + index)),
+        ),
+        value::field(value_slot, "number"),
+        span,
+        line,
+        statements,
+    )?;
     Ok(())
 }
