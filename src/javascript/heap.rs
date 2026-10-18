@@ -89,7 +89,8 @@ pub(super) const KIND_ENVIRONMENT: i64 = 5;
 pub(super) const ARRAY_HEADER_CELLS: i64 = 5;
 pub(super) const STRING_HEADER_CELLS: i64 = 3;
 pub(super) const OBJECT_HEADER_CELLS: i64 = 5;
-pub(super) const FUNCTION_CELLS: i64 = 9;
+pub(super) const FUNCTION_LENGTH: i64 = 9;
+pub(super) const FUNCTION_CELLS: i64 = 10;
 pub(super) const ENV_HEADER_CELLS: i64 = 5;
 
 /// Object row cells per own data property (key pair + tagged payload).

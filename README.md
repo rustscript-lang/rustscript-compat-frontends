@@ -8,7 +8,7 @@ TypeScript and Lua compatibility frontends for `pd-vm`. RustScript (`.rss`) rema
 
 - `.ts` and `.mts`: a statically checked, VM-backed TypeScript subset.
 - `.lua`: the existing Lua compatibility frontend.
-- `.js`, `.mjs`, and `.cjs`: rejected as both entry files and imported dependencies. There is no JavaScript fallback.
+- Default mode rejects `.js`, `.mjs`, and `.cjs` as both entry files and imported dependencies. There is no JavaScript fallback; `.js` has a separate explicit profile below.
 
 The tested subset includes scalar values, simple null unions, arrays, required and optional record/interface fields, type aliases, callable values, simple generics, contextual callback parameters, and TypeScript-to-TypeScript / TypeScript-to-RustScript imports. An omitted optional field is accepted; reading it produces the VM `Null` value, matching an explicit `null`. Missing required fields and values of the wrong present type remain compile-time errors. Host functions and nominal host types must come from the caller's `HostApiCatalog`; `declare function` only checks an existing catalog entry. Host overloads, numeric ABI narrowing, and resource passing/ownership are checked before execution.
 
@@ -73,6 +73,46 @@ Core-owned (file argument or Core's own `unknown flag` refusal). Default
 invocations, `--help`/`--version`, output values, errors and artifact
 authority behavior are unchanged. This documents the Compat-side selection
 only; it adds no new Core flags.
+
+## Explicit ES5.1 static-script profile
+
+The Rust API's `JAVASCRIPT_ES5_PLUGIN` and `javascript_es5_flavor()` expose
+an isolated, bounded JavaScript profile. Heap-backed programs require the
+explicit reference-array catalog and per-VM runtime initialization. Default
+`compile_options` and CLI invocations continue to select TypeScript/Lua;
+there is no JavaScript CLI selector, and `.mjs`/`.cjs` remain rejected.
+
+The profile supports ordinary closed strict source declarations and
+anonymous function expressions with unique plain identifier parameters.
+Strictness comes from an exact `"use strict"` directive or inheritance.
+Parameters have activation-local bindings: bare `var` preserves the passed
+value, function declarations install before statements, and explicit
+initializers execute in source order. Missing actuals are `undefined`;
+all actuals, including extras, evaluate once from left to right after the
+callee and method receiver. Managed values retain identity through calls.
+Function `length` and `["length"]` read the source formal count, independent
+of actual count and the private physical ABI.
+
+```javascript
+function first(a, b) { "use strict"; var a; return a; }
+var alias = first;
+var result = alias(7, 9, 11); // 7; alias.length is 2
+var missing = first();       // undefined
+```
+
+Each function and call is limited to 64 formals and 64 actuals respectively.
+Existing bounds remain 256 source functions, 65536 initialization cells,
+and 8192 active roots. The typed Core argument vector is separately bounded
+by its actual count; it is not a numeric guest-array allocation, and its
+construction carries no universal no-copy or linear-cost guarantee.
+Unknown parameter kinds do not imply numeric/object/callable facts:
+unsupported coercion, parameter-member and parameter-callee operations
+receive profile diagnostics. Closures/captures, runtime EnvironmentRecords,
+`arguments`, sloppy calls, named function expressions, constructors,
+prototypes/descriptors, `call`/`apply`/`bind`, general control flow and JS
+exception handling remain outside this intermediate profile. Arbitrary
+function properties are not synthesized. This is not a complete ES5.1
+engine or a complete function/exception implementation.
 
 ## Dependency and release status
 

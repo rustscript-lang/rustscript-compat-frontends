@@ -7,7 +7,7 @@
 
 use swc_common::Spanned;
 use swc_ecma_ast as ast;
-use vm::{Expr, ParseError, Stmt, TypeSchema};
+use vm::{BuiltinFunction, Expr, ParseError, Stmt, TypeSchema};
 
 use super::heap as layout;
 use super::lowerer::{Kind, Lowered, Lowerer};
@@ -371,6 +371,48 @@ fn instantiate(
     let order = lower.graph.scope(scope).order.clone();
     for id in &order {
         predeclare(lower, *id, scope, out)?;
+    }
+    for (id, ordinal, span) in lower.graph.scope(scope).formals.clone() {
+        let args = lower.function_args.ok_or_else(|| {
+            lower.error(
+                span,
+                "P4 formal initialization requires the invocation argument vector",
+            )
+        })?;
+        // The ordinal is a compiler-owned nonnegative constant. Get occurs
+        // only in the in-bounds branch; missing actuals are genuine Undefined.
+        // Borrow prevents Core's consuming element-read optimization from
+        // detaching a supplied box from the retained invocation vector.
+        let argument = Expr::IfElse {
+            condition: Box::new(Expr::Lt(
+                Box::new(Expr::Int(ordinal as i64)),
+                Box::new(Lowerer::builtin_call(
+                    BuiltinFunction::Len.call_index(),
+                    vec![Expr::Var(args)],
+                )),
+            )),
+            then_expr: Box::new(Lowerer::builtin_call(
+                BuiltinFunction::Get.call_index(),
+                vec![
+                    Expr::Borrow(Box::new(Expr::Var(args))),
+                    Expr::Int(ordinal as i64),
+                ],
+            )),
+            else_expr: Box::new(value::undefined()),
+        };
+        let name = lower.graph.binding(id).name.clone();
+        store_local(
+            lower,
+            &name,
+            span,
+            Lowered {
+                expr: argument,
+                kind: Kind::Dynamic,
+                array_length: None,
+                owned_roots: Vec::new(),
+            },
+            out,
+        )?;
     }
     for id in order {
         install_functions(lower, id, out)?;
@@ -797,10 +839,18 @@ fn validate_statements(lower: &Lowerer<'_>, statements: &[ast::Stmt]) -> Result<
         .order
         .iter()
         .map(|id| {
-            let kind = if lower.graph.binding(*id).fn_sites.is_empty() {
-                Kind::Undefined
-            } else {
+            let kind = if !lower.graph.binding(*id).fn_sites.is_empty() {
                 Kind::Function
+            } else if lower
+                .graph
+                .scope(lower.active_scope)
+                .formals
+                .iter()
+                .any(|(formal, _, _)| formal == id)
+            {
+                Kind::Dynamic
+            } else {
+                Kind::Undefined
             };
             (*id, ProfileFact::scalar(kind))
         })
@@ -1035,9 +1085,14 @@ fn validate_expr(
                 ast::Expr::Member(member) => {
                     let base = validate_expr(lower, &member.obj, facts)?;
                     admit_object_receiver(lower, member.span, base.kind)?;
-                    lower.member_key_units(member)?;
+                    let callee_kind =
+                        admit_member_read(lower, member, base.kind, base.array_length)?;
+                    admit_callable_kind(lower, member.span, callee_kind)?;
                 }
                 _ => unreachable!(),
+            }
+            for arg in &call.args {
+                validate_expr(lower, &arg.expr, facts)?;
             }
             // The current physical Completion ABI carries a dynamic JsValue;
             // match the live lowerer's broad object-like result classification.
@@ -1068,11 +1123,19 @@ pub(super) fn admit_call_callee(
     lower: &Lowerer<'_>,
     call: &ast::CallExpr,
 ) -> Result<(), ParseError> {
-    if !call.args.is_empty() {
+    if call.args.len() > super::scope::MAX_ARGUMENTS {
         return Err(lower.error(
             call.span,
-            "P0 source functions admit only zero-argument calls",
+            "P4 source calls exceed the 64 actual argument profile limit",
         ));
+    }
+    if call.type_args.is_some() {
+        return Err(lower.error(call.span, "P0 source functions reject type arguments"));
+    }
+    for arg in &call.args {
+        if arg.spread.is_some() {
+            return Err(lower.error(arg.span(), "P0 source functions reject spread arguments"));
+        }
     }
     let ast::Callee::Expr(callee) = &call.callee else {
         return Err(lower.error(
@@ -1133,7 +1196,16 @@ pub(super) fn admit_member_read(
         });
     }
     admit_object_receiver(lower, member.span, kind)?;
-    lower.member_key_units(member)?;
+    let key = lower.member_key_units(member)?;
+    if kind == Kind::Function {
+        if key != "length".encode_utf16().collect::<Vec<_>>() {
+            return Err(lower.error(
+                member.span,
+                "P4 source functions admit only the intrinsic length member",
+            ));
+        }
+        return Ok(Kind::Number);
+    }
     Ok(Kind::Object)
 }
 

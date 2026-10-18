@@ -1406,14 +1406,15 @@ fn address01_i_dead_outer_reference_is_refused() {
 }
 
 #[test]
-fn address01_i_dead_nonzero_call_is_refused() {
-    let text = must_refuse(
-        "function g(){\"use strict\";return 1;var f=function(){\"use strict\";return 1;};f(1);}",
+fn address01_i_dead_nonzero_call_is_validated_without_execution() {
+    let (values, _, _) = run_realm(
+        "function g(){\"use strict\";return 1;var f=function(){\"use strict\";return 1;};f(1);}var r=g();",
+        &["r"],
+        None,
+        false,
+        false,
     );
-    assert!(
-        text.contains("arity") || text.contains("argument") || text.contains("P0"),
-        "dead nonzero call must be a capability refusal, got {text}"
-    );
+    assert_number(&values[0], 1.0);
 }
 
 #[test]

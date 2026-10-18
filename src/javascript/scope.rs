@@ -10,6 +10,8 @@ use std::collections::HashMap;
 use swc_ecma_ast as ast;
 use vm::ParseError;
 
+pub(super) const MAX_ARGUMENTS: usize = 64;
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(super) struct ScopeId(pub u32);
 
@@ -49,6 +51,7 @@ pub(super) struct Scope {
     pub strict: bool,
     pub order: Vec<BindingId>,
     pub by_name: HashMap<String, BindingId>,
+    pub formals: Vec<(BindingId, usize, swc_common::Span)>,
 }
 
 pub(super) struct ScopeGraph {
@@ -153,6 +156,7 @@ impl<'a> Builder<'a> {
             strict,
             order: Vec::new(),
             by_name: HashMap::new(),
+            formals: Vec::new(),
         });
         id
     }
@@ -331,6 +335,24 @@ impl<'a> Builder<'a> {
             .is_some_and(|body| function_own_strict(&body.stmts, self.source, self.base));
         let child = self.new_scope(ScopeKind::Function, Some(parent), own || parent_strict);
         self.graph.function_scopes.insert(key, child);
+        if function.params.len() > MAX_ARGUMENTS {
+            return Err(self.error(
+                function.span,
+                "P4 source functions exceed the 64 formal parameter profile limit",
+            ));
+        }
+        for (ordinal, param) in function.params.iter().enumerate() {
+            let ast::Pat::Ident(binding) = &param.pat else {
+                return Err(self.error(
+                    param.span,
+                    "P4 source functions require plain identifier formals",
+                ));
+            };
+            let id = self.declare(child, binding.id.sym.as_str(), binding.id.span);
+            self.graph.scopes[child.0 as usize]
+                .formals
+                .push((id, ordinal, binding.id.span));
+        }
         if let Some(body) = function.body.as_ref() {
             self.walk_stmts(&body.stmts, child)?;
         }

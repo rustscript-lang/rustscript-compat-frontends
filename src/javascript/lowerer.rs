@@ -28,6 +28,8 @@ use vm::{
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Kind {
+    /// An ordinary JsValue without a proven source kind.
+    Dynamic,
     Undefined,
     Null,
     Boolean,
@@ -133,6 +135,7 @@ pub(super) struct Lowerer<'a> {
     enclosing_strict: bool,
     /// `this` parameter slot when lowering inside a source function body.
     function_this: Option<u16>,
+    pub(super) function_args: Option<u16>,
     /// Active carrier override inside function bodies (the carrier
     /// parameter slot). When `None`, the root realm carrier is used.
     carrier_override: Option<u16>,
@@ -1047,7 +1050,7 @@ impl Lowerer<'_> {
         // result or parenthesized form). Static admission requires an
         // object-like base; runtime guards handle the rest.
         let base = self.expr(&member.obj)?;
-        reference::admit_member_read(self, member, base.kind, base.array_length)?;
+        let result_kind = reference::admit_member_read(self, member, base.kind, base.array_length)?;
         let mut owned_roots = base.owned_roots;
         let (base_slot, base_stmt) = self.bind_temp(base.expr, member.obj.span())?;
         owned_roots.push(base_slot);
@@ -1079,10 +1082,9 @@ impl Lowerer<'_> {
                 stmts,
                 expr: Box::new(Expr::Var(value_slot)),
             },
-            // Dynamic own-property value: statically object-like (tag 5
-            // covers objects/functions; numbers/strings arrive with their
-            // real runtime tags). Callers use runtime tags, never this Kind.
-            kind: Kind::Object,
+            // Preserve the established broad own-property classification;
+            // the checked intrinsic function length has a numeric fact.
+            kind: result_kind,
             array_length: None,
             owned_roots: Self::compose_owned(owned_roots),
         })
@@ -1099,185 +1101,124 @@ impl Lowerer<'_> {
         current
     }
 
-    /// Lower a call expression: receiver-preserving member calls
-    /// (`obj.m()`, `(obj.m)()`) and bare strict calls (`f()`, `(f)()`).
-    /// Zero actual arguments only; the fixed physical ABI still passes a
-    /// real empty `Array<JsValue>` plus mode 0. Results unwrap the actual
-    /// Completion value.
+    /// Evaluate and root the callee/receiver before any actual expression.
     fn lower_call_expr(&mut self, call: &ast::CallExpr) -> Result<Lowered, ParseError> {
-        if !call.args.is_empty() {
-            return Err(self.error(
-                call.span,
-                "P0 source functions admit only zero-argument calls",
-            ));
-        }
         reference::admit_call_callee(self, call)?;
-        if call.type_args.is_some() {
-            return Err(self.error(call.span, "P0 source functions reject type arguments"));
-        }
-        for arg in &call.args {
-            if arg.spread.is_some() {
-                return Err(self.error(call.span, "P0 source functions reject spread arguments"));
-            }
-        }
         let ast::Callee::Expr(callee) = &call.callee else {
-            return Err(self.error(
-                call.span,
-                "P0 calls admit only identifier and member callees",
-            ));
+            unreachable!()
         };
-        let unwrapped = Self::unwrap_parens(callee);
-        if let ast::Expr::Member(member) = unwrapped {
-            return self.lower_method_call(member, call.span);
-        }
-        if let ast::Expr::Ident(ident) = unwrapped {
-            return self.lower_bare_call(ident, call.span);
-        }
-        Err(self.error(
-            call.span,
-            "P0 calls admit only identifier and member callees",
-        ))
-    }
-
-    /// Receiver-preserving method call: the SAME saved Reference base is
-    /// passed as `this`; base/key evaluate exactly once left-to-right.
-    fn lower_method_call(
-        &mut self,
-        member: &ast::MemberExpr,
-        span: swc_common::Span,
-    ) -> Result<Lowered, ParseError> {
-        let ref_get = self.helper_ref_get.ok_or_else(|| {
-            self.error(span, "P0 method calls require the realm reference helper")
-        })?;
-        let dispatch = self
-            .helper_dispatch
-            .ok_or_else(|| self.error(span, "P0 method calls require the realm dispatch helper"))?;
+        let span = call.span;
         let carrier = self.active_carrier(span)?;
-        let base = self.expr(&member.obj)?;
-        reference::admit_object_receiver(self, member.span, base.kind)?;
-        let mut owned_roots = base.owned_roots;
-        let (base_slot, base_stmt) = self.bind_temp(base.expr, member.obj.span())?;
-        owned_roots.push(base_slot);
-        let key_units = self.member_key_units(member)?;
-        let mut stmts = base_stmt;
-        // Callee and receiver root before the nested call: the key publishes
-        // into its own entry, then both constituents are re-affirmed.
-        let key_box = self.emit_utf16_node(&key_units, member.span, &mut stmts)?;
-        owned_roots.push(key_box);
-        let strict = Expr::Bool(self.enclosing_strict);
-        let reference = value::reference(
-            Expr::Var(base_slot),
-            value::field(key_box, "ref_slot"),
-            value::field(key_box, "generation"),
-            strict,
-        );
-        let (ref_slot, ref_stmt) = self.bind_typed(reference, value::reference_schema(), span)?;
-        stmts.push(ref_stmt);
-        let line = self.line(span);
-        self.reaffirm_root(carrier, base_slot, span, line, &mut stmts)?;
-        self.reaffirm_root(carrier, key_box, span, line, &mut stmts)?;
-        // GetValue through the SAME reference, then call with the SAME
-        // saved base as receiver.
-        let got = Self::guest_call(ref_get, vec![Expr::Var(carrier), Expr::Var(ref_slot)]);
-        let (func_slot, mut func_stmt) = self.bind_temp(got, span)?;
-        stmts.append(&mut func_stmt);
-        let receiver = value::field_of(Expr::Var(ref_slot), "base");
-        let (this_slot, mut this_stmt) = self.bind_temp(receiver, span)?;
-        stmts.append(&mut this_stmt);
-        let empty_args = Self::builtin_call(BuiltinFunction::ArrayNew.call_index(), Vec::new());
-        let completed = Self::guest_call(
-            dispatch,
-            vec![
-                Expr::Var(carrier),
-                Expr::Var(func_slot),
-                Expr::Var(this_slot),
-                empty_args,
-            ],
-        );
-        let (comp_slot, comp_stmt) =
-            self.bind_typed(completed, value::completion_schema(), span)?;
-        stmts.push(comp_stmt);
-        let (value_slot, mut value_stmt) =
-            self.bind_temp(value::field(comp_slot, "value"), span)?;
-        stmts.append(&mut value_stmt);
-        owned_roots.push(func_slot);
-        owned_roots.push(this_slot);
-        owned_roots.push(value_slot);
-        Ok(Lowered {
-            expr: Expr::Block {
-                stmts,
-                expr: Box::new(Expr::Var(value_slot)),
-            },
-            kind: Kind::Object,
-            array_length: None,
-            owned_roots: Self::compose_owned(owned_roots),
-        })
-    }
-
-    /// Bare strict call: the callee value was already detached from any
-    /// property Reference (stored/aliased), so `this` is Undefined.
-    fn lower_bare_call(
-        &mut self,
-        ident: &ast::Ident,
-        span: swc_common::Span,
-    ) -> Result<Lowered, ParseError> {
+        let mut owned = Vec::new();
+        let mut stmts = Vec::new();
+        let (func, receiver) = match Self::unwrap_parens(callee) {
+            ast::Expr::Ident(ident) => {
+                let callee = reference::lower_get(self, ident)?;
+                reference::admit_callable_kind(self, ident.span, callee.kind)?;
+                let (func, mut saved) = self.bind_temp(callee.expr, span)?;
+                stmts.append(&mut saved);
+                owned.extend(callee.owned_roots);
+                owned.push(func);
+                let (receiver, saved) = self.bind_temp_bare(value::undefined(), span)?;
+                stmts.push(saved);
+                (func, receiver)
+            }
+            ast::Expr::Member(member) => {
+                let base = self.expr(&member.obj)?;
+                reference::admit_object_receiver(self, member.span, base.kind)?;
+                let callee_kind =
+                    reference::admit_member_read(self, member, base.kind, base.array_length)?;
+                reference::admit_callable_kind(self, member.span, callee_kind)?;
+                owned.extend(base.owned_roots);
+                let (receiver, mut saved) = self.bind_temp(base.expr, span)?;
+                stmts.append(&mut saved);
+                owned.push(receiver);
+                let key = self.member_key_units(member)?;
+                let key = self.emit_utf16_node(&key, span, &mut stmts)?;
+                owned.push(key);
+                let reference = value::reference(
+                    Expr::Var(receiver),
+                    value::field(key, "ref_slot"),
+                    value::field(key, "generation"),
+                    Expr::Bool(self.enclosing_strict),
+                );
+                let (reference, saved) =
+                    self.bind_typed(reference, value::reference_schema(), span)?;
+                stmts.push(saved);
+                let get = self.helper_ref_get.ok_or_else(|| {
+                    self.error(span, "P0 method calls require the realm reference helper")
+                })?;
+                let got = Self::guest_call(get, vec![Expr::Var(carrier), Expr::Var(reference)]);
+                let (func, mut saved) = self.bind_temp(got, span)?;
+                stmts.append(&mut saved);
+                owned.push(func);
+                (func, receiver)
+            }
+            _ => unreachable!("shared callee admission"),
+        };
+        // The Core container does not trace guest payloads. Save/root each
+        // actual independently, including extras, across subsequent effects.
+        let mut actuals = Vec::new();
+        for arg in &call.args {
+            let actual = self.expr(&arg.expr)?;
+            owned.extend(actual.owned_roots);
+            let (slot, mut saved) = self.bind_temp(actual.expr, arg.span())?;
+            stmts.append(&mut saved);
+            owned.push(slot);
+            actuals.push(slot);
+        }
+        let (vector, saved) = self.bind_typed(
+            Self::builtin_call(BuiltinFunction::ArrayNew.call_index(), Vec::new()),
+            TypeSchema::Array(Box::new(value::schema())),
+            span,
+        )?;
+        stmts.push(saved);
+        for actual in actuals {
+            stmts.push(Stmt::Assign {
+                kind: vm::AssignmentKind::Set,
+                index: vector,
+                expr: Self::builtin_call(
+                    BuiltinFunction::ArrayPush.call_index(),
+                    vec![Expr::Var(vector), Expr::Var(actual)],
+                ),
+                line: self.line(span),
+            });
+        }
         let dispatch = self.helper_dispatch.ok_or_else(|| {
             self.error(span, "P0 function calls require the realm dispatch helper")
         })?;
-        let carrier = self.active_carrier(span)?;
-        let name = ident.sym.as_str();
-        let (slot, kind) = match reference::resolve(self, name) {
-            reference::NameHit::Local(id) => {
-                let slot = *self.binding_slots.get(&id).ok_or_else(|| {
-                    self.error(ident.span, "P3 binding was collected but not instantiated")
-                })?;
-                let kind = self
-                    .binding_kinds
-                    .get(&id)
-                    .copied()
-                    .unwrap_or(Kind::Undefined);
-                (slot, kind)
-            }
-            reference::NameHit::Outer(_) => {
-                return Err(self.error(
-                    ident.span,
-                    &format!("P4 free-variable capture of '{name}' is outside this closed subset"),
-                ));
-            }
-            reference::NameHit::BuiltinUndefined | reference::NameHit::Missing => {
-                return Err(self.error(ident.span, &format!("unknown local '{name}'")));
-            }
-        };
-        reference::admit_callable_kind(self, ident.span, kind)?;
-        let mut stmts = Vec::new();
-        let (func_slot, mut func_stmt) = self.bind_temp(Expr::Var(slot), ident.span)?;
-        stmts.append(&mut func_stmt);
-        let (this_slot, this_stmt) = self.bind_temp_bare(value::undefined(), span)?;
-        stmts.push(this_stmt);
-        let empty_args = Self::builtin_call(BuiltinFunction::ArrayNew.call_index(), Vec::new());
         let completed = Self::guest_call(
             dispatch,
             vec![
                 Expr::Var(carrier),
-                Expr::Var(func_slot),
-                Expr::Var(this_slot),
-                empty_args,
+                Expr::Var(func),
+                Expr::Var(receiver),
+                Expr::Var(vector),
             ],
         );
-        let (comp_slot, comp_stmt) =
-            self.bind_typed(completed, value::completion_schema(), span)?;
-        stmts.push(comp_stmt);
-        let (value_slot, mut value_stmt) =
-            self.bind_temp(value::field(comp_slot, "value"), span)?;
-        stmts.append(&mut value_stmt);
+        let (completion, saved) = self.bind_typed(completed, value::completion_schema(), span)?;
+        stmts.push(saved);
+        // root_leave is nonallocating. Root the surviving result FIRST, then
+        // release only evaluation-owned metadata, never caller bindings.
+        let (result, mut saved) = self.bind_temp(value::field(completion, "value"), span)?;
+        stmts.append(&mut saved);
+        // A late nonallocating use keeps the exact Core vector (including
+        // extras) alive through completion-value handoff, not just its boxes.
+        let (_, retained) = self.bind_typed(
+            Self::builtin_call(BuiltinFunction::Len.call_index(), vec![Expr::Var(vector)]),
+            TypeSchema::Int,
+            span,
+        )?;
+        stmts.push(retained);
+        reference::release_consumed_roots(self, &owned, result, span, &mut stmts)?;
         Ok(Lowered {
             expr: Expr::Block {
                 stmts,
-                expr: Box::new(Expr::Var(value_slot)),
+                expr: Box::new(Expr::Var(result)),
             },
             kind: Kind::Object,
             array_length: None,
-            owned_roots: vec![func_slot, value_slot],
+            owned_roots: vec![result],
         })
     }
 
@@ -1758,6 +1699,10 @@ impl Lowerer<'_> {
             (6i64, 0),
             (7i64, 0),
             (8i64, 1),
+            (
+                layout::FUNCTION_LENGTH,
+                function.function.params.len() as i64,
+            ),
         ] {
             self.emit_cell_write(
                 carrier,
@@ -1871,6 +1816,7 @@ fn lower_primitive(
         string_eq: None,
         enclosing_strict: false,
         function_this: None,
+        function_args: None,
         carrier_override: None,
         frame_override: None,
         root_scope: None,
@@ -1992,6 +1938,7 @@ fn collect_from_expr(
             Ok(())
         }
         ast::Expr::Call(c) => {
+            reference::admit_call_callee(lower, c)?;
             if let ast::Callee::Expr(callee) = &c.callee {
                 collect_from_expr(callee, lower, enclosing_strict)?;
             }
@@ -2032,10 +1979,10 @@ fn collect_from_expr(
     }
 }
 
-/// Validate one anonymous ordinary zero-parameter function and assign its
-/// code ID. Bodies admit directives plus a simple Return, bare `return;`
-/// or empty normal completion. Free lexical captures, named/self binding,
-/// parameters, constructors, throw/try and generators are explicit
+/// Validate one bounded anonymous ordinary strict function and assign its
+/// code ID. Closed declarations and the existing single-Return body profile
+/// share the declaration graph with ordered plain formals. Free lexical
+/// captures, named/self binding, constructors, throw/try and generators are explicit
 /// capability rejections.
 fn collect_function(
     function: &ast::FnExpr,
@@ -2062,10 +2009,10 @@ fn collect_function(
             "P0 source functions reject async and generator functions",
         ));
     }
-    if !func.params.is_empty() {
+    if func.params.len() > scope::MAX_ARGUMENTS {
         return Err(lower.error(
             span,
-            "P0 source functions admit only zero formal parameters",
+            "P4 source functions exceed the 64 formal parameter profile limit",
         ));
     }
     if func.this_param.is_some() {
@@ -2225,6 +2172,7 @@ fn lower_with_realm(
         string_eq: None,
         enclosing_strict: false,
         function_this: None,
+        function_args: None,
         carrier_override: None,
         frame_override: None,
         root_scope: None,
@@ -2622,16 +2570,6 @@ fn append_source_function(
     // root scope plus frame override route every newborn root into this
     // activation's frame; capacity is prefixed after the body is known.
     let frame_slot = lower.slot(collected.span)?;
-    let saved_bindings = std::mem::take(&mut lower.bindings);
-    let saved_this = lower.function_this.replace(param_this);
-    let saved_carrier = lower.carrier_override.replace(param_carrier);
-    let saved_frame = lower.frame_override.replace(frame_slot);
-    let saved_scope = lower.root_scope.replace(RootScope {
-        frame_slot,
-        entries: HashMap::new(),
-        next_entry: 0,
-    });
-    let saved_strict = std::mem::replace(&mut lower.enclosing_strict, collected.strict);
     let body = collected
         .function
         .body
@@ -2645,11 +2583,29 @@ fn append_source_function(
         .get(&fn_key)
         .copied()
         .ok_or_else(|| lower.error(collected.span, "P3 function scope was not collected"))?;
+    let saved_bindings = std::mem::take(&mut lower.bindings);
+    let saved_this = lower.function_this.replace(param_this);
+    let saved_args = lower.function_args.replace(param_args);
+    let saved_carrier = lower.carrier_override.replace(param_carrier);
+    let saved_frame = lower.frame_override.replace(frame_slot);
+    let saved_scope = lower.root_scope.replace(RootScope {
+        frame_slot,
+        entries: HashMap::new(),
+        next_entry: 0,
+    });
+    let saved_strict = std::mem::replace(&mut lower.enclosing_strict, collected.strict);
     let saved_active = lower.active_scope;
     let saved_lengths = std::mem::take(&mut lower.array_lengths);
     let saved_type_names = lower.type_names.take();
     lower.active_scope = fn_scope;
+    let saved_slots = std::mem::take(&mut lower.binding_slots);
+    let saved_kinds = std::mem::take(&mut lower.binding_kinds);
+    let saved_length_ids = std::mem::take(&mut lower.array_length_ids);
     let lowered = reference::lower_function_body(lower, &body.stmts, &mut body_stmts);
+    lower.binding_slots = saved_slots;
+    lower.binding_kinds = saved_kinds;
+    lower.array_length_ids = saved_length_ids;
+    lower.function_args = saved_args;
     lower.active_scope = saved_active;
     lower.array_lengths = saved_lengths;
     lower.type_names = saved_type_names;
@@ -2671,7 +2627,6 @@ fn append_source_function(
     lower.carrier_override = saved_carrier;
     lower.frame_override = saved_frame;
     lower.enclosing_strict = saved_strict;
-    lower.charge_initial_cells(layout::FRAME_FIXED_CELLS as u64, collected.span)?;
     // Frame capacity is known only after the body lowered; prefix entry,
     // then save the real Completion, leave the frame without allocating
     // or collecting, and return. The caller pins Completion.value with
@@ -2687,6 +2642,7 @@ fn append_source_function(
         .as_ref()
         .map(|heap| heap.helpers)
         .ok_or_else(|| lower.error(collected.span, "P0 source functions require the realm heap"))?;
+    lower.charge_initial_cells(layout::FRAME_FIXED_CELLS as u64, collected.span)?;
     let completion_expr = completion.unwrap_or_else(value::completion_normal);
     let (comp_slot, comp_stmt) =
         lower.bind_typed(completion_expr, value::completion_schema(), collected.span)?;
@@ -2700,8 +2656,18 @@ fn append_source_function(
         line,
     }];
     let leave_ack = lower.slot(collected.span)?;
+    let retained_args = lower.slot(collected.span)?;
     let mut epilogue = vec![
         comp_stmt,
+        Stmt::Let {
+            index: retained_args,
+            declared_schema: Some(TypeSchema::Int),
+            expr: Lowerer::builtin_call(
+                BuiltinFunction::Len.call_index(),
+                vec![Expr::Var(param_args)],
+            ),
+            line,
+        },
         Stmt::Let {
             index: leave_ack,
             declared_schema: Some(TypeSchema::Int),

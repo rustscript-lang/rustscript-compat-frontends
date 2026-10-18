@@ -556,10 +556,8 @@ fn helper_rejection(source: &str) -> String {
 fn p0_source_unimplemented_shapes_reject_precisely() {
     for source in [
         "var f=function(){return this;};f();",
-        "var f=function(x){\n\"use strict\";return x;};f();",
         "var f=function named(){\"use strict\";return;};f();",
         "var x=1;var f=function(){\"use strict\";return x;};f();",
-        "var f=function(){\"use strict\";return this;};f(1);",
         "var obj={m:1};obj.m=2;",
         "var f=function(){\"use strict\";return this;};new f();",
     ] {

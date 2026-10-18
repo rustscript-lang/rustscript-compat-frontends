@@ -273,6 +273,7 @@ pub(crate) fn append_ref_get(
     let obj_gen = lower.slot(span)?;
     let obj_base = lower.slot(span)?;
     let obj_tag = lower.slot(span)?;
+    let obj_kind = lower.slot(span)?;
     let kind_num = lower.slot(span)?;
     let count_num = lower.slot(span)?;
     let key_base = lower.slot(span)?;
@@ -377,15 +378,21 @@ pub(crate) fn append_ref_get(
             line,
         },
         Stmt::Let {
-            index: kind_num,
+            index: obj_kind,
             declared_schema: Some(TypeSchema::Number),
             expr: read_base(obj_base, 0),
             line,
         },
         assert_stmt(
-            Expr::Eq(
-                Box::new(Lowerer::as_number(Expr::Var(kind_num))),
-                Box::new(Expr::Float(layout::KIND_OBJECT as f64)),
+            Expr::Or(
+                Box::new(Expr::Eq(
+                    Box::new(Lowerer::as_number(Expr::Var(obj_kind))),
+                    Box::new(Expr::Float(layout::KIND_OBJECT as f64)),
+                )),
+                Box::new(Expr::Eq(
+                    Box::new(Lowerer::as_number(Expr::Var(obj_kind))),
+                    Box::new(Expr::Float(layout::KIND_FUNCTION as f64)),
+                )),
             ),
             line,
         ),
@@ -966,6 +973,57 @@ pub(crate) fn append_ref_get(
             line,
         },
     ];
+    // The already checked UTF-16 key needs no allocation. Only exact
+    // "length" is intrinsic on function nodes; other keys still refuse.
+    let mut exact_length = Expr::Bool(true);
+    for (position, unit) in "length".encode_utf16().enumerate() {
+        exact_length = Expr::And(
+            Box::new(exact_length),
+            Box::new(Expr::Eq(
+                Box::new(Lowerer::as_number(read_base(
+                    key_base,
+                    layout::STRING_HEADER_CELLS + position as i64,
+                ))),
+                Box::new(Expr::Float(f64::from(unit))),
+            )),
+        );
+    }
+    body.push(Stmt::IfElse {
+        condition: Expr::Eq(
+            Box::new(Lowerer::as_number(Expr::Var(obj_kind))),
+            Box::new(Expr::Float(layout::KIND_FUNCTION as f64)),
+        ),
+        then_branch: vec![
+            assert_stmt(
+                Expr::Eq(
+                    Box::new(Lowerer::as_number(Expr::Var(search_len))),
+                    Box::new(Expr::Float(6.0)),
+                ),
+                line,
+            ),
+            assert_stmt(exact_length, line),
+            Stmt::Assign {
+                kind: vm::AssignmentKind::Set,
+                index: res_tag,
+                expr: Expr::Int(value::NUMBER),
+                line,
+            },
+            Stmt::Assign {
+                kind: vm::AssignmentKind::Set,
+                index: res_number,
+                expr: Lowerer::as_number(read_base(obj_base, layout::FUNCTION_LENGTH)),
+                line,
+            },
+            Stmt::Assign {
+                kind: vm::AssignmentKind::Set,
+                index: found,
+                expr: Expr::Bool(true),
+                line,
+            },
+        ],
+        else_branch: Vec::new(),
+        line,
+    });
     body.push(Stmt::While {
         condition: Expr::And(
             Box::new(Expr::Not(Box::new(Expr::Var(found)))),

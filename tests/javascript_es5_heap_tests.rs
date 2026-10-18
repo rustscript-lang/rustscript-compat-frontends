@@ -77,7 +77,8 @@ struct HeapHistoryPlugin {
 }
 
 /// The real bare-call sequence starts at its callee snapshot and ends
-/// after binding refresh and both metadata-only owned-root clears.
+/// after binding refresh and result-temp cleanup. Invocation-owned roots
+/// now clear inside the call block, after the completion handoff.
 fn heap_call_replay_bounds(
     ir: &vm::FrontendIr,
     store: usize,
@@ -109,9 +110,34 @@ fn heap_call_replay_bounds(
     {
         end += 1;
     }
-    if end < store + 4 {
+    let callee_entry = ir.stmts[start..store]
+        .iter()
+        .find_map(|stmt| match stmt {
+            vm::Stmt::Let {
+                expr: vm::Expr::Call(target, _, args, _, _),
+                ..
+            } if *target == root_write
+                && matches!(args.get(3), Some(vm::Expr::Var(slot)) if *slot == callee) =>
+            {
+                match args.get(2) {
+                    Some(vm::Expr::Int(entry)) => Some(*entry),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .ok_or_else(|| heap_rejection("actual saved-callee root entry".to_owned()))?;
+    let cleared_in_call = ir.stmts[start..store].iter().any(|stmt| {
+        matches!(stmt,
+            vm::Stmt::Let {expr: vm::Expr::Call(target, _, args, _, _), ..}
+            if *target == root_write
+                && matches!(args.get(2), Some(vm::Expr::Int(entry)) if *entry == callee_entry)
+                && matches!(args.get(3), Some(vm::Expr::Call(..)))
+        )
+    });
+    if !cleared_in_call || end < store + 3 {
         return Err(heap_rejection(
-            "binding refresh and callee/result cleanup required".to_owned(),
+            "in-call callee cleanup, binding refresh and result cleanup required".to_owned(),
         ));
     }
     Ok((start, end))
@@ -204,6 +230,10 @@ fn append_heap_history_driver(ir: &mut vm::FrontendIr, iters: u64) -> Result<(),
                 expr: expr.clone(),
                 line: *line,
             }),
+            vm::Stmt::Assign {
+                kind: vm::AssignmentKind::Set,
+                ..
+            } => replay.push(stmt.clone()),
             other => {
                 return Err(heap_rejection(format!(
                     "heap fixture replays only Let bindings, got {other:?}"
@@ -344,10 +374,14 @@ struct HeapHistoryEvidence {
 }
 
 fn heap_history_run(iters: u64, native: bool) -> HeapHistoryEvidence {
+    heap_history_run_source(HEAP_HISTORY_SOURCE, iters, native)
+}
+
+fn heap_history_run_source(source: &str, iters: u64, native: bool) -> HeapHistoryEvidence {
     let plugin: &'static HeapHistoryPlugin = Box::leak(Box::new(HeapHistoryPlugin { iters }));
     let catalog = heap_catalog();
     let compilation = vm::compile_source_with_flavor_and_options_with_capture_certification(
-        HEAP_HISTORY_SOURCE,
+        source,
         vm::SourceFlavor::Plugin(vm::FrontendId::new("javascript-es5-heap-history")),
         vm::CompileSourceFileOptions::new()
             .with_source_plugin(plugin)
@@ -508,6 +542,15 @@ fn heap_assert_history_bound(short: HeapHistoryEvidence, long: HeapHistoryEviden
 #[test]
 fn p2_heap_history_reuses_backing_across_factory_calls() {
     heap_assert_history_bound(heap_history_run(64, false), heap_history_run(4096, false));
+}
+
+#[test]
+fn p4_argument_history_retains_aliases_and_reclaims_unused_extras() {
+    let source = "var keep={n:7,t:true,f:false,s:\"\\uD800\\0\"};var alias=keep;var a=[7,8];var f=function(x){\"use strict\";var local=[9];return x;};var o=f({n:7},\"unused\");var r=o.n;var old=alias.n;var st=alias.s;var bt=alias.t;var bf=alias.f;var av=a[1];";
+    heap_assert_history_bound(
+        heap_history_run_source(source, 64, false),
+        heap_history_run_source(source, 4096, false),
+    );
 }
 
 #[test]
@@ -3518,7 +3561,8 @@ fn p2_heap_function_environment_parent_cycle_traces_and_sweeps() {
     let kept = phase("env-retained", 12);
     let swept = phase("env-swept", 9);
     eprintln!("P2_ENV_GRAPH ids={ids:?} retained={kept:?} swept={swept:?}");
-    assert_eq!(&kept[..4], &[3, 9 + 3 + 5 + 3 + 15 + 3, 0, 0]);
+    // Function10 + raw3; child environment5 + raw3; parent15 + raw3.
+    assert_eq!(&kept[..4], &[3, 10 + 3 + 5 + 3 + 15 + 3, 0, 0]);
     assert_eq!(
         &kept[4..6],
         &ids[2..4],
@@ -3537,7 +3581,7 @@ fn p2_heap_function_environment_parent_cycle_traces_and_sweeps() {
     assert_eq!(kept[11], 7, "primitive environment payload stays intact");
     assert_eq!(
         &swept[..6],
-        &[1, 3, 9 + 3, 3, 3, 3],
+        &[1, 3, 10 + 3, 3, 3, 3],
         "unrooted cyclic component must be swept"
     );
     assert_ne!(
