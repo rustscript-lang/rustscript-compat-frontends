@@ -30,6 +30,10 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - name: Tests
+        env:
+          CARGO_PROFILE_TEST_OPT_LEVEL: "2"
+          CARGO_PROFILE_TEST_DEBUG_ASSERTIONS: "true"
+          CARGO_PROFILE_TEST_OVERFLOW_CHECKS: "true"
         run: cargo test --locked --workspace -- --test-threads=1
       - name: TypeScript, Lua, and version CLI smoke
         run: |
