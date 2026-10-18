@@ -775,28 +775,82 @@ main();
     );
 }
 
+// Old name: source_compiler_self_copy_resource_rejection_remains_a_compile_diagnostic
 #[test]
-fn source_compiler_self_copy_resource_rejection_remains_a_compile_diagnostic() {
-    let catalog = owner_catalog();
+fn certified_wrong_pair_source_is_refused_against_move_owner() {
     let source = legacy_raw_source("WRONG_PAIR_SOURCE");
-    let error = match vm::compile_source_with_flavor_and_options_with_capture_certification(
-        source,
-        crate::typescript_flavor(),
-        crate::compile_options_with_catalog(catalog),
-    ) {
-        Ok(_) => panic!("resource-signature self-copy must remain rejected by the compiler"),
-        Err(error) => error,
-    };
-    let diagnostic = format!("{error:?}");
+    assert!(source.contains("dispatcher(other, 0)"));
+    assert!(source.contains("create([10])"));
+    assert!(source.contains("create([20])"));
+    let mut machine = certified_vm(source, ProbePlan::MismatchCandidate);
     assert!(
-        diagnostic.contains("E_OWNERSHIP_COPY_RESOURCE"),
-        "{diagnostic}"
+        machine
+            .capture_certification_stats()
+            .is_some_and(|stats| stats.valid && stats.capture_facts > 0),
+        "certified producer facts must be present; aggregate slot schemas are not authority"
+    );
+    let dispatcher = machine
+        .program()
+        .callable_prototypes
+        .iter()
+        .find(|prototype| prototype.self_slot.is_some())
+        .expect("certified WRONG_PAIR_SOURCE keeps one self-bearing dispatcher");
+    let self_slot = dispatcher.self_slot.expect("self slot");
+    let self_mode = dispatcher
+        .capture_slots
+        .iter()
+        .zip(&dispatcher.capture_modes)
+        .find_map(|(slot, mode)| (*slot == self_slot).then_some(*mode))
+        .expect("self capture mode");
+    assert_eq!(self_mode, CaptureBindingMode::Copy);
+    assert_eq!(
+        dispatcher
+            .capture_modes
+            .iter()
+            .filter(|mode| **mode == CaptureBindingMode::Move)
+            .count(),
+        1
+    );
+    let error = machine
+        .run()
+        .expect_err("a valid other resource must not become the certified Move owner");
+    assert!(
+        error
+            .to_string()
+            .contains("candidate is not the certified Move owner"),
+        "certified producer refusal, not the ordinary fixture diagnostic: {error}"
     );
     assert!(
-        diagnostic.contains("closure capture of resource value"),
-        "{diagnostic}"
+        !error
+            .to_string()
+            .contains("active callable's Move-captured resource"),
+        "ordinary fixture wording must not be reused as certified authority: {error}"
     );
-    eprintln!("compile-time resource self-copy rejection: {diagnostic}");
+    {
+        let context = machine.host_context();
+        let state = context.module_state::<ProbeState>().expect("proof state");
+        assert_eq!(state.calls, 1);
+        assert_eq!(state.candidate_borrows, 1);
+        assert_eq!(state.owner_borrows, 1);
+        assert_ne!(state.candidate_handles[0], state.owner_handles[0]);
+        assert_eq!(state.comparisons, [false]);
+        assert_eq!(state.candidate_values, [Value::Int(20)]);
+        assert_eq!(state.owner_values, [Value::Int(10)]);
+        assert_eq!(state.root_during_call, [CaptureRootState::Live]);
+        eprintln!(
+            "certified wrong-pair refusal: candidate={:?} owner={:?} payloads={:?}/{:?} root={:?}",
+            state.candidate_handles[0],
+            state.owner_handles[0],
+            state.candidate_values[0],
+            state.owner_values[0],
+            state.root_during_call[0],
+        );
+    }
+    assert_eq!(machine.host_context().resource_count(), 2);
+    machine
+        .reset_for_reuse()
+        .expect("certified wrong-pair reset");
+    assert_eq!(machine.host_context().resource_count(), 0);
 }
 
 #[test]

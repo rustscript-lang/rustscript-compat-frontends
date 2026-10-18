@@ -1215,10 +1215,103 @@ fn run_fresh_fixture(artifact: &std::path::Path) -> std::process::Output {
 }
 
 fn fixture_marker(stdout: &str, name: &str) -> String {
+    let marker = format!("{name}=");
     stdout
         .lines()
-        .find_map(|line| line.strip_prefix(&format!("{name}=")).map(str::to_owned))
+        .find_map(|line| {
+            let body = line
+                .strip_prefix("test helper_fresh_process_vmbc_entry ... ")
+                .or_else(|| line.strip_prefix("test helper_fresh_process_aot_entry ... "))
+                .unwrap_or(line);
+            body.strip_prefix(&marker).map(str::to_owned)
+        })
         .unwrap_or_else(|| panic!("fixture must print {name}; stdout:\n{stdout}"))
+}
+
+fn expect_fixture_marker_refused(stdout: &str, name: &str) {
+    let owned_stdout = stdout.to_owned();
+    let owned_name = name.to_owned();
+    let caught = std::panic::catch_unwind(move || fixture_marker(&owned_stdout, &owned_name));
+    assert!(
+        caught.is_err(),
+        "marker {name} must stay refused for {stdout:?}"
+    );
+}
+
+#[test]
+fn fixture_marker_libtest_accepts_bare_line_and_equals_value() {
+    assert_eq!(
+        fixture_marker(
+            "ES51_FIXTURE_OUTCOME=denied:HostError(\"x\")\n",
+            "ES51_FIXTURE_OUTCOME"
+        ),
+        "denied:HostError(\"x\")"
+    );
+    assert_eq!(
+        fixture_marker("ES51_AOT_INFO=a=b=c\n", "ES51_AOT_INFO"),
+        "a=b=c"
+    );
+}
+
+#[test]
+fn fixture_marker_libtest_refuses_missing_fake_prefix_and_key_boundary() {
+    expect_fixture_marker_refused("", "ES51_FIXTURE_OUTCOME");
+    expect_fixture_marker_refused("running 1 test\n", "ES51_FIXTURE_OUTCOME");
+    expect_fixture_marker_refused(
+        "test helper_fresh_process_vmbc_entry ... ok\n",
+        "ES51_FIXTURE_OUTCOME",
+    );
+    expect_fixture_marker_refused(
+        "not test helper_fresh_process_vmbc_entry ... ES51_FIXTURE_OUTCOME=denied\n",
+        "ES51_FIXTURE_OUTCOME",
+    );
+    expect_fixture_marker_refused(
+        "test helper_fresh_process_other_entry ... ES51_FIXTURE_OUTCOME=denied\n",
+        "ES51_FIXTURE_OUTCOME",
+    );
+    expect_fixture_marker_refused(
+        "noise ES51_FIXTURE_OUTCOME=denied\n",
+        "ES51_FIXTURE_OUTCOME",
+    );
+    expect_fixture_marker_refused("ES51_AOT_BYTES=1\n", "ES51_AOT");
+    expect_fixture_marker_refused(
+        "test helper_fresh_process_aot_entry ... ES51_AOT_BYTES=1\n",
+        "ES51_AOT",
+    );
+    expect_fixture_marker_refused(
+        "test helper_fresh_process_vmbc_entry ...  ES51_FIXTURE_OUTCOME=denied\n",
+        "ES51_FIXTURE_OUTCOME",
+    );
+}
+
+#[test]
+fn fixture_marker_libtest_accepts_known_status_prefixes() {
+    let vmbc = "running 1 test\ntest helper_fresh_process_vmbc_entry ... ES51_FIXTURE_OUTCOME=denied:HostError(\"owned array allocation requires a source-certified program\")\nES51_FIXTURE_RESOURCES=0\n";
+    assert_eq!(
+        fixture_marker(vmbc, "ES51_FIXTURE_OUTCOME"),
+        "denied:HostError(\"owned array allocation requires a source-certified program\")"
+    );
+    assert_eq!(fixture_marker(vmbc, "ES51_FIXTURE_RESOURCES"), "0");
+    let aot = "running 1 test\ntest helper_fresh_process_aot_entry ... ES51_AOT_BYTES=4648560\nES51_AOT_LOAD=ok\nES51_AOT_INFO=whole-program aot: enabled|  a=b\n";
+    assert_eq!(fixture_marker(aot, "ES51_AOT_BYTES"), "4648560");
+    assert_eq!(
+        fixture_marker(aot, "ES51_AOT_INFO"),
+        "whole-program aot: enabled|  a=b"
+    );
+    assert_eq!(
+        fixture_marker(
+            "test helper_fresh_process_vmbc_entry ... ES51_FIXTURE_OUTCOME=a=b=c\n",
+            "ES51_FIXTURE_OUTCOME",
+        ),
+        "a=b=c"
+    );
+    assert_eq!(
+        fixture_marker(
+            "test helper_fresh_process_aot_entry ... ES51_AOT_INFO=left=right\n",
+            "ES51_AOT_INFO",
+        ),
+        "left=right"
+    );
 }
 
 #[test]
@@ -1273,16 +1366,7 @@ fn p5_logical_fuel_interrupt_keeps_owner_charged_until_reset() {
 }
 
 fn p5_assert_artifact_authority_refusal(stdout: &str) {
-    // The existing VMBC fixture prints its first marker after the test harness
-    // status prefix; preserve the fixture and parse only that exact prefix.
-    let outcome = stdout
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix("test helper_fresh_process_vmbc_entry ... ")
-                .unwrap_or(line)
-                .strip_prefix("ES51_FIXTURE_OUTCOME=")
-        })
-        .expect("fixture authority outcome marker");
+    let outcome = fixture_marker(stdout, "ES51_FIXTURE_OUTCOME");
     assert!(outcome.starts_with("denied:"), "{outcome}");
     assert!(
         outcome.contains("certif") || outcome.contains("source"),

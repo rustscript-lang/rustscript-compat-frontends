@@ -521,6 +521,22 @@ fn format_typescript_schema(schema: &vm::TypeSchema, source_label: &str) -> Stri
             )
         }
         TypeSchema::Resource(key) => format!("Resource<{}>", key.as_str()),
+        TypeSchema::Result { ok, err } => {
+            let labels = source_label
+                .strip_prefix("Result<")
+                .and_then(|label| label.strip_suffix('>'))
+                .map(split_top_level)
+                .filter(|labels| labels.len() == 2);
+            let (ok_label, err_label) = match labels {
+                Some(labels) => (labels[0], labels[1]),
+                None => ("", ""),
+            };
+            format!(
+                "Result<{}, {}>",
+                format_typescript_schema(ok, ok_label),
+                format_typescript_schema(err, err_label)
+            )
+        }
     }
 }
 
@@ -530,4 +546,95 @@ pub fn typescript_flavor() -> vm::SourceFlavor {
 
 pub fn lua_flavor() -> vm::SourceFlavor {
     vm::SourceFlavor::Plugin(FrontendId::new("lua"))
+}
+
+#[cfg(test)]
+mod sdk_result_owner_tests {
+    use vm::{ResourceTypeKey, TypeSchema};
+
+    fn result(ok: TypeSchema, err: TypeSchema) -> TypeSchema {
+        TypeSchema::Result {
+            ok: Box::new(ok),
+            err: Box::new(err),
+        }
+    }
+
+    #[test]
+    fn result_formatter_is_canonical_and_uses_source_labels_only_when_bounded() {
+        let key = ResourceTypeKey::new("io.file").expect("valid resource key");
+        let scalar = result(TypeSchema::Int, TypeSchema::String);
+        assert_eq!(
+            super::format_typescript_schema(&scalar, ""),
+            "Result<Int, string>"
+        );
+        assert_eq!(
+            super::format_typescript_schema(&scalar, "Result<Int, string>"),
+            "Result<Int, string>"
+        );
+        assert_eq!(
+            super::format_typescript_schema(&scalar, "Result<Int>"),
+            "Result<Int, string>"
+        );
+        assert_eq!(
+            super::format_typescript_schema(&scalar, "Result<Int, string, extra>"),
+            "Result<Int, string>"
+        );
+        assert_eq!(
+            super::format_typescript_schema(&scalar, "not-a-result"),
+            "Result<Int, string>"
+        );
+
+        let named = result(
+            TypeSchema::Named("Profile".to_owned(), vec![TypeSchema::Int]),
+            TypeSchema::String,
+        );
+        assert_eq!(
+            super::format_typescript_schema(&named, "Result<Profile<Int>, string>"),
+            "Result<Profile<Int>, string>"
+        );
+        assert_eq!(
+            super::format_typescript_schema(&named, ""),
+            "Result<Profile, string>"
+        );
+        assert_eq!(
+            super::format_typescript_schema(&named, "Profile<Int>, string"),
+            "Result<Profile, string>"
+        );
+
+        let nested = result(
+            result(TypeSchema::Int, TypeSchema::String),
+            TypeSchema::Bool,
+        );
+        assert_eq!(
+            super::format_typescript_schema(&nested, "Result<Result<Int, string>, boolean>"),
+            "Result<Result<Int, string>, boolean>"
+        );
+        assert_eq!(
+            super::format_typescript_schema(&nested, ""),
+            "Result<Result<Int, string>, boolean>"
+        );
+
+        let resource = result(
+            TypeSchema::Resource(key),
+            TypeSchema::GenericParam("E".to_owned()),
+        );
+        assert_eq!(
+            super::format_typescript_schema(&resource, ""),
+            "Result<Resource<io.file>, E>"
+        );
+        assert_eq!(
+            super::format_typescript_schema(&TypeSchema::Map(Box::new(TypeSchema::String)), ""),
+            "Record<string, string>"
+        );
+        assert_eq!(
+            super::format_typescript_schema(
+                &TypeSchema::Named(
+                    "Result".to_owned(),
+                    vec![TypeSchema::Int, TypeSchema::String]
+                ),
+                ""
+            ),
+            "Result"
+        );
+    }
 }

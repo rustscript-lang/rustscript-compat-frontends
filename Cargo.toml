@@ -15,8 +15,8 @@ name = "pd-vm-compat-run"
 path = "src/bin/pd-vm-compat-run.rs"
 
 [dependencies]
-pd-host-function = { git = "https://github.com/rustscript-lang/rustscript", rev = "47cac633cde1f9cb67607141e0a6cfe9103ca4a4", package = "pd-host-function" }
-pd-vm = { git = "https://github.com/rustscript-lang/rustscript", rev = "47cac633cde1f9cb67607141e0a6cfe9103ca4a4" }
+pd-host-function = { git = "https://github.com/rustscript-lang/rustscript", rev = "31973aae3c417826dacedc82a6e5ea19e585bbbb", package = "pd-host-function" }
+pd-vm = { git = "https://github.com/rustscript-lang/rustscript", rev = "31973aae3c417826dacedc82a6e5ea19e585bbbb" }
 swc_common = "26.0.0"
 swc_ecma_ast = "29.0.2"
 swc_ecma_parser = { version = "46.0.0", default-features = false, features = ["typescript", "stacker"] }

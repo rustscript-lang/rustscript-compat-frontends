@@ -378,6 +378,10 @@ fn generic_params_in_schema(schema: &TypeSchema) -> Vec<String> {
                 }
                 visit(result, seen, ordered);
             }
+            TypeSchema::Result { ok, err } => {
+                visit(ok, seen, ordered);
+                visit(err, seen, ordered);
+            }
             TypeSchema::Unknown
             | TypeSchema::Null
             | TypeSchema::Int
@@ -446,6 +450,10 @@ fn substitute_type_schema(
                 .collect(),
             result: Box::new(substitute_type_schema(result, bindings)),
         },
+        TypeSchema::Result { ok, err } => TypeSchema::Result {
+            ok: Box::new(substitute_type_schema(ok, bindings)),
+            err: Box::new(substitute_type_schema(err, bindings)),
+        },
         TypeSchema::Unknown
         | TypeSchema::Null
         | TypeSchema::Int
@@ -470,6 +478,7 @@ pub(crate) fn schema_value_type(schema: &TypeSchema) -> vm::ValueType {
             vm::ValueType::Array
         }
         TypeSchema::Map(_) | TypeSchema::Object(_) | TypeSchema::Named(_, _) => vm::ValueType::Map,
+        TypeSchema::Result { .. } => vm::ValueType::Map,
         TypeSchema::Callable { .. } => vm::ValueType::Callable,
         TypeSchema::Number
         | TypeSchema::Unknown
@@ -697,6 +706,10 @@ fn collect_host_named_type_names(schema: &vm::HostTypeSchema, names: &mut HashSe
             for field in fields {
                 collect_host_named_type_names(&field.ty, names);
             }
+        }
+        vm::HostTypeSchema::Result { ok, err } => {
+            collect_host_named_type_names(ok, names);
+            collect_host_named_type_names(err, names);
         }
         vm::HostTypeSchema::Unknown
         | vm::HostTypeSchema::Null
@@ -1712,6 +1725,10 @@ impl<'a> Lowerer<'a> {
                     .iter()
                     .any(|param| Self::schema_contains_named_type(param, names))
                     || Self::schema_contains_named_type(result, names)
+            }
+            TypeSchema::Result { ok, err } => {
+                Self::schema_contains_named_type(ok, names)
+                    || Self::schema_contains_named_type(err, names)
             }
             TypeSchema::Unknown
             | TypeSchema::Null
@@ -5653,6 +5670,10 @@ impl<'a> Lowerer<'a> {
             },
             vm::HostTypeSchema::Resource(key) => TypeSchema::Resource(key.clone()),
             vm::HostTypeSchema::Named { name, .. } => TypeSchema::Named(name.clone(), Vec::new()),
+            vm::HostTypeSchema::Result { ok, err } => TypeSchema::Result {
+                ok: Box::new(Self::host_type_schema(ok)),
+                err: Box::new(Self::host_type_schema(err)),
+            },
         }
     }
 
@@ -8445,4 +8466,147 @@ pub(crate) fn parse_reference_array_imports_for_plugin(
 ) -> Result<Vec<vm::ModuleImport>, vm::SourcePathError> {
     module_imports_with_reference_defaults(source, context.source_id, true)
         .map_err(|error| vm::SourcePathError::Source(vm::SourceError::Parse(error)))
+}
+
+#[cfg(test)]
+mod sdk_result_owner_tests {
+    use std::collections::{HashMap, HashSet};
+
+    use vm::TypeSchema;
+
+    fn result(ok: TypeSchema, err: TypeSchema) -> TypeSchema {
+        TypeSchema::Result {
+            ok: Box::new(ok),
+            err: Box::new(err),
+        }
+    }
+
+    fn bindings(pairs: &[(&str, TypeSchema)]) -> HashMap<String, TypeSchema> {
+        pairs
+            .iter()
+            .map(|(name, schema)| ((*name).to_owned(), schema.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn generic_params_visit_ok_before_err_and_keep_nested_order() {
+        let repeated = result(
+            TypeSchema::GenericParam("T".to_owned()),
+            TypeSchema::GenericParam("T".to_owned()),
+        );
+        assert_eq!(
+            super::generic_params_in_schema(&repeated),
+            vec!["T".to_owned()]
+        );
+        let distinct = result(
+            TypeSchema::Callable {
+                params: vec![TypeSchema::GenericParam("A".to_owned())],
+                result: Box::new(TypeSchema::GenericParam("B".to_owned())),
+            },
+            TypeSchema::GenericParam("C".to_owned()),
+        );
+        assert_eq!(
+            super::generic_params_in_schema(&distinct),
+            vec!["A".to_owned(), "B".to_owned(), "C".to_owned()]
+        );
+        let mut fields = HashMap::new();
+        fields.insert("z".to_owned(), TypeSchema::GenericParam("Z".to_owned()));
+        fields.insert("a".to_owned(), TypeSchema::GenericParam("A".to_owned()));
+        let nested = result(
+            TypeSchema::Object(fields),
+            TypeSchema::GenericParam("E".to_owned()),
+        );
+        assert_eq!(
+            super::generic_params_in_schema(&nested),
+            vec!["A".to_owned(), "Z".to_owned(), "E".to_owned()]
+        );
+    }
+
+    #[test]
+    fn substitute_and_physical_projection_keep_logical_result() {
+        let key = vm::ResourceTypeKey::new("io.file").expect("valid resource key");
+        let schema = result(
+            TypeSchema::GenericParam("T".to_owned()),
+            TypeSchema::Named(
+                "Box".to_owned(),
+                vec![TypeSchema::GenericParam("E".to_owned())],
+            ),
+        );
+        assert_eq!(
+            super::substitute_type_schema(
+                &schema,
+                &bindings(&[("T", TypeSchema::Int), ("E", TypeSchema::String)])
+            ),
+            result(
+                TypeSchema::Int,
+                TypeSchema::Named("Box".to_owned(), vec![TypeSchema::String])
+            )
+        );
+        let preserved = result(
+            TypeSchema::GenericParam("Missing".to_owned()),
+            TypeSchema::Resource(key.clone()),
+        );
+        assert_eq!(
+            super::substitute_type_schema(&preserved, &bindings(&[("T", TypeSchema::Int)])),
+            preserved
+        );
+        assert_eq!(super::schema_value_type(&schema), vm::ValueType::Map);
+        assert!(matches!(schema, TypeSchema::Result { .. }));
+        assert_eq!(
+            super::schema_value_type(&TypeSchema::Map(Box::new(TypeSchema::String))),
+            vm::ValueType::Map
+        );
+        assert_ne!(schema, TypeSchema::Map(Box::new(TypeSchema::Unknown)));
+    }
+
+    #[test]
+    fn parser_host_projection_and_name_walk_keep_both_result_branches() {
+        let projected = super::Lowerer::host_type_schema(&vm::HostTypeSchema::Result {
+            ok: Box::new(vm::HostTypeSchema::Named {
+                name: "Profile".to_owned(),
+                fields: vec![vm::HostStructField::new("name", vm::HostTypeSchema::String)],
+            }),
+            err: Box::new(vm::HostTypeSchema::String),
+        });
+        assert_eq!(
+            projected,
+            result(
+                TypeSchema::Named("Profile".to_owned(), Vec::new()),
+                TypeSchema::String
+            )
+        );
+        assert!(!matches!(
+            projected,
+            TypeSchema::Object(_) | TypeSchema::Map(_)
+        ));
+
+        let mut names = HashSet::new();
+        super::collect_host_named_type_names(
+            &vm::HostTypeSchema::Result {
+                ok: Box::new(vm::HostTypeSchema::Int),
+                err: Box::new(vm::HostTypeSchema::Named {
+                    name: "ErrOnly".to_owned(),
+                    fields: Vec::new(),
+                }),
+            },
+            &mut names,
+        );
+        assert!(names.contains("ErrOnly"));
+        assert!(!names.contains("Profile"));
+
+        let err_named = result(
+            TypeSchema::Int,
+            TypeSchema::Named("ErrOnly".to_owned(), Vec::new()),
+        );
+        let mut wanted = HashSet::new();
+        wanted.insert("ErrOnly".to_owned());
+        assert!(super::Lowerer::schema_contains_named_type(
+            &err_named, &wanted
+        ));
+        let mut absent = HashSet::new();
+        absent.insert("Missing".to_owned());
+        assert!(!super::Lowerer::schema_contains_named_type(
+            &err_named, &absent
+        ));
+    }
 }

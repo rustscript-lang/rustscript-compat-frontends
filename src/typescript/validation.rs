@@ -192,6 +192,22 @@ fn validate_expression(
         | Expr::MoveVar(_)
         | Expr::MoveField { .. }
         | Expr::MoveIndex { .. } => {}
+        Expr::ResultConstruct { payload, .. } => {
+            validate_expression(payload, typed, source_id)?;
+        }
+        Expr::ResultMatch {
+            value,
+            ok_expr,
+            err_expr,
+            ..
+        } => {
+            validate_expression(value, typed, source_id)?;
+            validate_expression(ok_expr, typed, source_id)?;
+            validate_expression(err_expr, typed, source_id)?;
+        }
+        Expr::ResultQuery { value, .. } | Expr::ResultTry { value, .. } => {
+            validate_expression(value, typed, source_id)?;
+        }
     }
     Ok(())
 }
@@ -512,6 +528,10 @@ fn host_type_schema(schema: &vm::HostTypeSchema) -> TypeSchema {
                 .map(|field| (field.name.clone(), host_type_schema(&field.ty)))
                 .collect(),
         ),
+        vm::HostTypeSchema::Result { ok, err } => TypeSchema::Result {
+            ok: Box::new(host_type_schema(ok)),
+            err: Box::new(host_type_schema(err)),
+        },
     }
 }
 
@@ -560,6 +580,10 @@ fn substitute(
                 .collect(),
             result: Box::new(substitute(result, bindings)),
         },
+        TypeSchema::Result { ok, err } => TypeSchema::Result {
+            ok: Box::new(substitute(ok, bindings)),
+            err: Box::new(substitute(err, bindings)),
+        },
         TypeSchema::Unknown
         | TypeSchema::Null
         | TypeSchema::Int
@@ -569,5 +593,97 @@ fn substitute(
         | TypeSchema::String
         | TypeSchema::Bytes
         | TypeSchema::Resource(_) => schema.clone(),
+    }
+}
+
+#[cfg(test)]
+mod sdk_result_owner_tests {
+    use std::collections::HashMap;
+
+    use vm::TypeSchema;
+
+    fn result(ok: TypeSchema, err: TypeSchema) -> TypeSchema {
+        TypeSchema::Result {
+            ok: Box::new(ok),
+            err: Box::new(err),
+        }
+    }
+
+    fn bindings(pairs: &[(&str, TypeSchema)]) -> HashMap<String, TypeSchema> {
+        pairs
+            .iter()
+            .map(|(name, schema)| ((*name).to_owned(), schema.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn host_result_keeps_both_branches_and_stays_distinct_from_named_and_map() {
+        let key = vm::ResourceTypeKey::new("io.file").expect("valid resource key");
+        let host = vm::HostTypeSchema::Result {
+            ok: Box::new(vm::HostTypeSchema::Optional(Box::new(
+                vm::HostTypeSchema::Array(Box::new(vm::HostTypeSchema::Int)),
+            ))),
+            err: Box::new(vm::HostTypeSchema::Named {
+                name: "SdkFailure".to_owned(),
+                fields: vec![vm::HostStructField::new("code", vm::HostTypeSchema::Int)],
+            }),
+        };
+        let projected = super::host_type_schema(&host);
+        assert_eq!(
+            projected,
+            result(
+                TypeSchema::Optional(Box::new(TypeSchema::Array(Box::new(TypeSchema::Int)))),
+                TypeSchema::Object([("code".to_owned(), TypeSchema::Int)].into_iter().collect()),
+            )
+        );
+        assert!(!matches!(
+            projected,
+            TypeSchema::Map(_) | TypeSchema::Named(_, _)
+        ));
+        let resource = super::host_type_schema(&vm::HostTypeSchema::Result {
+            ok: Box::new(vm::HostTypeSchema::Resource(key.clone())),
+            err: Box::new(vm::HostTypeSchema::String),
+        });
+        assert_eq!(
+            resource,
+            result(TypeSchema::Resource(key), TypeSchema::String)
+        );
+        assert_eq!(
+            super::host_type_schema(&vm::HostTypeSchema::Map(Box::new(
+                vm::HostTypeSchema::String
+            ))),
+            TypeSchema::Map(Box::new(TypeSchema::String))
+        );
+    }
+
+    #[test]
+    fn substitute_retains_result_branches_and_unbound_or_resource_payloads() {
+        let key = vm::ResourceTypeKey::new("io.file").expect("valid resource key");
+        let schema = result(
+            TypeSchema::GenericParam("T".to_owned()),
+            TypeSchema::Optional(Box::new(TypeSchema::GenericParam("E".to_owned()))),
+        );
+        assert_eq!(
+            super::substitute(
+                &schema,
+                &bindings(&[("T", TypeSchema::Int), ("E", TypeSchema::String)])
+            ),
+            result(
+                TypeSchema::Int,
+                TypeSchema::Optional(Box::new(TypeSchema::String))
+            )
+        );
+        let preserved = result(
+            TypeSchema::GenericParam("Missing".to_owned()),
+            TypeSchema::Resource(key.clone()),
+        );
+        assert_eq!(
+            super::substitute(&preserved, &bindings(&[("T", TypeSchema::Int)])),
+            preserved
+        );
+        assert!(matches!(
+            super::substitute(&schema, &HashMap::new()),
+            TypeSchema::Result { .. }
+        ));
     }
 }

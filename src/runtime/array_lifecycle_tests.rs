@@ -302,28 +302,155 @@ main();
     assert_eq!(machine.host_context().resource_count(), 0);
 }
 
+fn open_number_array_payloads(machine: &mut Vm) -> Vec<Vec<Value>> {
+    let handles = machine
+        .locals()
+        .iter()
+        .filter_map(|value| match value {
+            Value::Int(raw) => u64::try_from(*raw)
+                .ok()
+                .and_then(|raw| ResourceHandle::from_raw(raw).ok()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let mut seen = Vec::new();
+    let mut payloads = Vec::new();
+    for handle in handles {
+        if seen.contains(&handle) {
+            continue;
+        }
+        let payload = {
+            let context = machine.host_context();
+            let Ok(borrowed) =
+                context.borrow_resource_with_key::<NumberArray>(handle, &array_key())
+            else {
+                continue;
+            };
+            borrowed.get().0.clone()
+        };
+        seen.push(handle);
+        payloads.push(payload);
+    }
+    payloads
+}
+
+fn assert_signature_resource_is_not_owned_payload(program: &vm::Program) {
+    let reader = program
+        .callable_prototypes
+        .iter()
+        .find(|prototype| prototype.self_slot.is_some())
+        .expect("self-bearing reader");
+    let self_slot = reader.self_slot.expect("self slot");
+    assert!(reader.capture_slots.contains(&self_slot));
+    let self_mode = reader
+        .capture_slots
+        .iter()
+        .zip(&reader.capture_modes)
+        .find_map(|(slot, mode)| (*slot == self_slot).then_some(*mode))
+        .expect("self capture mode");
+    assert_eq!(
+        self_mode,
+        CaptureBindingMode::Copy,
+        "copying the callable is not a Resource copy: modes={:?}",
+        reader.capture_modes
+    );
+    assert!(
+        !reader.capture_modes.contains(&CaptureBindingMode::Move),
+        "a Resource parameter is not an owned payload"
+    );
+    assert!(
+        reader.schema.as_ref().is_some_and(|schema| {
+            matches!(
+                schema,
+                TypeSchema::Callable { params, .. }
+                    if params
+                        .iter()
+                        .any(|param| matches!(param, TypeSchema::Resource(_)))
+            )
+        }),
+        "the original signature still names a Resource parameter"
+    );
+    let type_map = program.type_map.as_ref().expect("checked local schemas");
+    for source in &reader.capture_source_slots {
+        let schema = type_map
+            .local_schemas
+            .get(usize::from(*source))
+            .and_then(Option::as_ref);
+        assert!(
+            !matches!(schema, Some(TypeSchema::Resource(_))),
+            "self copy must not capture an owned Resource: {schema:?}"
+        );
+    }
+}
+
+// Old name: self_bearing_move_owner_with_another_resource_parameter_hits_pinned_barrier
 #[test]
-fn self_bearing_move_owner_with_another_resource_parameter_hits_pinned_barrier() {
-    let catalog = owner_catalog();
-    let error = match crate::collect_typescript_type_hints_with_options(
-        WRONG_PAIR_SOURCE,
-        crate::compile_options_with_catalog(Arc::clone(&catalog)),
-    ) {
-        Ok(_) => panic!(
-            "pinned Core unexpectedly admitted a second Resource argument alongside the Move-captured owner"
-        ),
-        Err(error) => error,
-    };
-    let diagnostic = format!("{error:?}");
-    assert!(
-        diagnostic.contains("E_OWNERSHIP_COPY_RESOURCE"),
-        "the real TypeScript wrong-pair control must stop at the pinned ownership barrier: {diagnostic}"
+fn wrong_pair_source_reaches_typed_owner_comparison() {
+    let (compiled, catalog) = fixture_program(WRONG_PAIR_SOURCE);
+    let dispatcher = compiled
+        .program
+        .callable_prototypes
+        .iter()
+        .find(|prototype| prototype.self_slot.is_some())
+        .expect("WRONG_PAIR_SOURCE keeps one self-bearing dispatcher");
+    let self_slot = dispatcher.self_slot.expect("self slot");
+    let self_mode = dispatcher
+        .capture_slots
+        .iter()
+        .zip(&dispatcher.capture_modes)
+        .find_map(|(slot, mode)| (*slot == self_slot).then_some(*mode))
+        .expect("self capture mode");
+    assert_eq!(
+        self_mode,
+        CaptureBindingMode::Copy,
+        "the callable value is not an owned Resource"
     );
-    assert!(
-        diagnostic.contains("closure capture of resource value")
-            && diagnostic.contains("resources cannot be cloned into a closure cell"),
-        "the barrier must be the concrete move-only dispatcher diagnostic: {diagnostic}"
+    let move_sources = dispatcher
+        .capture_source_slots
+        .iter()
+        .zip(&dispatcher.capture_modes)
+        .filter_map(|(slot, mode)| (*mode == CaptureBindingMode::Move).then_some(*slot))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        move_sources.len(),
+        1,
+        "only the real owner is Move-captured"
     );
+    assert_eq!(
+        compiled
+            .program
+            .type_map
+            .as_ref()
+            .and_then(|type_map| type_map.local_schemas.get(usize::from(move_sources[0])))
+            .and_then(Option::as_ref),
+        Some(&TypeSchema::Resource(array_key()))
+    );
+    let mut machine = Vm::new(compiled.program);
+    owner_registry(&catalog)
+        .bind_vm_cached(&mut machine)
+        .expect("wrong-pair imports bind");
+    let error = machine
+        .run()
+        .expect_err("a second live resource must not pass the Move-owner comparison");
+    assert!(
+        error
+            .to_string()
+            .contains("candidate is not the active callable's Move-captured resource"),
+        "ordinary fixture comparison, not a compile barrier: {error}"
+    );
+    let mut payloads = open_number_array_payloads(&mut machine);
+    payloads.sort_by_key(|payload| match payload.first() {
+        Some(Value::Int(value)) => *value,
+        _ => i64::MAX,
+    });
+    assert_eq!(
+        payloads,
+        vec![vec![Value::Int(10)], vec![Value::Int(20)]],
+        "both typed payloads stay independently open after refusal"
+    );
+    assert_eq!(machine.host_context().resource_count(), 2);
+    machine.reset_for_reuse().expect("wrong-pair refusal reset");
+    assert_eq!(machine.host_context().resource_count(), 0);
 }
 
 const LEGITIMATE_DISPATCHER_SOURCE: &str = r#"
@@ -652,8 +779,9 @@ fn numeric_signature_wrong_resource_reaches_typed_owner_comparison() {
     assert_eq!(machine.host_context().resource_count(), 0);
 }
 
+// Old name: resource_signature_self_copy_without_owner_keeps_core_rejection
 #[test]
-fn resource_signature_self_copy_without_owner_keeps_core_rejection() {
+fn resource_signature_self_copy_without_owner_executes() {
     let source = r#"
 import { create, length } from "arrays";
 import type { Resource } from "rustscript:types";
@@ -666,17 +794,24 @@ function main(): number {
 }
 main();
 "#;
-    let catalog = owner_catalog();
-    let error = match vm::compile_source_with_flavor_and_options(
-        source,
-        crate::typescript_flavor(),
-        crate::compile_options_with_catalog(catalog),
-    ) {
-        Ok(_) => panic!("resource-containing callable self Copy must remain rejected"),
-        Err(error) => error,
-    };
-    eprintln!("resource-signature self Copy without owner: {error:?}");
-    assert!(format!("{error:?}").contains("E_OWNERSHIP_COPY_RESOURCE"));
+    let (compiled, catalog) = fixture_program(source);
+    assert_signature_resource_is_not_owned_payload(&compiled.program);
+    let mut machine = Vm::new(compiled.program);
+    owner_registry(&catalog)
+        .bind_vm_cached(&mut machine)
+        .expect("Resource-signature reader imports bind");
+    assert_eq!(
+        machine
+            .run()
+            .expect("copying a callable with a Resource parameter should execute"),
+        vm::VmStatus::Halted
+    );
+    assert_eq!(machine.stack().last(), Some(&Value::Int(1)));
+    assert_eq!(machine.host_context().resource_count(), 1);
+    machine
+        .reset_for_reuse()
+        .expect("Resource-signature reader reset");
+    assert_eq!(machine.host_context().resource_count(), 0);
 }
 
 #[test]
@@ -718,8 +853,10 @@ main();
     assert_eq!(machine.host_context().resource_count(), 0);
 }
 
+// Old name: native_resource_signature_self_copy_and_move_owner_controls
+// SourceFlavor::RustScript is the historical source flavor, not an AOT execution.
 #[test]
-fn native_resource_signature_self_copy_and_move_owner_controls() {
+fn rustscript_resource_signature_self_copy_executes_and_move_owner_stays_checked() {
     let catalog = owner_catalog();
     let self_source = r#"
 use arrays;
@@ -729,16 +866,27 @@ let reader: fn(resource<compat.number_array>) -> number = |candidate| if reader 
 let candidate: resource<compat.number_array> = arrays::create([1]);
 reader(candidate);
 "#;
-    let error = match vm::compile_source_with_flavor_and_options(
+    let compiled = vm::compile_source_with_flavor_and_options(
         self_source,
         vm::compiler::SourceFlavor::RustScript,
         crate::compile_options_with_catalog(Arc::clone(&catalog)),
-    ) {
-        Ok(_) => panic!("native resource-containing self Copy must remain rejected"),
-        Err(error) => error,
-    };
-    eprintln!("native resource-signature self Copy: {error:?}");
-    assert!(format!("{error:?}").contains("E_OWNERSHIP_COPY_RESOURCE"));
+    )
+    .expect("RustScript callable with a Resource parameter should compile");
+    assert_signature_resource_is_not_owned_payload(&compiled.program);
+    let mut machine = Vm::new(compiled.program);
+    owner_registry(&catalog)
+        .bind_vm_cached(&mut machine)
+        .expect("RustScript reader imports bind");
+    assert_eq!(
+        machine
+            .run()
+            .expect("RustScript self copy of a Resource-signature callable should execute"),
+        vm::VmStatus::Halted
+    );
+    assert_eq!(machine.stack().last(), Some(&Value::Int(1)));
+    assert_eq!(machine.host_context().resource_count(), 1);
+    machine.reset_for_reuse().expect("RustScript reader reset");
+    assert_eq!(machine.host_context().resource_count(), 0);
 
     let move_source = r#"
 use arrays;
@@ -773,4 +921,34 @@ reader(candidate);
         .reset_for_reuse()
         .expect("native owner control reset");
     assert_eq!(machine.host_context().resource_count(), 0);
+}
+
+#[test]
+fn genuine_owned_resource_copy_remains_compile_rejected() {
+    // Current Core syntax: tests/cli_embedding_resources.rs copies a made
+    // resource with `.copy()`, and tests/repl_public_api.rs copies a local
+    // whose schema is Resource. The value copied here is that resource.
+    let source = "use arrays;\nlet owner: resource<compat.number_array> = arrays::create([1]);\nlet alias = owner.copy();\n";
+    let error = match vm::compile_source_with_flavor_and_options(
+        source,
+        vm::compiler::SourceFlavor::RustScript,
+        crate::compile_options_with_catalog(owner_catalog()),
+    ) {
+        Ok(_) => panic!("copying an owned Resource must stay rejected"),
+        Err(error) => error,
+    };
+    let diagnostic = format!("{error:?}");
+    eprintln!("genuine owned resource copy: source={source:?} diagnostic={diagnostic}");
+    assert!(
+        diagnostic.contains("E_OWNERSHIP_COPY_RESOURCE"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("cannot copy resource value 'owner'"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("resources are move-only and do not support '.copy()'"),
+        "{diagnostic}"
+    );
 }
