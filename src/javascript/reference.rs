@@ -989,6 +989,42 @@ fn validate_expr(
             validate_expr(lower, &unary.arg, facts)?;
             Kind::String
         }
+        ast::Expr::Unary(unary) if unary.op == ast::UnaryOp::Bang => {
+            validate_expr(lower, &unary.arg, facts)?;
+            Kind::Boolean
+        }
+        ast::Expr::Bin(binary)
+            if matches!(
+                binary.op,
+                ast::BinaryOp::LogicalAnd | ast::BinaryOp::LogicalOr
+            ) =>
+        {
+            let left = validate_expr(lower, &binary.left, facts)?;
+            let mut selected = facts.clone();
+            let right = validate_expr(lower, &binary.right, &mut selected)?;
+            for (id, left) in facts.iter_mut() {
+                let right = selected
+                    .get(id)
+                    .copied()
+                    .unwrap_or(ProfileFact::scalar(Kind::Dynamic));
+                let kind = super::lowerer::expression::join_kind(left.kind, right.kind);
+                left.array_length = super::lowerer::expression::join_length(
+                    kind,
+                    left.array_length,
+                    right.array_length,
+                );
+                left.kind = kind;
+            }
+            let kind = super::lowerer::expression::join_kind(left.kind, right.kind);
+            return Ok(ProfileFact {
+                kind,
+                array_length: super::lowerer::expression::join_length(
+                    kind,
+                    left.array_length,
+                    right.array_length,
+                ),
+            });
+        }
         ast::Expr::Unary(unary) if unary.op == ast::UnaryOp::Minus => {
             let operand = validate_expr(lower, &unary.arg, facts)?;
             admit_numeric_operand(lower, unary.span, operand.kind)?;
@@ -1188,8 +1224,14 @@ pub(super) fn admit_member_read(
         && let ast::MemberProp::Computed(property) = &member.prop
         && let Some(index) = Lowerer::member_index_literal(&property.expr)
     {
+        let length = length.ok_or_else(|| {
+            lower.error(
+                member.span,
+                "P5 array access requires an exact length after conditional flow",
+            )
+        })?;
         let position = usize::try_from(index).unwrap_or(usize::MAX);
-        return Ok(if length.is_some_and(|len| position >= len) {
+        return Ok(if position >= length {
             Kind::Undefined
         } else {
             Kind::Number
@@ -1238,8 +1280,14 @@ pub(super) fn admit_member_write(
             "P0 indexed writes require a numeric-array binding",
         ));
     }
+    let length = length.ok_or_else(|| {
+        lower.error(
+            member.span,
+            "P5 array access requires an exact length after conditional flow",
+        )
+    })?;
     let position = usize::try_from(index).unwrap_or(usize::MAX);
-    if length.is_some_and(|len| position >= len) {
+    if position >= length {
         return Err(lower.error(
             property.span(),
             "P0 numeric arrays reject length-changing writes",

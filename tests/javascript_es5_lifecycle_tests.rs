@@ -1222,6 +1222,180 @@ fn fixture_marker(stdout: &str, name: &str) -> String {
 }
 
 #[test]
+fn p5_logical_fuel_interrupt_keeps_owner_charged_until_reset() {
+    // A finite admitted source, not a recursive/capture extension. Its actual
+    // alias comparison precedes a labeled test-only numeric phase observation.
+    let source = "function f(a){'use strict';return a&&a;}var o={s:'live'};var r=f(o);r===o;4242.5;var after='later';";
+    let (mut machine, _) = lifecycle_vm(source, false);
+    let tag = Value::string("tag");
+    let number = Value::string("number");
+    let flag = Value::string("flag");
+    let mut reached = false;
+    machine.set_fuel(0);
+    for _ in 0..200_000 {
+        // Preserve unpaid metering debt across yields; replacing the balance
+        // with one repeatedly cannot fund a multi-unit existing host operation.
+        machine.add_fuel(1).expect("bounded cumulative fuel credit");
+        let status = machine.run().expect("bounded fuel step");
+        let phase = machine.stack().iter().position(|value| {
+            matches!(value, Value::Map(fields) if fields.len()==5 && fields.get(&tag)==Some(&Value::Int(3)) && fields.get(&number)==Some(&Value::Float(4242.5)))
+        });
+        if let Some(position) = phase {
+            let Some(Value::Map(result)) = position
+                .checked_sub(1)
+                .and_then(|index| machine.stack().get(index))
+            else {
+                panic!("actual logical alias comparison before the phase")
+            };
+            assert_eq!(result.get(&tag), Some(&Value::Int(2)));
+            assert_eq!(result.get(&flag), Some(&Value::Bool(true)));
+            assert_eq!(status, VmStatus::Yielded);
+            assert_eq!(machine.last_yield_reason(), Some(vm::VmYieldReason::Fuel));
+            reached = true;
+            break;
+        }
+        assert_eq!(status, VmStatus::Yielded, "phase must precede halt");
+    }
+    assert!(
+        reached,
+        "logical source phase within the original 200000 total fuel bound"
+    );
+    assert_eq!(machine.host_context().resource_count(), 1);
+    let stats = pd_vm_compat_frontends::runtime::array::owned_array_runtime_stats(&mut machine)
+        .expect("charged owner");
+    assert_eq!((stats.pending, stats.registered), (0, 1));
+    eprintln!("P5_FUEL actual_alias=true reason=Fuel resources=1 pending=0 registered=1");
+    machine.reset_for_reuse().expect("fuel reset");
+    assert_eq!(machine.host_context().resource_count(), 0);
+    assert!(
+        pd_vm_compat_frontends::runtime::array::owned_array_runtime_stats(&mut machine).is_none()
+    );
+}
+
+fn p5_assert_artifact_authority_refusal(stdout: &str) {
+    // The existing VMBC fixture prints its first marker after the test harness
+    // status prefix; preserve the fixture and parse only that exact prefix.
+    let outcome = stdout
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("test helper_fresh_process_vmbc_entry ... ")
+                .unwrap_or(line)
+                .strip_prefix("ES51_FIXTURE_OUTCOME=")
+        })
+        .expect("fixture authority outcome marker");
+    assert!(outcome.starts_with("denied:"), "{outcome}");
+    assert!(
+        outcome.contains("certif") || outcome.contains("source"),
+        "{outcome}"
+    );
+    assert!(
+        !outcome.contains("catalog")
+            && !outcome.contains("host import")
+            && !outcome.contains("No such file"),
+        "{outcome}"
+    );
+    assert_eq!(fixture_marker(stdout, "ES51_FIXTURE_RESOURCES"), "0");
+    assert_eq!(fixture_marker(stdout, "ES51_FIXTURE_STACK"), "1");
+    assert_eq!(
+        fixture_marker(stdout, "ES51_FIXTURE_STACK_TOP"),
+        "Array([])"
+    );
+}
+
+#[test]
+fn p5_logical_source_deleted_artifacts_do_not_gain_realm_authority() {
+    let scratch = LifecycleScratch::new("p5-logical-artifact");
+    let source = "function f(a){'use strict';return a&&a;}var a=[7];var b=f(a);false&&(a=[]);var r=b||a;r===b;";
+    let main = write_js_file(&scratch.0, "main.js", source);
+    let (mut machine, _) = file_certified_vm(&main);
+    assert_eq!(
+        machine.run().expect("logical source positive"),
+        VmStatus::Halted
+    );
+    let Value::Map(result) = machine.stack().last().expect("logical result") else {
+        panic!("boxed result")
+    };
+    assert_eq!(result.get(&Value::string("flag")), Some(&Value::Bool(true)));
+    assert_eq!(machine.host_context().resource_count(), 1);
+    let artifact = scratch.0.join("logical.vmbc");
+    std::fs::write(
+        &artifact,
+        vm::encode_program(machine.program()).expect("VMBC"),
+    )
+    .expect("artifact write");
+    std::fs::remove_file(&main).expect("source deletion");
+    assert!(!main.exists());
+    let output = run_fresh_fixture(&artifact);
+    let stdout = String::from_utf8(output.stdout).expect("fixture UTF8");
+    let stderr = String::from_utf8(output.stderr).expect("fixture UTF8");
+    eprintln!("P5_ARTIFACT_FRESH stdout={stdout}\nstderr={stderr}");
+    p5_assert_artifact_authority_refusal(&stdout);
+    assert_eq!(fixture_marker(&stdout, "ES51_FIXTURE_RESOURCES"), "0");
+    assert_eq!(fixture_marker(&stdout, "ES51_FIXTURE_FACTS"), "none");
+    machine.reset_for_reuse().expect("positive reset");
+    assert_eq!(machine.host_context().resource_count(), 0);
+}
+
+#[test]
+fn p5_logical_source_deleted_aot_pair_does_not_gain_realm_authority() {
+    std::thread::Builder::new()
+        .stack_size(33_554_432)
+        .spawn(|| {
+            let scratch = LifecycleScratch::new("p5-logical-aot-artifact");
+            let source =
+                "function f(a){'use strict';return a||a;}var o={s:'live'};var r=f(o);r===o;";
+            let main = write_js_file(&scratch.0, "main.js", source);
+            let (mut machine, _) = file_certified_vm(&main);
+            machine
+                .compile_aot()
+                .expect("logical source native compilation");
+            assert_eq!(
+                machine.run().expect("logical native positive"),
+                VmStatus::Halted
+            );
+            let Value::Map(result) = machine.stack().last().expect("logical result") else {
+                panic!("boxed result")
+            };
+            assert_eq!(result.get(&Value::string("flag")), Some(&Value::Bool(true)));
+            let count = machine.aot_exec_count();
+            let info = machine.dump_aot_info();
+            assert!(count > 0 && info.contains("lowering=ssa"));
+            eprintln!("P5_ARTIFACT_NATIVE actual_vm_aot_exec_count={count}\n{info}");
+            let artifact = scratch.0.join("logical.vmbc");
+            std::fs::write(
+                &artifact,
+                vm::encode_program(machine.program()).expect("VMBC"),
+            )
+            .expect("artifact write");
+            let aot = scratch.0.join("logical.pat");
+            machine.save_aot_artifact_to_file(&aot).expect("AOT save");
+            std::fs::remove_file(&main).expect("source deletion");
+            assert!(!main.exists());
+            let output = run_fresh_aot_fixture(&artifact, &aot);
+            let stdout = String::from_utf8(output.stdout).expect("fixture UTF8");
+            let stderr = String::from_utf8(output.stderr).expect("fixture UTF8");
+            eprintln!("P5_ARTIFACT_FRESH_AOT stdout={stdout}\nstderr={stderr}");
+            assert_eq!(fixture_marker(&stdout, "ES51_AOT_LOAD"), "ok");
+            assert_eq!(
+                fixture_marker(&stdout, "ES51_AOT_RESOURCES_AFTER_LOAD"),
+                "0"
+            );
+            assert_ne!(
+                fixture_marker(&stdout, "ES51_AOT_FACTS_AFTER_LOAD"),
+                "valid"
+            );
+            p5_assert_artifact_authority_refusal(&stdout);
+            assert_eq!(fixture_marker(&stdout, "ES51_FIXTURE_RESOURCES"), "0");
+            assert_ne!(fixture_marker(&stdout, "ES51_FIXTURE_FACTS"), "valid");
+            machine.reset_for_reuse().expect("positive reset");
+            assert_eq!(machine.host_context().resource_count(), 0);
+        })
+        .expect("native stack worker")
+        .join()
+        .expect("artifact assertions");
+}
+
+#[test]
 fn artifact_source_deleted_vmbc_denied_in_fresh_process() {
     let scratch = LifecycleScratch::new("artifact-fresh");
     let main = write_js_file(&scratch.0, "main.js", LIFECYCLE_ALIAS_SOURCE);

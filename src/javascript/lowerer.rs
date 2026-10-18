@@ -14,6 +14,8 @@ use super::prelude::values as value_emitters;
 use super::reference;
 use super::representation as value;
 use super::scope;
+#[path = "expression.rs"]
+pub(super) mod expression;
 use super::string_literal::{
     MAX_LITERAL_UTF16_UNITS, StringStrictness, decode_string_literal, narrowed_span,
 };
@@ -728,6 +730,12 @@ impl Lowerer<'_> {
                 reference::lower_assign_expr(self, assign)
             }
             ast::Expr::Unary(u) if u.op == ast::UnaryOp::TypeOf => reference::lower_typeof(self, u),
+            ast::Expr::Unary(u) if u.op == ast::UnaryOp::Bang => self.lower_not(u),
+            ast::Expr::Bin(b)
+                if matches!(b.op, ast::BinaryOp::LogicalAnd | ast::BinaryOp::LogicalOr) =>
+            {
+                self.lower_logical(b)
+            }
             ast::Expr::Array(literal) => self.lower_array_expr(literal),
             ast::Expr::Unary(u) if u.op == ast::UnaryOp::Minus => {
                 let operand = self.expr(&u.arg)?;

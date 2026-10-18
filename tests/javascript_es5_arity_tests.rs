@@ -698,6 +698,62 @@ fn scalar_argument_boundary_native_ssa() {
 }
 
 #[test]
+fn p5_logical_returned_function_alias_and_allocating_rhs_keep_identity() {
+    let values = observed(
+        "function select(a){\"use strict\";return a&&a;}function f(a,b){\"use strict\";return a;}var original=f;var r=select(original);original=null;var same=r===f;var n=r.length;var answer=r(7,8);",
+        false,
+        observer::Observer {
+            reads: ["same", "n", "answer"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            force_gc: true,
+            collect: true,
+            ..Default::default()
+        },
+    );
+    let tail = &values[values.len() - 3..];
+    assert_eq!(field(&tail[0], "flag"), Value::Bool(true));
+    assert_eq!(field(&tail[1], "number"), Value::Float(2.0));
+    assert_eq!(field(&tail[2], "number"), Value::Float(7.0));
+    let values = observed(
+        "function wrap(a){\"use strict\";return a&&{child:a};}var original={s:\"payload\"};var r=wrap(original);original=null;var same=r.child.s===\"payload\";",
+        false,
+        observer::Observer {
+            reads: vec!["same".into()],
+            force_gc: true,
+            collect: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        field(values.last().expect("selected transitive alias"), "flag"),
+        Value::Bool(true)
+    );
+    let released = observed(
+        "function select(a){\"use strict\";return a&&a;}var r=select({child:{s:\"payload\"}});r=null;",
+        false,
+        observer::Observer {
+            force_gc: true,
+            collect: true,
+            stats: true,
+            ..Default::default()
+        },
+    );
+    let tail = &released[released.len() - 3..];
+    assert_eq!(
+        &tail[..2],
+        &[Value::Int(1), Value::Int(13)],
+        "only the source function node survives after the last graph alias is cleared"
+    );
+    assert!(matches!(tail[2], Value::Int(collections) if collections>0));
+    eprintln!(
+        "P5_RELEASE live_nodes={:?} occupied_node_cells={:?} collections={:?}",
+        tail[0], tail[1], tail[2]
+    );
+}
+
+#[test]
 fn strict_formal_returns_real_actual() {
     let value = run("function f(a,b){\"use strict\";return a;}f(7,9);", false);
     assert_eq!(field(&value, "tag"), Value::Int(3));

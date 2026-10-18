@@ -1,0 +1,53 @@
+{"id":"not-undefined","source":"!undefined;","expect":true}
+{"id":"not-null","source":"!null;","expect":true}
+{"id":"not-false","source":"!false;","expect":true}
+{"id":"not-true","source":"!true;","expect":false}
+{"id":"not-zero","source":"!0;","expect":true}
+{"id":"not-negative-zero","source":"!-0;","expect":true}
+{"id":"not-nan","source":"!(0/0);","expect":true}
+{"id":"not-positive-infinity","source":"!(1/0);","expect":false}
+{"id":"not-negative-infinity","source":"!(-1/0);","expect":false}
+{"id":"not-negative-number","source":"!-7;","expect":false}
+{"id":"not-empty-string","source":"var s=''; !s;","expect":true}
+{"id":"not-ascii-string","source":"var s='a'; !s;","expect":false}
+{"id":"not-nul-string","source":"var s='\\u0000'; !s;","expect":false}
+{"id":"not-lone-surrogate","source":"var s='\\uD800'; !s;","expect":false}
+{"id":"not-array","source":"![];","expect":false}
+{"id":"not-object","source":"!{};","expect":false}
+{"id":"not-function","source":"function f(){'use strict';} !f;","expect":false}
+{"id":"or-left-number","source":"1 || 7;","expect":1}
+{"id":"and-left-zero","source":"0 && 7;","expect":0}
+{"id":"and-left-negative-zero","source":"-0 && 7;","expect":"-0"}
+{"id":"and-left-nan","source":"(0/0) && 7;","expect":"NaN"}
+{"id":"or-right-infinity","source":"0 || (1/0);","expect":"Infinity"}
+{"id":"or-left-negative-infinity","source":"(-1/0) || 7;","expect":"-Infinity"}
+{"id":"or-left-undefined-and-null","source":"(undefined && 7) === undefined;","expect":true}
+{"id":"and-left-null","source":"(null && 7) === null;","expect":true}
+{"id":"skipped-assignment","source":"var x=0; false && (x=1); x;","expect":0}
+{"id":"selected-assignment","source":"var x=0; true && (x=7); x;","expect":7}
+{"id":"left-once","source":"var x=0; (x=x+1) || (x=x+2); x;","expect":1}
+{"id":"left-before-right","source":"var x=0; (x=x+1) && (x=x+2); x;","expect":3}
+{"id":"saved-left-overwritten-binding","source":"var x=1; var r=x && (x=2); r;","expect":2}
+{"id":"left-assignment-unconditional","source":"var x=0; !(x=7); x;","expect":7}
+{"id":"nested-order","source":"var x=0; ((x=x+1) && (x=x+2)) || (x=x+4); x;","expect":3}
+{"id":"chained-operands","source":"0 || 2 && 3 || 4;","expect":3}
+{"id":"member-false","source":"var o={a:false}; !o.a;","expect":true}
+{"id":"member-true","source":"var o={a:true}; !o.a;","expect":false}
+{"id":"member-empty-string","source":"var o={a:''}; !o.a;","expect":true}
+{"id":"member-zero","source":"var o={a:0}; !o.a;","expect":true}
+{"id":"call-false","source":"function f(){'use strict';return false;} !f();","expect":true}
+{"id":"call-true","source":"function f(){'use strict';return true;} !f();","expect":false}
+{"id":"formal-false","source":"function f(x){'use strict';return !x;} f(false);","expect":true}
+{"id":"formal-empty-string","source":"function f(x){'use strict';return !x;} f('');","expect":true}
+{"id":"formal-number","source":"function f(x){'use strict';return !x;} f(2);","expect":false}
+{"id":"object-identity","source":"var o={a:1}; var r=o || {}; r===o;","expect":true}
+{"id":"array-identity","source":"var a=[1]; var r=a || []; r===a;","expect":true}
+{"id":"function-identity","source":"function f(a,b){'use strict';return a;} var r=f || f; r===f;","expect":true}
+{"id":"function-length-selected","source":"function f(a,b){'use strict';return a;} var r=f || f; r.length;","expect":2}
+{"id":"string-contents-selected","source":"var s='\\uD800\\u0000'; (s || 'replacement') === s;","expect":true}
+{"id":"skipped-typeof-cache","source":"var x=1; false && typeof x; typeof x === 'number';","expect":true}
+{"id":"skipped-or-typeof-cache","source":"var x=1; true || typeof x; typeof x === 'number';","expect":true}
+{"id":"nested-typeof-cache","source":"var x=1; false && (true && typeof x); typeof x === 'number';","expect":true}
+{"id":"selected-typeof-cache","source":"var x=1; var s=true && typeof x; typeof x === s;","expect":true}
+{"id":"unchanged-array-length","source":"var a=[1]; true && (a=[7]); a[0];","expect":7}
+{"id":"left-typeof-cache-unconditional","source":"var x=1; (typeof x) || (typeof x); typeof x === 'number';","expect":true}

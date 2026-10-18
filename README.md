@@ -100,6 +100,17 @@ var result = alias(7, 9, 11); // 7; alias.length is 2
 var missing = first();       // undefined
 ```
 
+P5-A adds runtime truthiness for `!`, `&&` and `||` over the currently
+representable primitives, strings, arrays, plain objects and functions.
+Logical operators evaluate the left operand once, skip an unselected right
+operand, and return the original selected boxed value. Scalars remain
+heap-free when their source needs no realm. Conditional assignments merge
+kind and exact array-length facts conservatively; later numeric, callable
+or indexed operations may therefore receive a profile refusal even when
+one branch is a constant. String truthiness reads checked UTF-16 length,
+without coercion or user callbacks. This slice does not add `?:`, coercive
+arithmetic/equality, general statement conditions, or JavaScript exceptions.
+
 Each function and call is limited to 64 formals and 64 actuals respectively.
 Existing bounds remain 256 source functions, 65536 initialization cells,
 and 8192 active roots. The typed Core argument vector is separately bounded

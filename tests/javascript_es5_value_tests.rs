@@ -266,6 +266,31 @@ fn field(map: &Value, key: &str) -> Value {
 }
 
 #[test]
+fn p5_red_runtime_truthiness_scalars() {
+    assert_eq!(run_unboxed("!undefined;"), Value::Bool(true));
+    assert_eq!(run_unboxed("!null;"), Value::Bool(true));
+    assert_eq!(run_unboxed("!false;"), Value::Bool(true));
+    assert_eq!(run_unboxed("!true;"), Value::Bool(false));
+    assert_eq!(run_unboxed("!-0;"), Value::Bool(true));
+    assert_eq!(run_unboxed("!(0/0);"), Value::Bool(true));
+    assert_eq!(run_unboxed("!(1/0);"), Value::Bool(false));
+}
+
+#[test]
+fn p5_red_short_circuit_preserves_operand_and_side_effects() {
+    assert_eq!(run_unboxed("1 || 7;"), Value::Float(1.0));
+    assert_eq!(run_unboxed("0 && 7;"), Value::Float(0.0));
+    assert_eq!(
+        run_unboxed("var x=0; false && (x=1); x;"),
+        Value::Float(0.0)
+    );
+    assert_eq!(
+        run_unboxed("var x=0; (x=x+1) || (x=x+2); x;"),
+        Value::Float(1.0)
+    );
+}
+
+#[test]
 fn p2_immediate_undefined_and_null_tags_differ() {
     let undefined = boxed_map(run_boxed("undefined;"));
     let null = boxed_map(run_boxed("null;"));
