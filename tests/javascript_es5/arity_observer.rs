@@ -9,6 +9,9 @@ pub struct Observer {
     pub collect: bool,
     pub force_gc: bool,
     pub stats: bool,
+    /// Push each source-call Completion kind/has_value from the real call
+    /// block. Default off so existing tails stay unchanged.
+    pub completion: bool,
 }
 
 fn error(message: &str) -> ParseError {
@@ -208,6 +211,9 @@ impl SourcePlugin for Observer {
                 });
             }
         }
+        if self.completion {
+            probe_completion(&mut ir.stmts);
+        }
         if self.stats {
             let c = carrier(&ir)?;
             let observe = helper(&ir, "__compat_es5_heap_observe")?;
@@ -230,5 +236,67 @@ impl SourcePlugin for Observer {
             }
         }
         Ok(ir)
+    }
+}
+
+fn probe_completion(stmts: &mut Vec<Stmt>) {
+    let mut index = 0;
+    while index < stmts.len() {
+        let slot = match &stmts[index] {
+            Stmt::Let {
+                index: slot,
+                declared_schema: Some(TypeSchema::Named(name, _)),
+                ..
+            } if name == "__CompatEs5Completion" => Some(*slot),
+            _ => None,
+        };
+        if let Some(slot) = slot {
+            stmts.insert(
+                index + 1,
+                Stmt::Expr {
+                    expr: field(slot, "has_value"),
+                    line: 1,
+                },
+            );
+            stmts.insert(
+                index + 1,
+                Stmt::Expr {
+                    expr: field(slot, "kind"),
+                    line: 1,
+                },
+            );
+            index += 3;
+            continue;
+        }
+        match &mut stmts[index] {
+            Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => {
+                probe_expr(expr);
+            }
+            Stmt::IfElse {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                probe_completion(then_branch);
+                probe_completion(else_branch);
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+}
+
+fn probe_expr(expr: &mut Expr) {
+    match expr {
+        Expr::Block { stmts, expr } => {
+            probe_completion(stmts);
+            probe_expr(expr);
+        }
+        Expr::Call(_, _, args, _, _) => {
+            for arg in args {
+                probe_expr(arg);
+            }
+        }
+        _ => {}
     }
 }

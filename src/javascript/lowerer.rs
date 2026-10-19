@@ -10,6 +10,8 @@
 //! evaluator, no source substring matching.
 use super::heap as layout;
 use super::prelude::heap as heap_emitters;
+use super::prelude::undefined_box;
+use super::prelude::utf16_init;
 use super::prelude::values as value_emitters;
 use super::reference;
 use super::representation as value;
@@ -164,6 +166,10 @@ pub(super) struct Lowerer<'a> {
     pub(super) binding_slots: HashMap<scope::BindingId, u16>,
     pub(super) binding_kinds: HashMap<scope::BindingId, Kind>,
     pub(super) type_names: Option<reference::TypeNames>,
+    /// Compiler-global UTF-16 initializer pool. Not saved around nested
+    /// source functions: identical unit sequences share one helper across
+    /// every activation in this compilation.
+    pub(crate) utf16_inits: utf16_init::Utf16InitPool,
 }
 
 impl Lowerer<'_> {
@@ -550,7 +556,7 @@ impl Lowerer<'_> {
     }
 
     /// Emit one consumed numeric cell write through the realm write helper.
-    fn emit_cell_write(
+    pub(super) fn emit_cell_write(
         &mut self,
         carrier: u16,
         addr: Expr,
@@ -1361,23 +1367,22 @@ impl Lowerer<'_> {
         let line = self.line(span);
         let newborn =
             self.begin_node(carrier, count, layout::KIND_STRING, span, line, statements)?;
-        self.emit_cell_write(
-            carrier,
-            Expr::Add(Box::new(Expr::Var(newborn.base)), Box::new(Expr::Int(2))),
-            Self::as_number(Expr::Int(length)),
-            span,
-            line,
-            statements,
-        )?;
-        for (position, unit) in units.iter().enumerate() {
-            let offset = layout::STRING_HEADER_CELLS + position as i64;
-            self.emit_cell_write(
+        if let Some(helper) = utf16_init::intern(&mut self.utf16_inits, units) {
+            // Consume the raw-base result in a typed Let. The call is not a
+            // Stmt::Expr, so a surrounding branch does not leave a stack value.
+            let returned = self.slot(span)?;
+            statements.push(Stmt::Let {
+                index: returned,
+                declared_schema: Some(TypeSchema::Int),
+                expr: Self::guest_call(helper, vec![Expr::Var(carrier), Expr::Var(newborn.base)]),
+                line,
+            });
+        } else {
+            utf16_init::emit_initializer_writes(
+                self,
                 carrier,
-                Expr::Add(
-                    Box::new(Expr::Var(newborn.base)),
-                    Box::new(Expr::Int(offset)),
-                ),
-                Self::as_number(Expr::Int(i64::from(*unit))),
+                newborn.base,
+                units,
                 span,
                 line,
                 statements,
@@ -1745,10 +1750,13 @@ pub(super) fn lower(
     context: &SourceFrontendContext<'_>,
 ) -> Result<FrontendIr, ParseError> {
     let heap_needed = script.body.iter().any(stmt_needs_heap);
-    if !heap_needed {
-        return lower_primitive(script, source, source_id, base);
-    }
-    lower_with_realm(script, source, source_id, base, context)
+    let mut ir = if !heap_needed {
+        lower_primitive(script, source, source_id, base)?
+    } else {
+        lower_with_realm(script, source, source_id, base, context)?
+    };
+    undefined_box::factor(&mut ir);
+    Ok(ir)
 }
 
 fn member_key_is_integer_literal(expression: &ast::Expr) -> bool {
@@ -1838,6 +1846,7 @@ fn lower_primitive(
         binding_slots: HashMap::new(),
         binding_kinds: HashMap::new(),
         type_names: None,
+        utf16_inits: utf16_init::Utf16InitPool::default(),
     };
     lower.active_scope = lower.graph.script;
     let mut statements = Vec::new();
@@ -2194,6 +2203,7 @@ fn lower_with_realm(
         binding_slots: HashMap::new(),
         binding_kinds: HashMap::new(),
         type_names: None,
+        utf16_inits: utf16_init::Utf16InitPool::default(),
     };
     lower.active_scope = lower.graph.script;
     let script_strict = lower.script_strict(script);
@@ -2317,6 +2327,12 @@ fn lower_with_realm(
             .checked_add(function_count as u16)
             .ok_or_else(|| lower.error(probe_span, "JS dispatch index space exhausted"))?;
         lower.helper_dispatch = Some(dispatch_index);
+        utf16_init::arm(
+            &mut lower.utf16_inits,
+            dispatch_index.checked_add(1),
+            helper_write,
+            carrier_schema.clone(),
+        );
         let collected = std::mem::take(&mut lower.collected_functions);
         for (position, item) in collected.iter().enumerate() {
             append_source_function(
@@ -2344,6 +2360,21 @@ fn lower_with_realm(
             )?;
             debug_assert_eq!(dispatch, dispatch_index);
         }
+    }
+    if !lower.utf16_inits.is_armed() {
+        let first = base_ir
+            .functions
+            .iter()
+            .map(|function| function.index)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1);
+        utf16_init::arm(
+            &mut lower.utf16_inits,
+            first,
+            helper_write,
+            carrier_schema.clone(),
+        );
     }
     // Script activation frame: reserve the frame slot, lower the body into
     // a side buffer under a fresh root scope, then prefix frame entry with
@@ -2374,7 +2405,16 @@ fn lower_with_realm(
         ),
         line,
     });
+    let body_len = body.len();
     statements.extend(body);
+    let frame_at = statements.len() - body_len - 1;
+    utf16_init::append_declarations(
+        &mut lower,
+        &mut base_ir,
+        &mut statements,
+        frame_at,
+        probe_span,
+    )?;
     base_ir.stmts.extend(statements);
     base_ir.locals = usize::from(lower.next_slot);
     base_ir.local_bindings.extend(lower.source_bindings);
@@ -2866,7 +2906,7 @@ pub(super) fn lower_member_write_stmt(
     right: &ast::Expr,
     span: swc_common::Span,
     statements: &mut Vec<Stmt>,
-) -> Result<(), ParseError> {
+) -> Result<u16, ParseError> {
     let kind = match member.obj.as_ref() {
         ast::Expr::Ident(object) => lower
             .bindings
@@ -2983,5 +3023,5 @@ pub(super) fn lower_member_write_stmt(
         value_roots.push(value_slot);
     }
     reference::release_consumed_roots(lower, &value_roots, slot, span, statements)?;
-    Ok(())
+    Ok(value_slot)
 }

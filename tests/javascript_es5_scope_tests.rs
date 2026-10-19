@@ -853,11 +853,9 @@ fn outer_binding_is_p4_not_a_copied_local() {
 
 #[test]
 fn nonliteral_if_and_exceptions_stay_outside_this_profile() {
-    let if_text = must_refuse("if(1){var x=1;}");
-    assert!(
-        !if_text.contains("ReferenceError"),
-        "non-literal if must not invent an exception result: {if_text}"
-    );
+    // P6-A admits non-literal if. The old scope refusal is obsolete; branch
+    // behavior is covered by javascript_es5_control_flow_tests.
+    compile_text("if(1){var x=1;}").expect("runtime if is admitted");
     let _throw = must_refuse("throw 1;");
     let _catch = must_refuse("try{throw 1;}catch(e){e;}");
 }
@@ -1727,7 +1725,26 @@ fn address02_i_typeof_fresh_string_and_operand_release() {
     expect_released_like(fresh, REALM_BASELINE);
     let operand = "var t=typeof {};t=null;";
     read_string("var t=typeof {};", "t", "object");
-    expect_released_like(operand, "var t=typeof 1;t=null;");
+    // Static proven path has one cache string; dynamic path six. This baseline
+    // isolates managed object operand release without adding a managed operand.
+    // Occupied cells are the raw block: 3-cell raw header + 3-cell string header
+    // + UTF-16 units. "number" is 12. Six names
+    // undefined/object/boolean/number/string/function are 15+12+13+12+12+14 = 78.
+    let sparse = "var t=typeof 1;t=null;";
+    assert_eq!(
+        post_collect_accounting(sparse),
+        (1, 12),
+        "static proven typeof 1 retains one cache string"
+    );
+    let dynamic_value = "var n=1;var c=0;if(c){n=true;}var t=typeof n;";
+    read_string(dynamic_value, "t", "number");
+    let dynamic = "var n=1;var c=0;if(c){n=true;}var t=typeof n;t=null;";
+    assert_eq!(
+        post_collect_accounting(dynamic),
+        (6, 78),
+        "dynamic primitive typeof retains six cache strings and no managed operand"
+    );
+    expect_released_like(operand, dynamic);
 }
 
 #[test]

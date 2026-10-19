@@ -14,14 +14,14 @@ use super::lowerer::{Kind, Lowered, Lowerer};
 use super::representation as value;
 use super::scope::{BindingId, ScopeId};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub(super) struct TypeNames {
-    pub undefined: u16,
-    pub object: u16,
-    pub boolean: u16,
-    pub number: u16,
-    pub string: u16,
-    pub function: u16,
+    pub undefined: Option<u16>,
+    pub object: Option<u16>,
+    pub boolean: Option<u16>,
+    pub number: Option<u16>,
+    pub string: Option<u16>,
+    pub function: Option<u16>,
 }
 
 pub(super) enum NameHit {
@@ -160,17 +160,30 @@ pub(super) fn lower_typeof(
     let mut operand_roots = operand.owned_roots;
     let (value_slot, mut bound) = lower.bind_evaluation(operand.expr, operand.kind, unary.span)?;
     stmts.append(&mut bound);
+    if let Some(text) = proven_es5_name(operand.kind) {
+        let name = ensure_type_name(lower, text, unary.span, &mut stmts)?;
+        let result = copy_cached_name(lower, name, unary.span, &mut stmts)?;
+        if lower.has_root(value_slot) {
+            operand_roots.push(value_slot);
+        }
+        release_consumed_roots(lower, &operand_roots, result, unary.span, &mut stmts)?;
+        return Ok(Lowered {
+            expr: Expr::Block {
+                stmts,
+                expr: Box::new(Expr::Var(result)),
+            },
+            kind: Kind::String,
+            array_length: None,
+            owned_roots: vec![result],
+        });
+    }
     ensure_type_names(lower, unary.span, &mut stmts)?;
-    let names = lower
-        .type_names
-        .as_ref()
-        .ok_or_else(|| lower.error(unary.span, "P3 typeof type-name cache was not installed"))?;
-    let undefined_name = names.undefined;
-    let object_name = names.object;
-    let boolean_name = names.boolean;
-    let number_name = names.number;
-    let string_name = names.string;
-    let function_name = names.function;
+    let undefined_name = require_type_name(lower, "undefined", unary.span)?;
+    let object_name = require_type_name(lower, "object", unary.span)?;
+    let boolean_name = require_type_name(lower, "boolean", unary.span)?;
+    let number_name = require_type_name(lower, "number", unary.span)?;
+    let string_name = require_type_name(lower, "string", unary.span)?;
+    let function_name = require_type_name(lower, "function", unary.span)?;
     let line = lower.line(unary.span);
     let result = lower.slot(unary.span)?;
     stmts.push(Stmt::Let {
@@ -317,7 +330,23 @@ pub(super) fn lower_script_statements(
     lower.active_scope = scope;
     validate_statements(lower, statements)?;
     instantiate(lower, scope, out)?;
-    lower_stmt_list(lower, statements, out, false)
+    if needs_script_completion(statements) {
+        let span = statements[0].span();
+        let tail = alloc_script_tail(lower, span, out)?;
+        lower_script_list(lower, statements, out, &tail)?;
+        let line = lower.line(span);
+        out.push(Stmt::Expr {
+            expr: Expr::Var(tail.present),
+            line,
+        });
+        out.push(Stmt::Expr {
+            expr: Expr::Var(tail.value),
+            line,
+        });
+        Ok(())
+    } else {
+        lower_stmt_list(lower, statements, out, false)
+    }
 }
 
 pub(super) fn lower_function_body(
@@ -327,6 +356,9 @@ pub(super) fn lower_function_body(
 ) -> Result<Option<Expr>, ParseError> {
     validate_statements(lower, statements)?;
     instantiate(lower, lower.active_scope, out)?;
+    if use_control(statements) {
+        return Ok(Some(lower_function_controlled(lower, statements, out)?));
+    }
     let mut completion = None;
     let mut stopped = false;
     let mut in_prologue = true;
@@ -358,7 +390,7 @@ pub(super) fn lower_function_body(
             }
             continue;
         }
-        lower_one(lower, statement, out, true)?;
+        lower_one(lower, statement, out, true, true)?;
     }
     Ok(completion)
 }
@@ -492,7 +524,7 @@ fn lower_stmt_list(
         {
             continue;
         }
-        lower_one(lower, statement, out, in_function)?;
+        lower_one(lower, statement, out, in_function, true)?;
     }
     Ok(())
 }
@@ -502,13 +534,16 @@ fn lower_one(
     statement: &ast::Stmt,
     out: &mut Vec<Stmt>,
     in_function: bool,
+    push_expr: bool,
 ) -> Result<(), ParseError> {
     match statement {
         ast::Stmt::Decl(ast::Decl::Var(declaration)) => lower_var(lower, declaration, out),
         ast::Stmt::Decl(ast::Decl::Fn(_)) => Ok(()),
         ast::Stmt::Block(block) => lower_stmt_list(lower, &block.stmts, out, in_function),
-        ast::Stmt::If(if_stmt) => lower_declaration_if(lower, if_stmt, out, in_function),
-        ast::Stmt::Expr(expr) => lower_expr_stmt(lower, expr, out),
+        ast::Stmt::If(if_stmt) if is_declaration_only_if(if_stmt) => {
+            lower_declaration_if(lower, if_stmt, out, in_function, push_expr)
+        }
+        ast::Stmt::Expr(expr) => lower_expr_stmt(lower, expr, out, push_expr).map(|_| ()),
         ast::Stmt::Empty(_) => Ok(()),
         ast::Stmt::Return(_) if in_function => Err(lower.error(
             statement.span(),
@@ -564,6 +599,7 @@ fn lower_declaration_if(
     if_stmt: &ast::IfStmt,
     out: &mut Vec<Stmt>,
     in_function: bool,
+    push_expr: bool,
 ) -> Result<(), ParseError> {
     if !is_declaration_only_if(if_stmt) {
         return Err(lower.error(
@@ -577,43 +613,439 @@ fn lower_declaration_if(
         None => None,
     };
     if let Some(arm) = selected {
-        lower_one(lower, arm, out, in_function)?;
+        lower_one(lower, arm, out, in_function, push_expr)?;
     }
     Ok(())
+}
+
+struct ScriptTail {
+    present: u16,
+    value: u16,
+}
+
+struct FunctionTail {
+    returned: u16,
+    completion: u16,
+}
+
+fn assign(index: u16, expr: Expr, line: u32) -> Stmt {
+    Stmt::Assign {
+        kind: vm::AssignmentKind::Set,
+        index,
+        expr,
+        line,
+    }
+}
+
+fn alloc_script_tail(
+    lower: &mut Lowerer<'_>,
+    span: swc_common::Span,
+    out: &mut Vec<Stmt>,
+) -> Result<ScriptTail, ParseError> {
+    let present = lower.slot(span)?;
+    let line = lower.line(span);
+    out.push(Stmt::Let {
+        index: present,
+        declared_schema: Some(TypeSchema::Bool),
+        expr: Expr::Bool(false),
+        line,
+    });
+    let (value, mut bound) = lower.bind_temp(value::undefined(), span)?;
+    out.append(&mut bound);
+    Ok(ScriptTail { present, value })
+}
+
+fn note_value(
+    lower: &mut Lowerer<'_>,
+    tail: &ScriptTail,
+    slot: u16,
+    span: swc_common::Span,
+    out: &mut Vec<Stmt>,
+) -> Result<(), ParseError> {
+    let line = lower.line(span);
+    out.push(assign(tail.value, Expr::Var(slot), line));
+    lower.refresh_root(tail.value, span, out)?;
+    out.push(assign(tail.present, Expr::Bool(true), line));
+    Ok(())
+}
+
+fn copy_if_present(
+    lower: &mut Lowerer<'_>,
+    from: &ScriptTail,
+    to: &ScriptTail,
+    span: swc_common::Span,
+    out: &mut Vec<Stmt>,
+) -> Result<(), ParseError> {
+    let line = lower.line(span);
+    let mut then_branch = vec![
+        assign(to.value, Expr::Var(from.value), line),
+        assign(to.present, Expr::Bool(true), line),
+    ];
+    lower.refresh_root(to.value, span, &mut then_branch)?;
+    out.push(Stmt::IfElse {
+        condition: Expr::Var(from.present),
+        then_branch,
+        else_branch: Vec::new(),
+        line,
+    });
+    Ok(())
+}
+
+fn lower_script_list(
+    lower: &mut Lowerer<'_>,
+    statements: &[ast::Stmt],
+    out: &mut Vec<Stmt>,
+    tail: &ScriptTail,
+) -> Result<(), ParseError> {
+    for statement in statements {
+        if let ast::Stmt::Expr(expr) = statement
+            && let ast::Expr::Lit(ast::Lit::Str(literal)) = expr.expr.as_ref()
+            && lower.is_exact_use_strict_lexeme(literal.span)
+        {
+            continue;
+        }
+        lower_script_one(lower, statement, out, tail)?;
+    }
+    Ok(())
+}
+
+fn lower_script_one(
+    lower: &mut Lowerer<'_>,
+    statement: &ast::Stmt,
+    out: &mut Vec<Stmt>,
+    tail: &ScriptTail,
+) -> Result<(), ParseError> {
+    match statement {
+        ast::Stmt::If(if_stmt) if !is_declaration_only_if(if_stmt) => {
+            lower_runtime_if_script(lower, if_stmt, out, tail)
+        }
+        ast::Stmt::Block(block) => {
+            let inner = alloc_script_tail(lower, block.span, out)?;
+            lower_script_list(lower, &block.stmts, out, &inner)?;
+            copy_if_present(lower, &inner, tail, block.span, out)
+        }
+        ast::Stmt::Expr(expr) => {
+            if let Some(slot) = lower_expr_stmt(lower, expr, out, false)? {
+                note_value(lower, tail, slot, expr.span, out)?;
+            }
+            Ok(())
+        }
+        other => lower_one(lower, other, out, false, false),
+    }
+}
+
+fn lower_runtime_if_script(
+    lower: &mut Lowerer<'_>,
+    if_stmt: &ast::IfStmt,
+    out: &mut Vec<Stmt>,
+    outer: &ScriptTail,
+) -> Result<(), ParseError> {
+    let (flag, mut condition) = lower.condition_flag(&if_stmt.test)?;
+    out.append(&mut condition);
+    let incoming_names = lower.type_names;
+    let before = super::lowerer::expression::BranchFacts::save(lower);
+    let then_tail = alloc_script_tail(lower, if_stmt.cons.span(), out)?;
+    let mut then_branch = Vec::new();
+    lower_script_one(lower, &if_stmt.cons, &mut then_branch, &then_tail)?;
+    let then_facts = super::lowerer::expression::BranchFacts::save(lower);
+    before.restore(lower);
+    lower.type_names = incoming_names;
+    let else_span = if_stmt
+        .alt
+        .as_ref()
+        .map(|alt| alt.span())
+        .unwrap_or(if_stmt.span);
+    let else_tail = alloc_script_tail(lower, else_span, out)?;
+    let mut else_branch = Vec::new();
+    if let Some(alt) = &if_stmt.alt {
+        lower_script_one(lower, alt, &mut else_branch, &else_tail)?;
+    }
+    then_facts.merge(lower);
+    lower.type_names = incoming_names;
+    let line = lower.line(if_stmt.span);
+    out.push(Stmt::IfElse {
+        condition: Expr::Var(flag),
+        then_branch,
+        else_branch,
+        line,
+    });
+    let mut take_then = Vec::new();
+    copy_if_present(lower, &then_tail, outer, if_stmt.span, &mut take_then)?;
+    let mut take_else = Vec::new();
+    copy_if_present(lower, &else_tail, outer, if_stmt.span, &mut take_else)?;
+    out.push(Stmt::IfElse {
+        condition: Expr::Var(flag),
+        then_branch: take_then,
+        else_branch: take_else,
+        line,
+    });
+    Ok(())
+}
+
+fn lower_function_controlled(
+    lower: &mut Lowerer<'_>,
+    statements: &[ast::Stmt],
+    out: &mut Vec<Stmt>,
+) -> Result<Expr, ParseError> {
+    let Some(span) = statements.first().map(|statement| statement.span()) else {
+        return Ok(value::completion_normal());
+    };
+    let returned = lower.slot(span)?;
+    let line = lower.line(span);
+    out.push(Stmt::Let {
+        index: returned,
+        declared_schema: Some(TypeSchema::Bool),
+        expr: Expr::Bool(false),
+        line,
+    });
+    let completion = lower.slot(span)?;
+    out.push(Stmt::Let {
+        index: completion,
+        declared_schema: Some(value::completion_schema()),
+        expr: value::completion_normal(),
+        line,
+    });
+    let tail = FunctionTail {
+        returned,
+        completion,
+    };
+    lower_function_list(lower, statements, out, &tail)?;
+    Ok(Expr::Var(completion))
+}
+
+fn lower_function_list(
+    lower: &mut Lowerer<'_>,
+    statements: &[ast::Stmt],
+    out: &mut Vec<Stmt>,
+    tail: &FunctionTail,
+) -> Result<(), ParseError> {
+    let mut in_prologue = true;
+    for statement in statements {
+        if in_prologue
+            && let ast::Stmt::Expr(expr) = statement
+            && matches!(expr.expr.as_ref(), ast::Expr::Lit(ast::Lit::Str(_)))
+        {
+            continue;
+        }
+        in_prologue = false;
+        let mut inner = Vec::new();
+        let incoming_names = lower.type_names;
+        lower_function_one(lower, statement, &mut inner, tail)?;
+        out.push(Stmt::IfElse {
+            condition: Expr::Var(tail.returned),
+            then_branch: Vec::new(),
+            else_branch: inner,
+            line: lower.line(statement.span()),
+        });
+        lower.type_names = incoming_names;
+    }
+    Ok(())
+}
+
+fn lower_function_one(
+    lower: &mut Lowerer<'_>,
+    statement: &ast::Stmt,
+    out: &mut Vec<Stmt>,
+    tail: &FunctionTail,
+) -> Result<(), ParseError> {
+    match statement {
+        ast::Stmt::Return(ret) => lower_controlled_return(lower, ret, out, tail),
+        ast::Stmt::If(if_stmt) if !is_declaration_only_if(if_stmt) => {
+            lower_runtime_if_function(lower, if_stmt, out, tail)
+        }
+        ast::Stmt::Block(block) => lower_function_list(lower, &block.stmts, out, tail),
+        other => lower_one(lower, other, out, true, false),
+    }
+}
+
+fn lower_controlled_return(
+    lower: &mut Lowerer<'_>,
+    ret: &ast::ReturnStmt,
+    out: &mut Vec<Stmt>,
+    tail: &FunctionTail,
+) -> Result<(), ParseError> {
+    let value = match ret.arg.as_deref() {
+        Some(arg) => {
+            let lowered = lower.expr(arg)?;
+            let (slot, mut bound) = lower.bind_temp(lowered.expr, ret.span)?;
+            out.append(&mut bound);
+            Expr::Var(slot)
+        }
+        None => value::undefined(),
+    };
+    let record = lower.slot(ret.span)?;
+    let line = lower.line(ret.span);
+    out.push(Stmt::Let {
+        index: record,
+        declared_schema: Some(value::completion_schema()),
+        expr: value::completion_return(value),
+        line,
+    });
+    out.push(assign(tail.completion, Expr::Var(record), line));
+    out.push(assign(tail.returned, Expr::Bool(true), line));
+    Ok(())
+}
+
+fn lower_runtime_if_function(
+    lower: &mut Lowerer<'_>,
+    if_stmt: &ast::IfStmt,
+    out: &mut Vec<Stmt>,
+    tail: &FunctionTail,
+) -> Result<(), ParseError> {
+    let (flag, mut condition) = lower.condition_flag(&if_stmt.test)?;
+    out.append(&mut condition);
+    let incoming_names = lower.type_names;
+    let before = super::lowerer::expression::BranchFacts::save(lower);
+    let mut then_branch = Vec::new();
+    lower_function_one(lower, &if_stmt.cons, &mut then_branch, tail)?;
+    let then_facts = super::lowerer::expression::BranchFacts::save(lower);
+    before.restore(lower);
+    lower.type_names = incoming_names;
+    let mut else_branch = Vec::new();
+    if let Some(alt) = &if_stmt.alt {
+        lower_function_one(lower, alt, &mut else_branch, tail)?;
+    }
+    then_facts.merge(lower);
+    lower.type_names = incoming_names;
+    out.push(Stmt::IfElse {
+        condition: Expr::Var(flag),
+        then_branch,
+        else_branch,
+        line: lower.line(if_stmt.span),
+    });
+    Ok(())
+}
+
+fn needs_script_completion(statements: &[ast::Stmt]) -> bool {
+    statements.iter().any(stmt_needs_script_completion)
+}
+
+fn stmt_needs_script_completion(statement: &ast::Stmt) -> bool {
+    match statement {
+        ast::Stmt::If(_) | ast::Stmt::Empty(_) => true,
+        ast::Stmt::Block(block) => {
+            block.stmts.is_empty() || block.stmts.iter().any(stmt_needs_script_completion)
+        }
+        ast::Stmt::Decl(ast::Decl::Var(declaration)) => {
+            declaration.decls.iter().any(|decl| decl.init.is_none())
+        }
+        _ => false,
+    }
+}
+
+fn contains_general_if(statements: &[ast::Stmt]) -> bool {
+    statements.iter().any(stmt_has_general_if)
+}
+
+fn stmt_has_general_if(statement: &ast::Stmt) -> bool {
+    match statement {
+        ast::Stmt::If(if_stmt) => {
+            !is_declaration_only_if(if_stmt)
+                || stmt_has_general_if(&if_stmt.cons)
+                || if_stmt.alt.as_deref().is_some_and(stmt_has_general_if)
+        }
+        ast::Stmt::Block(block) => block.stmts.iter().any(stmt_has_general_if),
+        _ => false,
+    }
+}
+
+fn use_control(statements: &[ast::Stmt]) -> bool {
+    contains_general_if(statements) || !legacy_return_shape(statements)
+}
+
+fn legacy_return_shape(statements: &[ast::Stmt]) -> bool {
+    let mut seen_return = false;
+    for statement in statements {
+        if seen_return {
+            if !skippable_after_return(statement) {
+                return false;
+            }
+            continue;
+        }
+        if matches!(statement, ast::Stmt::Return(_)) {
+            seen_return = true;
+            continue;
+        }
+        if contains_return(statement) {
+            return false;
+        }
+    }
+    true
+}
+
+fn contains_return(statement: &ast::Stmt) -> bool {
+    match statement {
+        ast::Stmt::Return(_) => true,
+        ast::Stmt::Block(block) => block.stmts.iter().any(contains_return),
+        ast::Stmt::If(if_stmt) => {
+            contains_return(&if_stmt.cons) || if_stmt.alt.as_deref().is_some_and(contains_return)
+        }
+        _ => false,
+    }
+}
+
+fn join_profile(left: &ProfileFacts, right: &ProfileFacts) -> ProfileFacts {
+    let mut joined = left.clone();
+    for (id, right_fact) in right {
+        let left_fact = joined
+            .get(id)
+            .copied()
+            .unwrap_or_else(|| ProfileFact::scalar(Kind::Dynamic));
+        let kind = super::lowerer::expression::join_kind(left_fact.kind, right_fact.kind);
+        joined.insert(
+            *id,
+            ProfileFact {
+                kind,
+                array_length: super::lowerer::expression::join_length(
+                    kind,
+                    left_fact.array_length,
+                    right_fact.array_length,
+                ),
+            },
+        );
+    }
+    joined
 }
 
 fn lower_expr_stmt(
     lower: &mut Lowerer<'_>,
     expr: &ast::ExprStmt,
     out: &mut Vec<Stmt>,
-) -> Result<(), ParseError> {
+    push: bool,
+) -> Result<Option<u16>, ParseError> {
     if let ast::Expr::Assign(assign) = expr.expr.as_ref()
         && assign.op == ast::AssignOp::Assign
         && let ast::AssignTarget::Simple(ast::SimpleAssignTarget::Member(member)) = &assign.left
     {
-        super::lowerer::lower_member_write_stmt(lower, member, &assign.right, expr.span, out)?;
-        return Ok(());
+        let slot =
+            super::lowerer::lower_member_write_stmt(lower, member, &assign.right, expr.span, out)?;
+        return Ok(Some(slot));
     }
     let lowered = lower.expr(&expr.expr)?;
     if lower.root_scope.is_some() {
         let (slot, mut stmts) = lower.bind_evaluation(lowered.expr, lowered.kind, expr.span)?;
         out.append(&mut stmts);
-        out.push(Stmt::Expr {
-            expr: Expr::Var(slot),
-            line: lower.line(expr.span),
-        });
+        if push {
+            out.push(Stmt::Expr {
+                expr: Expr::Var(slot),
+                line: lower.line(expr.span),
+            });
+        }
         // The observer/result root survives; only its consumed operands are
         // released. Primitive outputs need no logical entry.
         release_consumed_roots(lower, &lowered.owned_roots, slot, expr.span, out)?;
+        Ok(Some(slot))
     } else {
         let (slot, mut stmts) = lower.bind_temp(lowered.expr, expr.span)?;
         out.append(&mut stmts);
-        out.push(Stmt::Expr {
-            expr: Expr::Var(slot),
-            line: lower.line(expr.span),
-        });
+        if push {
+            out.push(Stmt::Expr {
+                expr: Expr::Var(slot),
+                line: lower.line(expr.span),
+            });
+        }
+        Ok(Some(slot))
     }
-    Ok(())
 }
 
 fn lower_return(
@@ -716,12 +1148,17 @@ fn persistent_root(lower: &Lowerer<'_>, slot: u16) -> bool {
     let Some(names) = &lower.type_names else {
         return false;
     };
-    slot == names.undefined
-        || slot == names.object
-        || slot == names.boolean
-        || slot == names.number
-        || slot == names.string
-        || slot == names.function
+    [
+        names.undefined,
+        names.object,
+        names.boolean,
+        names.number,
+        names.string,
+        names.function,
+    ]
+    .into_iter()
+    .flatten()
+    .any(|cached| cached == slot)
 }
 
 fn unwrap_parens(expr: &ast::Expr) -> &ast::Expr {
@@ -741,28 +1178,105 @@ pub(super) fn clear_temp(
     lower.clear_root(slot, span, out)
 }
 
+fn proven_es5_name(kind: Kind) -> Option<&'static str> {
+    match kind {
+        Kind::Undefined => Some("undefined"),
+        Kind::Null => Some("object"),
+        Kind::Boolean => Some("boolean"),
+        Kind::Number => Some("number"),
+        Kind::String => Some("string"),
+        Kind::Dynamic | Kind::Array | Kind::Object | Kind::Function => None,
+    }
+}
+
+fn cached_type_name(names: &TypeNames, text: &str) -> Option<u16> {
+    match text {
+        "undefined" => names.undefined,
+        "object" => names.object,
+        "boolean" => names.boolean,
+        "number" => names.number,
+        "string" => names.string,
+        "function" => names.function,
+        _ => None,
+    }
+}
+
+fn store_type_name(names: &mut TypeNames, text: &str, slot: u16) {
+    let field = match text {
+        "undefined" => &mut names.undefined,
+        "object" => &mut names.object,
+        "boolean" => &mut names.boolean,
+        "number" => &mut names.number,
+        "string" => &mut names.string,
+        "function" => &mut names.function,
+        _ => return,
+    };
+    *field = Some(slot);
+}
+
+fn require_type_name(
+    lower: &Lowerer<'_>,
+    text: &str,
+    span: swc_common::Span,
+) -> Result<u16, ParseError> {
+    lower
+        .type_names
+        .as_ref()
+        .and_then(|names| cached_type_name(names, text))
+        .ok_or_else(|| lower.error(span, "P3 typeof type-name cache was not installed"))
+}
+
+fn copy_cached_name(
+    lower: &mut Lowerer<'_>,
+    name: u16,
+    span: swc_common::Span,
+    out: &mut Vec<Stmt>,
+) -> Result<u16, ParseError> {
+    let result = lower.slot(span)?;
+    out.push(Stmt::Let {
+        index: result,
+        declared_schema: Some(value::schema()),
+        expr: Expr::Var(name),
+        line: lower.line(span),
+    });
+    lower.refresh_root(result, span, out)?;
+    Ok(result)
+}
+
+fn ensure_type_name(
+    lower: &mut Lowerer<'_>,
+    text: &str,
+    span: swc_common::Span,
+    out: &mut Vec<Stmt>,
+) -> Result<u16, ParseError> {
+    if let Some(slot) = lower
+        .type_names
+        .as_ref()
+        .and_then(|names| cached_type_name(names, text))
+    {
+        return Ok(slot);
+    }
+    let slot = emit_type_name(lower, text, span, out)?;
+    let names = lower.type_names.get_or_insert(TypeNames::default());
+    store_type_name(names, text, slot);
+    Ok(slot)
+}
+
 fn ensure_type_names(
     lower: &mut Lowerer<'_>,
     span: swc_common::Span,
     out: &mut Vec<Stmt>,
 ) -> Result<(), ParseError> {
-    if lower.type_names.is_some() {
-        return Ok(());
+    for text in [
+        "undefined",
+        "object",
+        "boolean",
+        "number",
+        "string",
+        "function",
+    ] {
+        ensure_type_name(lower, text, span, out)?;
     }
-    let undefined = emit_type_name(lower, "undefined", span, out)?;
-    let object = emit_type_name(lower, "object", span, out)?;
-    let boolean = emit_type_name(lower, "boolean", span, out)?;
-    let number = emit_type_name(lower, "number", span, out)?;
-    let string = emit_type_name(lower, "string", span, out)?;
-    let function = emit_type_name(lower, "function", span, out)?;
-    lower.type_names = Some(TypeNames {
-        undefined,
-        object,
-        boolean,
-        number,
-        string,
-        function,
-    });
     Ok(())
 }
 
@@ -927,10 +1441,8 @@ fn validate_stmt(
                 validate_stmt(lower, alt, &mut alternate)?;
             }
             if !is_declaration_only_if(if_stmt) {
-                return Err(lower.error(
-                    if_stmt.span,
-                    "unsupported JavaScript ES5 P0 statement: general if is outside this scope",
-                ));
+                *facts = join_profile(&consequent, &alternate);
+                return Ok(());
             }
             *facts = if literal_bool(&if_stmt.test) == Some(true) {
                 consequent

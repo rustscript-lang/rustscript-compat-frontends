@@ -255,7 +255,16 @@ fn syntactic_rhs_is_validated_even_when_skipped_or_post_return() {
         refuse(source, "binary operator");
     }
     refuse("1 ? 2 : 3;", "primitive expression");
-    refuse("if(1){var x=1;}", "general if");
+    // P6-A admits this runtime if. Completion and branch behavior are in
+    // javascript_es5_control_flow_tests; this only retires the obsolete refusal.
+    vm::compile_source_with_flavor_and_options(
+        "if(1){var x=1;}",
+        javascript_es5_flavor(),
+        vm::CompileSourceFileOptions::new()
+            .with_source_plugin(&JAVASCRIPT_ES5_PLUGIN)
+            .with_host_api_catalog(reference_array_effective_catalog()),
+    )
+    .expect("runtime if is admitted");
     refuse("false && (1=='1');", "binary operator");
 }
 

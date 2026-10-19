@@ -35,6 +35,12 @@ impl Flow {
             named_lengths: lower.array_lengths.clone(),
         }
     }
+    fn restore(self, lower: &mut Lowerer<'_>) {
+        lower.binding_kinds = self.kinds;
+        lower.bindings = self.bindings;
+        lower.array_length_ids = self.lengths;
+        lower.array_lengths = self.named_lengths;
+    }
     fn merge(self, lower: &mut Lowerer<'_>) {
         for (id, right) in &mut lower.binding_kinds {
             *right = join_kind(self.kinds.get(id).copied().unwrap_or(Kind::Dynamic), *right);
@@ -59,7 +65,39 @@ impl Flow {
     }
 }
 
+/// Emission facts around one runtime conditional. Slots and roots stay
+/// monotonic; only kinds and exact lengths are restored or joined.
+pub(in crate::javascript) struct BranchFacts(Flow);
+
+impl BranchFacts {
+    pub(in crate::javascript) fn save(lower: &Lowerer<'_>) -> Self {
+        Self(Flow::save(lower))
+    }
+    pub(in crate::javascript) fn restore(self, lower: &mut Lowerer<'_>) {
+        self.0.restore(lower);
+    }
+    pub(in crate::javascript) fn merge(self, lower: &mut Lowerer<'_>) {
+        self.0.merge(lower);
+    }
+}
+
 impl Lowerer<'_> {
+    /// Evaluate a condition once and bind its ES5 ToBoolean result.
+    pub(in crate::javascript) fn condition_flag(
+        &mut self,
+        test: &ast::Expr,
+    ) -> Result<(u16, Vec<Stmt>), ParseError> {
+        let lowered = self.expr(test)?;
+        let (slot, mut stmts) = self.bind_evaluation(lowered.expr, lowered.kind, test.span())?;
+        let predicate = self.truthiness(slot, test.span())?;
+        let (flag, flag_stmt) = self.bind_typed(predicate, TypeSchema::Bool, test.span())?;
+        stmts.push(flag_stmt);
+        let mut owned = lowered.owned_roots;
+        owned.push(slot);
+        reference::release_consumed_roots(self, &owned, flag, test.span(), &mut stmts)?;
+        Ok((flag, stmts))
+    }
+
     /// The saved box is inspected by its real tag, including call/member
     /// results whose compiler Kind is deliberately broad.
     fn truthiness(&mut self, slot: u16, span: swc_common::Span) -> Result<Expr, ParseError> {

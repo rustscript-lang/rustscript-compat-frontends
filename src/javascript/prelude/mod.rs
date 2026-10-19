@@ -7,4 +7,6 @@
 //! back into source activation frames.
 
 pub(super) mod heap;
+pub(super) mod undefined_box;
+pub(super) mod utf16_init;
 pub(super) mod values;
