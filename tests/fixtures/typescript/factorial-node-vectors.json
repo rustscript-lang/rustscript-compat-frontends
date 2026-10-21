@@ -1,0 +1,73 @@
+{
+  "node": "v26.7.0",
+  "upstream_commit": "19b4ced86c99815f142d4a46a028f55487b8038a",
+  "cases": [
+    {
+      "node_input": 0,
+      "expression": "0",
+      "outcome": "return",
+      "value": 1
+    },
+    {
+      "node_input": {
+        "number": "-0"
+      },
+      "expression": "-0",
+      "outcome": "return",
+      "value": 1
+    },
+    {
+      "node_input": 1,
+      "expression": "1",
+      "outcome": "return",
+      "value": 1
+    },
+    {
+      "node_input": 6,
+      "expression": "6",
+      "outcome": "return",
+      "value": 720
+    },
+    {
+      "node_input": -1,
+      "expression": "-1",
+      "outcome": "throw",
+      "error_name": "Error",
+      "message": "only natural numbers are supported"
+    },
+    {
+      "node_input": 1.5,
+      "expression": "1.5",
+      "outcome": "throw",
+      "error_name": "Error",
+      "message": "only natural numbers are supported"
+    },
+    {
+      "node_input": {
+        "number": "NaN"
+      },
+      "expression": "Math.sqrt(-1)",
+      "outcome": "throw",
+      "error_name": "Error",
+      "message": "only natural numbers are supported"
+    },
+    {
+      "node_input": {
+        "number": "Infinity"
+      },
+      "expression": "1e308 * 10",
+      "outcome": "throw",
+      "error_name": "Error",
+      "message": "only natural numbers are supported"
+    },
+    {
+      "node_input": {
+        "number": "-Infinity"
+      },
+      "expression": "-1e308 * 10",
+      "outcome": "throw",
+      "error_name": "Error",
+      "message": "only natural numbers are supported"
+    }
+  ]
+}

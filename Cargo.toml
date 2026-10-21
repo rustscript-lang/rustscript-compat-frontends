@@ -2,7 +2,7 @@
 name = "pd-vm-compat-frontends"
 version = "0.1.0"
 edition = "2024"
-description = "JavaScript and Lua compatibility frontends for pd-vm"
+description = "TypeScript and Lua compatibility frontends for pd-vm"
 license = "MIT"
 repository = "https://github.com/rustscript-lang/rustscript-compat-frontends"
 homepage = "https://rustscript.org/"
@@ -15,4 +15,11 @@ name = "pd-vm-compat-run"
 path = "src/bin/pd-vm-compat-run.rs"
 
 [dependencies]
-pd-vm = { git = "https://github.com/rustscript-lang/rustscript", rev = "b1d6cffede77f49410bf63525f30b9a46b02dc01" }
+pd-host-function = { git = "https://github.com/rustscript-lang/rustscript", rev = "31973aae3c417826dacedc82a6e5ea19e585bbbb", package = "pd-host-function" }
+pd-vm = { git = "https://github.com/rustscript-lang/rustscript", rev = "31973aae3c417826dacedc82a6e5ea19e585bbbb" }
+swc_common = "26.0.0"
+swc_ecma_ast = "29.0.2"
+swc_ecma_parser = { version = "46.0.0", default-features = false, features = ["typescript", "stacker"] }
+
+[dev-dependencies]
+serde_json = "1"
