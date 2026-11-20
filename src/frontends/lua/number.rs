@@ -5,27 +5,68 @@
 //! Lua object. Addition, subtraction, multiplication, division, and negation
 //! are Core f64 operations. Floor remainder is not Core `Mod`: that opcode is
 //! truncating. Power is `math::powf`.
+//!
+//! Remainder temps are names outside the Lua identifier grammar. They are
+//! probed on the same builder, because `alloc_local_named` reuses a slot for
+//! an existing name and unnamed allocation is private. A process-wide counter
+//! or a hard-to-guess legal identifier is not a private namespace.
+//!
+//! Each remainder takes two fresh frame slots. Core locals are frame-scoped,
+//! and this kernel does not own statement boundaries, so it cannot reuse a
+//! slot that a still-live nested expression might need. A future lowerer must
+//! bound that cost before production wiring. This module does not.
 
 use vm::{BuiltinFunction, Expr, LocalIrBuilder, LocalSlot, ParseError, Stmt};
 
 /// A Lua number whose classification is already done.
 ///
-/// `expr` must evaluate to a binary64 value. Passing a Core `Int` is outside
-/// this ABI.
+/// This kernel checks only a directly visible literal. A visible `Int`, or
+/// another non-float literal, is rejected even in release builds. It is not
+/// coerced. `Var` and `Call` are not inspected: matching those variants does
+/// not prove binary64. Full-pipeline integration must pass
+/// [`FloatTypeEvidence`] only after the Lua numeric classifier has established
+/// Float.
 #[derive(Clone, Debug)]
 pub(crate) struct ClassifiedNumber {
     expr: Expr,
 }
 
-impl ClassifiedNumber {
-    pub(crate) fn from_f64_expr(expr: Expr) -> Self {
-        Self { expr }
-    }
+/// Caller attestation that an expression is already binary64.
+///
+/// Constructing this does not inspect the expression. The future numeric
+/// classifier is the production source of this token. This kernel does not
+/// re-check `Var` or `Call`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FloatTypeEvidence {
+    _private: (),
+}
 
+impl FloatTypeEvidence {
+    pub(crate) const fn attested() -> Self {
+        Self { _private: () }
+    }
+}
+
+impl ClassifiedNumber {
     pub(crate) fn literal(value: f64) -> Self {
         Self {
             expr: Expr::Float(value),
         }
+    }
+
+    /// `evidence` is the caller's proof. A directly visible non-float literal
+    /// still fails, because that proof is contradicted by the IR the kernel
+    /// can see.
+    pub(crate) fn from_attested_float(
+        expr: Expr,
+        _evidence: FloatTypeEvidence,
+    ) -> Result<Self, ParseError> {
+        if let Some(kind) = directly_known_non_float_literal(&expr) {
+            return Err(ParseError::new(format!(
+                "classified Lua number requires binary64, found Core {kind} literal"
+            )));
+        }
+        Ok(Self { expr })
     }
 
     pub(crate) fn neg(self) -> Expr {
@@ -60,17 +101,16 @@ impl ClassifiedNumber {
 }
 
 /// Temps for operations that must evaluate each operand once and then reuse it.
+///
+/// Slots stay live for the returned expression. Calling `floor_mod` again on
+/// this lowering allocates new slots; it does not reclaim the previous pair.
 pub(crate) struct NumberLowering<'a> {
     builder: &'a mut LocalIrBuilder,
-    temp_id: u32,
 }
 
 impl<'a> NumberLowering<'a> {
     pub(crate) fn new(builder: &'a mut LocalIrBuilder) -> Self {
-        Self {
-            builder,
-            temp_id: 0,
-        }
+        Self { builder }
     }
 
     /// Lua `%` on binary64: `lhs - floor(lhs / rhs) * rhs`.
@@ -96,9 +136,30 @@ impl<'a> NumberLowering<'a> {
     }
 
     fn alloc_temp(&mut self, role: &str) -> Result<LocalSlot, ParseError> {
-        let name = format!("__lua_number_{role}_{}", self.temp_id);
-        self.temp_id += 1;
-        self.builder.alloc_local_named(&name)
+        // `$` and `.` are outside `[A-Za-z_][A-Za-z0-9_]*`, so a Lua local
+        // cannot use this name. The probe is what makes a second lowering on
+        // the same builder fresh; the ordinal is not a process-wide counter.
+        let mut ordinal = 0u32;
+        loop {
+            let name = format!("$lua.number.{role}.{ordinal}");
+            if self.builder.resolve_local_expr(&name).is_none() {
+                return self.builder.alloc_local_named(&name);
+            }
+            ordinal = ordinal
+                .checked_add(1)
+                .ok_or_else(|| ParseError::new("lua number temp ordinal overflow"))?;
+        }
+    }
+}
+
+fn directly_known_non_float_literal(expr: &Expr) -> Option<&'static str> {
+    match expr {
+        Expr::Int(_) => Some("Int"),
+        Expr::Null => Some("Null"),
+        Expr::Bool(_) => Some("Bool"),
+        Expr::String(_) => Some("String"),
+        Expr::Bytes(_) => Some("Bytes"),
+        _ => None,
     }
 }
 

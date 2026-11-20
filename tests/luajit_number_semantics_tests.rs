@@ -7,7 +7,7 @@
 #[path = "../src/frontends/lua/number.rs"]
 mod number;
 
-use number::{ClassifiedNumber, NumberLowering};
+use number::{ClassifiedNumber, FloatTypeEvidence, NumberLowering};
 use vm::{AssignmentKind, Compiler, Expr, LocalIrBuilder, LocalSlot, Stmt, Value, Vm};
 
 const PROTOCOL_06: [&str; 4] = ["3.5", "1", "-1", "-2.5"];
@@ -39,7 +39,7 @@ fn case06_business_results_match_frozen_protocol() {
     drop(lowering);
 
     let ran = run(
-        &builder,
+        builder,
         vec![
             expr_stmt(quotient),
             expr_stmt(positive_remainder),
@@ -186,6 +186,131 @@ fn operands_are_evaluated_once_left_then_right() {
     assert_unary_eval_once();
 }
 
+#[test]
+fn remainder_temps_keep_a_guest_local_and_a_nested_rhs() {
+    // Both examples share one builder and one Core compile/run.
+    // `__lua_number_mod_lhs_0` is a legal Lua identifier and the name the
+    // pre-fix allocator reused for its first remainder temp.
+    let mut builder = LocalIrBuilder::new();
+    let guest = builder
+        .alloc_local_named("__lua_number_mod_lhs_0")
+        .expect("guest local");
+    let collided = {
+        let mut lowering = NumberLowering::new(&mut builder);
+        lowering
+            .floor_mod(
+                ClassifiedNumber::literal(7.0),
+                ClassifiedNumber::literal(5.0),
+            )
+            .expect("colliding remainder")
+    };
+    let nested = {
+        let inner = {
+            let mut lowering = NumberLowering::new(&mut builder);
+            lowering
+                .floor_mod(
+                    ClassifiedNumber::literal(10.0),
+                    ClassifiedNumber::literal(4.0),
+                )
+                .expect("inner remainder")
+        };
+        let mut lowering = NumberLowering::new(&mut builder);
+        lowering
+            .floor_mod(
+                ClassifiedNumber::literal(7.0),
+                ClassifiedNumber::from_attested_float(inner, FloatTypeEvidence::attested())
+                    .expect("inner remainder is binary64"),
+            )
+            .expect("outer remainder")
+    };
+    let ir = builder.finish(vec![
+        let_int(guest, 42),
+        expr_stmt(collided),
+        expr_stmt(nested),
+    ]);
+    let ran = run_stmts(ir.locals, ir.stmts);
+    let collision_is_two = matches!(
+        ran.stack.first(),
+        Some(Value::Float(number)) if number.to_bits() == 0x4000_0000_0000_0000
+    );
+    let guest_kept = matches!(ran.locals.get(usize::from(guest)), Some(Value::Int(42)));
+    let nested_is_one = matches!(
+        ran.stack.get(1),
+        Some(Value::Float(number)) if number.to_bits() == PROTOCOL_06_BITS[1]
+    );
+    let private_names: Vec<&str> = ir
+        .local_bindings
+        .iter()
+        .filter(|(_, slot)| *slot != guest)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    let private_names_are_lua = private_names.iter().any(|name| is_lua_identifier(name));
+    assert!(
+        collision_is_two,
+        "7 % 5 should be 2; finish_locals={} stack={:?} locals={:?}",
+        ir.locals, ran.stack, ran.locals
+    );
+    assert!(
+        guest_kept,
+        "guest slot was overwritten; locals={:?}",
+        ran.locals
+    );
+    assert!(
+        nested_is_one,
+        "7 % (10 % 4) should be 1; stack={:?} locals={:?}",
+        ran.stack, ran.locals
+    );
+    assert!(
+        !private_names_are_lua,
+        "private temps are legal Lua identifiers: {private_names:?}"
+    );
+}
+
+#[test]
+fn known_int_literal_is_rejected_before_truncating_div() {
+    let evidence = FloatTypeEvidence::attested();
+    let seven = ClassifiedNumber::from_attested_float(Expr::Int(7), evidence);
+    let two = ClassifiedNumber::from_attested_float(Expr::Int(2), evidence);
+    let negative = ClassifiedNumber::from_attested_float(Expr::Int(-5), evidence);
+    let message = seven
+        .expect_err("Int(7) must not enter classified arithmetic")
+        .message;
+    assert!(
+        message.contains("Int"),
+        "rejection should name the visible literal, got {message}"
+    );
+    assert!(two.is_err(), "Int(2) must not enter classified arithmetic");
+    assert!(
+        negative.is_err(),
+        "Int(-5) must not enter classified arithmetic"
+    );
+    let boolean = ClassifiedNumber::from_attested_float(Expr::Bool(true), evidence);
+    assert!(
+        boolean.is_err(),
+        "a visible Bool literal must not enter classified arithmetic"
+    );
+}
+
+#[test]
+fn attested_var_is_not_retyped_by_the_number_kernel() {
+    let mut builder = LocalIrBuilder::new();
+    let slot = builder.alloc_local_named("n").expect("guest local");
+    let classified =
+        ClassifiedNumber::from_attested_float(Expr::Var(slot), FloatTypeEvidence::attested());
+    assert!(
+        classified.is_ok(),
+        "matching Var is not Float evidence and is not a kernel type check: {classified:?}"
+    );
+    let call = ClassifiedNumber::from_attested_float(
+        Expr::Call(0, Vec::new(), Vec::new(), None, None),
+        FloatTypeEvidence::attested(),
+    );
+    assert!(
+        call.is_ok(),
+        "matching Call is not Float evidence and is not a kernel type check: {call:?}"
+    );
+}
+
 #[derive(Clone, Copy)]
 enum Expect {
     Bits(u64),
@@ -210,7 +335,7 @@ fn eval_binary(op: fn(ClassifiedNumber, ClassifiedNumber) -> Expr, lhs: f64, rhs
         ClassifiedNumber::literal(rhs),
     );
     let builder = LocalIrBuilder::new();
-    run(&builder, vec![expr_stmt(expr)])
+    run(builder, vec![expr_stmt(expr)])
         .stack
         .into_iter()
         .next()
@@ -228,7 +353,7 @@ fn eval_floor_mod(lhs: f64, rhs: f64) -> Value {
             )
             .expect("bind remainder temps")
     };
-    run(&builder, vec![expr_stmt(expr)])
+    run(builder, vec![expr_stmt(expr)])
         .stack
         .into_iter()
         .next()
@@ -238,7 +363,7 @@ fn eval_floor_mod(lhs: f64, rhs: f64) -> Value {
 fn eval_unary(op: fn(ClassifiedNumber) -> Expr, operand: f64) -> Value {
     let expr = op(ClassifiedNumber::literal(operand));
     let builder = LocalIrBuilder::new();
-    run(&builder, vec![expr_stmt(expr)])
+    run(builder, vec![expr_stmt(expr)])
         .stack
         .into_iter()
         .next()
@@ -261,12 +386,12 @@ fn assert_binary_eval_once(
         let mut lowering = NumberLowering::new(&mut builder);
         op(
             &mut lowering,
-            ClassifiedNumber::from_f64_expr(counted_literal(sequence, left_mark, lhs)),
-            ClassifiedNumber::from_f64_expr(counted_literal(sequence, right_mark, rhs)),
+            attested_float(counted_literal(sequence, left_mark, lhs)),
+            attested_float(counted_literal(sequence, right_mark, rhs)),
         )
     };
     let ran = run(
-        &builder,
+        builder,
         vec![
             let_int(sequence, 0),
             let_int(left_mark, 0),
@@ -299,9 +424,9 @@ fn assert_unary_eval_once() {
     let mut builder = LocalIrBuilder::new();
     let sequence = builder.alloc_local_named("sequence").expect("sequence");
     let mark = builder.alloc_local_named("mark").expect("mark");
-    let expr = ClassifiedNumber::from_f64_expr(counted_literal(sequence, mark, 0.0)).neg();
+    let expr = attested_float(counted_literal(sequence, mark, 0.0)).neg();
     let ran = run(
-        &builder,
+        builder,
         vec![let_int(sequence, 0), let_int(mark, 0), expr_stmt(expr)],
     );
     assert_eq!(local_int(&ran, sequence), 1, "{:?}", ran.locals);
@@ -329,11 +454,9 @@ fn counted_literal(sequence: LocalSlot, mark: LocalSlot, value: f64) -> Expr {
     }
 }
 
-fn run(_builder: &LocalIrBuilder, stmts: Vec<Stmt>) -> Ran {
-    // LocalIrBuilder does not expose its next local. Every allocated slot is
-    // referenced by the statements, so the frame size is one past the highest index.
-    let local_count = local_count_in(&stmts);
-    run_stmts(local_count, stmts)
+fn run(builder: LocalIrBuilder, stmts: Vec<Stmt>) -> Ran {
+    let ir = builder.finish(stmts);
+    run_stmts(ir.locals, ir.stmts)
 }
 
 fn run_stmts(local_count: usize, stmts: Vec<Stmt>) -> Ran {
@@ -351,58 +474,20 @@ fn run_stmts(local_count: usize, stmts: Vec<Stmt>) -> Ran {
     }
 }
 
-fn local_count_in(stmts: &[Stmt]) -> usize {
-    let mut highest = 0usize;
-    for stmt in stmts {
-        note_stmt(stmt, &mut highest);
-    }
-    highest
+fn attested_float(expr: Expr) -> ClassifiedNumber {
+    ClassifiedNumber::from_attested_float(expr, FloatTypeEvidence::attested())
+        .expect("caller constructed a binary64 expression")
 }
 
-fn note_stmt(stmt: &Stmt, highest: &mut usize) {
-    match stmt {
-        Stmt::Let { index, expr, .. } | Stmt::Assign { index, expr, .. } => {
-            bump(highest, *index);
-            note_expr(expr, highest);
-        }
-        Stmt::Expr { expr, .. } => note_expr(expr, highest),
-        other => panic!("unexpected statement in number probe: {other:?}"),
+fn is_lua_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
     }
-}
-
-fn note_expr(expr: &Expr, highest: &mut usize) {
-    match expr {
-        Expr::Var(slot) => bump(highest, *slot),
-        Expr::Neg(inner) => note_expr(inner, highest),
-        Expr::Add(lhs, rhs)
-        | Expr::Sub(lhs, rhs)
-        | Expr::Mul(lhs, rhs)
-        | Expr::Div(lhs, rhs)
-        | Expr::Mod(lhs, rhs) => {
-            note_expr(lhs, highest);
-            note_expr(rhs, highest);
-        }
-        Expr::Call(_, _, arguments, _, _) => {
-            for argument in arguments {
-                note_expr(argument, highest);
-            }
-        }
-        Expr::Block { stmts, expr } => {
-            for stmt in stmts {
-                note_stmt(stmt, highest);
-            }
-            note_expr(expr, highest);
-        }
-        Expr::Float(_) | Expr::Int(_) => {}
-        other => panic!("unexpected expression in number probe: {other:?}"),
-    }
-}
-
-fn bump(highest: &mut usize, slot: LocalSlot) {
-    let next = usize::from(slot) + 1;
-    if next > *highest {
-        *highest = next;
-    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
 fn expr_stmt(expr: Expr) -> Stmt {
