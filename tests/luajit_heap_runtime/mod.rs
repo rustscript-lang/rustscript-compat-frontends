@@ -2,8 +2,6 @@
 //!
 //! This is not a production plugin and is not wired to the `.lua` entry.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use vm::compiler::ir::{ResolvedHostCall, ResolvedHostParam};
 use vm::{
     CallOutcome, CallReturn, CompileSourceFileOptions, Expr, FrontendImportSyntax, FrontendIr,
@@ -14,19 +12,31 @@ use vm::{
     VmError, VmStatus,
 };
 
-use super::heap::{self, HeapLimits, LuaTableResource, TableRef};
+use super::heap::{self, LuaTableResource, TableRef};
+use vm::HostContext;
 
-static BODY_ENTRIES: AtomicU64 = AtomicU64::new(0);
-static ALIVE_ENTRIES: AtomicU64 = AtomicU64::new(0);
-static FORGED_SLOT: AtomicU64 = AtomicU64::new(0);
-static FORGED_GENERATION: AtomicU64 = AtomicU64::new(0);
-
-pub fn body_entries() -> u64 {
-    BODY_ENTRIES.load(Ordering::SeqCst)
+/// Per-VM probe counters. They live in the execution scope so parallel tests
+/// do not share a process-global tally.
+#[derive(Clone, Copy, Debug, Default)]
+struct ProbeCounters {
+    body: u64,
+    alive: u64,
+    forged_slot: u64,
+    forged_generation: u64,
 }
 
-pub fn alive_entries() -> u64 {
-    ALIVE_ENTRIES.load(Ordering::SeqCst)
+/// A probe that did not produce a halted stack. Counts belong to that VM only.
+#[derive(Debug)]
+pub struct ProbeError {
+    pub message: String,
+    pub body_entries: u64,
+    pub alive_entries: u64,
+}
+
+impl std::fmt::Display for ProbeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -46,17 +56,10 @@ pub enum Probe {
 pub struct ProbeResult {
     pub stack: Vec<Value>,
     pub body_entries: u64,
+    pub alive_entries: u64,
     pub published_raw: Option<i64>,
     pub forged_slot: Option<u64>,
     pub forged_generation: Option<u64>,
-}
-
-pub struct PublishStats {
-    pub before_live: u32,
-    pub after_live: u32,
-    pub before_slots: u32,
-    pub after_slots: u32,
-    pub publish_failed: bool,
 }
 
 struct ProbePlugin;
@@ -79,7 +82,7 @@ impl SourcePlugin for ProbePlugin {
     }
 }
 
-pub fn run_probe(probe: Probe) -> Result<ProbeResult, String> {
+pub fn run_probe(probe: Probe) -> Result<ProbeResult, ProbeError> {
     let catalog = catalog();
     let source = probe_source(probe);
     let compiled = vm::compile_source_with_flavor_and_options(
@@ -89,17 +92,28 @@ pub fn run_probe(probe: Probe) -> Result<ProbeResult, String> {
             .with_source_plugin(&ProbePlugin)
             .with_host_api_catalog(std::sync::Arc::new(catalog.clone())),
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| probe_error(error.to_string()))?;
     let mut registry = HostFunctionRegistry::empty();
-    register_hosts(&mut registry, &catalog).map_err(|error| error.to_string())?;
-    let mut vm = compiled.into_vm().map_err(|error| error.to_string())?;
+    register_hosts(&mut registry, &catalog).map_err(|error| probe_error(error.to_string()))?;
+    let mut vm = compiled
+        .into_vm()
+        .map_err(|error| probe_error(error.to_string()))?;
     registry
         .bind_vm_cached(&mut vm)
-        .map_err(|error| error.to_string())?;
-    let before = body_entries();
-    let status = vm.run().map_err(|error| error.to_string())?;
+        .map_err(|error| probe_error(error.to_string()))?;
+    let status = vm.run();
+    let counters = read_counters(&mut vm);
+    let status = status.map_err(|error| ProbeError {
+        message: error.to_string(),
+        body_entries: counters.body,
+        alive_entries: counters.alive,
+    })?;
     if status != VmStatus::Halted {
-        return Err(format!("probe did not halt: {status:?}"));
+        return Err(ProbeError {
+            message: format!("probe did not halt: {status:?}"),
+            body_entries: counters.body,
+            alive_entries: counters.alive,
+        });
     }
     let stack = vm.stack().to_vec();
     let published_raw = stack.iter().find_map(|value| match value {
@@ -108,15 +122,15 @@ pub fn run_probe(probe: Probe) -> Result<ProbeResult, String> {
     });
     Ok(ProbeResult {
         stack,
-        body_entries: body_entries().saturating_sub(before),
+        body_entries: counters.body,
+        alive_entries: counters.alive,
         published_raw,
-        forged_slot: non_zero(FORGED_SLOT.load(Ordering::SeqCst)),
-        forged_generation: non_zero(FORGED_GENERATION.load(Ordering::SeqCst)),
+        forged_slot: non_zero(counters.forged_slot),
+        forged_generation: non_zero(counters.forged_generation),
     })
 }
 
-pub fn fill_resource_table_then_fail_publish() -> PublishStats {
-    let catalog = catalog();
+pub fn with_idle_vm<T>(body: impl FnOnce(&mut vm::Vm) -> T) -> T {
     let compiled = vm::compile_source_with_flavor_and_options(
         "idle",
         SourceFlavor::Lua,
@@ -124,30 +138,21 @@ pub fn fill_resource_table_then_fail_publish() -> PublishStats {
     )
     .expect("idle program");
     let mut vm = compiled.into_vm().expect("vm");
-    let mut host = vm.host_context();
-    heap::install(
-        &mut host,
-        HeapLimits {
-            nodes: 2048,
-            roots: 4,
-            edges: 4,
-            max_generation: 8,
-        },
-    )
-    .expect("install");
-    for _ in 0..vm::resource::handle::DEFAULT_MAX_RESOURCES {
-        heap::publish(&mut host).expect("fill resource table");
-    }
-    let before = heap::stats(&mut host).expect("stats");
-    let failed = heap::publish(&mut host).is_err();
-    let after = heap::stats(&mut host).expect("stats after");
-    let _ = catalog;
-    PublishStats {
-        before_live: before.live_nodes,
-        after_live: after.live_nodes,
-        before_slots: before.node_slots,
-        after_slots: after.node_slots,
-        publish_failed: failed,
+    body(&mut vm)
+}
+
+fn read_counters(vm: &mut vm::Vm) -> ProbeCounters {
+    vm.host_context()
+        .scope_state::<ProbeCounters>()
+        .copied()
+        .unwrap_or_default()
+}
+
+fn probe_error(message: String) -> ProbeError {
+    ProbeError {
+        message,
+        body_entries: 0,
+        alive_entries: 0,
     }
 }
 
@@ -315,8 +320,8 @@ struct AcceptNamed;
 
 impl HostOwnedFunction for Publish {
     fn call(&mut self, call: &mut OwnedHostCall<'_>) -> Result<CallOutcome, VmError> {
-        note_body();
         let mut host = call.vm().host_context();
+        note_body(&mut host);
         let value = heap::publish(&mut host).map_err(host_error)?;
         Ok(CallOutcome::Return(CallReturn::one(value)))
     }
@@ -324,8 +329,10 @@ impl HostOwnedFunction for Publish {
 
 impl HostOwnedFunction for Alive {
     fn call(&mut self, call: &mut OwnedHostCall<'_>) -> Result<CallOutcome, VmError> {
-        note_body();
-        note_alive();
+        let mut host = call.vm().host_context();
+        note_body(&mut host);
+        note_alive(&mut host);
+        drop(host);
         let table = recover(call, 0)?;
         let mut host = call.vm().host_context();
         let alive = heap::with_heap(&mut host, |heap| Ok(heap.alive(table))).map_err(host_error)?;
@@ -335,8 +342,10 @@ impl HostOwnedFunction for Alive {
 
 impl HostOwnedFunction for Observe {
     fn call(&mut self, call: &mut OwnedHostCall<'_>) -> Result<CallOutcome, VmError> {
-        note_body();
-        note_alive();
+        let mut host = call.vm().host_context();
+        note_body(&mut host);
+        note_alive(&mut host);
+        drop(host);
         let table = recover(call, 0)?;
         let _marker = int_arg(&call, 1)?;
         let mut host = call.vm().host_context();
@@ -349,7 +358,9 @@ impl HostOwnedFunction for Observe {
 
 impl HostOwnedFunction for SetEdge {
     fn call(&mut self, call: &mut OwnedHostCall<'_>) -> Result<CallOutcome, VmError> {
-        note_body();
+        let mut host = call.vm().host_context();
+        note_body(&mut host);
+        drop(host);
         let from = recover(call, 0)?;
         let key = int_arg(&call, 1)?;
         let to = recover(call, 2)?;
@@ -361,7 +372,9 @@ impl HostOwnedFunction for SetEdge {
 
 impl HostOwnedFunction for EdgeIs {
     fn call(&mut self, call: &mut OwnedHostCall<'_>) -> Result<CallOutcome, VmError> {
-        note_body();
+        let mut host = call.vm().host_context();
+        note_body(&mut host);
+        drop(host);
         let from = recover(call, 0)?;
         let key = int_arg(&call, 1)?;
         let to = recover(call, 2)?;
@@ -374,9 +387,9 @@ impl HostOwnedFunction for EdgeIs {
 
 impl HostOwnedFunction for Enter {
     fn call(&mut self, call: &mut OwnedHostCall<'_>) -> Result<CallOutcome, VmError> {
-        note_body();
         let width = int_arg(&call, 0)?;
         let mut host = call.vm().host_context();
+        note_body(&mut host);
         heap::with_heap(&mut host, |heap| heap.enter_roots(width)).map_err(host_error)?;
         Ok(CallOutcome::Return(CallReturn::one(Value::Int(1))))
     }
@@ -384,7 +397,9 @@ impl HostOwnedFunction for Enter {
 
 impl HostOwnedFunction for Root {
     fn call(&mut self, call: &mut OwnedHostCall<'_>) -> Result<CallOutcome, VmError> {
-        note_body();
+        let mut host = call.vm().host_context();
+        note_body(&mut host);
+        drop(host);
         let slot = int_arg(&call, 0)?;
         let table = recover(call, 1)?;
         let returned = call.args()[1].clone();
@@ -400,9 +415,9 @@ impl HostOwnedFunction for Root {
 
 impl HostOwnedFunction for Collect {
     fn call(&mut self, call: &mut OwnedHostCall<'_>) -> Result<CallOutcome, VmError> {
-        note_body();
         let mut host = call.vm().host_context();
-        let marked = heap::with_heap(&mut host, |heap| Ok(heap.collect())).map_err(host_error)?;
+        note_body(&mut host);
+        let marked = heap::collect(&mut host).map_err(host_error)?;
         Ok(CallOutcome::Return(CallReturn::one(Value::Int(
             i64::from(marked.live_nodes),
         ))))
@@ -411,15 +426,18 @@ impl HostOwnedFunction for Collect {
 
 impl HostOwnedFunction for Close {
     fn call(&mut self, call: &mut OwnedHostCall<'_>) -> Result<CallOutcome, VmError> {
-        note_body();
+        let mut host = call.vm().host_context();
+        note_body(&mut host);
+        drop(host);
         let _taken = call.take_arg(0)?;
         Ok(CallOutcome::Return(CallReturn::one(Value::Int(1))))
     }
 }
 
 impl HostOwnedFunction for ForgeNamed {
-    fn call(&mut self, _call: &mut OwnedHostCall<'_>) -> Result<CallOutcome, VmError> {
-        note_body();
+    fn call(&mut self, call: &mut OwnedHostCall<'_>) -> Result<CallOutcome, VmError> {
+        let mut host = call.vm().host_context();
+        note_body(&mut host);
         let mut map = vm::bytecode::VmMap::new();
         map.insert(Value::string("slot"), Value::Int(7));
         map.insert(Value::string("generation"), Value::Int(9));
@@ -431,14 +449,19 @@ impl HostOwnedFunction for ForgeNamed {
 
 impl HostOwnedFunction for AcceptNamed {
     fn call(&mut self, call: &mut OwnedHostCall<'_>) -> Result<CallOutcome, VmError> {
-        note_body();
-        let Value::Map(map) = &call.args()[0] else {
-            return Err(VmError::HostError("named carrier was not a map".to_string()));
+        let (slot, generation) = {
+            let Value::Map(map) = &call.args()[0] else {
+                return Err(VmError::HostError("named carrier was not a map".to_string()));
+            };
+            (map_int(map, "slot")?, map_int(map, "generation")?)
         };
-        let slot = map_int(map, "slot")?;
-        let generation = map_int(map, "generation")?;
-        FORGED_SLOT.store(slot as u64, Ordering::SeqCst);
-        FORGED_GENERATION.store(generation as u64, Ordering::SeqCst);
+        let mut host = call.vm().host_context();
+        note_body(&mut host);
+        let counters = host
+            .scope_state_or_insert_with(ProbeCounters::default)
+            .map_err(host_error)?;
+        counters.forged_slot = slot as u64;
+        counters.forged_generation = generation as u64;
         Ok(CallOutcome::Return(CallReturn::one(Value::Int(1))))
     }
 }
@@ -480,12 +503,18 @@ fn int_arg(call: &OwnedHostCall<'_>, index: usize) -> Result<u32, VmError> {
     }
 }
 
-fn note_body() {
-    BODY_ENTRIES.fetch_add(1, Ordering::SeqCst);
+fn note_body(host: &mut HostContext<'_>) {
+    let counters = host
+        .scope_state_or_insert_with(ProbeCounters::default)
+        .expect("probe counter scope");
+    counters.body = counters.body.saturating_add(1);
 }
 
-fn note_alive() {
-    ALIVE_ENTRIES.fetch_add(1, Ordering::SeqCst);
+fn note_alive(host: &mut HostContext<'_>) {
+    let counters = host
+        .scope_state_or_insert_with(ProbeCounters::default)
+        .expect("probe counter scope");
+    counters.alive = counters.alive.saturating_add(1);
 }
 
 fn host_error(error: impl ToString) -> VmError {
@@ -581,8 +610,6 @@ fn build_ir(source: &str) -> Result<FrontendIr, ParseError> {
             });
         }
         "named" => {
-            FORGED_SLOT.store(0, Ordering::SeqCst);
-            FORGED_GENERATION.store(0, Ordering::SeqCst);
             let record = local(&mut builder, "record")?;
             stmts.push(bind(record, call("lua_heap_forge_named", Vec::new())));
             stmts.push(Stmt::Expr {

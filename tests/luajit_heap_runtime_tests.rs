@@ -10,9 +10,9 @@ mod heap;
 #[path = "luajit_heap_runtime/mod.rs"]
 mod support;
 
-use heap::{CollectReport, HandleKind, HeapLimits, LuaHeap, RootFrameId};
-use support::{Probe, alive_entries, body_entries, run_probe};
-use vm::Value;
+use heap::{CollectReport, HandleKind, HeapLimits, LuaHeap, LuaTableResource, RootFrameId, TableRef};
+use support::{Probe, run_probe, with_idle_vm};
+use vm::{HostContext, ResourceHandle, Value};
 
 fn tight_limits() -> HeapLimits {
     HeapLimits {
@@ -161,14 +161,17 @@ fn typed_resource_boundary_rejects_int_foreign_and_expired_values() {
     let transfer = run_probe(Probe::Transfer).expect("transfer");
     assert_eq!(transfer.stack, vec![Value::Int(1)]);
     assert!(transfer.body_entries > 0, "typed host body ran for a published table");
+    assert!(transfer.alive_entries > 0, "alive ran inside the same VM");
 
     let alias = run_probe(Probe::Alias).expect("alias");
     assert_eq!(alias.stack, vec![Value::Int(1)], "same table write is visible through the other handle");
 
-    let before_int = body_entries();
-    let rejected_int = run_probe(Probe::RejectInt);
-    assert!(rejected_int.is_err(), "ordinary int is not a table: {rejected_int:?}");
-    assert_eq!(body_entries(), before_int, "int rejection happens before the host body");
+    let before_int = run_probe(Probe::RejectInt).expect_err("ordinary int is not a table");
+    assert_eq!(
+        before_int.body_entries, 0,
+        "int rejection happens before the host body"
+    );
+    assert_eq!(before_int.alive_entries, 0);
 
     let published = run_probe(Probe::Publish).expect("publish handle");
     assert_eq!(published.published_raw, published.stack.first().and_then(|value| match value {
@@ -179,17 +182,13 @@ fn typed_resource_boundary_rejects_int_foreign_and_expired_values() {
         [Value::Int(raw)] => *raw,
         other => panic!("publish did not return one handle: {other:?}"),
     };
-    let before_foreign = alive_entries();
-    let foreign = run_probe(Probe::RejectForeign { raw });
-    assert!(foreign.is_err(), "cross-vm handle is rejected: {foreign:?}");
-    assert_eq!(alive_entries(), before_foreign, "foreign rejection is before the host body");
+    let foreign = run_probe(Probe::RejectForeign { raw }).expect_err("cross-vm handle is rejected");
+    assert_eq!(foreign.body_entries, 0, "foreign rejection is before the host body");
+    assert_eq!(foreign.alive_entries, 0);
 
-    let before_expired = alive_entries();
-    let expired = run_probe(Probe::Expired);
-    assert!(expired.is_err(), "expired handle is rejected: {expired:?}");
+    let expired = run_probe(Probe::Expired).expect_err("expired handle is rejected");
     assert_eq!(
-        alive_entries(),
-        before_expired,
+        expired.alive_entries, 0,
         "close runs; the later alive call must not"
     );
 
@@ -197,24 +196,264 @@ fn typed_resource_boundary_rejects_int_foreign_and_expired_values() {
     assert_eq!(named.stack, vec![Value::Int(1)]);
     assert_eq!(named.forged_slot, Some(7));
     assert_eq!(named.forged_generation, Some(9));
-    assert!(
-        rejected_int.is_err() && named.stack == vec![Value::Int(1)],
-        "a named record of copyable ints is not provenance; typed resource is the carrier"
-    );
+    // A named record of copyable ints is not the table carrier. Rejecting one
+    // ordinary int does not show that every Lua number, or an unrelated auth
+    // token, is isolated from table tokens.
 }
 
 #[test]
 fn nested_argument_root_keeps_the_first_argument_across_collect() {
     let rooted = run_probe(Probe::NestedRooted).expect("rooted nest");
     assert_eq!(rooted.stack, vec![Value::Int(1)]);
-    let unrooted = run_probe(Probe::NestedUnrooted).expect("unrooted nest");
-    assert_eq!(unrooted.stack, vec![Value::Int(0)]);
+    let unrooted = run_probe(Probe::NestedUnrooted).expect_err("collected token is retired");
+    assert!(
+        unrooted.message.contains("resource_already_closed"),
+        "an unrooted table's token must be invalid after collect: {unrooted}"
+    );
+    assert_eq!(
+        unrooted.body_entries, 3,
+        "enter, publish, and collect ran; the later observe must not"
+    );
+    assert_eq!(unrooted.alive_entries, 0);
 }
 
 #[test]
-fn publish_failure_against_the_resource_table_rolls_back_the_node() {
-    let stats = support::fill_resource_table_then_fail_publish();
-    assert_eq!(stats.before_live, stats.after_live);
-    assert_eq!(stats.before_slots, stats.after_slots);
-    assert!(stats.publish_failed);
+fn full_resource_table_publish_occupies_a_slot_then_rolls_it_back() {
+    with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(
+            &mut host,
+            HeapLimits {
+                nodes: 2048,
+                roots: 4,
+                edges: 4,
+                max_generation: 8,
+            },
+        )
+        .expect("install");
+        let rooted_raw = publish_raw(&mut host);
+        let rooted = table_ref(&host, rooted_raw);
+        let frame = heap::with_heap(&mut host, |heap| heap.enter_roots(1)).expect("frame");
+        heap::with_heap(&mut host, |heap| heap.write_root(frame, 0, rooted)).expect("root");
+        let spare_raw = publish_raw(&mut host);
+        let spare = resource_handle(spare_raw);
+        while host.resource_count() < vm::resource::handle::DEFAULT_MAX_RESOURCES {
+            let _filled = publish_raw(&mut host);
+        }
+        assert_eq!(
+            host.resource_count(),
+            vm::resource::handle::DEFAULT_MAX_RESOURCES
+        );
+
+        let before = heap::stats(&mut host).expect("stats");
+        let failed = heap::publish(&mut host);
+        let after = heap::stats(&mut host).expect("stats after");
+        let error = failed.expect_err("a full resource table must refuse the next publish");
+        assert_eq!(
+            after.node_slots,
+            before.node_slots + 1,
+            "refused publish must occupy a lua slot before push_resource returns; error={error}"
+        );
+        assert_eq!(
+            after.live_nodes,
+            before.live_nodes,
+            "rollback must release the occupied slot; error={error}"
+        );
+        assert_eq!(after.live_roots, before.live_roots, "existing roots must stay");
+        assert!(
+            heap::with_heap(&mut host, |heap| Ok(heap.alive(rooted))).expect("rooted check"),
+            "the existing root stays live"
+        );
+        assert_eq!(
+            host.resource_count(),
+            vm::resource::handle::DEFAULT_MAX_RESOURCES
+        );
+        match &error {
+            heap::HeapError::Scope(message) if message.contains("resource_limit_exceeded") => {}
+            other => panic!("refusal must be the real push_resource limit, got {other:?}"),
+        }
+
+        let progress = host
+            .close_resource::<LuaTableResource>(spare, vm::ResourceCloseReason::Requested)
+            .expect("close one token to free a resource slot");
+        assert_eq!(progress, vm::resource::CloseProgress::Ready);
+        let reused_raw = publish_raw(&mut host);
+        let reused = table_ref(&host, reused_raw);
+        assert_eq!(
+            reused.slot(),
+            before.node_slots,
+            "the slot occupied by the refused publish is reused"
+        );
+        assert_eq!(
+            reused.generation(),
+            2,
+            "rollback must bump the generation before reuse"
+        );
+        assert!(heap::with_heap(&mut host, |heap| Ok(heap.alive(reused))).expect("reused check"));
+        assert!(heap::with_heap(&mut host, |heap| Ok(heap.alive(rooted))).expect("root remains"));
+    });
+}
+
+fn publish_raw(host: &mut HostContext<'_>) -> i64 {
+    match heap::publish(host).expect("publish") {
+        Value::Int(raw) => raw,
+        other => panic!("publish did not return a handle: {other:?}"),
+    }
+}
+
+fn resource_handle(raw: i64) -> ResourceHandle {
+    ResourceHandle::from_raw(u64::try_from(raw).expect("positive handle")).expect("handle")
+}
+
+fn table_ref(host: &HostContext<'_>, raw: i64) -> TableRef {
+    let handle = resource_handle(raw);
+    let token = host
+        .typed_resource_with_key::<LuaTableResource>(handle, &LuaTableResource::key())
+        .expect("typed token");
+    host.resource(&token).expect("live token").get().table()
+}
+
+/// A host resource that is not a Lua table. Collection must not close it.
+struct UnrelatedHostResource;
+
+impl vm::resource::HostResource for UnrelatedHostResource {}
+
+#[test]
+fn collect_returns_token_quota_and_republish_exceeds_the_core_limit() {
+    with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(
+            &mut host,
+            HeapLimits {
+                nodes: 64,
+                roots: 4,
+                edges: 4,
+                max_generation: 64,
+            },
+        )
+        .expect("install");
+        let unrelated = host
+            .push_resource(UnrelatedHostResource)
+            .expect("unrelated host resource");
+        let rooted_raw = publish_raw(&mut host);
+        let rooted = table_ref(&host, rooted_raw);
+        let frame = heap::with_heap(&mut host, |heap| heap.enter_roots(1)).expect("frame");
+        heap::with_heap(&mut host, |heap| heap.write_root(frame, 0, rooted)).expect("root");
+
+        let mut published = 1usize;
+        let mut last_doomed = 0i64;
+        let batch = 32usize;
+        while published <= vm::resource::handle::DEFAULT_MAX_RESOURCES {
+            for _ in 0..batch {
+                last_doomed = publish_raw(&mut host);
+                published = published.saturating_add(1);
+            }
+            let before_nodes = heap::stats(&mut host).expect("before nodes").live_nodes;
+            let before_tokens = host.resource_count();
+            let report = heap::collect(&mut host).expect("collect");
+            let after = heap::stats(&mut host).expect("after nodes");
+            assert!(
+                before_nodes > after.live_nodes,
+                "collect must sweep unrooted tables in this same VM"
+            );
+            assert_eq!(after.live_nodes, 1, "the rooted table stays");
+            assert_eq!(report.live_nodes, 1);
+            assert_eq!(
+                host.resource_count(),
+                2,
+                "swept tokens must retire and return quota; before_tokens={before_tokens}"
+            );
+            assert!(
+                before_tokens > host.resource_count(),
+                "live tokens must drop with the swept tables"
+            );
+            assert!(
+                heap::with_heap(&mut host, |heap| Ok(heap.alive(rooted))).expect("rooted node"),
+                "the rooted node stays live"
+            );
+            let rooted_token = resource_handle(rooted_raw);
+            assert!(
+                host.typed_resource_with_key::<LuaTableResource>(
+                    rooted_token,
+                    &LuaTableResource::key(),
+                )
+                .is_ok(),
+                "the rooted token stays valid"
+            );
+            let doomed = resource_handle(last_doomed);
+            assert!(
+                host.typed_resource_with_key::<LuaTableResource>(doomed, &LuaTableResource::key())
+                    .is_err(),
+                "a collected token must be invalid without leaving the VM"
+            );
+            assert!(
+                host.resource(&unrelated).is_ok(),
+                "an unrelated host resource is not a collected table"
+            );
+        }
+        assert!(
+            published > vm::resource::handle::DEFAULT_MAX_RESOURCES,
+            "cumulative publish, collect, and republish must pass the core limit"
+        );
+        let _again = publish_raw(&mut host);
+    });
+}
+
+#[test]
+fn reset_for_reuse_rejects_old_handles_and_starts_an_empty_heap() {
+    with_idle_vm(|vm| {
+        let raw = {
+            let mut host = vm.host_context();
+            heap::install(
+                &mut host,
+                HeapLimits {
+                    nodes: 8,
+                    roots: 2,
+                    edges: 2,
+                    max_generation: 4,
+                },
+            )
+            .expect("install");
+            let raw = publish_raw(&mut host);
+            let table = table_ref(&host, raw);
+            let frame = heap::with_heap(&mut host, |heap| heap.enter_roots(1)).expect("frame");
+            heap::with_heap(&mut host, |heap| heap.write_root(frame, 0, table)).expect("root");
+            let before = heap::stats(&mut host).expect("before reset");
+            assert!(before.live_nodes > 0);
+            assert!(before.live_roots > 0);
+            raw
+        };
+        vm.reset_for_reuse().expect("start reset");
+        let waker = std::task::Waker::noop();
+        let mut context = std::task::Context::from_waker(&waker);
+        match vm.poll_reset_for_reuse(&mut context) {
+            std::task::Poll::Ready(Ok(())) => {}
+            other => panic!("reset did not finish: {other:?}"),
+        }
+        let mut host = vm.host_context();
+        let rejected = host.typed_resource_with_key::<LuaTableResource>(
+            resource_handle(raw),
+            &LuaTableResource::key(),
+        );
+        assert!(rejected.is_err(), "old handle must be rejected: {rejected:?}");
+        assert!(
+            host.scope_state::<heap::LuaHeap>().is_none(),
+            "the replacement scope starts without a heap"
+        );
+        assert_eq!(host.resource_count(), 0, "the new scope has no leftover tokens");
+        heap::install(
+            &mut host,
+            HeapLimits {
+                nodes: 8,
+                roots: 2,
+                edges: 2,
+                max_generation: 4,
+            },
+        )
+        .expect("reinstall");
+        let empty = heap::stats(&mut host).expect("empty heap");
+        assert_eq!(empty.live_nodes, 0);
+        assert_eq!(empty.live_roots, 0);
+        let _again = publish_raw(&mut host);
+    });
 }

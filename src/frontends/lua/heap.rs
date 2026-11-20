@@ -7,7 +7,9 @@
 //! live in one `LuaHeap` stored in the current `ExecutionScope`. A published
 //! guest value is a typed `resource<lua.table>` token in that same scope's
 //! resource table. The token is not a second heap and is not a GC root: only
-//! an explicit root frame keeps a node alive across `collect`.
+//! an explicit root frame keeps a node alive across `collect`. Collection
+//! closes each swept node's token through the scope close contract and returns
+//! that quota before the node is released.
 //!
 //! Borrowed from the ES5 heap at `3e348a010bc8d84baa5b7d1169a5f50aeb4e46ec`
 //! `src/javascript/heap.rs`: slot plus generation handles, explicit root
@@ -32,7 +34,6 @@ pub use handle::{HandleKind, TableRef};
 pub use resource::LuaTableResource;
 pub use table::{CollectReport, HeapError, HeapLimits, HeapStats, LuaHeap, RootFrameId};
 
-use vm::resource::handle::DEFAULT_MAX_RESOURCES;
 use vm::{HostContext, Value};
 
 /// Installs the scope heap before the first use. A second install is refused
@@ -48,23 +49,41 @@ pub fn install(host: &mut HostContext, limits: HeapLimits) -> Result<(), HeapErr
 
 /// Allocates a table and publishes its typed resource token.
 ///
-/// The resource table is checked before the node is reserved. A refused
-/// publish therefore does not add a live node or a slot. If insertion fails
-/// after a reserve, the node is rolled back before the error returns.
+/// The node is reserved before `HostContext::push_resource`. A full resource
+/// table refuses that insert after the reservation. The reserved node is then
+/// rolled back, so live occupancy and existing roots return to their previous
+/// state and the slot can be reused at the next generation.
 pub fn publish(host: &mut HostContext) -> Result<Value, HeapError> {
-    if host.resource_count() >= DEFAULT_MAX_RESOURCES {
-        return Err(HeapError::PublishRejected);
-    }
     let table = with_heap(host, LuaHeap::alloc)?;
-    let pushed = host.push_resource(LuaTableResource::new(table));
-    let resource = match pushed {
+    let resource = match host.push_resource(LuaTableResource::new(table)) {
         Ok(resource) => resource,
         Err(error) => {
-            let _ = with_heap(host, |heap| heap.rollback(table));
+            with_heap(host, |heap| heap.rollback(table))?;
             return Err(HeapError::from_scope(error));
         }
     };
-    let raw = i64::try_from(resource.handle().raw()).map_err(|_| HeapError::CarrierOutOfRange)?;
+    let raw_u64 = resource.handle().raw();
+    if let Err(error) = with_heap(host, |heap| heap.bind_token(table, raw_u64)) {
+        host.close_resource::<LuaTableResource>(
+            resource.handle(),
+            vm::ResourceCloseReason::Requested,
+        )
+        .map_err(HeapError::from_scope)?;
+        with_heap(host, |heap| heap.rollback(table))?;
+        return Err(error);
+    }
+    let raw = match i64::try_from(raw_u64) {
+        Ok(raw) => raw,
+        Err(_) => {
+            host.close_resource::<LuaTableResource>(
+                resource.handle(),
+                vm::ResourceCloseReason::Requested,
+            )
+            .map_err(HeapError::from_scope)?;
+            with_heap(host, |heap| heap.rollback(table))?;
+            return Err(HeapError::CarrierOutOfRange);
+        }
+    };
     Ok(Value::Int(raw))
 }
 
@@ -78,6 +97,30 @@ pub fn with_heap<T>(
         .scope_state_or_insert_with(|| LuaHeap::new(HeapLimits::production()))
         .map_err(HeapError::from_scope)?;
     body(heap)
+}
+
+/// Host-side collection. Unreachable tables lose their typed tokens through
+/// `HostContext::close_resource` before the heap sweep, so the scope quota
+/// comes back in this same VM. Stored handles are not roots.
+pub fn collect(host: &mut HostContext) -> Result<table::CollectReport, HeapError> {
+    let doomed = with_heap(host, |heap| Ok(heap.unmarked_tokens()))?;
+    for raw in doomed {
+        let handle =
+            vm::ResourceHandle::from_raw(raw).map_err(|_| HeapError::CarrierOutOfRange)?;
+        let progress = host
+            .close_resource::<LuaTableResource>(handle, vm::ResourceCloseReason::Requested)
+            .map_err(HeapError::from_scope)?;
+        if progress != vm::resource::CloseProgress::Ready {
+            return Err(HeapError::Scope(
+                "lua table close did not finish synchronously".to_string(),
+            ));
+        }
+        with_heap(host, |heap| {
+            heap.clear_token(raw);
+            Ok(())
+        })?;
+    }
+    with_heap(host, |heap| Ok(heap.collect()))
 }
 
 /// Reads occupancy counters from the scope heap.

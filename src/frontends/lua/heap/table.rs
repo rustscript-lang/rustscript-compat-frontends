@@ -57,14 +57,12 @@ pub enum HeapError {
     NoRootFrame,
     /// The frame id is not the current top frame, or its index is out of range.
     StaleFrame,
-    /// The scope resource table cannot take another token.
-    PublishRejected,
     /// The resource handle does not fit in a positive VM integer.
     CarrierOutOfRange,
     /// This scope already has a heap.
     AlreadyInstalled,
-    /// Execution-scope or resource-table failure. The node was rolled back
-    /// when the failure happened after a reserve.
+    /// Execution-scope or resource-table failure. `publish` rolls the reserved
+    /// node back before returning this error.
     Scope(String),
 }
 
@@ -86,7 +84,6 @@ impl fmt::Display for HeapError {
             Self::WrongKind => write!(formatter, "lua handle is not a table"),
             Self::NoRootFrame => write!(formatter, "no lua root frame"),
             Self::StaleFrame => write!(formatter, "stale lua root frame"),
-            Self::PublishRejected => write!(formatter, "lua table publish rejected"),
             Self::CarrierOutOfRange => write!(formatter, "lua resource carrier out of range"),
             Self::AlreadyInstalled => write!(formatter, "lua heap already installed"),
             Self::Scope(message) => write!(formatter, "lua heap scope error: {message}"),
@@ -149,6 +146,9 @@ enum SlotState {
 struct Slot {
     generation: u32,
     state: SlotState,
+    /// Raw resource handle for this node. Ownership metadata only: the mark
+    /// phase does not read it, so the token is not a GC root.
+    token: Option<u64>,
 }
 
 struct Edge {
@@ -211,6 +211,7 @@ impl LuaHeap {
                 return Err(HeapError::StaleHandle);
             }
             slot.state = SlotState::Live { marked: false };
+            slot.token = None;
             return Ok(TableRef::table(self.domain, index, slot.generation));
         }
         if self.slots.len() >= self.limits.nodes as usize {
@@ -223,6 +224,7 @@ impl LuaHeap {
         self.slots.push(Slot {
             generation: 1,
             state: SlotState::Live { marked: false },
+            token: None,
         });
         self.note_node_peak();
         Ok(TableRef::table(self.domain, index, 1))
@@ -340,35 +342,46 @@ impl LuaHeap {
         Ok(())
     }
 
+    /// Records the typed token that owns `table`. The handle is not installed
+    /// as a root.
+    pub fn bind_token(&mut self, table: TableRef, raw: u64) -> Result<(), HeapError> {
+        self.require_live(table)?;
+        let slot = &mut self.slots[table.slot() as usize];
+        if slot.token.is_some() {
+            return Err(HeapError::StaleHandle);
+        }
+        slot.token = Some(raw);
+        Ok(())
+    }
+
+    /// Drops the stored handle after the resource table has closed it. The
+    /// node stays until sweep.
+    pub fn clear_token(&mut self, raw: u64) {
+        for slot in &mut self.slots {
+            if slot.token == Some(raw) {
+                slot.token = None;
+            }
+        }
+    }
+
+    /// Tokens of live nodes the current mark does not reach. Runs the same
+    /// mark as `collect` and does not release slots.
+    pub fn unmarked_tokens(&mut self) -> Vec<u64> {
+        self.mark_reachable();
+        self.slots
+            .iter()
+            .filter_map(|slot| match slot.state {
+                SlotState::Live { marked: false } => slot.token,
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Non-moving mark from explicit roots, then sweep unmarked nodes.
     /// Freed slots are reused with a bumped generation. A slot whose next
     /// generation would pass `max_generation` is retired instead.
     pub fn collect(&mut self) -> CollectReport {
-        for slot in &mut self.slots {
-            if let SlotState::Live { marked } = &mut slot.state {
-                *marked = false;
-            }
-        }
-        let mut work = Vec::new();
-        let rooted: Vec<TableRef> = self.roots.iter().copied().flatten().collect();
-        for handle in rooted {
-            if self.alive(handle) {
-                self.mark_slot(handle.slot(), &mut work);
-            }
-        }
-        while let Some(slot) = work.pop() {
-            let targets: Vec<(u32, u32)> = self
-                .edges
-                .iter()
-                .filter(|edge| edge.from == slot)
-                .map(|edge| (edge.to_slot, edge.to_generation))
-                .collect();
-            for (to_slot, to_generation) in targets {
-                if self.slot_live(to_slot, to_generation) {
-                    self.mark_slot(to_slot, &mut work);
-                }
-            }
-        }
+        self.mark_reachable();
         let swept: Vec<u32> = self
             .slots
             .iter()
@@ -439,6 +452,34 @@ impl LuaHeap {
         })
     }
 
+    fn mark_reachable(&mut self) {
+        for slot in &mut self.slots {
+            if let SlotState::Live { marked } = &mut slot.state {
+                *marked = false;
+            }
+        }
+        let mut work = Vec::new();
+        let rooted: Vec<TableRef> = self.roots.iter().copied().flatten().collect();
+        for handle in rooted {
+            if self.alive(handle) {
+                self.mark_slot(handle.slot(), &mut work);
+            }
+        }
+        while let Some(slot) = work.pop() {
+            let targets: Vec<(u32, u32)> = self
+                .edges
+                .iter()
+                .filter(|edge| edge.from == slot)
+                .map(|edge| (edge.to_slot, edge.to_generation))
+                .collect();
+            for (to_slot, to_generation) in targets {
+                if self.slot_live(to_slot, to_generation) {
+                    self.mark_slot(to_slot, &mut work);
+                }
+            }
+        }
+    }
+
     fn mark_slot(&mut self, index: u32, work: &mut Vec<u32>) {
         if let SlotState::Live { marked } = &mut self.slots[index as usize].state {
             if !*marked {
@@ -452,10 +493,12 @@ impl LuaHeap {
         let slot = &mut self.slots[index as usize];
         if slot.generation >= self.limits.max_generation {
             slot.state = SlotState::Retired;
+            slot.token = None;
             return;
         }
         slot.generation = slot.generation.saturating_add(1);
         slot.state = SlotState::Free;
+        slot.token = None;
         self.free_list.push(index);
     }
 
