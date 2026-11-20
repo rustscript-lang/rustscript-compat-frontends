@@ -102,25 +102,60 @@ pub fn with_heap<T>(
 /// Host-side collection. Unreachable tables lose their typed tokens through
 /// `HostContext::close_resource` before the heap sweep, so the scope quota
 /// comes back in this same VM. Stored handles are not roots.
+///
+/// A token this heap still stores may already have been removed by
+/// `close_resource`, `take_resource`, or a TakeOwned host parameter. For that
+/// stored token only, `ResourceAlreadyClosed` (slot not reused) and
+/// `ResourceStale` (slot reused) are retired: the token is cleared and the
+/// sweep continues. The successor in a reused slot is not closed. Any other
+/// structured error, including a wrong table or a type mismatch, stops the
+/// sweep. Tokens already cleared stay cleared, so a later collection retries
+/// only the unprocessed suffix.
 pub fn collect(host: &mut HostContext) -> Result<table::CollectReport, HeapError> {
     let doomed = with_heap(host, |heap| Ok(heap.unmarked_tokens()))?;
     for raw in doomed {
-        let handle =
-            vm::ResourceHandle::from_raw(raw).map_err(|_| HeapError::CarrierOutOfRange)?;
-        let progress = host
-            .close_resource::<LuaTableResource>(handle, vm::ResourceCloseReason::Requested)
-            .map_err(HeapError::from_scope)?;
-        if progress != vm::resource::CloseProgress::Ready {
-            return Err(HeapError::Scope(
-                "lua table close did not finish synchronously".to_string(),
-            ));
-        }
-        with_heap(host, |heap| {
-            heap.clear_token(raw);
-            Ok(())
-        })?;
+        retire_doomed_token(host, raw)?;
     }
     with_heap(host, |heap| Ok(heap.collect()))
+}
+
+fn retire_doomed_token(host: &mut HostContext, raw: u64) -> Result<(), HeapError> {
+    let handle = vm::ResourceHandle::from_raw(raw).map_err(|_| HeapError::CarrierOutOfRange)?;
+    match host.close_resource::<LuaTableResource>(handle, vm::ResourceCloseReason::Requested) {
+        Ok(progress) => {
+            // `LuaTableResource` uses the default synchronous close, which
+            // returns Ready. Core can also report AlreadyClosed for a Closing
+            // slot, but this concrete type has no path that returns Pending.
+            if progress != vm::resource::CloseProgress::Ready {
+                return Err(HeapError::Scope(
+                    "lua table close did not finish synchronously".to_string(),
+                ));
+            }
+        }
+        Err(error) => {
+            let stored = with_heap(host, |heap| Ok(heap.stores_token(raw)))?;
+            if !(stored && retired_lua_token(&error)) {
+                return Err(HeapError::from_scope(error));
+            }
+        }
+    }
+    with_heap(host, |heap| {
+        heap.clear_token(raw);
+        Ok(())
+    })
+}
+
+fn retired_lua_token(error: &vm::HostContextError) -> bool {
+    match error.kind() {
+        vm::HostContextErrorKind::Scope(vm::execution_scope::ExecutionScopeError::Resource(
+            resource,
+        )) => matches!(
+            resource.code(),
+            vm::resource::ResourceErrorCode::ResourceAlreadyClosed
+                | vm::resource::ResourceErrorCode::ResourceStale
+        ),
+        _ => false,
+    }
 }
 
 /// Reads occupancy counters from the scope heap.

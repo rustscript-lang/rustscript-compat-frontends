@@ -294,6 +294,196 @@ fn full_resource_table_publish_occupies_a_slot_then_rolls_it_back() {
     });
 }
 
+fn scope_resource_code(error: &vm::HostContextError) -> vm::resource::ResourceErrorCode {
+    match error.kind() {
+        vm::HostContextErrorKind::Scope(vm::execution_scope::ExecutionScopeError::Resource(
+            resource,
+        )) => resource.code(),
+        other => panic!("close did not return a scope resource error: {other:?}"),
+    }
+}
+
+fn root_table(host: &mut HostContext<'_>, table: TableRef) {
+    let frame = heap::with_heap(host, |heap| heap.enter_roots(1)).expect("root frame");
+    heap::with_heap(host, |heap| heap.write_root(frame, 0, table)).expect("root");
+}
+
+fn sweep_limits() -> HeapLimits {
+    HeapLimits {
+        nodes: 16,
+        roots: 4,
+        edges: 4,
+        max_generation: 16,
+    }
+}
+
+/// External `close_resource` retires the core token while the lua node still
+/// stores it. The slot is not reused, so a later close reports
+/// `ResourceAlreadyClosed`. Collection must still sweep that node and another
+/// ordinary unreachable table, then accept a second collection in the same VM.
+#[test]
+fn collect_finishes_when_an_unreused_token_is_already_closed() {
+    with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, sweep_limits()).expect("install");
+        let unrelated = host
+            .push_resource(UnrelatedHostResource)
+            .expect("unrelated host resource");
+        let rooted_raw = publish_raw(&mut host);
+        let rooted = table_ref(&host, rooted_raw);
+        root_table(&mut host, rooted);
+        let retired_raw = publish_raw(&mut host);
+        let retired = table_ref(&host, retired_raw);
+        let retired_handle = resource_handle(retired_raw);
+        let other_raw = publish_raw(&mut host);
+        let other_handle = resource_handle(other_raw);
+
+        let progress = host
+            .close_resource::<LuaTableResource>(
+                retired_handle,
+                vm::ResourceCloseReason::Requested,
+            )
+            .expect("external close");
+        assert_eq!(progress, vm::resource::CloseProgress::Ready);
+        let observed = host
+            .close_resource::<LuaTableResource>(
+                retired_handle,
+                vm::ResourceCloseReason::Requested,
+            )
+            .expect_err("slot was not reused");
+        assert_eq!(
+            scope_resource_code(&observed),
+            vm::resource::ResourceErrorCode::ResourceAlreadyClosed
+        );
+        assert!(
+            heap::with_heap(&mut host, |heap| Ok(heap.alive(retired))).expect("retired node"),
+            "the lua node still stores the closed token"
+        );
+        assert_eq!(host.resource_count(), 3, "close already returned one quota unit");
+        assert_eq!(heap::stats(&mut host).expect("before").live_nodes, 3);
+
+        let report = heap::collect(&mut host)
+            .expect("an already-closed stored token must not stop collection");
+        assert_eq!(report.live_nodes, 1);
+        assert_eq!(host.resource_count(), 2, "only the other doomed token is closed");
+        assert!(heap::with_heap(&mut host, |heap| Ok(heap.alive(rooted))).expect("rooted"));
+        assert!(
+            host.typed_resource_with_key::<LuaTableResource>(
+                resource_handle(rooted_raw),
+                &LuaTableResource::key(),
+            )
+            .is_ok(),
+            "the rooted token stays valid"
+        );
+        assert!(
+            host.typed_resource_with_key::<LuaTableResource>(other_handle, &LuaTableResource::key())
+                .is_err(),
+            "the other unreachable table is collected"
+        );
+        assert!(host.resource(&unrelated).is_ok(), "unrelated resource stays");
+        assert!(
+            host.scope_state::<heap::LuaHeap>().is_some(),
+            "collection must not replace the scope with reset"
+        );
+
+        let again = heap::collect(&mut host).expect("a later collection must also finish");
+        assert_eq!(again.live_nodes, 1);
+        assert_eq!(host.resource_count(), 2, "the second collection must not release quota again");
+        assert_eq!(heap::stats(&mut host).expect("after").collections, 2);
+        assert!(heap::with_heap(&mut host, |heap| Ok(heap.alive(rooted))).expect("root remains"));
+        assert!(host.resource(&unrelated).is_ok(), "unrelated resource remains");
+    });
+}
+
+/// `take_resource` vacates the core slot. The next publish reuses that slot, so
+/// the stored token is `ResourceStale`. The successor in that slot must stay
+/// usable, and another unreachable table must still be collected.
+#[test]
+fn collect_finishes_when_a_reused_token_is_stale() {
+    with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, sweep_limits()).expect("install");
+        let unrelated = host
+            .push_resource(UnrelatedHostResource)
+            .expect("unrelated host resource");
+        let rooted_raw = publish_raw(&mut host);
+        let rooted = table_ref(&host, rooted_raw);
+        root_table(&mut host, rooted);
+        let other_raw = publish_raw(&mut host);
+        let other_handle = resource_handle(other_raw);
+        let retired_raw = publish_raw(&mut host);
+        let retired = table_ref(&host, retired_raw);
+        let retired_handle = resource_handle(retired_raw);
+
+        let _taken = host
+            .take_resource::<LuaTableResource>(retired_handle)
+            .expect("take the stored token");
+        let successor_raw = publish_raw(&mut host);
+        let successor_handle = resource_handle(successor_raw);
+        let successor = table_ref(&host, successor_raw);
+        root_table(&mut host, successor);
+        assert_eq!(
+            retired_handle.slot_index().expect("retired slot"),
+            successor_handle.slot_index().expect("successor slot"),
+            "the successor must occupy the same core slot"
+        );
+        assert_ne!(retired_handle.generation(), successor_handle.generation());
+        let observed = host
+            .close_resource::<LuaTableResource>(
+                retired_handle,
+                vm::ResourceCloseReason::Requested,
+            )
+            .expect_err("reused slot");
+        assert_eq!(
+            scope_resource_code(&observed),
+            vm::resource::ResourceErrorCode::ResourceStale
+        );
+        assert!(
+            heap::with_heap(&mut host, |heap| Ok(heap.alive(retired))).expect("retired node"),
+            "the lua node still stores the stale token"
+        );
+        assert!(
+            heap::with_heap(&mut host, |heap| Ok(heap.alive(successor))).expect("successor node")
+        );
+        assert_eq!(host.resource_count(), 4);
+        assert_eq!(heap::stats(&mut host).expect("before").live_nodes, 4);
+
+        let report = heap::collect(&mut host)
+            .expect("a stale stored token must not stop collection");
+        assert_eq!(report.live_nodes, 2, "rooted table and successor stay");
+        assert_eq!(
+            host.resource_count(),
+            3,
+            "only the other doomed token is closed; the successor keeps its quota"
+        );
+        assert_eq!(
+            table_ref(&host, successor_raw).slot(),
+            successor.slot(),
+            "the successor token is still the live occupant of the reused slot"
+        );
+        assert!(heap::with_heap(&mut host, |heap| Ok(heap.alive(successor))).expect("successor"));
+        assert!(heap::with_heap(&mut host, |heap| Ok(heap.alive(rooted))).expect("rooted"));
+        assert!(
+            host.typed_resource_with_key::<LuaTableResource>(other_handle, &LuaTableResource::key())
+                .is_err(),
+            "the other unreachable table is collected"
+        );
+        assert!(host.resource(&unrelated).is_ok(), "unrelated resource stays");
+        assert!(
+            host.scope_state::<heap::LuaHeap>().is_some(),
+            "collection must not replace the scope with reset"
+        );
+
+        let again = heap::collect(&mut host).expect("a later collection must also finish");
+        assert_eq!(again.live_nodes, 2);
+        assert_eq!(host.resource_count(), 3, "the second collection must not release quota again");
+        assert_eq!(heap::stats(&mut host).expect("after").collections, 2);
+        assert_eq!(table_ref(&host, successor_raw).generation(), successor.generation());
+        assert!(heap::with_heap(&mut host, |heap| Ok(heap.alive(rooted))).expect("root remains"));
+        assert!(host.resource(&unrelated).is_ok(), "unrelated resource remains");
+    });
+}
+
 fn publish_raw(host: &mut HostContext<'_>) -> i64 {
     match heap::publish(host).expect("publish") {
         Value::Int(raw) => raw,

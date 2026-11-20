@@ -354,6 +354,11 @@ impl LuaHeap {
         Ok(())
     }
 
+    /// Whether `raw` is the token currently stored on a node in this heap.
+    pub(super) fn stores_token(&self, raw: u64) -> bool {
+        self.slots.iter().any(|slot| slot.token == Some(raw))
+    }
+
     /// Drops the stored handle after the resource table has closed it. The
     /// node stays until sweep.
     pub fn clear_token(&mut self, raw: u64) {
