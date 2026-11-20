@@ -684,6 +684,12 @@ impl Cx {
                 self.walk_expr(left);
                 self.walk_expr(right);
             }
+            Expr::BinaryChain { base, steps, .. } => {
+                self.walk_expr(base);
+                for step in steps {
+                    self.walk_expr(&step.expr);
+                }
+            }
             Expr::Ternary {
                 cond,
                 then_expr,
@@ -694,22 +700,23 @@ impl Cx {
                 self.walk_expr(then_expr);
                 self.walk_expr(else_expr);
             }
-            Expr::Call {
-                callee, args, span, ..
-            } => {
-                self.note_import(*span, callee, args);
-                self.walk_expr(callee);
-                self.walk_args(args);
+            Expr::SuffixChain { base, steps, .. } => {
+                self.walk_expr(base);
+                for (index, step) in steps.iter().enumerate() {
+                    match step {
+                        Suffix::Field { .. } => {}
+                        Suffix::Index { key, .. } => self.walk_expr(key),
+                        Suffix::Call { span, args, .. } => {
+                            // A later call's callee is a suffix, not the base name.
+                            if index == 0 {
+                                self.note_import(*span, base, args);
+                            }
+                            self.walk_args(args);
+                        }
+                        Suffix::Method { args, .. } => self.walk_args(args),
+                    }
+                }
             }
-            Expr::MethodCall { receiver, args, .. } => {
-                self.walk_expr(receiver);
-                self.walk_args(args);
-            }
-            Expr::Index { table, key, .. } => {
-                self.walk_expr(table);
-                self.walk_expr(key);
-            }
-            Expr::Field { table, .. } => self.walk_expr(table),
             Expr::Function { body, .. } => self.walk_func(body, false),
             Expr::ShortFunction {
                 params,

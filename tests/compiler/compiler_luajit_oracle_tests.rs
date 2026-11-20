@@ -985,3 +985,355 @@ fn locked_luajit_syntax_boundaries() {
         failed.join("\n")
     );
 }
+
+fn return_expr(chunk: &ast::Chunk) -> &ast::Expr {
+    let Stmt::Return { values, .. } = &chunk.body.stmts[0] else {
+        panic!("return");
+    };
+    &values.exprs[0]
+}
+
+fn parse_resolve_drop(source: &[u8]) -> ast::Chunk {
+    let chunk = parser::parse_chunk(source).expect("parse");
+    let resolution = resolve::resolve(&chunk);
+    assert!(resolution.errors.is_empty(), "{:?}", resolution.errors);
+    chunk
+}
+
+/// Follow a chain node, not each operand. This does not call `walk_expr` or `Drop`.
+fn binary_chain_nesting(expr: &ast::Expr) -> u32 {
+    let mut depth = 0u32;
+    let mut cursor = expr;
+    loop {
+        match cursor {
+            ast::Expr::BinaryChain { base, .. } => {
+                depth += 1;
+                cursor = base;
+            }
+            _ => return depth,
+        }
+    }
+}
+
+fn suffix_chain_nesting(expr: &ast::Expr) -> u32 {
+    let mut depth = 0u32;
+    let mut cursor = expr;
+    loop {
+        match cursor {
+            ast::Expr::SuffixChain { base, .. } => {
+                depth += 1;
+                cursor = base;
+            }
+            _ => return depth,
+        }
+    }
+}
+
+fn assert_add_chain(expr: &ast::Expr, ops: usize) {
+    assert_eq!(binary_chain_nesting(expr), 1, "add spine is nested");
+    let ast::Expr::BinaryChain { base, steps, .. } = expr else {
+        panic!("expected add chain");
+    };
+    assert!(matches!(base.as_ref(), ast::Expr::Number { .. }));
+    assert_eq!(steps.len(), ops);
+    assert!(steps.iter().all(|step| step.op == ast::BinOp::Add));
+}
+
+fn assert_field_chain(expr: &ast::Expr, ops: usize) {
+    assert_eq!(suffix_chain_nesting(expr), 1, "suffix spine is nested");
+    let ast::Expr::SuffixChain { base, steps, .. } = expr else {
+        panic!("expected field chain");
+    };
+    assert!(matches!(base.as_ref(), ast::Expr::Name { .. }));
+    assert_eq!(steps.len(), ops);
+    assert!(
+        steps
+            .iter()
+            .all(|step| matches!(step, ast::Suffix::Field { nav: false, .. }))
+    );
+}
+
+fn number_raw(expr: &ast::Expr) -> &str {
+    match expr {
+        ast::Expr::Number { raw, .. } => raw,
+        _ => panic!("expected number at {:?}", expr.span()),
+    }
+}
+
+fn name_is(expr: &ast::Expr, text: &str) -> bool {
+    matches!(expr, ast::Expr::Name { name, .. } if name.is(text))
+}
+
+fn expect_syntax_error(source: &[u8], fragment: &str) {
+    let err = parser::parse_chunk(source).expect_err("syntax error");
+    assert!(
+        err.message.contains(fragment),
+        "message {:?} does not contain {fragment}",
+        err.message
+    );
+}
+
+#[test]
+fn left_spine_depth_does_not_grow_with_length() {
+    let short_ops = 4usize;
+    let long_ops = 32usize;
+    let short = parse_resolve_drop(&joined("return ", "1", "+", short_ops + 1));
+    let long = parse_resolve_drop(&joined("return ", "1", "+", long_ops + 1));
+    assert_add_chain(return_expr(&short), short_ops);
+    assert_add_chain(return_expr(&long), long_ops);
+    drop(short);
+    drop(long);
+}
+
+#[test]
+fn suffix_spine_depth_does_not_grow_with_length() {
+    let short_ops = 4usize;
+    let long_ops = 32usize;
+    let short = parse_resolve_drop(&joined("return a", ".b", "", short_ops));
+    let long = parse_resolve_drop(&joined("return a", ".b", "", long_ops));
+    assert_field_chain(return_expr(&short), short_ops);
+    assert_field_chain(return_expr(&long), long_ops);
+    drop(short);
+    drop(long);
+}
+
+#[test]
+fn composite_binary_keeps_precedence_and_order() {
+    let chunk = parse_resolve_drop(b"return 1+2*3-4/5");
+    let ast::Expr::BinaryChain { base, steps, span } = return_expr(&chunk) else {
+        panic!("expected left chain");
+    };
+    assert_eq!(number_raw(base), "1");
+    assert_eq!(span.start, 7);
+    assert_eq!(span.end, 16);
+    assert_eq!(steps.len(), 2);
+    assert_eq!(steps[0].op, ast::BinOp::Add);
+    assert_eq!(steps[1].op, ast::BinOp::Sub);
+    let ast::Expr::BinaryChain {
+        base: mul_base,
+        steps: mul_steps,
+        ..
+    } = &steps[0].expr
+    else {
+        panic!("expected mul chain");
+    };
+    assert_eq!(number_raw(mul_base), "2");
+    assert_eq!(mul_steps.len(), 1);
+    assert_eq!(mul_steps[0].op, ast::BinOp::Mul);
+    assert_eq!(number_raw(&mul_steps[0].expr), "3");
+    let ast::Expr::BinaryChain {
+        base: div_base,
+        steps: div_steps,
+        ..
+    } = &steps[1].expr
+    else {
+        panic!("expected div chain");
+    };
+    assert_eq!(number_raw(div_base), "4");
+    assert_eq!(div_steps[0].op, ast::BinOp::Div);
+    assert_eq!(number_raw(&div_steps[0].expr), "5");
+
+    let powers = parse_resolve_drop(b"return 2^3^2");
+    let ast::Expr::Binary {
+        op, left, right, ..
+    } = return_expr(&powers)
+    else {
+        panic!("power stays right-associative");
+    };
+    assert_eq!(*op, ast::BinOp::Pow);
+    assert_eq!(number_raw(left), "2");
+    let ast::Expr::Binary {
+        op: inner_op,
+        left: inner_left,
+        right: inner_right,
+        ..
+    } = right.as_ref()
+    else {
+        panic!("inner power");
+    };
+    assert_eq!(*inner_op, ast::BinOp::Pow);
+    assert_eq!(number_raw(inner_left), "3");
+    assert_eq!(number_raw(inner_right), "2");
+
+    let logic = parse_resolve_drop(b"return a and b and c");
+    let ast::Expr::BinaryChain { base, steps, .. } = return_expr(&logic) else {
+        panic!("and chain");
+    };
+    assert!(name_is(base, "a"));
+    assert_eq!(steps.len(), 2);
+    assert_eq!(steps[0].op, ast::BinOp::And);
+    assert!(name_is(&steps[0].expr, "b"));
+    assert_eq!(steps[1].op, ast::BinOp::And);
+    assert!(name_is(&steps[1].expr, "c"));
+
+    let mixed = parse_resolve_drop(b"return a and b or c");
+    let ast::Expr::BinaryChain { base, steps, .. } = return_expr(&mixed) else {
+        panic!("or chain");
+    };
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].op, ast::BinOp::Or);
+    assert!(name_is(&steps[0].expr, "c"));
+    let ast::Expr::BinaryChain {
+        base: and_base,
+        steps: and_steps,
+        ..
+    } = base.as_ref()
+    else {
+        panic!("and stays left of or");
+    };
+    assert!(name_is(and_base, "a"));
+    assert_eq!(and_steps[0].op, ast::BinOp::And);
+    assert!(name_is(&and_steps[0].expr, "b"));
+
+    let grouped = parse_resolve_drop(b"return a+(b+c)");
+    let ast::Expr::BinaryChain { steps, .. } = return_expr(&grouped) else {
+        panic!("outer add");
+    };
+    assert_eq!(steps.len(), 1);
+    let ast::Expr::Paren { inner, .. } = &steps[0].expr else {
+        panic!("paren is a boundary");
+    };
+    let ast::Expr::BinaryChain {
+        steps: inner_steps, ..
+    } = inner.as_ref()
+    else {
+        panic!("inner add");
+    };
+    assert_eq!(inner_steps.len(), 1);
+    assert!(name_is(&inner_steps[0].expr, "c"));
+}
+
+#[test]
+fn composite_suffix_keeps_order_and_boundaries() {
+    let chunk = parse_resolve_drop(b"return a.b[1]():m(2)");
+    let expr = return_expr(&chunk);
+    assert!(expr.is_multi());
+    assert_eq!(suffix_chain_nesting(expr), 1);
+    let ast::Expr::SuffixChain { base, steps, span } = expr else {
+        panic!("suffix chain");
+    };
+    assert!(name_is(base, "a"));
+    assert_eq!(span.start, 7);
+    assert_eq!(steps.len(), 4);
+    assert!(matches!(
+        &steps[0],
+        ast::Suffix::Field { name, nav: false, .. } if name.is("b")
+    ));
+    assert!(matches!(&steps[1], ast::Suffix::Index { nav: false, .. }));
+    assert!(matches!(&steps[2], ast::Suffix::Call { nav: false, .. }));
+    assert!(matches!(
+        &steps[3],
+        ast::Suffix::Method { method, receiver_nav: false, method_nav: false, .. }
+            if method.is("m")
+    ));
+    assert_eq!(steps[0].span().end, 10);
+    assert_eq!(steps[3].span(), *span);
+
+    let paren = parse_resolve_drop(b"return (f.g())");
+    let wrapped = return_expr(&paren);
+    assert!(!wrapped.is_multi());
+    assert!(matches!(wrapped, ast::Expr::Paren { .. }));
+
+    let calls = parse_resolve_drop(b"return f()()");
+    assert!(return_expr(&calls).is_multi());
+    assert_eq!(suffix_chain_nesting(return_expr(&calls)), 1);
+
+    let outer_nav = parse_resolve_drop(b"a.b?.c = 1");
+    match &outer_nav.body.stmts[0] {
+        Stmt::Assign { targets, .. } => {
+            assert!(targets[0].has_nav());
+            assert!(matches!(&targets[0], ast::AssignTarget::Field { name, .. } if name.is("c")));
+        }
+        _ => panic!("assign"),
+    }
+    let inner_nav = parse_resolve_drop(b"a?.b.c = 1");
+    match &inner_nav.body.stmts[0] {
+        Stmt::Assign { targets, .. } => assert!(!targets[0].has_nav()),
+        _ => panic!("assign"),
+    }
+
+    let imports = parse_resolve_drop(b"return require('a')+require('b')");
+    let resolution = resolve::resolve(&imports);
+    assert_eq!(resolution.imports.len(), 2);
+    assert_eq!(resolution.imports[0].spec, b"a");
+    assert_eq!(resolution.imports[1].spec, b"b");
+    assert!(resolution.imports[0].call_span.start < resolution.imports[1].call_span.start);
+
+    let method_import = parse_resolve_drop(b"return require('a').b('c')");
+    let resolution = resolve::resolve(&method_import);
+    assert_eq!(resolution.imports.len(), 1);
+    assert_eq!(resolution.imports[0].spec, b"a");
+}
+
+#[test]
+fn chain_syntax_errors_are_ordinary() {
+    expect_syntax_error(b"return 1 +", "expected expression");
+    expect_syntax_error(b"return a.", "expected name");
+    expect_syntax_error(b"a?.b, c = 1", "safe navigation");
+    expect_syntax_error(b"f() = 1", "expected");
+
+    let mut trailing_add = joined("return ", "1", "+", 256);
+    trailing_add.push(b'+');
+    expect_syntax_error(&trailing_add, "expected expression");
+
+    let mut trailing_field = joined("return a", ".b", "", 64);
+    trailing_field.push(b'.');
+    expect_syntax_error(&trailing_field, "expected name");
+}
+
+#[test]
+fn long_flat_chains_finish_on_the_default_test_thread() {
+    // libtest uses the default 2 MiB thread stack. Do not raise it.
+    let operands = 4096usize;
+    let adds = joined("return ", "1", "+", operands);
+    let chunk = parse_resolve_drop(&adds);
+    assert_add_chain(return_expr(&chunk), operands - 1);
+    drop(chunk);
+
+    let fields = joined("return a", ".b", "", operands);
+    let chunk = parse_resolve_drop(&fields);
+    assert_field_chain(return_expr(&chunk), operands);
+    drop(chunk);
+
+    let mut calls = b"return a".to_vec();
+    for _ in 0..operands {
+        calls.extend_from_slice(b"()");
+    }
+    let chunk = parse_resolve_drop(&calls);
+    let expr = return_expr(&chunk);
+    assert!(expr.is_multi());
+    assert_eq!(suffix_chain_nesting(expr), 1);
+    let ast::Expr::SuffixChain { steps, .. } = expr else {
+        panic!("call chain");
+    };
+    assert_eq!(steps.len(), operands);
+    drop(chunk);
+
+    // Locked LuaJIT load() accepts the add, field and call lengths above.
+    // An `and` chain was accepted at 10875 operands and rejected by 11000
+    // as "control structure too long". That is a compiler limit, not a
+    // grammar limit, and is not encoded here.
+    let ands = joined("return ", "a", " and ", 12000);
+    let chunk = parse_resolve_drop(&ands);
+    let ast::Expr::BinaryChain { steps, .. } = return_expr(&chunk) else {
+        panic!("and chain");
+    };
+    assert_eq!(steps.len(), 11999);
+    assert!(steps.iter().all(|step| step.op == ast::BinOp::And));
+    drop(chunk);
+
+    if let Some(path) = configured_oracle() {
+        assert!(
+            oracle_accepts(&path, &adds),
+            "LuaJIT rejected the add chain"
+        );
+        assert!(
+            oracle_accepts(&path, &fields),
+            "LuaJIT rejected the field chain"
+        );
+        assert!(
+            oracle_accepts(&path, &calls),
+            "LuaJIT rejected the call chain"
+        );
+    }
+}

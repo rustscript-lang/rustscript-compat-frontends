@@ -666,22 +666,38 @@ impl<'a> Parser<'a> {
     }
 
     fn binop_body(&mut self, flags: Flags, limit: u8) -> Result<Expr, lexer::SyntaxError> {
-        let mut left = self.unop(flags)?;
+        let mut base = self.unop(flags)?;
         while let Some((op, left_pri, right_pri)) = binop_of(self.kind()) {
             if left_pri <= limit {
                 break;
             }
-            self.bump();
-            let right = self.binop(flags, right_pri)?;
-            let span = left.span().cover(right.span());
-            left = Expr::Binary {
-                span,
-                op,
-                left: Box::new(left),
-                right: Box::new(right),
-            };
+            if right_pri < left_pri {
+                // Right-associative `^` and `..` spend a syntax level. Nest
+                // them; do not append them to a left spine.
+                self.bump();
+                let right = self.binop(flags, right_pri)?;
+                let span = base.span().cover(right.span());
+                base = Expr::Binary {
+                    span,
+                    op,
+                    left: Box::new(base),
+                    right: Box::new(right),
+                };
+                continue;
+            }
+            let chain_pri = left_pri;
+            let mut steps = Vec::new();
+            while let Some((op, left_pri, right_pri)) = binop_of(self.kind()) {
+                if left_pri != chain_pri || left_pri <= limit {
+                    break;
+                }
+                self.bump();
+                let right = self.binop(flags, right_pri)?;
+                steps.push(BinStep { op, expr: right });
+            }
+            base = finish_binary_chain(base, steps);
         }
-        Ok(left)
+        Ok(base)
     }
 
     fn unop(&mut self, flags: Flags) -> Result<Expr, lexer::SyntaxError> {
@@ -763,7 +779,7 @@ impl<'a> Parser<'a> {
 
     fn primary(&mut self, flags: Flags) -> Result<Primary, lexer::SyntaxError> {
         let start = self.here();
-        let mut expr = if self.eat(Tok::Char(b'(')) {
+        let expr = if self.eat(Tok::Char(b'(')) {
             let inner = self.expr(Flags::expr())?;
             self.expect_char(b')')?;
             Expr::Paren {
@@ -785,6 +801,8 @@ impl<'a> Parser<'a> {
         } else {
             return Err(self.error("expected expression"));
         };
+        let base_span = expr.span();
+        let mut steps = Vec::new();
         let mut nav_used = false;
         loop {
             let mut nav = false;
@@ -794,13 +812,11 @@ impl<'a> Parser<'a> {
             }
             if self.kind() == Tok::Char(b'[') {
                 let key = self.bracket()?;
-                let span = expr.span().cover(self.previous_span());
-                expr = Expr::Index {
-                    span,
-                    table: Box::new(expr),
-                    key: Box::new(key),
+                steps.push(Suffix::Index {
+                    span: base_span.cover(self.previous_span()),
+                    key,
                     nav,
-                };
+                });
             } else if self.kind() == Tok::Char(b':') {
                 if flags.nocolon {
                     if nav {
@@ -816,41 +832,38 @@ impl<'a> Parser<'a> {
                     nav_used = true;
                 }
                 let args = self.args()?;
-                let span = expr.span().cover(args_span(&args));
-                expr = Expr::MethodCall {
-                    span,
-                    receiver: Box::new(expr),
+                steps.push(Suffix::Method {
+                    span: base_span.cover(args_span(&args)),
                     method,
                     args,
                     receiver_nav: nav,
                     method_nav,
-                };
+                });
             } else if is_args_start(self.kind()) {
                 let args = self.args()?;
-                let span = expr.span().cover(args_span(&args));
-                expr = Expr::Call {
-                    span,
-                    callee: Box::new(expr),
+                steps.push(Suffix::Call {
+                    span: base_span.cover(args_span(&args)),
                     args,
                     nav,
-                };
+                });
             } else if nav || self.kind() == Tok::Char(b'.') {
                 if !nav {
                     self.bump();
                 }
                 let field = self.name()?;
-                let span = expr.span().cover(field.span);
-                expr = Expr::Field {
-                    span,
-                    table: Box::new(expr),
+                steps.push(Suffix::Field {
+                    span: base_span.cover(field.span),
                     name: field,
                     nav,
-                };
+                });
             } else {
                 break;
             }
         }
-        Ok(Primary { expr, nav_used })
+        Ok(Primary {
+            expr: finish_suffix_chain(expr, steps),
+            nav_used,
+        })
     }
 
     fn bracket(&mut self) -> Result<Expr, lexer::SyntaxError> {
@@ -949,35 +962,68 @@ fn is_args_start(kind: Tok) -> bool {
 }
 
 fn is_call(expr: &Expr) -> bool {
-    matches!(expr, Expr::Call { .. } | Expr::MethodCall { .. })
+    match expr {
+        Expr::SuffixChain { steps, .. } => {
+            matches!(
+                steps.last(),
+                Some(Suffix::Call { .. } | Suffix::Method { .. })
+            )
+        }
+        _ => false,
+    }
 }
 
 fn assign_target(expr: Expr) -> Result<AssignTarget, Span> {
     match expr {
         Expr::Name { name, .. } => Ok(AssignTarget::Name(name)),
-        Expr::Index {
+        Expr::SuffixChain {
             span,
-            table,
-            key,
-            nav,
-        } => Ok(AssignTarget::Index {
-            span,
-            table,
-            key,
-            nav,
-        }),
-        Expr::Field {
-            span,
-            table,
-            name,
-            nav,
-        } => Ok(AssignTarget::Field {
-            span,
-            table,
-            name,
-            nav,
-        }),
+            base,
+            mut steps,
+        } => {
+            let last = steps.pop();
+            let table = finish_suffix_chain(*base, steps);
+            match last {
+                Some(Suffix::Index { key, nav, .. }) => Ok(AssignTarget::Index {
+                    span,
+                    table: Box::new(table),
+                    key: Box::new(key),
+                    nav,
+                }),
+                Some(Suffix::Field { name, nav, .. }) => Ok(AssignTarget::Field {
+                    span,
+                    table: Box::new(table),
+                    name,
+                    nav,
+                }),
+                _ => Err(span),
+            }
+        }
         other => Err(other.span()),
+    }
+}
+
+fn finish_binary_chain(base: Expr, steps: Vec<BinStep>) -> Expr {
+    let Some(last) = steps.last() else {
+        return base;
+    };
+    let span = base.span().cover(last.expr.span());
+    Expr::BinaryChain {
+        span,
+        base: Box::new(base),
+        steps,
+    }
+}
+
+fn finish_suffix_chain(base: Expr, steps: Vec<Suffix>) -> Expr {
+    let Some(last) = steps.last() else {
+        return base;
+    };
+    let span = last.span();
+    Expr::SuffixChain {
+        span,
+        base: Box::new(base),
+        steps,
     }
 }
 

@@ -287,6 +287,57 @@ pub enum Field {
     Item { span: Span, value: Expr },
 }
 
+/// One left-associative operator and the operand that follows it.
+///
+/// Steps stay in source order. Short-circuit operators are not reordered,
+/// and a parenthesized operand remains a `Paren` boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BinStep {
+    pub op: BinOp,
+    pub expr: Expr,
+}
+
+/// One suffix operation, in source order.
+///
+/// `span` covers the chain base through this operation, the same range the
+/// old nested node stored. Navigation flags stay on the step that used them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Suffix {
+    Field {
+        span: Span,
+        name: Name,
+        nav: bool,
+    },
+    Index {
+        span: Span,
+        key: Expr,
+        nav: bool,
+    },
+    Call {
+        span: Span,
+        args: Args,
+        nav: bool,
+    },
+    Method {
+        span: Span,
+        method: Name,
+        args: Args,
+        receiver_nav: bool,
+        method_nav: bool,
+    },
+}
+
+impl Suffix {
+    pub fn span(&self) -> Span {
+        match self {
+            Self::Field { span, .. }
+            | Self::Index { span, .. }
+            | Self::Call { span, .. }
+            | Self::Method { span, .. } => *span,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Expr {
     Nil {
@@ -321,11 +372,23 @@ pub enum Expr {
         op: UnOp,
         expr: Box<Expr>,
     },
+    /// Right-associative `^` or `..`. Each operator spends a syntax level, so
+    /// this spine stays nested and bounded by `LJ_MAX_XLEVEL`.
     Binary {
         span: Span,
         op: BinOp,
         left: Box<Expr>,
         right: Box<Expr>,
+    },
+    /// Left-associative operators at one precedence. `steps` is non-empty.
+    ///
+    /// The parser builds these in a loop, so the length is not a syntax-level
+    /// nest. Storing the spine in a `Vec` keeps parse, drop and resolve off
+    /// that length. Construction appends operands; it does not clone a prefix.
+    BinaryChain {
+        span: Span,
+        base: Box<Expr>,
+        steps: Vec<BinStep>,
     },
     Ternary {
         span: Span,
@@ -333,31 +396,14 @@ pub enum Expr {
         then_expr: Box<Expr>,
         else_expr: Box<Expr>,
     },
-    Call {
+    /// Field, index, call and method steps after a primary. `steps` is non-empty.
+    ///
+    /// A trailing call or method is a multiple-value expression. A `Paren`
+    /// around the chain is not. Mixed suffixes keep source order.
+    SuffixChain {
         span: Span,
-        callee: Box<Expr>,
-        args: Args,
-        nav: bool,
-    },
-    MethodCall {
-        span: Span,
-        receiver: Box<Expr>,
-        method: Name,
-        args: Args,
-        receiver_nav: bool,
-        method_nav: bool,
-    },
-    Index {
-        span: Span,
-        table: Box<Expr>,
-        key: Box<Expr>,
-        nav: bool,
-    },
-    Field {
-        span: Span,
-        table: Box<Expr>,
-        name: Name,
-        nav: bool,
+        base: Box<Expr>,
+        steps: Vec<Suffix>,
     },
     Function {
         span: Span,
@@ -387,11 +433,9 @@ impl Expr {
             | Self::Paren { span, .. }
             | Self::Unary { span, .. }
             | Self::Binary { span, .. }
+            | Self::BinaryChain { span, .. }
             | Self::Ternary { span, .. }
-            | Self::Call { span, .. }
-            | Self::MethodCall { span, .. }
-            | Self::Index { span, .. }
-            | Self::Field { span, .. }
+            | Self::SuffixChain { span, .. }
             | Self::Function { span, .. }
             | Self::ShortFunction { span, .. }
             | Self::Table { span, .. } => *span,
@@ -399,9 +443,13 @@ impl Expr {
     }
 
     pub fn is_multi(&self) -> bool {
-        matches!(
-            self,
-            Self::Call { .. } | Self::MethodCall { .. } | Self::Vararg { .. }
-        )
+        match self {
+            Self::Vararg { .. } => true,
+            Self::SuffixChain { steps, .. } => matches!(
+                steps.last(),
+                Some(Suffix::Call { .. } | Suffix::Method { .. })
+            ),
+            _ => false,
+        }
     }
 }
