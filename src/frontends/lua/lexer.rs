@@ -961,11 +961,21 @@ fn classify_number(raw: &[u8]) -> Result<NumberKind, ()> {
         }
     }
     let mut digits = 0u32;
-    let digit_start = p;
+    let mut decimal_sig = [0u8; 20];
+    let mut decimal_len = 0usize;
+    let mut decimal_too_long = false;
     while p < raw.len() {
         if is_base_digit(raw[p], base) {
             if base == 2 && raw[p] > b'1' {
                 return Err(());
+            }
+            if base == 10 && dot.is_none() {
+                if decimal_len < decimal_sig.len() {
+                    decimal_sig[decimal_len] = raw[p];
+                    decimal_len += 1;
+                } else {
+                    decimal_too_long = true;
+                }
             }
             digits += 1;
             p += 1;
@@ -979,7 +989,6 @@ fn classify_number(raw: &[u8]) -> Result<NumberKind, ()> {
             break;
         }
     }
-    let _ = digit_start;
     if !hasdig && digits == 0 {
         return Err(());
     }
@@ -1034,13 +1043,13 @@ fn classify_number(raw: &[u8]) -> Result<NumberKind, ()> {
     } else {
         NumberKind::Integer
     };
+    let mut saw_ll = false;
     if p < raw.len() {
         if (raw[p] | 0x20) == b'i' {
             p += 1;
             kind = NumberKind::Imaginary;
         } else if !float_fmt {
             let mut saw_u = false;
-            let mut saw_ll = false;
             if (raw[p] | 0x20) == b'u' {
                 p += 1;
                 saw_u = true;
@@ -1073,7 +1082,28 @@ fn classify_number(raw: &[u8]) -> Result<NumberKind, ()> {
             return Err(());
         }
     }
+    // strscan_bin rejects more than 64 significant bits for every format.
+    // Leading zeros are already skipped, matching lj_strscan.c.
+    if base == 2 && digits > 64 {
+        return Err(());
+    }
+    // LL/ULL integers share the unsigned 64-bit scan limit. A leading minus
+    // is a separate unary operator, so it does not widen this token.
+    if saw_ll
+        && !float_fmt
+        && base == 10
+        && (decimal_too_long || decimal_above_u64(&decimal_sig[..decimal_len]))
+    {
+        return Err(());
+    }
+    if saw_ll && !float_fmt && base == 16 && digits > 16 {
+        return Err(());
+    }
     Ok(kind)
+}
+
+fn decimal_above_u64(digits: &[u8]) -> bool {
+    digits.len() == 20 && digits > b"18446744073709551615"
 }
 
 fn is_base_digit(c: u8, base: u32) -> bool {

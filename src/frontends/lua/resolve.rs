@@ -187,6 +187,27 @@ impl Cx {
         });
     }
 
+    fn reject_continues_into_locals(&mut self, scope: usize) {
+        let active = self.locals.len() as u32;
+        let mut into_local = Vec::new();
+        for jump in &mut self.scopes[scope].jumps {
+            if jump.kind != JumpKind::Continue || jump.resolved {
+                continue;
+            }
+            if jump.slot < active {
+                into_local.push((jump.span, jump.slot));
+            }
+            jump.resolved = true;
+        }
+        for (span, slot) in into_local {
+            let local_name = self.locals[slot as usize].name.clone();
+            self.resolution.errors.push(ResolveError::JumpIntoLocal {
+                goto_span: span,
+                local_name,
+            });
+        }
+    }
+
     fn leave_scope(&mut self, end: u32) {
         let scope = self.scopes.pop().expect("scope");
         self.close_scope(scope, end, false);
@@ -457,6 +478,8 @@ impl Cx {
                 self.enter_scope();
                 self.walk_block(body, false, false);
                 self.walk_expr(until);
+                let scope = self.scopes.len() - 1;
+                self.reject_continues_into_locals(scope);
                 self.leave_scope(until.span().end);
                 self.leave_loop(span.end);
             }

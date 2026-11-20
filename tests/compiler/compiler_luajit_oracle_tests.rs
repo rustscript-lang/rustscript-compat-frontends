@@ -1,9 +1,9 @@
-//! Differential syntax checks against the locked LuaJIT 2.1 binary.
+//! Differential syntax checks against a locked LuaJIT 2.1 binary.
 //!
-//! Set LUAJIT_ORACLE to the luajit built from 96f7b297 with
-//! XCFLAGS=-DLUAJIT_ENABLE_LUA52COMPAT. The test loads each sample with
-//! load(source, "@probe", "t") and requires the same accept/reject result
-//! from the private parser. This is not a second public file entry.
+//! Ordinary Cargo does not spawn LuaJIT. Set LUAJIT_ORACLE to the luajit
+//! built from 96f7b297 with XCFLAGS=-DLUAJIT_ENABLE_LUA52COMPAT to compare
+//! load(source, "@probe", "t"). jit.version is a runtime baseline, not the
+//! source identity. This is not a second public file entry.
 
 #[path = "../../src/frontends/lua/ast.rs"]
 mod ast;
@@ -15,14 +15,34 @@ mod parser;
 mod resolve;
 
 use std::io::Write;
-use std::process::Command;
+use std::process::{Command, Stdio};
+
+use ast::Stmt;
 
 const ORACLE_SHA: &str = "96f7b297326e9fd454b7186c6858b2773f94a0dc";
+const ORACLE_VERSION_BASELINE: &str = "LuaJIT 2.1.1795119671";
 
-fn oracle_path() -> String {
-    std::env::var("LUAJIT_ORACLE").unwrap_or_else(|_| {
-        "/mnt/workspace/rustscript-lua/tmp/lua52-syntax/LuaJIT/src/luajit".to_string()
-    })
+const LOAD_DRIVER: &str = "\
+local src = io.read('*a')
+local fn = load(src, '@probe', 't')
+if fn then
+  io.write('ACCEPT\\n')
+else
+  io.write('REJECT\\n')
+end
+";
+
+const BASELINE_DRIVER: &str = "\
+io.write(jit.version, '\\n')
+local g = load('local goto = 1', '@g', 't')
+local b = load('for i=1,2 do break print(i) end', '@b', 't')
+io.write(g and 'BAD_GOTO' or 'GOTO_KW', '\\n')
+io.write(b and 'BREAK_OK' or 'BREAK_BAD', '\\n')
+io.write(type(table.pack), '\\n')
+";
+
+fn configured_oracle() -> Option<String> {
+    std::env::var("LUAJIT_ORACLE").ok()
 }
 
 fn syntax_ok(source: &[u8]) -> bool {
@@ -32,44 +52,112 @@ fn syntax_ok(source: &[u8]) -> bool {
     }
 }
 
-fn oracle_accepts(source: &[u8]) -> bool {
-    let dir = std::env::var("TMPDIR")
-        .unwrap_or_else(|_| "/mnt/workspace/rustscript-lua/tmp/lua52-syntax".to_string());
-    let src = format!("{dir}/oracle-case.bin");
-    let mut file = std::fs::File::create(&src).expect("oracle source");
-    file.write_all(source).expect("write oracle source");
-    let driver = format!("{dir}/load_t.lua");
-    let output = Command::new(oracle_path())
-        .arg(&driver)
-        .arg(&src)
-        .output()
-        .expect("run locked luajit");
+fn spawn_oracle(path: &str, args: &[&str], stdin_bytes: Option<&[u8]>) -> std::process::Output {
+    let mut cmd = Command::new(path);
+    cmd.args(args)
+        .stdin(if stdin_bytes.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(target_os = "linux")]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(limit_oracle_child);
+    }
+    let mut child = cmd.spawn().unwrap_or_else(|err| {
+        panic!("LUAJIT_ORACLE at {path:?} failed to start: {err}");
+    });
+    if let Some(bytes) = stdin_bytes {
+        let mut input = child
+            .stdin
+            .take()
+            .unwrap_or_else(|| panic!("LUAJIT_ORACLE at {path:?} has no stdin pipe"));
+        input.write_all(bytes).unwrap_or_else(|err| {
+            panic!("LUAJIT_ORACLE at {path:?} rejected stdin: {err}");
+        });
+    }
+    child.wait_with_output().unwrap_or_else(|err| {
+        panic!("LUAJIT_ORACLE at {path:?} failed while waiting: {err}");
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn limit_oracle_child() -> std::io::Result<()> {
+    #[repr(C)]
+    struct RLimit {
+        cur: u64,
+        max: u64,
+    }
+    unsafe extern "C" {
+        fn setrlimit(resource: i32, rlim: *const RLimit) -> i32;
+        fn alarm(seconds: u32) -> u32;
+        fn _exit(code: i32) -> !;
+    }
+    const RLIMIT_CPU: i32 = 0;
+    const RLIMIT_AS: i32 = 9;
+    let cpu = RLimit { cur: 2, max: 2 };
+    let address = RLimit {
+        cur: 128 * 1024 * 1024,
+        max: 128 * 1024 * 1024,
+    };
+    unsafe {
+        if setrlimit(RLIMIT_CPU, &cpu) != 0 || setrlimit(RLIMIT_AS, &address) != 0 {
+            _exit(126);
+        }
+        alarm(5);
+    }
+    Ok(())
+}
+
+fn require_success(path: &str, output: &std::process::Output, what: &str) {
+    if output.status.success() && output.stderr.is_empty() {
+        return;
+    }
+    panic!(
+        "LUAJIT_ORACLE at {path:?} {what} failed: status={} stdout={:?} stderr={:?}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn assert_oracle_baseline(path: &str) {
+    let output = spawn_oracle(path, &["-e", BASELINE_DRIVER], None);
+    require_success(path, &output, "baseline");
     let text = String::from_utf8_lossy(&output.stdout);
-    text.starts_with("ACCEPT")
+    let expected = format!("{ORACLE_VERSION_BASELINE}\nGOTO_KW\nBREAK_OK\nfunction\n");
+    assert_eq!(
+        text, expected,
+        "oracle flag/version baseline mismatch; jit.version is not source identity (source commit {ORACLE_SHA})"
+    );
+    eprintln!(
+        "oracle baseline jit.version={ORACLE_VERSION_BASELINE} (version string is not source identity); source commit {ORACLE_SHA}"
+    );
+}
+
+fn oracle_accepts(path: &str, source: &[u8]) -> bool {
+    let output = spawn_oracle(path, &["-e", LOAD_DRIVER], Some(source));
+    require_success(path, &output, "load protocol");
+    match output.stdout.as_slice() {
+        b"ACCEPT\n" => true,
+        b"REJECT\n" => false,
+        other => panic!(
+            "LUAJIT_ORACLE at {path:?} broke the ACCEPT/REJECT protocol: {:?}",
+            String::from_utf8_lossy(other)
+        ),
+    }
 }
 
 #[test]
 fn oracle_config_accepts_52_markers() {
-    let dir = std::env::var("TMPDIR")
-        .unwrap_or_else(|_| "/mnt/workspace/rustscript-lua/tmp/lua52-syntax".to_string());
-    let output = Command::new(oracle_path())
-        .arg("-e")
-        .arg(
-            "local g = load('local goto = 1', '@g', 't')\n\
-             local b = load('for i=1,2 do break print(i) end', '@b', 't')\n\
-             io.write(g and 'BAD_GOTO' or 'GOTO_KW', ' ')\n\
-             io.write(b and 'BREAK_OK' or 'BREAK_BAD', ' ')\n\
-             io.write(type(table.pack), '\\n')",
-        )
-        .env("TMPDIR", &dir)
-        .output()
-        .expect("oracle config");
-    let text = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        text.contains("GOTO_KW") && text.contains("BREAK_OK") && text.contains("function"),
-        "oracle {ORACLE_SHA} is not Lua 5.2 compat: {text:?} {:?}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let Some(path) = configured_oracle() else {
+        eprintln!("oracle baseline not run: LUAJIT_ORACLE unset; not a differential GREEN");
+        return;
+    };
+    assert_oracle_baseline(&path);
 }
 
 fn cases() -> Vec<(&'static str, &'static [u8])> {
@@ -526,10 +614,26 @@ fn cases() -> Vec<(&'static str, &'static [u8])> {
 
 #[test]
 fn differential_matches_locked_luajit() {
+    let Some(path) = configured_oracle() else {
+        eprintln!(
+            "oracle differential not run: LUAJIT_ORACLE unset; cases=0 accept=0 reject=0; not a differential GREEN"
+        );
+        return;
+    };
+    assert_oracle_baseline(&path);
     let mut mismatches = Vec::new();
+    let mut accept = 0u32;
+    let mut reject = 0u32;
+    let mut compared = 0u32;
     for (name, source) in cases() {
+        compared += 1;
         let ours = syntax_ok(source);
-        let theirs = oracle_accepts(source);
+        let theirs = oracle_accepts(&path, source);
+        if theirs {
+            accept += 1;
+        } else {
+            reject += 1;
+        }
         if ours != theirs {
             mismatches.push(format!(
                 "{name}: parser={} oracle={}",
@@ -538,6 +642,26 @@ fn differential_matches_locked_luajit() {
             ));
         }
     }
+    for (name, source, _) in boundary_samples() {
+        compared += 1;
+        let ours = syntax_ok(&source);
+        let theirs = oracle_accepts(&path, &source);
+        if theirs {
+            accept += 1;
+        } else {
+            reject += 1;
+        }
+        if ours != theirs {
+            mismatches.push(format!(
+                "{name}: parser={} oracle={}",
+                if ours { "ACCEPT" } else { "REJECT" },
+                if theirs { "ACCEPT" } else { "REJECT" }
+            ));
+        }
+    }
+    eprintln!(
+        "oracle differential cases={compared} accept={accept} reject={reject} scope=load(..., \"t\") source={ORACLE_SHA}"
+    );
     assert!(
         mismatches.is_empty(),
         "syntax disagrees with LuaJIT {ORACLE_SHA}:\n{}",
@@ -627,4 +751,237 @@ fn bom_is_recorded_and_not_part_of_return() {
     assert!(matches!(chunk.body.stmts[0], ast::Stmt::Return { .. }));
 }
 
-use ast::Stmt;
+fn nested_do(n: usize) -> Vec<u8> {
+    let mut source = String::new();
+    for _ in 0..n {
+        source.push_str("do ");
+    }
+    for _ in 0..n {
+        source.push_str("end ");
+    }
+    source.into_bytes()
+}
+
+fn joined(prefix: &str, item: &str, sep: &str, count: usize) -> Vec<u8> {
+    let mut source = String::from(prefix);
+    for index in 0..count {
+        if index > 0 {
+            source.push_str(sep);
+        }
+        source.push_str(item);
+    }
+    source.into_bytes()
+}
+
+fn labels(count: usize) -> Vec<u8> {
+    let mut source = String::new();
+    for index in 0..count {
+        if index > 0 {
+            source.push(' ');
+        }
+        source.push_str(&format!("::l{index}::"));
+    }
+    source.into_bytes()
+}
+
+fn assignment(count: usize, wrap_do: bool) -> Vec<u8> {
+    let mut names = String::new();
+    let mut values = String::new();
+    for index in 0..count {
+        if index > 0 {
+            names.push(',');
+            values.push(',');
+        }
+        names.push_str(&format!("a{index}"));
+        values.push('1');
+    }
+    let body = format!("{names} = {values}");
+    if wrap_do {
+        format!("do {body} end").into_bytes()
+    } else {
+        body.into_bytes()
+    }
+}
+
+fn ternary(count: usize) -> Vec<u8> {
+    let mut source = String::from("return ");
+    for _ in 0..count {
+        source.push_str("a?");
+    }
+    source.push('1');
+    for _ in 0..count {
+        source.push_str(":0");
+    }
+    source.into_bytes()
+}
+
+fn bits(prefix: &str, count: usize, suffix: &str) -> Vec<u8> {
+    format!("return {prefix}{}{suffix}", "1".repeat(count)).into_bytes()
+}
+
+/// Boundaries measured against locked LuaJIT 96f7b297 with LUAJIT_ENABLE_LUA52COMPAT.
+/// `expect` is load(..., "t") accept. These samples do not spawn that binary.
+fn boundary_samples() -> Vec<(String, Vec<u8>, bool)> {
+    let mut samples = Vec::new();
+    let mut add = |name: &str, source: Vec<u8>, accept: bool| {
+        samples.push((name.to_string(), source, accept));
+    };
+    add("triple_eq", b"a === 1".to_vec(), false);
+    add("eq_stmt", b"a == 1".to_vec(), false);
+    add("ne_stmt", b"a ~= 1".to_vec(), true);
+    add("ne_expr", b"return a ~= b".to_vec(), true);
+    add("add_assign", b"a += 1".to_vec(), true);
+    add("add_assign_space", b"a + = 1".to_vec(), false);
+    add(
+        "repeat_continue_early",
+        b"repeat do continue end local x = 1 until true".to_vec(),
+        false,
+    );
+    add(
+        "repeat_continue_late",
+        b"repeat local x = 1 do continue end until true".to_vec(),
+        true,
+    );
+    add(
+        "while_continue_early",
+        b"while true do do continue end local x = 1 end".to_vec(),
+        true,
+    );
+    add(
+        "repeat_if_continue_early",
+        b"repeat if true then continue end local x = 1 until true".to_vec(),
+        false,
+    );
+    add(
+        "repeat_if_continue_late",
+        b"repeat local x = 1 if true then continue end until true".to_vec(),
+        true,
+    );
+    add(
+        "repeat_continue_then_second_local",
+        b"repeat local x = 1 do continue end local y = 2 until true".to_vec(),
+        false,
+    );
+    add(
+        "dec_ll_max",
+        b"return 18446744073709551615LL".to_vec(),
+        true,
+    );
+    add(
+        "dec_ll_over",
+        b"return 18446744073709551616LL".to_vec(),
+        false,
+    );
+    add(
+        "dec_ull_max",
+        b"return 18446744073709551615ULL".to_vec(),
+        true,
+    );
+    add(
+        "dec_ull_over",
+        b"return 18446744073709551616ULL".to_vec(),
+        false,
+    );
+    add(
+        "dec_ll_neg_max",
+        b"return -18446744073709551615LL".to_vec(),
+        true,
+    );
+    add(
+        "dec_ll_neg_over",
+        b"return -18446744073709551616LL".to_vec(),
+        false,
+    );
+    add(
+        "dec_ll_leading_zero_max",
+        b"return 00018446744073709551615LL".to_vec(),
+        true,
+    );
+    add(
+        "dec_ll_leading_zero_over",
+        b"return 00018446744073709551616LL".to_vec(),
+        false,
+    );
+    add(
+        "dec_ll_20_under",
+        b"return 10000000000000000000LL".to_vec(),
+        true,
+    );
+    add(
+        "dec_unsuffixed_over",
+        b"return 18446744073709551616".to_vec(),
+        true,
+    );
+    add(
+        "hex_ll_16",
+        format!("return 0x{}LL", "F".repeat(16)).into_bytes(),
+        true,
+    );
+    add(
+        "hex_ll_17",
+        format!("return 0x{}LL", "F".repeat(17)).into_bytes(),
+        false,
+    );
+    add(
+        "hex_ll_leading_zero_16",
+        format!("return 0x0000{}LL", "F".repeat(16)).into_bytes(),
+        true,
+    );
+    add(
+        "hex_ll_leading_zero_17",
+        format!("return 0x0000{}LL", "F".repeat(17)).into_bytes(),
+        false,
+    );
+    add("bin_64", bits("0b", 64, ""), true);
+    add("bin_65", bits("0b", 65, ""), false);
+    add("bin_ll_64", bits("0b", 64, "LL"), true);
+    add("bin_ll_65", bits("0b", 65, "LL"), false);
+    add("bin_ll_leading_zero_64", bits("0b000", 64, "LL"), true);
+    add("bin_ll_leading_zero_65", bits("0b000", 65, "LL"), false);
+    add("do_198", nested_do(198), true);
+    add("do_199", nested_do(199), false);
+    add("add_400", joined("return ", "1", "+", 400), true);
+    add("pow_198", joined("return ", "2", "^", 198), true);
+    add("pow_199", joined("return ", "2", "^", 199), false);
+    add("cat_198", joined("return ", "'a'", "..", 198), true);
+    add("cat_199", joined("return ", "'a'", "..", 199), false);
+    add("tern_197", ternary(197), true);
+    add("tern_198", ternary(198), false);
+    add("lab_199", labels(199), true);
+    add("lab_200", labels(200), false);
+    add(
+        "lab_do_198",
+        format!("do {} end", String::from_utf8(labels(198)).unwrap()).into_bytes(),
+        true,
+    );
+    add(
+        "lab_do_199",
+        format!("do {} end", String::from_utf8(labels(199)).unwrap()).into_bytes(),
+        false,
+    );
+    add("asg_199", assignment(199, false), true);
+    add("asg_200", assignment(200, false), false);
+    add("asg_do_198", assignment(198, true), true);
+    add("asg_do_199", assignment(199, true), false);
+    samples
+}
+
+#[test]
+fn locked_luajit_syntax_boundaries() {
+    let mut failed = Vec::new();
+    for (name, source, expect) in boundary_samples() {
+        let got = syntax_ok(&source);
+        if got != expect {
+            failed.push(format!(
+                "{name}: parser {} expected {}",
+                if got { "ACCEPT" } else { "REJECT" },
+                if expect { "ACCEPT" } else { "REJECT" }
+            ));
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "locked syntax boundary mismatch (no external oracle):\n{}",
+        failed.join("\n")
+    );
+}

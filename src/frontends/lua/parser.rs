@@ -44,7 +44,10 @@ struct Parser<'a> {
     tokens: Vec<Token>,
     index: usize,
     last_statement: bool,
+    level: u32,
 }
+
+const LJ_MAX_XLEVEL: u32 = 200;
 
 pub fn parse_chunk(source: &[u8]) -> Result<Chunk, lexer::SyntaxError> {
     let lexed = lexer::lex(source)?;
@@ -53,6 +56,7 @@ pub fn parse_chunk(source: &[u8]) -> Result<Chunk, lexer::SyntaxError> {
         tokens: lexed.tokens,
         index: 0,
         last_statement: false,
+        level: 0,
     };
     let start = parser.here();
     let body = parser.block()?;
@@ -102,6 +106,18 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn synlevel_begin(&mut self) -> Result<(), lexer::SyntaxError> {
+        self.level += 1;
+        if self.level >= LJ_MAX_XLEVEL {
+            return Err(self.error("chunk has too many syntax levels"));
+        }
+        Ok(())
+    }
+
+    fn synlevel_end(&mut self) {
+        self.level = self.level.saturating_sub(1);
+    }
+
     fn error(&self, message: impl Into<String>) -> lexer::SyntaxError {
         lexer::SyntaxError::at(self.here(), self.line(), message)
     }
@@ -141,14 +157,45 @@ impl<'a> Parser<'a> {
     }
 
     fn block(&mut self) -> Result<Block, lexer::SyntaxError> {
+        self.synlevel_begin()?;
+        let block = self.block_body();
+        if block.is_ok() {
+            self.synlevel_end();
+        }
+        block
+    }
+
+    fn block_body(&mut self) -> Result<Block, lexer::SyntaxError> {
         let start = self.here();
         let saved = self.last_statement;
         let mut stmts = Vec::new();
         let mut is_last = false;
+        // LuaJIT parses a trailing label by recursing into parse_label, and
+        // each recursion takes a syntax level. The first label does not.
+        // Semicolons stay inside that chain; another statement ends it.
+        let mut label_chain = 0u32;
         while !is_last && !self.is_end() {
+            if self.kind() == Tok::Label {
+                if label_chain > 0 {
+                    self.synlevel_begin()?;
+                }
+                label_chain += 1;
+            } else if label_chain > 1 {
+                for _ in 1..label_chain {
+                    self.synlevel_end();
+                }
+                label_chain = 0;
+            } else {
+                label_chain = 0;
+            }
             stmts.push(self.statement()?);
             is_last = self.last_statement;
             while self.eat(Tok::Char(b';')) {}
+        }
+        if label_chain > 1 {
+            for _ in 1..label_chain {
+                self.synlevel_end();
+            }
         }
         self.last_statement = saved;
         let end = if stmts.is_empty() {
@@ -436,7 +483,12 @@ impl<'a> Parser<'a> {
             });
         }
         let mut targets = vec![target];
+        let mut nvars = 1u32;
         while self.eat(Tok::Char(b',')) {
+            if self.level + nvars >= LJ_MAX_XLEVEL {
+                return Err(self.error("too many variable names"));
+            }
+            nvars += 1;
             let next = self.primary(Flags::stmt().nonav())?;
             if is_call(&next.expr) {
                 return Err(self.error("invalid assignment target"));
@@ -468,7 +520,6 @@ impl<'a> Parser<'a> {
             Tok::Shr => BinOp::Shr,
             Tok::Sar => BinOp::Sar,
             Tok::Concat => BinOp::Concat,
-            Tok::Eq => BinOp::Eq,
             Tok::Ne => BinOp::BXor,
             _ => return None,
         };
@@ -585,6 +636,7 @@ impl<'a> Parser<'a> {
     fn expr(&mut self, flags: Flags) -> Result<Expr, lexer::SyntaxError> {
         let mut left = self.binop(flags, 0)?;
         if self.eat(Tok::Char(b'?')) {
+            self.synlevel_begin()?;
             let then_expr = self.expr(Flags {
                 nores: false,
                 nocolon: true,
@@ -592,6 +644,7 @@ impl<'a> Parser<'a> {
             })?;
             self.expect_char(b':')?;
             let else_expr = self.expr(Flags::expr())?;
+            self.synlevel_end();
             let span = left.span().cover(else_expr.span());
             left = Expr::Ternary {
                 span,
@@ -604,6 +657,15 @@ impl<'a> Parser<'a> {
     }
 
     fn binop(&mut self, flags: Flags, limit: u8) -> Result<Expr, lexer::SyntaxError> {
+        self.synlevel_begin()?;
+        let expr = self.binop_body(flags, limit);
+        if expr.is_ok() {
+            self.synlevel_end();
+        }
+        expr
+    }
+
+    fn binop_body(&mut self, flags: Flags, limit: u8) -> Result<Expr, lexer::SyntaxError> {
         let mut left = self.unop(flags)?;
         while let Some((op, left_pri, right_pri)) = binop_of(self.kind()) {
             if left_pri <= limit {
