@@ -18,7 +18,7 @@ pub struct HeapLimits {
     pub nodes: u32,
     /// Simultaneous explicit root slots.
     pub roots: u32,
-    /// Live table-entry records, including a scalar `__mode` field.
+    /// Live table-entry records, including one scalar field value.
     pub edges: u32,
     /// Highest generation a slot may hold. The next release retires it.
     pub max_generation: u32,
@@ -179,15 +179,20 @@ struct Edge {
 }
 
 enum EdgeValue {
-    Table { slot: u32, generation: u32 },
-    ModeScalar(Value),
+    Table {
+        slot: u32,
+        generation: u32,
+    },
+    /// One guest scalar in the same record as a table target. Field 0 is the
+    /// only key whose string is read as `__mode`.
+    Scalar(Value),
 }
 
 impl EdgeValue {
     fn table(&self) -> Option<(u32, u32)> {
         match self {
             Self::Table { slot, generation } => Some((*slot, *generation)),
-            Self::ModeScalar(_) => None,
+            Self::Scalar(_) => None,
         }
     }
 }
@@ -531,21 +536,38 @@ impl LuaHeap {
         self.write_table_edge(from, EdgeKey::Field(key), to)
     }
 
-    /// Writes the non-reference scalar forms of the direct `__mode` field.
+    /// Writes a scalar into the same record and quota as a table edge.
+    ///
+    /// Nil deletes that record. A string may occupy any direct field. A number
+    /// or boolean remains a field 0 value; only that key's string is `__mode`.
+    pub fn set_field_scalar(
+        &mut self,
+        from: TableRef,
+        key: u32,
+        value: Value,
+    ) -> Result<(), HeapError> {
+        debug_assert!(
+            matches!(value, Value::Null | Value::String(_))
+                || (key == Self::MODE_FIELD && matches!(value, Value::Float(_) | Value::Bool(_)))
+        );
+        self.require_live(from)?;
+        let key = EdgeKey::Field(key);
+        if matches!(value, Value::Null) {
+            self.clear_edge(from, key);
+            Ok(())
+        } else {
+            self.write_edge(from, key, EdgeValue::Scalar(value))
+        }
+    }
+
+    /// Writes the non-reference forms of the direct `__mode` field.
     /// Nil deletes the record; other scalar values occupy the same edge quota.
     pub fn set_mode_scalar(&mut self, from: TableRef, value: Value) -> Result<(), HeapError> {
         debug_assert!(matches!(
             value,
             Value::Null | Value::String(_) | Value::Float(_) | Value::Bool(_)
         ));
-        self.require_live(from)?;
-        let key = EdgeKey::Field(Self::MODE_FIELD);
-        if matches!(value, Value::Null) {
-            self.clear_edge(from, key);
-            Ok(())
-        } else {
-            self.write_edge(from, key, EdgeValue::ModeScalar(value))
-        }
+        self.set_field_scalar(from, Self::MODE_FIELD, value)
     }
 
     /// Writes one object-key edge in the same record and quota as a field edge.
@@ -631,7 +653,7 @@ impl LuaHeap {
             Some(EdgeValue::Table { slot, generation }) => {
                 self.issued_value(TableRef::table(self.domain, *slot, *generation))
             }
-            Some(EdgeValue::ModeScalar(value)) => Ok(value.clone()),
+            Some(EdgeValue::Scalar(value)) => Ok(value.clone()),
             None => Ok(Value::Null),
         }
     }
@@ -1065,7 +1087,7 @@ impl LuaHeap {
             }
             if self.metatable_edges > 0
                 && edge.key == EdgeKey::Field(Self::MODE_FIELD)
-                && let EdgeValue::ModeScalar(Value::String(mode)) = &edge.value
+                && let EdgeValue::Scalar(Value::String(mode)) = &edge.value
             {
                 let mode = WeakMode::parse(mode, &mut self.scan.weak_mode_bytes);
                 if mode.keys || mode.values {

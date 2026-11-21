@@ -571,16 +571,15 @@ fn set_edge(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
                     heap::with_heap(&mut host, |heap| heap.set_edge(from, key, to))
                 }
                 class
-                    if key == heap::LuaHeap::MODE_FIELD
-                        && (matches!(to_value, Value::Null)
-                            || matches!(
+                    if matches!(class, heap::GuestClass::String)
+                        || matches!(to_value, Value::Null)
+                        || (key == heap::LuaHeap::MODE_FIELD
+                            && matches!(
                                 class,
-                                heap::GuestClass::String
-                                    | heap::GuestClass::Number
-                                    | heap::GuestClass::Boolean
+                                heap::GuestClass::Number | heap::GuestClass::Boolean
                             )) =>
                 {
-                    heap::with_heap(&mut host, |heap| heap.set_mode_scalar(from, to_value))
+                    heap::with_heap(&mut host, |heap| heap.set_field_scalar(from, key, to_value))
                 }
                 _ => return Err(host_fault("edge target is not a table")),
             }

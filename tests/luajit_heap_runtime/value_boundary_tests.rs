@@ -985,6 +985,122 @@ return type(owner.keep)
     assert_eq!(observed[0], observed[1], "original weak field referent");
 }
 
+/// Ordinary dot fields store one UTF-8 string in the same edge record as a table.
+///
+/// The candidate lowerer has no concatenation, so the string is a literal placed
+/// in a local and then cleared. That is the runnable stand-in for a dynamic
+/// string that must not remain a local root. Field 0 stays the only `__mode` key.
+#[test]
+fn lua_candidate_weak_collection_keeps_an_ordinary_utf8_string_field() {
+    let kept = "kv-caf\u{e9}-42";
+    let source = format!(
+        r#"
+local mt = {{}}
+mt.__mode = "@mode@"
+local owner = {{}}
+setmetatable(owner, mt)
+local kept = "{kept}"
+local drop = {{}}
+owner.keep = kept
+owner.drop = drop
+observe_table(drop, 0)
+kept = nil
+drop = nil
+collectgarbage("collect")
+return owner.keep
+"#
+    );
+    for mode in ["v", "kv"] {
+        let source = source.replace("@mode@", mode);
+        assert_weak_probe(&source, kept, &[false], 2, 1);
+    }
+    let control = source
+        .replace("@mode@", "v")
+        .replace(r#"collectgarbage("collect")"#, "");
+    assert_weak_probe(&control, kept, &[true], 3, 0);
+
+    let ordinary_mode_text = r#"
+local mt = {}
+mt.note = "kv"
+local owner = {}
+setmetatable(owner, mt)
+local drop = {}
+owner.drop = drop
+observe_table(drop, 0)
+drop = nil
+collectgarbage("collect")
+return type(owner.drop)
+"#;
+    assert_weak_probe(ordinary_mode_text, "table", &[true], 2, 1);
+
+    let mode_stays_field_zero = format!(
+        r#"
+local mt = {{}}
+mt.__mode = "v"
+mt.note = "k"
+local owner = {{}}
+setmetatable(owner, mt)
+local kept = "{kept}"
+local drop = {{}}
+owner.keep = kept
+owner.drop = drop
+observe_table(drop, 0)
+kept = nil
+drop = nil
+collectgarbage("collect")
+return owner.keep
+"#
+    );
+    assert_weak_probe(&mode_stays_field_zero, kept, &[false], 3, 1);
+
+    let deleted = format!(
+        r#"
+local owner = {{}}
+owner.keep = "{kept}"
+owner.keep = nil
+return type(owner.keep)
+"#
+    );
+    let mut vm = candidate(&deleted);
+    assert_eq!(
+        vm.run().expect("delete an ordinary string field"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::string("nil")]);
+    let stats = heap::stats(&mut vm.host_context()).unwrap();
+    assert_eq!(stats.live_edges, 0, "nil removes the string record");
+    assert_eq!(stats.collections, 0);
+
+    let string_over_table = format!(
+        r#"
+local owner = {{}}
+local drop = {{}}
+owner.keep = drop
+owner.keep = "{kept}"
+observe_table(drop, 0)
+return owner.keep
+"#
+    );
+    assert_weak_probe(&string_over_table, kept, &[true], 1, 0);
+
+    let table_over_string = format!(
+        r#"
+local owner = {{}}
+local drop = {{}}
+owner.keep = "{kept}"
+owner.keep = drop
+observe_table(drop, 0)
+observe_table(owner.keep, 0)
+return type(owner.keep)
+"#
+    );
+    let overwritten = assert_weak_probe(&table_over_string, "table", &[true, true], 1, 0);
+    assert_eq!(
+        overwritten[0], overwritten[1],
+        "table replaces the string record"
+    );
+}
+
 #[test]
 fn lua_candidate_weak_keys_trace_values_with_or_without_a_back_reference() {
     let source = r#"
