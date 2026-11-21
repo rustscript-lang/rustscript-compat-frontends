@@ -9,6 +9,8 @@ mod heap;
 
 #[path = "luajit_heap_runtime/mod.rs"]
 mod support;
+#[path = "luajit_heap_runtime/value_boundary_tests.rs"]
+mod value_boundary_tests;
 
 use heap::{
     CollectReport, HandleKind, HeapLimits, LuaHeap, LuaTableResource, RootFrameId, TableRef,

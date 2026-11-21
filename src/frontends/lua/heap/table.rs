@@ -459,6 +459,13 @@ impl LuaHeap {
         Ok(())
     }
 
+    pub(crate) fn published_token(&self, table: TableRef) -> Result<u64, HeapError> {
+        self.require_live(table)?;
+        self.slots[table.slot() as usize]
+            .token
+            .ok_or(HeapError::StaleHandle)
+    }
+
     /// Clears the token stored on `table` without searching other slots.
     /// Does not close a host resource and does not sweep. Collection uses
     /// [`Self::clear_exact_token`] instead.

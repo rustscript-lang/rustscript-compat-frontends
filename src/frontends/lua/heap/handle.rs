@@ -22,7 +22,7 @@ pub struct TableRef {
 }
 
 impl TableRef {
-    pub(super) fn table(domain: u64, slot: u32, generation: u32) -> Self {
+    pub(crate) fn table(domain: u64, slot: u32, generation: u32) -> Self {
         Self {
             domain,
             slot,

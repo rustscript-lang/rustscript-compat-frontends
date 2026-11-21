@@ -54,6 +54,10 @@ pub fn install(host: &mut HostContext, limits: HeapLimits) -> Result<(), HeapErr
 /// rolled back, so live occupancy and existing roots return to their previous
 /// state and the slot can be reused at the next generation.
 pub fn publish(host: &mut HostContext) -> Result<Value, HeapError> {
+    publish_table(host).map(|(_, raw)| Value::Int(raw))
+}
+
+pub(super) fn publish_table(host: &mut HostContext) -> Result<(TableRef, i64), HeapError> {
     let table = with_heap(host, LuaHeap::alloc)?;
     let resource = match host.push_resource(LuaTableResource::new(table)) {
         Ok(resource) => resource,
@@ -84,7 +88,7 @@ pub fn publish(host: &mut HostContext) -> Result<Value, HeapError> {
             return Err(HeapError::CarrierOutOfRange);
         }
     };
-    Ok(Value::Int(raw))
+    Ok((table, raw))
 }
 
 /// Runs `body` against the scope heap, creating it with production limits if
