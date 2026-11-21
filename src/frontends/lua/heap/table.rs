@@ -165,6 +165,39 @@ struct Frame {
     width: u32,
 }
 
+/// Counts the loops one collect actually ran.
+///
+/// Production keeps these counters. Each add sits on an edge or slot the
+/// collector already visits. They are not a second graph, and reading them
+/// does not sweep or close tokens. Host collection still closes tokens before
+/// sweep; there is no public sweep that skips that close.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScanMeter {
+    pub mark_passes: u64,
+    pub index_edge_checks: u64,
+    pub index_slot_checks: u64,
+    pub outgoing_edge_checks: u64,
+    pub sweep_edge_checks: u64,
+    pub token_slot_checks: u64,
+    pub token_closes: u64,
+}
+
+/// A stored token identified while marking. Close checks this slot and
+/// generation directly; it does not search the slot vector.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct DoomedToken {
+    pub(super) raw: u64,
+    pub(super) slot: u32,
+    pub(super) generation: u32,
+}
+
+/// Temporary outgoing-edge index for one mark. Dropped when mark returns.
+/// Not stored on the heap, so it is not a second persistent graph.
+struct OutgoingIndex {
+    offsets: Vec<u32>,
+    targets: Vec<(u32, u32)>,
+}
+
 /// One scope's table nodes, edges, roots, and scan state.
 pub struct LuaHeap {
     domain: u64,
@@ -180,6 +213,7 @@ pub struct LuaHeap {
     peak_nodes: u32,
     peak_roots: u32,
     peak_edges: u32,
+    scan: ScanMeter,
 }
 
 impl LuaHeap {
@@ -200,7 +234,15 @@ impl LuaHeap {
             peak_nodes: 0,
             peak_roots: 0,
             peak_edges: 0,
+            scan: ScanMeter::default(),
         }
+    }
+
+    /// Returns the counts since the previous take and clears them.
+    pub fn take_scan_meter(&mut self) -> ScanMeter {
+        let meter = self.scan;
+        self.scan = ScanMeter::default();
+        meter
     }
 
     /// Reserves a live, unrooted table. Failure leaves occupancy unchanged.
@@ -273,7 +315,11 @@ impl LuaHeap {
         self.require_live(from)?;
         Ok(self.edges.iter().find_map(|edge| {
             if edge.from == from.slot() && edge.key == key {
-                Some(TableRef::table(self.domain, edge.to_slot, edge.to_generation))
+                Some(TableRef::table(
+                    self.domain,
+                    edge.to_slot,
+                    edge.to_generation,
+                ))
             } else {
                 None
             }
@@ -354,39 +400,69 @@ impl LuaHeap {
         Ok(())
     }
 
-    /// Whether `raw` is the token currently stored on a node in this heap.
-    pub(super) fn stores_token(&self, raw: u64) -> bool {
-        self.slots.iter().any(|slot| slot.token == Some(raw))
+    /// Clears the token stored on `table` without searching other slots.
+    /// Does not close a host resource and does not sweep. Collection uses
+    /// [`Self::clear_exact_token`] instead.
+    pub fn unbind_token(&mut self, table: TableRef) -> Result<(), HeapError> {
+        self.require_live(table)?;
+        self.slots[table.slot() as usize].token = None;
+        Ok(())
     }
 
-    /// Drops the stored handle after the resource table has closed it. The
-    /// node stays until sweep.
-    pub fn clear_token(&mut self, raw: u64) {
-        for slot in &mut self.slots {
-            if slot.token == Some(raw) {
-                slot.token = None;
-            }
+    /// Records one close attempt. The attempt is counted even when close
+    /// returns an error, so a later retry can be metered on its own.
+    pub(super) fn note_token_close(&mut self) {
+        self.scan.token_closes += 1;
+    }
+
+    /// Clears `token` only when that exact slot and generation still store it.
+    /// A reused slot, including a successor, is left alone.
+    pub(super) fn clear_exact_token(&mut self, token: DoomedToken) -> bool {
+        self.scan.token_slot_checks += 1;
+        let matches = self.slots.get(token.slot as usize).is_some_and(|slot| {
+            slot.generation == token.generation && slot.token == Some(token.raw)
+        });
+        if !matches {
+            return false;
         }
+        self.scan.token_slot_checks += 1;
+        self.slots[token.slot as usize].token = None;
+        true
     }
 
-    /// Tokens of live nodes the current mark does not reach. Runs the same
-    /// mark as `collect` and does not release slots.
-    pub fn unmarked_tokens(&mut self) -> Vec<u64> {
+    /// Marks once and returns unreachable stored tokens with their slots.
+    /// Does not release nodes. The caller closes those tokens, then
+    /// [`Self::sweep_marked`] uses this same mark.
+    pub(super) fn mark_and_doomed_tokens(&mut self) -> Vec<DoomedToken> {
         self.mark_reachable();
         self.slots
             .iter()
-            .filter_map(|slot| match slot.state {
-                SlotState::Live { marked: false } => slot.token,
+            .enumerate()
+            .filter_map(|(index, slot)| match slot.state {
+                SlotState::Live { marked: false } => slot.token.map(|raw| DoomedToken {
+                    raw,
+                    slot: index as u32,
+                    generation: slot.generation,
+                }),
                 _ => None,
             })
             .collect()
     }
 
-    /// Non-moving mark from explicit roots, then sweep unmarked nodes.
+    /// Non-moving mark from explicit roots, then one sweep of unmarked nodes.
     /// Freed slots are reused with a bumped generation. A slot whose next
     /// generation would pass `max_generation` is retired instead.
+    ///
+    /// This is the pure-heap collector. A host heap must use `heap::collect`,
+    /// which closes tokens before [`Self::sweep_marked`]. Calling this on a
+    /// host heap would skip that close.
     pub fn collect(&mut self) -> CollectReport {
         self.mark_reachable();
+        self.sweep_marked()
+    }
+
+    /// Releases nodes the current mark did not reach. Does not mark again.
+    pub(super) fn sweep_marked(&mut self) -> CollectReport {
         let swept: Vec<u32> = self
             .slots
             .iter()
@@ -401,9 +477,11 @@ impl LuaHeap {
             .iter()
             .filter(|slot| matches!(slot.state, SlotState::Live { marked: true }))
             .count() as u32;
-        for index in swept {
-            self.remove_edges_touching(index);
-            self.release_slot(index);
+        if !swept.is_empty() {
+            self.sweep_edges_once();
+            for index in swept {
+                self.release_slot(index);
+            }
         }
         self.clear_dead_roots();
         self.collections = self.collections.saturating_add(1);
@@ -458,11 +536,13 @@ impl LuaHeap {
     }
 
     fn mark_reachable(&mut self) {
+        self.scan.mark_passes += 1;
         for slot in &mut self.slots {
             if let SlotState::Live { marked } = &mut slot.state {
                 *marked = false;
             }
         }
+        let index = self.build_outgoing_index();
         let mut work = Vec::new();
         let rooted: Vec<TableRef> = self.roots.iter().copied().flatten().collect();
         for handle in rooted {
@@ -471,18 +551,67 @@ impl LuaHeap {
             }
         }
         while let Some(slot) = work.pop() {
-            let targets: Vec<(u32, u32)> = self
-                .edges
-                .iter()
-                .filter(|edge| edge.from == slot)
-                .map(|edge| (edge.to_slot, edge.to_generation))
-                .collect();
-            for (to_slot, to_generation) in targets {
+            let start = index.offsets[slot as usize] as usize;
+            let end = index.offsets[slot as usize + 1] as usize;
+            self.scan.outgoing_edge_checks += (end - start) as u64;
+            for &(to_slot, to_generation) in &index.targets[start..end] {
                 if self.slot_live(to_slot, to_generation) {
                     self.mark_slot(to_slot, &mut work);
                 }
             }
         }
+    }
+
+    /// Two passes over the stored edge vector, plus one pass over slots to
+    /// turn counts into offsets. The index is dropped at the end of mark.
+    fn build_outgoing_index(&mut self) -> OutgoingIndex {
+        let slot_count = self.slots.len();
+        let edge_count = self.edges.len();
+        self.scan.index_edge_checks += edge_count as u64;
+        let mut counts = vec![0u32; slot_count];
+        for edge in &self.edges {
+            if let Some(count) = counts.get_mut(edge.from as usize) {
+                *count = count.saturating_add(1);
+            }
+        }
+        self.scan.index_slot_checks += slot_count as u64;
+        let mut offsets = Vec::with_capacity(slot_count + 1);
+        offsets.push(0);
+        let mut running = 0u32;
+        for count in &counts {
+            running = running.saturating_add(*count);
+            offsets.push(running);
+        }
+        self.scan.index_edge_checks += edge_count as u64;
+        let mut cursor = offsets.clone();
+        let mut targets = vec![(0u32, 0u32); running as usize];
+        for edge in &self.edges {
+            let from = edge.from as usize;
+            if from >= slot_count {
+                continue;
+            }
+            let at = cursor[from] as usize;
+            if at < targets.len() {
+                targets[at] = (edge.to_slot, edge.to_generation);
+                cursor[from] = cursor[from].saturating_add(1);
+            }
+        }
+        OutgoingIndex { offsets, targets }
+    }
+
+    /// One filter of the edge vector. Skipped when every live node is marked,
+    /// so an all-live collect does not walk edges again.
+    fn sweep_edges_once(&mut self) {
+        let marked: Vec<bool> = self
+            .slots
+            .iter()
+            .map(|slot| matches!(slot.state, SlotState::Live { marked: true }))
+            .collect();
+        self.scan.sweep_edge_checks += self.edges.len() as u64;
+        self.edges.retain(|edge| {
+            marked.get(edge.from as usize).copied().unwrap_or(false)
+                && marked.get(edge.to_slot as usize).copied().unwrap_or(false)
+        });
     }
 
     fn mark_slot(&mut self, index: u32, work: &mut Vec<u32>) {

@@ -4,9 +4,9 @@
 //! VM carrier is the existing resource handle, validated by arena, type, and
 //! key. It does not store table fields and is not a GC root.
 
-use vm::resource::HostResource;
-use vm::host_extension::HostResourceType;
 use vm::ResourceTypeKey;
+use vm::host_extension::HostResourceType;
+use vm::resource::HostResource;
 
 use super::handle::TableRef;
 

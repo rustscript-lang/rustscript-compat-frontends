@@ -10,7 +10,9 @@ mod heap;
 #[path = "luajit_heap_runtime/mod.rs"]
 mod support;
 
-use heap::{CollectReport, HandleKind, HeapLimits, LuaHeap, LuaTableResource, RootFrameId, TableRef};
+use heap::{
+    CollectReport, HandleKind, HeapLimits, LuaHeap, LuaTableResource, RootFrameId, TableRef,
+};
 use support::{Probe, run_probe, with_idle_vm};
 use vm::{HostContext, ResourceHandle, Value};
 
@@ -38,13 +40,20 @@ fn alias_write_collect_reuse_and_hard_caps_stay_inside_one_heap() {
     assert_eq!(unrooted.live_nodes, 0, "an edge is not a root");
     assert!(!heap.alive(left));
     assert!(!heap.alive(right));
-    assert!(heap.edge(left, 1).is_err(), "a stale source is not a readable edge");
+    assert!(
+        heap.edge(left, 1).is_err(),
+        "a stale source is not a readable edge"
+    );
 
     let reused = heap.alloc().expect("reuse freed slot");
     assert_eq!(reused.slot(), right.slot());
     assert_ne!(reused.generation(), right.generation());
     assert!(!heap.alive(right), "stale generation stays dead");
-    assert_eq!(heap.stats().node_slots, 2, "reuse must not grow slot storage");
+    assert_eq!(
+        heap.stats().node_slots,
+        2,
+        "reuse must not grow slot storage"
+    );
 
     let dropped = heap.alloc().expect("second reuse");
     let frame: RootFrameId = heap.enter_roots(1).expect("frame");
@@ -78,7 +87,8 @@ fn failed_alloc_and_rollback_do_not_grow_live_storage() {
     assert!(!heap.alive(first));
     assert_eq!(heap.stats().live_nodes, 0);
     assert_eq!(
-        heap.stats().node_slots, 1,
+        heap.stats().node_slots,
+        1,
         "the slot stays for reuse, but it is not a live node"
     );
     let again = heap.alloc().expect("reuse after rollback");
@@ -109,7 +119,11 @@ fn generation_exhaustion_retires_the_slot_instead_of_wrapping() {
     assert!(heap.alloc().is_err(), "retired slot is not reused");
     assert!(!heap.alive(once));
     assert_eq!(heap.stats().live_nodes, 0);
-    assert_eq!(heap.stats().node_slots, 1, "retired storage remains, but is not live");
+    assert_eq!(
+        heap.stats().node_slots,
+        1,
+        "retired storage remains, but is not live"
+    );
 }
 
 #[test]
@@ -129,7 +143,8 @@ fn cyclic_create_and_collect_tracks_live_nodes_and_roots() {
         heap.write_root(frame, 0, kept).expect("root");
         let orphan = heap.alloc().expect("orphan");
         let orphan_link = heap.alloc().expect("orphan link");
-        heap.set_edge(orphan, 1, orphan_link).expect("orphan forward");
+        heap.set_edge(orphan, 1, orphan_link)
+            .expect("orphan forward");
         heap.set_edge(orphan_link, 1, orphan).expect("orphan back");
         let marked = heap.collect();
         assert_eq!(
@@ -143,7 +158,11 @@ fn cyclic_create_and_collect_tracks_live_nodes_and_roots() {
         assert_eq!(heap.collect().live_nodes, 0);
         assert_eq!(heap.stats().live_roots, 0);
     }
-    assert_eq!(heap.stats().node_slots, 4, "later rounds reuse the first four slots");
+    assert_eq!(
+        heap.stats().node_slots,
+        4,
+        "later rounds reuse the first four slots"
+    );
     assert!(heap.stats().peak_roots <= 4);
 }
 
@@ -160,11 +179,18 @@ fn a_handle_from_another_heap_is_rejected() {
 fn typed_resource_boundary_rejects_int_foreign_and_expired_values() {
     let transfer = run_probe(Probe::Transfer).expect("transfer");
     assert_eq!(transfer.stack, vec![Value::Int(1)]);
-    assert!(transfer.body_entries > 0, "typed host body ran for a published table");
+    assert!(
+        transfer.body_entries > 0,
+        "typed host body ran for a published table"
+    );
     assert!(transfer.alive_entries > 0, "alive ran inside the same VM");
 
     let alias = run_probe(Probe::Alias).expect("alias");
-    assert_eq!(alias.stack, vec![Value::Int(1)], "same table write is visible through the other handle");
+    assert_eq!(
+        alias.stack,
+        vec![Value::Int(1)],
+        "same table write is visible through the other handle"
+    );
 
     let before_int = run_probe(Probe::RejectInt).expect_err("ordinary int is not a table");
     assert_eq!(
@@ -174,16 +200,22 @@ fn typed_resource_boundary_rejects_int_foreign_and_expired_values() {
     assert_eq!(before_int.alive_entries, 0);
 
     let published = run_probe(Probe::Publish).expect("publish handle");
-    assert_eq!(published.published_raw, published.stack.first().and_then(|value| match value {
-        Value::Int(raw) => Some(*raw),
-        _ => None,
-    }));
+    assert_eq!(
+        published.published_raw,
+        published.stack.first().and_then(|value| match value {
+            Value::Int(raw) => Some(*raw),
+            _ => None,
+        })
+    );
     let raw = match published.stack.as_slice() {
         [Value::Int(raw)] => *raw,
         other => panic!("publish did not return one handle: {other:?}"),
     };
     let foreign = run_probe(Probe::RejectForeign { raw }).expect_err("cross-vm handle is rejected");
-    assert_eq!(foreign.body_entries, 0, "foreign rejection is before the host body");
+    assert_eq!(
+        foreign.body_entries, 0,
+        "foreign rejection is before the host body"
+    );
     assert_eq!(foreign.alive_entries, 0);
 
     let expired = run_probe(Probe::Expired).expect_err("expired handle is rejected");
@@ -255,11 +287,13 @@ fn full_resource_table_publish_occupies_a_slot_then_rolls_it_back() {
             "refused publish must occupy a lua slot before push_resource returns; error={error}"
         );
         assert_eq!(
-            after.live_nodes,
-            before.live_nodes,
+            after.live_nodes, before.live_nodes,
             "rollback must release the occupied slot; error={error}"
         );
-        assert_eq!(after.live_roots, before.live_roots, "existing roots must stay");
+        assert_eq!(
+            after.live_roots, before.live_roots,
+            "existing roots must stay"
+        );
         assert!(
             heap::with_heap(&mut host, |heap| Ok(heap.alive(rooted))).expect("rooted check"),
             "the existing root stays live"
@@ -339,17 +373,11 @@ fn collect_finishes_when_an_unreused_token_is_already_closed() {
         let other_handle = resource_handle(other_raw);
 
         let progress = host
-            .close_resource::<LuaTableResource>(
-                retired_handle,
-                vm::ResourceCloseReason::Requested,
-            )
+            .close_resource::<LuaTableResource>(retired_handle, vm::ResourceCloseReason::Requested)
             .expect("external close");
         assert_eq!(progress, vm::resource::CloseProgress::Ready);
         let observed = host
-            .close_resource::<LuaTableResource>(
-                retired_handle,
-                vm::ResourceCloseReason::Requested,
-            )
+            .close_resource::<LuaTableResource>(retired_handle, vm::ResourceCloseReason::Requested)
             .expect_err("slot was not reused");
         assert_eq!(
             scope_resource_code(&observed),
@@ -359,13 +387,21 @@ fn collect_finishes_when_an_unreused_token_is_already_closed() {
             heap::with_heap(&mut host, |heap| Ok(heap.alive(retired))).expect("retired node"),
             "the lua node still stores the closed token"
         );
-        assert_eq!(host.resource_count(), 3, "close already returned one quota unit");
+        assert_eq!(
+            host.resource_count(),
+            3,
+            "close already returned one quota unit"
+        );
         assert_eq!(heap::stats(&mut host).expect("before").live_nodes, 3);
 
         let report = heap::collect(&mut host)
             .expect("an already-closed stored token must not stop collection");
         assert_eq!(report.live_nodes, 1);
-        assert_eq!(host.resource_count(), 2, "only the other doomed token is closed");
+        assert_eq!(
+            host.resource_count(),
+            2,
+            "only the other doomed token is closed"
+        );
         assert!(heap::with_heap(&mut host, |heap| Ok(heap.alive(rooted))).expect("rooted"));
         assert!(
             host.typed_resource_with_key::<LuaTableResource>(
@@ -376,11 +412,17 @@ fn collect_finishes_when_an_unreused_token_is_already_closed() {
             "the rooted token stays valid"
         );
         assert!(
-            host.typed_resource_with_key::<LuaTableResource>(other_handle, &LuaTableResource::key())
-                .is_err(),
+            host.typed_resource_with_key::<LuaTableResource>(
+                other_handle,
+                &LuaTableResource::key()
+            )
+            .is_err(),
             "the other unreachable table is collected"
         );
-        assert!(host.resource(&unrelated).is_ok(), "unrelated resource stays");
+        assert!(
+            host.resource(&unrelated).is_ok(),
+            "unrelated resource stays"
+        );
         assert!(
             host.scope_state::<heap::LuaHeap>().is_some(),
             "collection must not replace the scope with reset"
@@ -388,10 +430,17 @@ fn collect_finishes_when_an_unreused_token_is_already_closed() {
 
         let again = heap::collect(&mut host).expect("a later collection must also finish");
         assert_eq!(again.live_nodes, 1);
-        assert_eq!(host.resource_count(), 2, "the second collection must not release quota again");
+        assert_eq!(
+            host.resource_count(),
+            2,
+            "the second collection must not release quota again"
+        );
         assert_eq!(heap::stats(&mut host).expect("after").collections, 2);
         assert!(heap::with_heap(&mut host, |heap| Ok(heap.alive(rooted))).expect("root remains"));
-        assert!(host.resource(&unrelated).is_ok(), "unrelated resource remains");
+        assert!(
+            host.resource(&unrelated).is_ok(),
+            "unrelated resource remains"
+        );
     });
 }
 
@@ -429,10 +478,7 @@ fn collect_finishes_when_a_reused_token_is_stale() {
         );
         assert_ne!(retired_handle.generation(), successor_handle.generation());
         let observed = host
-            .close_resource::<LuaTableResource>(
-                retired_handle,
-                vm::ResourceCloseReason::Requested,
-            )
+            .close_resource::<LuaTableResource>(retired_handle, vm::ResourceCloseReason::Requested)
             .expect_err("reused slot");
         assert_eq!(
             scope_resource_code(&observed),
@@ -448,8 +494,8 @@ fn collect_finishes_when_a_reused_token_is_stale() {
         assert_eq!(host.resource_count(), 4);
         assert_eq!(heap::stats(&mut host).expect("before").live_nodes, 4);
 
-        let report = heap::collect(&mut host)
-            .expect("a stale stored token must not stop collection");
+        let report =
+            heap::collect(&mut host).expect("a stale stored token must not stop collection");
         assert_eq!(report.live_nodes, 2, "rooted table and successor stay");
         assert_eq!(
             host.resource_count(),
@@ -464,11 +510,17 @@ fn collect_finishes_when_a_reused_token_is_stale() {
         assert!(heap::with_heap(&mut host, |heap| Ok(heap.alive(successor))).expect("successor"));
         assert!(heap::with_heap(&mut host, |heap| Ok(heap.alive(rooted))).expect("rooted"));
         assert!(
-            host.typed_resource_with_key::<LuaTableResource>(other_handle, &LuaTableResource::key())
-                .is_err(),
+            host.typed_resource_with_key::<LuaTableResource>(
+                other_handle,
+                &LuaTableResource::key()
+            )
+            .is_err(),
             "the other unreachable table is collected"
         );
-        assert!(host.resource(&unrelated).is_ok(), "unrelated resource stays");
+        assert!(
+            host.resource(&unrelated).is_ok(),
+            "unrelated resource stays"
+        );
         assert!(
             host.scope_state::<heap::LuaHeap>().is_some(),
             "collection must not replace the scope with reset"
@@ -476,11 +528,21 @@ fn collect_finishes_when_a_reused_token_is_stale() {
 
         let again = heap::collect(&mut host).expect("a later collection must also finish");
         assert_eq!(again.live_nodes, 2);
-        assert_eq!(host.resource_count(), 3, "the second collection must not release quota again");
+        assert_eq!(
+            host.resource_count(),
+            3,
+            "the second collection must not release quota again"
+        );
         assert_eq!(heap::stats(&mut host).expect("after").collections, 2);
-        assert_eq!(table_ref(&host, successor_raw).generation(), successor.generation());
+        assert_eq!(
+            table_ref(&host, successor_raw).generation(),
+            successor.generation()
+        );
         assert!(heap::with_heap(&mut host, |heap| Ok(heap.alive(rooted))).expect("root remains"));
-        assert!(host.resource(&unrelated).is_ok(), "unrelated resource remains");
+        assert!(
+            host.resource(&unrelated).is_ok(),
+            "unrelated resource remains"
+        );
     });
 }
 
@@ -625,12 +687,19 @@ fn reset_for_reuse_rejects_old_handles_and_starts_an_empty_heap() {
             resource_handle(raw),
             &LuaTableResource::key(),
         );
-        assert!(rejected.is_err(), "old handle must be rejected: {rejected:?}");
+        assert!(
+            rejected.is_err(),
+            "old handle must be rejected: {rejected:?}"
+        );
         assert!(
             host.scope_state::<heap::LuaHeap>().is_none(),
             "the replacement scope starts without a heap"
         );
-        assert_eq!(host.resource_count(), 0, "the new scope has no leftover tokens");
+        assert_eq!(
+            host.resource_count(),
+            0,
+            "the new scope has no leftover tokens"
+        );
         heap::install(
             &mut host,
             HeapLimits {
@@ -645,5 +714,646 @@ fn reset_for_reuse_rejects_old_handles_and_starts_an_empty_heap() {
         assert_eq!(empty.live_nodes, 0);
         assert_eq!(empty.live_roots, 0);
         let _again = publish_raw(&mut host);
+    });
+}
+
+struct ScanShape {
+    name: &'static str,
+    nodes: u32,
+    roots: u32,
+    edges: u32,
+    reachable: u32,
+    edges_in_live: bool,
+}
+
+fn scan_shape(
+    name: &'static str,
+    nodes: u32,
+    roots: u32,
+    edges: u32,
+    reachable: u32,
+    edges_in_live: bool,
+) -> ScanShape {
+    ScanShape {
+        name,
+        nodes,
+        roots,
+        edges,
+        reachable,
+        edges_in_live,
+    }
+}
+
+fn plan_scan_edges(shape: &ScanShape) -> Vec<(u32, u32, u32)> {
+    let mut next_key = vec![1u32; shape.nodes as usize];
+    let mut edges = Vec::with_capacity(shape.edges as usize);
+    if shape.edges_in_live {
+        let spanning = shape.reachable - shape.roots;
+        assert!(
+            shape.edges >= spanning,
+            "{} needs {spanning} spanning edges",
+            shape.name
+        );
+        for index in shape.roots..shape.reachable {
+            let from = index - 1;
+            let key = next_key[from as usize];
+            next_key[from as usize] = key + 1;
+            edges.push((from, key, index));
+        }
+        let mut round = 0u32;
+        while edges.len() < shape.edges as usize {
+            let from = round % shape.reachable;
+            let to = (round + 1) % shape.reachable;
+            let key = next_key[from as usize];
+            next_key[from as usize] = key + 1;
+            edges.push((from, key, to));
+            round += 1;
+            assert!(
+                round <= shape.edges + shape.reachable + 4,
+                "{} live plan stalled",
+                shape.name
+            );
+        }
+    } else {
+        let dead = shape.nodes - shape.reachable;
+        assert!(dead > 0, "{} dead-home needs a dead node", shape.name);
+        let mut round = 0u32;
+        while edges.len() < shape.edges as usize {
+            let from = shape.reachable + (round % dead);
+            let to = shape.reachable + ((round + 1) % dead);
+            let key = next_key[from as usize];
+            next_key[from as usize] = key + 1;
+            edges.push((from, key, to));
+            round += 1;
+            assert!(
+                round <= shape.edges + dead + 4,
+                "{} dead plan stalled",
+                shape.name
+            );
+        }
+    }
+    assert_eq!(
+        edges.len(),
+        shape.edges as usize,
+        "{} edge plan",
+        shape.name
+    );
+    edges
+}
+
+fn reachable_outgoing(shape: &ScanShape, plan: &[(u32, u32, u32)]) -> u64 {
+    plan.iter()
+        .filter(|(from, _, _)| *from < shape.reachable)
+        .count() as u64
+}
+
+/// The meter is the observation. Graph size is only the budget, not a stand-in
+/// for the counts.
+fn assert_linear_meter(
+    label: &str,
+    meter: &heap::ScanMeter,
+    slots: u64,
+    edges: u64,
+    outgoing: u64,
+    dead: u64,
+    doomed_tokens: u64,
+) {
+    assert_eq!(
+        meter.mark_passes,
+        1,
+        "{label} marks once (outgoing={} budget={outgoing} sweep={} token_slots={} closes={} index_edges={})",
+        meter.outgoing_edge_checks,
+        meter.sweep_edge_checks,
+        meter.token_slot_checks,
+        meter.token_closes,
+        meter.index_edge_checks
+    );
+    assert_eq!(
+        meter.outgoing_edge_checks, outgoing,
+        "{label} outgoing checks must be the visited edges; a full walk of reachable*edges exceeds this budget of {outgoing} (mark_passes={} sweep={} token_slots={})",
+        meter.mark_passes, meter.sweep_edge_checks, meter.token_slot_checks
+    );
+    assert_eq!(
+        meter.index_edge_checks,
+        edges.saturating_mul(2),
+        "{label} index build examines each stored edge twice"
+    );
+    assert_eq!(
+        meter.index_slot_checks, slots,
+        "{label} index build examines each slot once"
+    );
+    let sweep_budget = if dead == 0 { 0 } else { edges };
+    assert_eq!(
+        meter.sweep_edge_checks, sweep_budget,
+        "{label} sweep filters the edge vector once"
+    );
+    assert_eq!(meter.token_closes, doomed_tokens, "{label} closes");
+    assert!(
+        meter.token_slot_checks <= doomed_tokens.saturating_mul(3),
+        "{label} token slot checks {} are not direct lookups for {doomed_tokens} tokens (slots={slots})",
+        meter.token_slot_checks
+    );
+}
+
+fn assert_pure_kept(
+    heap: &LuaHeap,
+    nodes: &[TableRef],
+    shape: &ScanShape,
+    plan: &[(u32, u32, u32)],
+) {
+    assert_eq!(
+        heap.stats().live_nodes,
+        shape.reachable,
+        "{} live nodes",
+        shape.name
+    );
+    assert_eq!(
+        heap.stats().live_roots,
+        shape.roots,
+        "{} live roots",
+        shape.name
+    );
+    for index in 0..shape.reachable {
+        assert!(
+            heap.alive(nodes[index as usize]),
+            "{} root region stays",
+            shape.name
+        );
+    }
+    for index in shape.reachable..shape.nodes {
+        assert!(
+            !heap.alive(nodes[index as usize]),
+            "{} dead region is collected",
+            shape.name
+        );
+    }
+    if let Some((from, key, to)) = plan.iter().find(|(from, _, _)| *from < shape.reachable) {
+        assert_eq!(
+            heap.edge(nodes[*from as usize], *key).expect("kept edge"),
+            Some(nodes[*to as usize]),
+            "{} kept edge",
+            shape.name
+        );
+    }
+}
+
+fn collect_pure_shape(shape: &ScanShape) {
+    let mut heap = LuaHeap::new(HeapLimits::production());
+    let mut nodes = Vec::with_capacity(shape.nodes as usize);
+    for _ in 0..shape.nodes {
+        nodes.push(
+            heap.alloc()
+                .unwrap_or_else(|error| panic!("{} alloc: {error}", shape.name)),
+        );
+    }
+    let frame = heap
+        .enter_roots(shape.roots)
+        .unwrap_or_else(|error| panic!("{} roots: {error}", shape.name));
+    for index in 0..shape.roots {
+        heap.write_root(frame, index, nodes[index as usize])
+            .unwrap_or_else(|error| panic!("{} root: {error}", shape.name));
+    }
+    let plan = plan_scan_edges(shape);
+    for (from, key, to) in &plan {
+        heap.set_edge(nodes[*from as usize], *key, nodes[*to as usize])
+            .unwrap_or_else(|error| panic!("{} edge: {error}", shape.name));
+    }
+    let before = heap.stats();
+    let started = std::time::Instant::now();
+    let report = heap.collect();
+    if std::env::var_os("LUA_HEAP_TIME_COLLECT").is_some() {
+        eprintln!("time {} nanos={}", shape.name, started.elapsed().as_nanos());
+    }
+    let meter = heap.take_scan_meter();
+    eprintln!(
+        "meter {} mark={} index_edges={} index_slots={} outgoing={} sweep={} token_slots={} closes={}",
+        shape.name,
+        meter.mark_passes,
+        meter.index_edge_checks,
+        meter.index_slot_checks,
+        meter.outgoing_edge_checks,
+        meter.sweep_edge_checks,
+        meter.token_slot_checks,
+        meter.token_closes
+    );
+    assert_eq!(report.live_nodes, shape.reachable, "{}", shape.name);
+    assert_eq!(report.marked_nodes, shape.reachable, "{}", shape.name);
+    assert_pure_kept(&heap, &nodes, shape, &plan);
+    assert_linear_meter(
+        shape.name,
+        &meter,
+        u64::from(before.node_slots),
+        u64::from(before.live_edges),
+        reachable_outgoing(shape, &plan),
+        u64::from(shape.nodes - shape.reachable),
+        0,
+    );
+}
+
+fn collect_host_shape(shape: &ScanShape, share_resource: bool) {
+    let token_cap = vm::resource::handle::DEFAULT_MAX_RESOURCES;
+    let published = if share_resource {
+        shape.nodes as usize + 1
+    } else {
+        shape.nodes as usize
+    };
+    assert!(
+        published <= token_cap,
+        "{} uses {published} resources, cap is {token_cap}",
+        shape.name
+    );
+    with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, HeapLimits::production()).expect("install");
+        let unrelated = if share_resource {
+            Some(
+                host.push_resource(UnrelatedHostResource)
+                    .expect("shared resource"),
+            )
+        } else {
+            None
+        };
+        let mut nodes = Vec::with_capacity(shape.nodes as usize);
+        let mut raws = Vec::with_capacity(shape.nodes as usize);
+        for _ in 0..shape.nodes {
+            let raw = publish_raw(&mut host);
+            nodes.push(table_ref(&host, raw));
+            raws.push(raw);
+        }
+        let frame = heap::with_heap(&mut host, |heap| heap.enter_roots(shape.roots))
+            .unwrap_or_else(|error| panic!("{} roots: {error}", shape.name));
+        for index in 0..shape.roots {
+            let handle = nodes[index as usize];
+            heap::with_heap(&mut host, |heap| heap.write_root(frame, index, handle))
+                .unwrap_or_else(|error| panic!("{} root: {error}", shape.name));
+        }
+        let plan = plan_scan_edges(shape);
+        for (from, key, to) in &plan {
+            let source = nodes[*from as usize];
+            let target = nodes[*to as usize];
+            heap::with_heap(&mut host, |heap| heap.set_edge(source, *key, target))
+                .unwrap_or_else(|error| panic!("{} edge: {error}", shape.name));
+        }
+        let before = heap::stats(&mut host).expect("before");
+        let resources_before = host.resource_count();
+        let started = std::time::Instant::now();
+        let report = heap::collect(&mut host)
+            .unwrap_or_else(|error| panic!("{} collect: {error}", shape.name));
+        if std::env::var_os("LUA_HEAP_TIME_COLLECT").is_some() {
+            eprintln!("time {} nanos={}", shape.name, started.elapsed().as_nanos());
+        }
+        let resources_after = host.resource_count();
+        let meter = heap::take_scan_meter(&mut host).expect("meter");
+        eprintln!(
+            "meter {} mark={} index_edges={} index_slots={} outgoing={} sweep={} token_slots={} closes={}",
+            shape.name,
+            meter.mark_passes,
+            meter.index_edge_checks,
+            meter.index_slot_checks,
+            meter.outgoing_edge_checks,
+            meter.sweep_edge_checks,
+            meter.token_slot_checks,
+            meter.token_closes
+        );
+        let shared = usize::from(share_resource);
+        assert_eq!(report.live_nodes, shape.reachable, "{}", shape.name);
+        assert_eq!(report.marked_nodes, shape.reachable, "{}", shape.name);
+        assert_eq!(
+            resources_after,
+            shape.reachable as usize + shared,
+            "{} quota",
+            shape.name
+        );
+        if shape.reachable < shape.nodes {
+            assert!(
+                resources_before > resources_after,
+                "{} tokens drop",
+                shape.name
+            );
+        } else {
+            assert_eq!(
+                resources_before, resources_after,
+                "{} keeps every token",
+                shape.name
+            );
+        }
+        for index in 0..shape.reachable {
+            assert!(
+                host.typed_resource_with_key::<LuaTableResource>(
+                    resource_handle(raws[index as usize]),
+                    &LuaTableResource::key(),
+                )
+                .is_ok(),
+                "{} rooted token stays",
+                shape.name
+            );
+        }
+        if shape.nodes > shape.reachable {
+            let doomed = resource_handle(raws[shape.reachable as usize]);
+            assert!(
+                host.typed_resource_with_key::<LuaTableResource>(doomed, &LuaTableResource::key())
+                    .is_err(),
+                "{} collected token is invalid",
+                shape.name
+            );
+        }
+        if let Some(unrelated) = unrelated {
+            assert!(
+                host.resource(&unrelated).is_ok(),
+                "{} shared resource stays",
+                shape.name
+            );
+        }
+        heap::with_heap(&mut host, |heap| {
+            assert_pure_kept(heap, &nodes, shape, &plan);
+            Ok(())
+        })
+        .expect("kept");
+        assert_linear_meter(
+            shape.name,
+            &meter,
+            u64::from(before.node_slots),
+            u64::from(before.live_edges),
+            reachable_outgoing(shape, &plan),
+            u64::from(shape.nodes - shape.reachable),
+            u64::from(shape.nodes - shape.reachable),
+        );
+    });
+}
+
+#[test]
+fn collect_scan_small_graph_stays_inside_one_linear_pass() {
+    let pure = scan_shape("small-survival", 8, 2, 12, 4, true);
+    collect_pure_shape(&pure);
+    let host = scan_shape("small-host-death", 8, 1, 12, 2, true);
+    collect_host_shape(&host, true);
+}
+
+#[test]
+fn collect_scan_pure_limit_graphs_stay_linear() {
+    let limits = HeapLimits::production();
+    collect_pure_shape(&scan_shape(
+        "limit-survival-all",
+        limits.nodes,
+        limits.roots,
+        limits.edges,
+        limits.nodes,
+        true,
+    ));
+    collect_pure_shape(&scan_shape(
+        "limit-death-live-edges",
+        limits.nodes,
+        1,
+        limits.edges,
+        16,
+        true,
+    ));
+    collect_pure_shape(&scan_shape(
+        "limit-death-dead-edges",
+        limits.nodes,
+        1,
+        limits.edges,
+        1,
+        false,
+    ));
+}
+
+#[test]
+fn collect_scan_host_limit_graphs_stay_linear() {
+    let token_cap = u32::try_from(vm::resource::handle::DEFAULT_MAX_RESOURCES).expect("cap");
+    let edges = HeapLimits::production().edges;
+    collect_host_shape(
+        &scan_shape(
+            "token-cap-survival-all",
+            token_cap,
+            256,
+            edges,
+            token_cap,
+            true,
+        ),
+        false,
+    );
+    collect_host_shape(
+        &scan_shape("token-cap-death-live-edges", token_cap, 1, edges, 4, true),
+        false,
+    );
+    collect_host_shape(
+        &scan_shape(
+            "token-cap-shared-death-dead-edges",
+            token_cap - 1,
+            1,
+            edges,
+            1,
+            false,
+        ),
+        true,
+    );
+}
+
+/// AlreadyClosed and Stale still retire only this heap's exact token. The
+/// lookup is the identified slot, not a scan of every slot.
+#[test]
+fn collect_scan_retired_tokens_check_the_identified_slot() {
+    with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, sweep_limits()).expect("install");
+        let unrelated = host
+            .push_resource(UnrelatedHostResource)
+            .expect("unrelated");
+        let rooted_raw = publish_raw(&mut host);
+        let rooted = table_ref(&host, rooted_raw);
+        root_table(&mut host, rooted);
+        let mut filler = Vec::new();
+        for _ in 0..6 {
+            filler.push(publish_raw(&mut host));
+        }
+        let closed_raw = filler[0];
+        let closed = table_ref(&host, closed_raw);
+        let closed_handle = resource_handle(closed_raw);
+        host.close_resource::<LuaTableResource>(closed_handle, vm::ResourceCloseReason::Requested)
+            .expect("external close");
+        let stale_raw = filler[1];
+        let stale = table_ref(&host, stale_raw);
+        let stale_handle = resource_handle(stale_raw);
+        let _taken = host
+            .take_resource::<LuaTableResource>(stale_handle)
+            .expect("take");
+        let successor_raw = publish_raw(&mut host);
+        let successor = table_ref(&host, successor_raw);
+        root_table(&mut host, successor);
+        assert_eq!(
+            stale_handle.slot_index().expect("stale slot"),
+            resource_handle(successor_raw)
+                .slot_index()
+                .expect("successor slot")
+        );
+
+        let before_slots = heap::stats(&mut host).expect("slots").node_slots;
+        let report = heap::collect(&mut host).expect("retired tokens do not stop collection");
+        let meter = heap::take_scan_meter(&mut host).expect("meter");
+        eprintln!(
+            "meter retired-slot mark={} index_edges={} index_slots={} outgoing={} sweep={} token_slots={} closes={} slots={}",
+            meter.mark_passes,
+            meter.index_edge_checks,
+            meter.index_slot_checks,
+            meter.outgoing_edge_checks,
+            meter.sweep_edge_checks,
+            meter.token_slot_checks,
+            meter.token_closes,
+            before_slots
+        );
+        assert!(
+            before_slots > 3,
+            "the slot vector must be wider than a direct lookup"
+        );
+        assert_eq!(report.live_nodes, 2, "rooted table and successor stay");
+        assert!(heap::with_heap(&mut host, |heap| Ok(heap.alive(rooted))).expect("rooted"));
+        assert!(heap::with_heap(&mut host, |heap| Ok(heap.alive(successor))).expect("successor"));
+        assert!(!heap::with_heap(&mut host, |heap| Ok(heap.alive(closed))).expect("closed node"));
+        assert!(!heap::with_heap(&mut host, |heap| Ok(heap.alive(stale))).expect("stale node"));
+        assert!(
+            host.resource(&unrelated).is_ok(),
+            "unrelated resource stays"
+        );
+        assert!(
+            host.typed_resource_with_key::<LuaTableResource>(
+                resource_handle(successor_raw),
+                &LuaTableResource::key(),
+            )
+            .is_ok(),
+            "successor token stays usable"
+        );
+        assert!(
+            meter.token_slot_checks <= meter.token_closes.saturating_mul(3),
+            "retired close checked {} slots for {} closes; a full scan of {before_slots} slots would exceed this",
+            meter.token_slot_checks,
+            meter.token_closes
+        );
+        assert_eq!(meter.mark_passes, 1, "retired close still marks once");
+    });
+}
+
+/// A non-retired close error leaves the swept prefix closed, does not sweep,
+/// and the next collect marks again. A node rooted after the failure stays.
+#[test]
+fn collect_scan_failed_close_retries_after_remark() {
+    with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, sweep_limits()).expect("install");
+        let unrelated = host
+            .push_resource(UnrelatedHostResource)
+            .expect("unrelated");
+        let unrelated_raw = unrelated.handle().raw();
+        let keeper_raw = publish_raw(&mut host);
+        let keeper = table_ref(&host, keeper_raw);
+        root_table(&mut host, keeper);
+        let prefix_raw = publish_raw(&mut host);
+        let prefix = table_ref(&host, prefix_raw);
+        let other_raw = publish_raw(&mut host);
+        let other = table_ref(&host, other_raw);
+        let doomed = heap::with_heap(&mut host, |heap| {
+            let node = heap.alloc()?;
+            heap.bind_token(node, unrelated_raw)?;
+            Ok(node)
+        })
+        .expect("bind a foreign token");
+        let before_nodes = heap::stats(&mut host).expect("before").live_nodes;
+        let before_resources = host.resource_count();
+
+        let error = heap::collect(&mut host).expect_err("type mismatch must propagate");
+        match &error {
+            heap::HeapError::Scope(message) => {
+                assert!(
+                    message.contains("resource_type_mismatch"),
+                    "other close errors propagate, got {message}"
+                );
+            }
+            other => panic!("expected a scope close error, got {other:?}"),
+        }
+        let failed = heap::take_scan_meter(&mut host).expect("failed meter");
+        eprintln!(
+            "meter failed-close mark={} index_edges={} index_slots={} outgoing={} sweep={} token_slots={} closes={}",
+            failed.mark_passes,
+            failed.index_edge_checks,
+            failed.index_slot_checks,
+            failed.outgoing_edge_checks,
+            failed.sweep_edge_checks,
+            failed.token_slot_checks,
+            failed.token_closes
+        );
+        assert_eq!(
+            heap::stats(&mut host).expect("after error").live_nodes,
+            before_nodes
+        );
+        assert_eq!(heap::stats(&mut host).expect("collections").collections, 0);
+        assert_eq!(
+            failed.sweep_edge_checks, 0,
+            "an incomplete collect does not sweep"
+        );
+        assert_eq!(failed.mark_passes, 1);
+        assert!(
+            failed.token_slot_checks <= failed.token_closes.saturating_mul(3),
+            "the failed close checked {} slots for {} closes; a direct lookup stays within 3 per close",
+            failed.token_slot_checks,
+            failed.token_closes
+        );
+        assert!(
+            host.resource(&unrelated).is_ok(),
+            "the foreign resource is not closed"
+        );
+        assert!(
+            host.typed_resource_with_key::<LuaTableResource>(
+                resource_handle(prefix_raw),
+                &LuaTableResource::key(),
+            )
+            .is_err(),
+            "the successful prefix stays closed"
+        );
+        assert!(
+            host.typed_resource_with_key::<LuaTableResource>(
+                resource_handle(other_raw),
+                &LuaTableResource::key(),
+            )
+            .is_err(),
+            "the second prefix token stays closed"
+        );
+        assert_eq!(host.resource_count(), before_resources - 2);
+        assert!(heap::with_heap(&mut host, |heap| Ok(heap.alive(prefix))).expect("prefix node"));
+        assert!(heap::with_heap(&mut host, |heap| Ok(heap.alive(doomed))).expect("doomed node"));
+
+        heap::with_heap(&mut host, |heap| heap.unbind_token(doomed))
+            .expect("drop the foreign token binding");
+        root_table(&mut host, prefix);
+        let report = heap::collect(&mut host).expect("retry after the token is exact again");
+        let retry = heap::take_scan_meter(&mut host).expect("retry meter");
+        eprintln!(
+            "meter retry mark={} index_edges={} index_slots={} outgoing={} sweep={} token_slots={} closes={}",
+            retry.mark_passes,
+            retry.index_edge_checks,
+            retry.index_slot_checks,
+            retry.outgoing_edge_checks,
+            retry.sweep_edge_checks,
+            retry.token_slot_checks,
+            retry.token_closes
+        );
+        assert_eq!(retry.mark_passes, 1, "the retry marks again");
+        assert_eq!(
+            report.live_nodes, 2,
+            "keeper and the newly rooted prefix stay"
+        );
+        assert!(heap::with_heap(&mut host, |heap| Ok(heap.alive(keeper))).expect("keeper"));
+        assert!(
+            heap::with_heap(&mut host, |heap| Ok(heap.alive(prefix))).expect("remarked prefix")
+        );
+        assert!(!heap::with_heap(&mut host, |heap| Ok(heap.alive(other))).expect("other swept"));
+        assert!(!heap::with_heap(&mut host, |heap| Ok(heap.alive(doomed))).expect("doomed swept"));
+        assert!(host.resource(&unrelated).is_ok(), "shared resource remains");
+        assert!(
+            host.typed_resource_with_key::<LuaTableResource>(
+                resource_handle(keeper_raw),
+                &LuaTableResource::key(),
+            )
+            .is_ok()
+        );
     });
 }

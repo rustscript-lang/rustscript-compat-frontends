@@ -6,10 +6,9 @@ use vm::compiler::ir::{ResolvedHostCall, ResolvedHostParam};
 use vm::{
     CallOutcome, CallReturn, CompileSourceFileOptions, Expr, FrontendImportSyntax, FrontendIr,
     HostApiBuilder, HostApiCatalog, HostFunctionRegistry, HostFunctionSchema, HostImportSchema,
-    HostOwnedFunction, HostParamPassing, HostParamSchema, HostStructField,
-    HostStructSchema, HostTypeSchema, LocalIrBuilder, LocalSlot, OwnedHostCall, ParseError,
-    ResourceTypeKey, ResourceTypeSchema, SourceFlavor, SourcePlugin, Stmt, TypeSchema, Value,
-    VmError, VmStatus,
+    HostOwnedFunction, HostParamPassing, HostParamSchema, HostStructField, HostStructSchema,
+    HostTypeSchema, LocalIrBuilder, LocalSlot, OwnedHostCall, ParseError, ResourceTypeKey,
+    ResourceTypeSchema, SourceFlavor, SourcePlugin, Stmt, TypeSchema, Value, VmError, VmStatus,
 };
 
 use super::heap::{self, LuaTableResource, TableRef};
@@ -229,11 +228,7 @@ fn catalog() -> HostApiCatalog {
         ],
         HostTypeSchema::Resource(key.clone()),
     ));
-    builder.function(func(
-        "lua_heap_collect",
-        vec![],
-        HostTypeSchema::Int,
-    ));
+    builder.function(func("lua_heap_collect", vec![], HostTypeSchema::Int));
     builder.function(func(
         "lua_heap_close",
         vec![HostParamSchema::with_passing(
@@ -243,11 +238,7 @@ fn catalog() -> HostApiCatalog {
         )],
         HostTypeSchema::Int,
     ));
-    builder.function(func(
-        "lua_heap_forge_named",
-        vec![],
-        named.as_type(),
-    ));
+    builder.function(func("lua_heap_forge_named", vec![], named.as_type()));
     builder.function(func(
         "lua_heap_accept_named",
         vec![HostParamSchema::value("record", named.as_type())],
@@ -278,18 +269,35 @@ fn func(name: &str, params: Vec<HostParamSchema>, ret: HostTypeSchema) -> HostFu
     HostFunctionSchema::with_return(name, params, ret)
 }
 
-fn register_hosts(registry: &mut HostFunctionRegistry, catalog: &HostApiCatalog) -> Result<(), VmError> {
-    register(registry, catalog, "lua_heap_publish", 0, |_| Box::new(Publish))?;
+fn register_hosts(
+    registry: &mut HostFunctionRegistry,
+    catalog: &HostApiCatalog,
+) -> Result<(), VmError> {
+    register(registry, catalog, "lua_heap_publish", 0, |_| {
+        Box::new(Publish)
+    })?;
     register(registry, catalog, "lua_heap_alive", 1, |_| Box::new(Alive))?;
-    register(registry, catalog, "lua_heap_observe", 2, |_| Box::new(Observe))?;
-    register(registry, catalog, "lua_heap_set_edge", 3, |_| Box::new(SetEdge))?;
-    register(registry, catalog, "lua_heap_edge_is", 3, |_| Box::new(EdgeIs))?;
+    register(registry, catalog, "lua_heap_observe", 2, |_| {
+        Box::new(Observe)
+    })?;
+    register(registry, catalog, "lua_heap_set_edge", 3, |_| {
+        Box::new(SetEdge)
+    })?;
+    register(registry, catalog, "lua_heap_edge_is", 3, |_| {
+        Box::new(EdgeIs)
+    })?;
     register(registry, catalog, "lua_heap_enter", 1, |_| Box::new(Enter))?;
     register(registry, catalog, "lua_heap_root", 2, |_| Box::new(Root))?;
-    register(registry, catalog, "lua_heap_collect", 0, |_| Box::new(Collect))?;
+    register(registry, catalog, "lua_heap_collect", 0, |_| {
+        Box::new(Collect)
+    })?;
     register(registry, catalog, "lua_heap_close", 1, |_| Box::new(Close))?;
-    register(registry, catalog, "lua_heap_forge_named", 0, |_| Box::new(ForgeNamed))?;
-    register(registry, catalog, "lua_heap_accept_named", 1, |_| Box::new(AcceptNamed))?;
+    register(registry, catalog, "lua_heap_forge_named", 0, |_| {
+        Box::new(ForgeNamed)
+    })?;
+    register(registry, catalog, "lua_heap_accept_named", 1, |_| {
+        Box::new(AcceptNamed)
+    })?;
     Ok(())
 }
 
@@ -336,7 +344,9 @@ impl HostOwnedFunction for Alive {
         let table = recover(call, 0)?;
         let mut host = call.vm().host_context();
         let alive = heap::with_heap(&mut host, |heap| Ok(heap.alive(table))).map_err(host_error)?;
-        Ok(CallOutcome::Return(CallReturn::one(Value::Int(i64::from(alive)))))
+        Ok(CallOutcome::Return(CallReturn::one(Value::Int(i64::from(
+            alive,
+        )))))
     }
 }
 
@@ -381,7 +391,9 @@ impl HostOwnedFunction for EdgeIs {
         let mut host = call.vm().host_context();
         let same = heap::with_heap(&mut host, |heap| Ok(heap.edge(from, key) == Ok(Some(to))))
             .map_err(host_error)?;
-        Ok(CallOutcome::Return(CallReturn::one(Value::Int(i64::from(same)))))
+        Ok(CallOutcome::Return(CallReturn::one(Value::Int(i64::from(
+            same,
+        )))))
     }
 }
 
@@ -418,9 +430,9 @@ impl HostOwnedFunction for Collect {
         let mut host = call.vm().host_context();
         note_body(&mut host);
         let marked = heap::collect(&mut host).map_err(host_error)?;
-        Ok(CallOutcome::Return(CallReturn::one(Value::Int(
-            i64::from(marked.live_nodes),
-        ))))
+        Ok(CallOutcome::Return(CallReturn::one(Value::Int(i64::from(
+            marked.live_nodes,
+        )))))
     }
 }
 
@@ -451,7 +463,9 @@ impl HostOwnedFunction for AcceptNamed {
     fn call(&mut self, call: &mut OwnedHostCall<'_>) -> Result<CallOutcome, VmError> {
         let (slot, generation) = {
             let Value::Map(map) = &call.args()[0] else {
-                return Err(VmError::HostError("named carrier was not a map".to_string()));
+                return Err(VmError::HostError(
+                    "named carrier was not a map".to_string(),
+                ));
             };
             (map_int(map, "slot")?, map_int(map, "generation")?)
         };
@@ -474,9 +488,11 @@ fn map_int(map: &vm::bytecode::VmMap, key: &str) -> Result<i64, VmError> {
 }
 
 fn recover(call: &mut OwnedHostCall<'_>, index: usize) -> Result<TableRef, VmError> {
-    let value = call.args().get(index).cloned().ok_or_else(|| {
-        VmError::HostError(format!("missing argument {index}"))
-    })?;
+    let value = call
+        .args()
+        .get(index)
+        .cloned()
+        .ok_or_else(|| VmError::HostError(format!("missing argument {index}")))?;
     let Value::Int(raw) = value else {
         return Err(VmError::HostError(
             "table carrier is not a resource handle".to_string(),
@@ -485,8 +501,8 @@ fn recover(call: &mut OwnedHostCall<'_>, index: usize) -> Result<TableRef, VmErr
     let raw = u64::try_from(raw).map_err(|_| {
         VmError::HostError("table carrier is not a positive resource handle".to_string())
     })?;
-    let handle = vm::ResourceHandle::from_raw(raw)
-        .map_err(|error| VmError::HostError(error.to_string()))?;
+    let handle =
+        vm::ResourceHandle::from_raw(raw).map_err(|error| VmError::HostError(error.to_string()))?;
     let host = call.vm().host_context();
     let token = host
         .typed_resource_with_key::<LuaTableResource>(handle, &LuaTableResource::key())
@@ -499,7 +515,9 @@ fn int_arg(call: &OwnedHostCall<'_>, index: usize) -> Result<u32, VmError> {
         Some(Value::Int(value)) if *value >= 0 && *value <= i64::from(u32::MAX) => {
             Ok(*value as u32)
         }
-        _ => Err(VmError::HostError(format!("argument {index} is not a field index"))),
+        _ => Err(VmError::HostError(format!(
+            "argument {index} is not a field index"
+        ))),
     }
 }
 
@@ -656,10 +674,7 @@ fn hosts_for(source: &str) -> &'static [(&'static str, u8)] {
             ("lua_heap_close", 1),
             ("lua_heap_alive", 1),
         ],
-        "named" => &[
-            ("lua_heap_forge_named", 0),
-            ("lua_heap_accept_named", 1),
-        ],
+        "named" => &[("lua_heap_forge_named", 0), ("lua_heap_accept_named", 1)],
         "nested-rooted" => &[
             ("lua_heap_enter", 1),
             ("lua_heap_publish", 0),
@@ -692,7 +707,11 @@ fn resolution(catalog: &HostApiCatalog, name: &str) -> ResolvedHostCall {
         return_type: type_schema(&function.return_type),
         passing: function.params.iter().map(|param| param.passing).collect(),
         fingerprint: catalog.fingerprint(),
-        host_params: function.params.iter().map(|param| param.ty.clone()).collect(),
+        host_params: function
+            .params
+            .iter()
+            .map(|param| param.ty.clone())
+            .collect(),
         host_return_type: function.return_type.clone(),
     }
 }

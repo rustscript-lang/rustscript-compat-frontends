@@ -32,7 +32,7 @@ mod table;
 
 pub use handle::{HandleKind, TableRef};
 pub use resource::LuaTableResource;
-pub use table::{CollectReport, HeapError, HeapLimits, HeapStats, LuaHeap, RootFrameId};
+pub use table::{CollectReport, HeapError, HeapLimits, HeapStats, LuaHeap, RootFrameId, ScanMeter};
 
 use vm::{HostContext, Value};
 
@@ -99,50 +99,62 @@ pub fn with_heap<T>(
     body(heap)
 }
 
-/// Host-side collection. Unreachable tables lose their typed tokens through
-/// `HostContext::close_resource` before the heap sweep, so the scope quota
-/// comes back in this same VM. Stored handles are not roots.
+/// Host-side collection. One mark lists unreachable tokens. Each token is
+/// closed through `HostContext::close_resource` before the heap sweep, so the
+/// scope quota comes back in this same VM. Stored handles are not roots.
 ///
-/// A token this heap still stores may already have been removed by
-/// `close_resource`, `take_resource`, or a TakeOwned host parameter. For that
-/// stored token only, `ResourceAlreadyClosed` (slot not reused) and
-/// `ResourceStale` (slot reused) are retired: the token is cleared and the
-/// sweep continues. The successor in a reused slot is not closed. Any other
-/// structured error, including a wrong table or a type mismatch, stops the
-/// sweep. Tokens already cleared stay cleared, so a later collection retries
-/// only the unprocessed suffix.
+/// Close checks the slot and generation captured at mark time. It does not
+/// search the slot vector. For that exact stored token only,
+/// `ResourceAlreadyClosed` (slot not reused) and `ResourceStale` (slot reused)
+/// are retired: the identified slot is cleared and the sweep continues. A
+/// successor in a reused core slot is not closed, and a different lua slot is
+/// not cleared. Any other structured error, including a wrong table or a type
+/// mismatch, stops the sweep. Tokens already cleared stay cleared. The sweep
+/// does not run, so a later collection marks again and retries the remainder.
+///
+/// `LuaTableResource` uses the default synchronous close, which returns Ready.
+/// A Pending result is an error. This type has no path that starts an
+/// asynchronous close, and this collector does not add one.
 pub fn collect(host: &mut HostContext) -> Result<table::CollectReport, HeapError> {
-    let doomed = with_heap(host, |heap| Ok(heap.unmarked_tokens()))?;
-    for raw in doomed {
-        retire_doomed_token(host, raw)?;
+    let doomed = with_heap(host, |heap| Ok(heap.mark_and_doomed_tokens()))?;
+    for token in doomed {
+        retire_doomed_token(host, token)?;
     }
-    with_heap(host, |heap| Ok(heap.collect()))
+    with_heap(host, |heap| Ok(heap.sweep_marked()))
 }
 
-fn retire_doomed_token(host: &mut HostContext, raw: u64) -> Result<(), HeapError> {
-    let handle = vm::ResourceHandle::from_raw(raw).map_err(|_| HeapError::CarrierOutOfRange)?;
+fn retire_doomed_token(host: &mut HostContext, token: table::DoomedToken) -> Result<(), HeapError> {
+    let handle =
+        vm::ResourceHandle::from_raw(token.raw).map_err(|_| HeapError::CarrierOutOfRange)?;
+    with_heap(host, |heap| {
+        heap.note_token_close();
+        Ok(())
+    })?;
     match host.close_resource::<LuaTableResource>(handle, vm::ResourceCloseReason::Requested) {
         Ok(progress) => {
-            // `LuaTableResource` uses the default synchronous close, which
-            // returns Ready. Core can also report AlreadyClosed for a Closing
-            // slot, but this concrete type has no path that returns Pending.
             if progress != vm::resource::CloseProgress::Ready {
                 return Err(HeapError::Scope(
                     "lua table close did not finish synchronously".to_string(),
                 ));
             }
+            with_heap(host, |heap| {
+                let _cleared = heap.clear_exact_token(token);
+                Ok(())
+            })?;
+            Ok(())
         }
         Err(error) => {
-            let stored = with_heap(host, |heap| Ok(heap.stores_token(raw)))?;
-            if !(stored && retired_lua_token(&error)) {
+            if !retired_lua_token(&error) {
                 return Err(HeapError::from_scope(error));
+            }
+            let cleared = with_heap(host, |heap| Ok(heap.clear_exact_token(token)))?;
+            if cleared {
+                Ok(())
+            } else {
+                Err(HeapError::from_scope(error))
             }
         }
     }
-    with_heap(host, |heap| {
-        heap.clear_token(raw);
-        Ok(())
-    })
 }
 
 fn retired_lua_token(error: &vm::HostContextError) -> bool {
@@ -161,4 +173,9 @@ fn retired_lua_token(error: &vm::HostContextError) -> bool {
 /// Reads occupancy counters from the scope heap.
 pub fn stats(host: &mut HostContext) -> Result<HeapStats, HeapError> {
     with_heap(host, |heap| Ok(heap.stats()))
+}
+
+/// Reads and clears the scan counts from the scope heap. This does not collect.
+pub fn take_scan_meter(host: &mut HostContext) -> Result<ScanMeter, HeapError> {
+    with_heap(host, |heap| Ok(heap.take_scan_meter()))
 }
