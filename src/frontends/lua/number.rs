@@ -98,6 +98,10 @@ impl ClassifiedNumber {
             None,
         )
     }
+
+    pub(crate) fn into_expr(self) -> Expr {
+        self.expr
+    }
 }
 
 /// Temps for operations that must evaluate each operand once and then reuse it.
@@ -133,6 +137,36 @@ impl<'a> NumberLowering<'a> {
             stmts: vec![bind_temp(lhs_slot, lhs.expr), bind_temp(rhs_slot, rhs.expr)],
             expr: Box::new(remainder),
         })
+    }
+
+    /// Bind a guest local on the same builder that owns remainder temps.
+    pub(crate) fn alloc_local_named(&mut self, name: &str) -> Result<LocalSlot, ParseError> {
+        self.builder.alloc_local_named(name)
+    }
+
+    /// Bind an already classified value to a fresh temp.
+    ///
+    /// This does not search for a dead slot. Core compacts the frame later.
+    pub(crate) fn store(
+        &mut self,
+        value: ClassifiedNumber,
+        stmts: &mut Vec<Stmt>,
+    ) -> Result<ClassifiedNumber, ParseError> {
+        let slot = self.alloc_temp("value")?;
+        stmts.push(bind_temp(slot, value.expr));
+        ClassifiedNumber::from_attested_float(Expr::Var(slot), FloatTypeEvidence::attested())
+    }
+
+    /// Keep a chain step shallow when the value is not already a literal or slot.
+    pub(crate) fn materialize(
+        &mut self,
+        value: ClassifiedNumber,
+        stmts: &mut Vec<Stmt>,
+    ) -> Result<ClassifiedNumber, ParseError> {
+        if matches!(value.expr, Expr::Float(_) | Expr::Var(_)) {
+            return Ok(value);
+        }
+        self.store(value, stmts)
     }
 
     fn alloc_temp(&mut self, role: &str) -> Result<LocalSlot, ParseError> {
