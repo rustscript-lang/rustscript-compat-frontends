@@ -11,7 +11,10 @@
 //! loop, so it is emitted only in the dispatch arm, never inside a nested
 //! source loop. `break` and `continue` inside a source loop stay Core
 //! statements of that loop. User values are binary64 or bool. The state id
-//! is a private Core int and is not a Lua number.
+//! is a private Core int and is not a Lua number. In this numeric/bool slice
+//! only `false` is falsy: `0` and every other number are truthy. `if`,
+//! `elseif`, `while`, and `not` / `!` pass the operand through `core_truthy`
+//! before a Core branch or `Not`. The operand expression is placed once.
 
 use super::ast::{self, BinOp, Block, Chunk, Expr, Name, NumberKind, Span, Stmt, UnOp};
 use super::lexer;
@@ -279,7 +282,7 @@ impl<'a> Lower<'a> {
         };
         for arm in arms.iter().rev() {
             let then_body = self.branch_items(&arm.body.stmts)?;
-            let cond = self.expr(&arm.cond)?;
+            let cond = core_truthy(self.expr(&arm.cond)?);
             else_body_items = vec![Item::If {
                 cond,
                 then_body,
@@ -316,7 +319,7 @@ impl<'a> Lower<'a> {
                 return Err(self.fail(span, "return inside if is not a direct tail"));
             }
             else_branch = vec![CoreStmt::IfElse {
-                condition: self.expr(&arm.cond)?,
+                condition: core_truthy(self.expr(&arm.cond)?),
                 then_branch,
                 else_branch,
                 line,
@@ -344,7 +347,7 @@ impl<'a> Lower<'a> {
             return Err(self.fail(span, "return inside a loop is not in this slice"));
         }
         Ok(CoreStmt::While {
-            condition: self.expr(cond)?,
+            condition: core_truthy(self.expr(cond)?),
             body: body_stmts,
             line: self.line(span),
         })
@@ -493,7 +496,7 @@ impl<'a> Lower<'a> {
             Expr::Unary { op, expr, span } => {
                 let inner = Box::new(self.expr(expr)?);
                 match op {
-                    UnOp::Not | UnOp::Bang => Ok(CoreExpr::Not(inner)),
+                    UnOp::Not | UnOp::Bang => Ok(CoreExpr::Not(Box::new(core_truthy(*inner)))),
                     UnOp::Neg => Ok(CoreExpr::Neg(inner)),
                     _ => Err(self.fail(*span, "unary operator is not in this slice")),
                 }
@@ -765,6 +768,15 @@ fn dispatch_chain(state: LocalSlot, arms: Vec<(i64, Vec<CoreStmt>)>) -> CoreStmt
     pending
         .pop()
         .expect("dispatch chain includes the unknown-state break")
+}
+
+fn core_truthy(value: CoreExpr) -> CoreExpr {
+    // Core equality keeps bool and float apart, so this matches only `false`.
+    // `0` and every other number stay truthy. The value expression is used once.
+    CoreExpr::Not(Box::new(CoreExpr::Eq(
+        Box::new(value),
+        Box::new(CoreExpr::Bool(false)),
+    )))
 }
 
 fn let_expr(slot: LocalSlot, expr: CoreExpr, line: u32) -> CoreStmt {
