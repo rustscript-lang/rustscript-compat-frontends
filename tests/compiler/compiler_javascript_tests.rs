@@ -617,6 +617,88 @@ fn compile_source_file_js_complex_replay_break_line_resolves_non_executable_line
 }
 
 #[test]
+fn staged_same_example_second_copy_does_not_overwrite_first_root() {
+    fn frozen_beside(example: &std::path::Path) -> std::path::PathBuf {
+        let examples = example.parent().expect("staged example parent");
+        assert_eq!(
+            examples.file_name().and_then(|name| name.to_str()),
+            Some("examples"),
+            "staged example must stay under compat/examples"
+        );
+        let compat = examples.parent().expect("compat parent");
+        assert_eq!(
+            compat.file_name().and_then(|name| name.to_str()),
+            Some("compat"),
+            "staged example must stay under compat/examples"
+        );
+        let root = compat.parent().expect("staging root");
+        root.join("rustscript")
+            .join("stdlib")
+            .join("rss")
+            .join("strings.rss")
+    }
+
+    let file_name = "example_complex.js";
+    let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let fixture = manifest.join("examples").join(file_name);
+    let fixture_bytes = fs::read(&fixture).expect("read example fixture");
+    let frozen_fixture = fs::read(manifest.join("tests/fixtures/frozen_stdlib/strings.rss"))
+        .expect("read frozen strings fixture");
+
+    let first = staged_example_path(file_name);
+    let first_frozen = frozen_beside(&first);
+    assert_ne!(
+        first, fixture,
+        "observation must stay on the staged path, not the repository fixture"
+    );
+    assert_eq!(
+        fs::read(&first).expect("read first staged example"),
+        fixture_bytes,
+        "first staging must copy the complete example before observation"
+    );
+    assert_eq!(
+        fs::read(&first_frozen).expect("read first frozen stdlib"),
+        frozen_fixture,
+        "first staging must write the complete frozen stdlib"
+    );
+
+    let marker = b"staged-example-isolation-marker\n";
+    assert_ne!(marker.as_slice(), fixture_bytes.as_slice());
+    fs::write(&first, marker).expect("mark only the confirmed staged example");
+
+    let second = staged_example_path(file_name);
+    let second_frozen = frozen_beside(&second);
+    assert_eq!(
+        fs::read(&first).expect("read marked example after second staging"),
+        marker,
+        "second staging overwrote the first staged example"
+    );
+    assert_ne!(
+        first_frozen, second_frozen,
+        "second staging reused the first frozen strings.rss"
+    );
+    assert_eq!(
+        fs::read(&first_frozen).expect("read first frozen stdlib after second staging"),
+        frozen_fixture,
+        "second staging overwrote or truncated the first frozen stdlib"
+    );
+    assert_eq!(
+        fs::read(&second).expect("read second staged example"),
+        fixture_bytes,
+        "second staging must equal the complete example fixture"
+    );
+    assert_eq!(
+        fs::read(&second_frozen).expect("read second frozen stdlib"),
+        frozen_fixture,
+        "second staging must equal the complete frozen fixture"
+    );
+    assert_eq!(
+        fs::read(&fixture).expect("repository fixture must stay unchanged"),
+        fixture_bytes
+    );
+}
+
+#[test]
 fn javascript_module_declarations_are_ignored() {
     let case = RuntimeCase {
         name: "module declarations are ignored",
