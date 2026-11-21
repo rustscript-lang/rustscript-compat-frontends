@@ -10,6 +10,7 @@ mod lexer;
 mod parser;
 #[path = "../../src/frontends/lua/resolve.rs"]
 mod resolve;
+mod return_frame;
 
 use super::heap;
 use super::support;
@@ -131,7 +132,7 @@ fn entries(vm: &mut vm::Vm) -> Entries {
         .unwrap_or_default()
 }
 
-fn catalog() -> &'static Arc<vm::HostApiCatalog> {
+pub(super) fn catalog() -> &'static Arc<vm::HostApiCatalog> {
     static CATALOG: OnceLock<Arc<vm::HostApiCatalog>> = OnceLock::new();
     CATALOG.get_or_init(|| {
         use vm::{HostFunctionSchema, HostParamPassing, HostParamSchema, HostTypeSchema};
