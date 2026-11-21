@@ -1971,3 +1971,130 @@ return type(owner.@field@)
         assert_eq!(host.resource_count(), 3, "{field}");
     }
 }
+
+// Chunk `do` receives two tables from one call into one repeated local name.
+// Resolver records each name token as its own binding: both share
+// `visible_from` at the statement end, and `Binding.span` is that token's
+// span. The visible name is the second receiver. An explicit collect inside
+// the block keeps both caller-frame roots. Leaving the block drops both
+// roots; the next explicit collect closes both nodes and Core tokens. The
+// outer local of the same name is visible again. Omitting the post-block
+// collect leaves both receivers, so a dead witness is not a missing
+// allocation. `observe_table` inside `pair` records issuance and does not
+// retain a VM Value. This candidate does not capture the chunk weak table.
+// It is not a goto, a production `.lua` entry, a closure, or JIT/AOT.
+#[test]
+fn lua_candidate_chunk_do_releases_duplicate_receiver_roots() {
+    let source = r#"
+local function pair()
+  local left = {}
+  local right = {}
+  observe_table(left, 0)
+  observe_table(right, 0)
+  local a = left
+  local b = right
+  return a, b
+end
+local mt = {}
+mt.__mode = "v"
+local owner = {}
+setmetatable(owner, mt)
+local x = {}
+owner.keep = x
+observe_table(x, 0)
+do
+  local x, x = pair()
+  owner.seen = x
+  observe_table(x, 0)
+  collectgarbage("collect")
+  observe_table(owner.seen, 0)
+  observe_table(owner.keep, 0)
+end
+@after@
+"#;
+    let collect_after = "\
+collectgarbage(\"collect\")
+observe_table(x, 0)
+observe_table(owner.keep, 0)
+return type(owner.seen)
+";
+    let omit_after = "\
+observe_table(owner.seen, 0)
+observe_table(x, 0)
+observe_table(owner.keep, 0)
+return type(owner.seen)
+";
+    for (after, result, collections, live_nodes, live_edges, resources) in [
+        (omit_after, "table", 1u32, 5u32, 3u32, 5usize),
+        (collect_after, "nil", 2, 3, 2, 3),
+    ] {
+        let mut vm = candidate(&source.replace("@after@", after));
+        assert_eq!(
+            vm.run().expect("run duplicate receivers"),
+            VmStatus::Halted,
+            "{result}"
+        );
+        assert_eq!(vm.stack(), &[Value::string(result)], "{result}");
+        let mut host = vm.host_context();
+        let tables = host.scope_state::<Vec<ObservedTable>>().unwrap().clone();
+        // pair runs inside the block, so its issuance witnesses follow the
+        // outer observation recorded before the call.
+        let outer = tables[0];
+        let left = tables[1];
+        let right = tables[2];
+        let visible = tables[3];
+        let seen_inside = tables[4];
+        let keep_inside = tables[5];
+        assert_ne!(left, right, "pair returns two tables");
+        assert_eq!(visible, right, "the visible name is the second receiver");
+        assert_ne!(
+            visible, left,
+            "the shadowed receiver is not the visible name"
+        );
+        assert_eq!(
+            seen_inside, right,
+            "in-block collect keeps the visible receiver"
+        );
+        assert_eq!(
+            keep_inside, outer,
+            "in-block collect keeps the outer object"
+        );
+        let drop_alive = result == "table";
+        let (seen_after, restored, keep_after) = if drop_alive {
+            assert_eq!(
+                tables[6], right,
+                "omitted collect leaves the visible receiver"
+            );
+            (tables[6], tables[7], tables[8])
+        } else {
+            (right, tables[6], tables[7])
+        };
+        assert_eq!(restored, outer, "the restored name is the outer object");
+        assert_ne!(restored, right, "block exit does not keep the inner name");
+        assert_eq!(keep_after, outer, "owner.keep is the outer object");
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| Ok(heap.alive(left.table))).unwrap(),
+            drop_alive,
+            "shadowed receiver after the block; result={result}"
+        );
+        for (table, alive) in [
+            (left, drop_alive),
+            (right, drop_alive),
+            (outer, true),
+            (visible, drop_alive),
+            (seen_inside, drop_alive),
+            (keep_inside, true),
+            (seen_after, drop_alive),
+            (restored, true),
+            (keep_after, true),
+        ] {
+            assert_table_lifetime(&mut host, table, alive);
+        }
+        let stats = heap::stats(&mut host).unwrap();
+        assert_eq!(stats.collections, collections, "{result}");
+        assert_eq!(stats.live_nodes, live_nodes, "{result}");
+        assert_eq!(stats.live_edges, live_edges, "{result}");
+        assert_eq!(stats.live_roots, 0, "{result}");
+        assert_eq!(host.resource_count(), resources, "{result}");
+    }
+}

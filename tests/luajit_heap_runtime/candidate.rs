@@ -1358,12 +1358,15 @@ impl Lower<'_> {
     }
 
     fn chunk_binding(&self, name: &ast::Name, span: ast::Span) -> Result<usize, ParseError> {
+        // Repeated names in one statement share visible_from. The resolver
+        // stores each name token as Binding.span, which is the declaration.
         self.resolution
             .bindings
             .iter()
             .position(|binding| {
                 binding.function_id == 0
                     && binding.name == name.bytes
+                    && binding.span == name.span
                     && binding.visible_from == span.end
             })
             .ok_or_else(|| self.unsupported(span))
