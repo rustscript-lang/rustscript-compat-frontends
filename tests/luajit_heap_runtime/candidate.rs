@@ -2,7 +2,7 @@
 //! select it until the supported execution and root-transfer gates pass.
 
 use std::collections::{HashMap, HashSet};
-use vm::compiler::ir::{FunctionImpl, ResolvedHostCall, ResolvedHostParam};
+use vm::compiler::ir::{FunctionDecl, FunctionImpl, ResolvedHostCall, ResolvedHostParam};
 use vm::{
     AssignmentKind, CallOutcome, CallReturn, Expr, FrontendIr, HostApiBuilder, HostApiCatalog,
     HostFunctionRegistry, HostFunctionSchema, HostImportSchema, HostOwnedFunction, HostParamSchema,
@@ -30,7 +30,12 @@ const SET_EDGE: &str = "lua_internal::set_edge";
 const GET_EDGE: &str = "lua_internal::get_edge";
 pub(super) const FINISH_RETURN: &str = "lua_internal::finish_return";
 pub(super) const RETIRE_CALLEE: &str = "lua_internal::retire_callee";
-const RETIRE_CHUNK: &str = "lua_internal::retire_chunk";
+pub(super) const RETIRE_CHUNK: &str = "lua_internal::retire_chunk";
+/// Name of the test-only script callable that wraps one already-lowered chunk.
+///
+/// The inner Lua function stays unexported. Exporting that callee directly would
+/// skip the caller's `FINISH_RETURN` / `RETIRE_CALLEE` window.
+pub(super) const EXPORTED_CHUNK: &str = "lua_chunk_entry";
 const RELEASE_RESULT: &str = "lua_internal::release_result";
 // Test-only witnesses. They place an ordinary VM array on the source path.
 // They are not Lua syntax and are not registered on the production entry.
@@ -520,6 +525,7 @@ fn root_issued(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
     })
     .map_err(heap_error)?;
     with_witness(call.vm(), |witness| {
+        witness.issued.push(table);
         if role == 0 {
             witness.returned = Some(table);
             witness.returned_carrier = carrier_ptr(&value);
@@ -810,20 +816,28 @@ fn note_collect(
     host: &mut vm::HostContext<'_>,
     report: heap::CollectReport,
 ) -> Result<(), VmError> {
-    let Some((returned, discarded, key)) = host
-        .scope_state::<ReturnWitness>()
-        .map(|witness| (witness.returned, witness.discarded, witness.field_key))
+    let Some((returned, discarded, key, latest)) =
+        host.scope_state::<ReturnWitness>().map(|witness| {
+            (
+                witness.returned,
+                witness.discarded,
+                witness.field_key,
+                witness.issued.last().copied(),
+            )
+        })
     else {
         return Ok(());
     };
-    let (returned_alive, discarded_alive, returned_edge) = heap::with_heap(host, |heap| {
-        Ok((
-            returned.is_some_and(|table| heap.alive(table)),
-            discarded.is_some_and(|table| heap.alive(table)),
-            read_edge(heap, returned, key)?,
-        ))
-    })
-    .map_err(heap_error)?;
+    let (returned_alive, discarded_alive, returned_edge, latest_alive) =
+        heap::with_heap(host, |heap| {
+            Ok((
+                returned.is_some_and(|table| heap.alive(table)),
+                discarded.is_some_and(|table| heap.alive(table)),
+                read_edge(heap, returned, key)?,
+                latest.is_some_and(|table| heap.alive(table)),
+            ))
+        })
+        .map_err(heap_error)?;
     let swept = heap::take_scan_meter(host)
         .map_err(heap_error)?
         .scratch
@@ -840,6 +854,7 @@ fn note_collect(
         discarded_alive,
         returned_edge,
     });
+    witness.issued_alive_at_collect.push(latest_alive);
     Ok(())
 }
 
@@ -938,6 +953,114 @@ pub(super) fn lower_returning(
     let mut ir = lower.builder.finish(lower.stmts);
     ir.function_impls = lower.function_impls;
     Ok(ir)
+}
+
+/// Wrap one real, already-lowered chunk as an exported script callable.
+///
+/// The body is the chunk's own statements, including the Lua callee call and
+/// the normal `RETIRE_CHUNK` completion. The wrapper only connects the
+/// compiler's export slot. It does not emit a second root lifecycle.
+pub(super) fn lower_exported_chunk(
+    source: &str,
+    catalog: &HostApiCatalog,
+    publish_results: bool,
+) -> Result<FrontendIr, ParseError> {
+    let mut ir = lower_returning(source, catalog, publish_results)?;
+    let body_expr = connect_scalar_return(&mut ir)?;
+    let index = u16::try_from(ir.functions.len())
+        .map_err(|_| ParseError::at_line(1, "exported chunk exceeds the function index space"))?;
+    if ir.functions.iter().any(|func| func.index == index)
+        || ir.function_impls.contains_key(&index)
+        || ir.functions.iter().any(|func| func.name == EXPORTED_CHUNK)
+    {
+        return Err(ParseError::at_line(
+            1,
+            "exported chunk collides with an existing function",
+        ));
+    }
+    ir.functions.push(FunctionDecl {
+        name: EXPORTED_CHUNK.to_string(),
+        arity: 0,
+        index,
+        args: Vec::new(),
+        arg_schemas: Vec::new(),
+        return_schema: None,
+        type_params: Vec::new(),
+        exported: true,
+        return_type: vm::ValueType::Unknown,
+        symbol: None,
+    });
+    ir.function_sources.insert(index, source.to_string());
+    ir.function_impls.insert(
+        index,
+        FunctionImpl {
+            param_slots: Vec::new(),
+            capture_copies: Vec::new(),
+            body_stmts: std::mem::take(&mut ir.stmts),
+            body_expr,
+            body_expr_line: 1,
+        },
+    );
+    Ok(ir)
+}
+
+/// Keep the chunk's scalar return in a local so the script `Ret` can load it
+/// after `RETIRE_CHUNK`. A chunk with no return stays a null fallthrough.
+fn connect_scalar_return(ir: &mut FrontendIr) -> Result<Expr, ParseError> {
+    let Some(return_index) = ir
+        .functions
+        .iter()
+        .find(|func| func.name == RETURN_SCALAR)
+        .map(|func| func.index)
+    else {
+        return Ok(Expr::Null);
+    };
+    let mut found = None;
+    for (index, stmt) in ir.stmts.iter().enumerate() {
+        let Stmt::Expr { expr, .. } = stmt else {
+            continue;
+        };
+        let Expr::Call(call_index, ..) = expr else {
+            continue;
+        };
+        if *call_index != return_index {
+            continue;
+        }
+        if found.is_some() {
+            return Err(ParseError::at_line(
+                1,
+                "exported chunk has more than one scalar return",
+            ));
+        }
+        found = Some(index);
+    }
+    let Some(stmt_index) = found else {
+        return Err(ParseError::at_line(
+            1,
+            "scalar return host is declared but the chunk has no return statement",
+        ));
+    };
+    let slot = u16::try_from(ir.locals).map_err(|_| {
+        ParseError::at_line(1, "exported scalar slot exceeds the local index space")
+    })?;
+    ir.locals += 1;
+    ir.local_bindings.push(("#export-scalar".to_string(), slot));
+    let Stmt::Expr { expr, line } = ir.stmts.remove(stmt_index) else {
+        return Err(ParseError::at_line(
+            1,
+            "scalar return statement disappeared",
+        ));
+    };
+    ir.stmts.insert(
+        stmt_index,
+        Stmt::Let {
+            index: slot,
+            declared_schema: None,
+            expr,
+            line,
+        },
+    );
+    Ok(Expr::Var(slot))
 }
 
 struct Lower<'a> {
@@ -1769,6 +1892,10 @@ pub(super) struct ReturnWitness {
     pub collects: Vec<CollectNote>,
     pub release: Option<ReleaseNote>,
     pub handoffs: Vec<Handoff>,
+    /// Every table rooted by `root_issued`, in activation order.
+    pub issued: Vec<heap::TableRef>,
+    /// Whether the latest issued table was still alive at each guest collect.
+    pub issued_alive_at_collect: Vec<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

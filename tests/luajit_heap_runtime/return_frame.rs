@@ -288,6 +288,26 @@ impl SourcePlugin for UnpublishedReturn {
     }
 }
 
+struct ExportedChunk;
+
+impl SourcePlugin for ExportedChunk {
+    fn flavor(&self) -> SourceFlavor {
+        SourceFlavor::Lua
+    }
+
+    fn extensions(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    fn import_syntax(&self) -> FrontendImportSyntax {
+        FrontendImportSyntax::Lua
+    }
+
+    fn parse_source(&self, source: &str) -> Result<FrontendIr, ParseError> {
+        candidate::lower_exported_chunk(source, catalog(), true)
+    }
+}
+
 fn run(source: &str, publish_results: bool) -> vm::Vm {
     let catalog = Arc::clone(catalog());
     let options = if publish_results {
@@ -1704,4 +1724,312 @@ return collectgarbage("collect")
     );
     assert_eq!(during.live_nodes, exit.baseline.live_nodes + 1);
     assert_only_chunk_frame_retired(&mut exit);
+}
+
+const REPEATED_CALLS: usize = 260;
+
+const REPEATED_SOURCE: &str = r#"
+local function make()
+  local obj = {}
+  obj.self = obj
+  collectgarbage("collect")
+  return 7
+end
+local n = make()
+return n
+"#;
+
+fn bind_exported(source: &str) -> vm::Vm {
+    let catalog = Arc::clone(catalog());
+    let options = CompileSourceFileOptions::new()
+        .with_source_plugin(&ExportedChunk)
+        .with_host_api_catalog(Arc::clone(&catalog));
+    let mut vm = vm::compile_source_with_flavor_and_options(source, SourceFlavor::Lua, options)
+        .expect("compile exported chunk")
+        .into_vm()
+        .expect("create VM");
+    let mut registry = HostFunctionRegistry::empty();
+    candidate::register(&mut registry, &catalog).expect("register candidate runtime");
+    register_witnesses(&mut registry, &catalog);
+    register_caller_reads(&mut registry, &catalog);
+    register_binding_obs(&mut registry, &catalog);
+    registry
+        .bind_vm_cached(&mut vm)
+        .expect("bind candidate runtime");
+    vm.set_jit_config(vm::JitConfig {
+        enabled: false,
+        hot_loop_threshold: 0,
+        max_trace_len: 0,
+    });
+    vm
+}
+
+fn assert_exported_script_entry(vm: &vm::Vm) {
+    let program = vm.program();
+    assert!(
+        program
+            .exported_callables
+            .iter()
+            .all(|item| item.name != "make"),
+        "the Lua callee stays unexported so its caller still runs FINISH_RETURN"
+    );
+    let export = program
+        .exported_callables
+        .iter()
+        .find(|item| item.name == candidate::EXPORTED_CHUNK)
+        .expect("compiled script export");
+    assert_eq!(
+        program
+            .exported_callables
+            .iter()
+            .filter(|item| item.name == candidate::EXPORTED_CHUNK)
+            .count(),
+        1
+    );
+    let binding = program
+        .root_callable_bindings
+        .iter()
+        .find(|item| item.local_slot == export.local_slot)
+        .expect("export occupies one root callable slot");
+    let prototype = program
+        .callable_prototypes
+        .get(binding.prototype_id as usize)
+        .expect("export prototype");
+    let vm::CallableTarget::ScriptFunction(index) = prototype.target else {
+        panic!(
+            "export target is not a script function: {:?}",
+            prototype.target
+        );
+    };
+    let function = program
+        .script_functions
+        .get(index as usize)
+        .expect("export script function");
+    assert!(
+        function.end_ip > function.entry_ip,
+        "export region is not empty"
+    );
+    assert!(
+        region_has(program, function.entry_ip, function.end_ip, OpCode::Ret),
+        "the exported chunk retires with Ret"
+    );
+    let retire = import_index(program, candidate::RETIRE_CHUNK);
+    assert!(
+        region_calls(program, function.entry_ip, function.end_ip, retire),
+        "the exported chunk still emits this activation's RETIRE_CHUNK"
+    );
+    let finish = import_index(program, candidate::FINISH_RETURN);
+    assert!(
+        region_calls(program, function.entry_ip, function.end_ip, finish),
+        "the exported chunk still runs FINISH_RETURN"
+    );
+    let callee_retire = import_index(program, candidate::RETIRE_CALLEE);
+    assert!(
+        region_calls(program, function.entry_ip, function.end_ip, callee_retire),
+        "the exported chunk still retires the Lua callee"
+    );
+    let mut callee = None;
+    let mut ip = function.entry_ip as usize;
+    let end = function.end_ip as usize;
+    while ip < end {
+        let op = OpCode::try_from(program.code[ip]).expect("opcode");
+        if op == OpCode::CallScript {
+            let prototype_id =
+                u32::from_le_bytes(program.code[ip + 1..ip + 5].try_into().expect("prototype"));
+            let target = program
+                .callable_prototypes
+                .get(prototype_id as usize)
+                .expect("callee prototype");
+            let vm::CallableTarget::ScriptFunction(callee_index) = target.target else {
+                panic!("CallScript inside the export is not a script function");
+            };
+            assert_ne!(callee_index, index, "the export must not call itself");
+            let callee_fn = program
+                .script_functions
+                .get(callee_index as usize)
+                .expect("Lua callee");
+            assert!(
+                ip < callee_fn.entry_ip as usize || ip >= callee_fn.end_ip as usize,
+                "the call site is outside the callee"
+            );
+            assert!(
+                region_has(program, callee_fn.entry_ip, callee_fn.end_ip, OpCode::Ret),
+                "the Lua callee still retires with Ret"
+            );
+            let collect = import_index(program, candidate::COLLECT);
+            assert!(
+                region_calls(program, callee_fn.entry_ip, callee_fn.end_ip, collect),
+                "the activation collects while the callee frame is still current"
+            );
+            callee = Some(callee_index);
+            break;
+        }
+        ip += 1 + op.operand_len();
+    }
+    assert!(
+        callee.is_some(),
+        "the export body has no real Lua callee call"
+    );
+}
+
+/// Same VM and same outer scope, 260 normal completions of one exported chunk.
+///
+/// LuaJIT's separate 260-activation oracle is not this compat result. Rust
+/// starts the real callable, observes, and collects in this scope. It does not
+/// reset the VM, drop the scope, or call `leave_roots` for the activation frame.
+#[test]
+fn exported_chunk_reuses_one_root_slot_across_260_calls() {
+    let mut vm = bind_exported(REPEATED_SOURCE);
+    assert_exported_script_entry(&vm);
+    let outer_frame = heap::with_heap(&mut vm.host_context(), |heap| heap.enter_roots(1))
+        .expect("native heap accepts an outer frame");
+    let carrier = heap::publish_guest(&mut vm.host_context()).expect("outer table");
+    let outer_table = heap::with_heap(&mut vm.host_context(), |heap| {
+        let heap::GuestClass::Table(table) = heap.guest_class(&carrier) else {
+            return Err(heap::HeapError::WrongKind);
+        };
+        heap.write_root(outer_frame, 0, table)?;
+        Ok(table)
+    })
+    .expect("write the outer root");
+    assert_eq!(vm.run().expect("empty root halts"), VmStatus::Halted);
+    let baseline = heap::stats(&mut vm.host_context()).expect("entry baseline");
+    let baseline_resources = vm.host_context().resource_count();
+    assert_eq!(baseline.root_slots, 1, "setup: one outer root slot");
+    assert_eq!(baseline.live_roots, 1, "setup: one live outer root");
+    assert_eq!(baseline.live_nodes, 1, "setup: one outer node");
+    assert_eq!(baseline_resources, 1, "setup: one outer resource");
+    assert_eq!(vm.call_depth(), 0, "setup: root frame has halted");
+    let host_calls_before = vm.interpreter_metrics_snapshot().generic_builtin_call_count;
+    let mut retained = None;
+    for round in 0..REPEATED_CALLS {
+        let callable = vm
+            .resolve_exported_callable(candidate::EXPORTED_CHUNK)
+            .unwrap_or_else(|error| panic!("round {round}: export binding missing: {error}"));
+        assert!(
+            matches!(callable, Value::Callable(_)),
+            "round {round}: export is not a callable"
+        );
+        let value = vm
+            .invoke_callable(callable, &[])
+            .unwrap_or_else(|error| panic!("round {round}: callable failed: {error}"));
+        assert_eq!(value, Value::Float(7.0), "round {round}: scalar handoff");
+        assert_eq!(vm.call_depth(), 0, "round {round}: no leftover Core frame");
+        let seen = witness(&mut vm);
+        assert_eq!(seen.issued.len(), round + 1, "round {round}: one new table");
+        assert_eq!(
+            seen.collects.len(),
+            round + 1,
+            "round {round}: one in-activation collect"
+        );
+        assert_eq!(
+            seen.issued_alive_at_collect.len(),
+            round + 1,
+            "round {round}: collect observed the new table"
+        );
+        assert!(
+            seen.issued_alive_at_collect[round],
+            "round {round}: collect inside the activation must still see the table"
+        );
+        let table = seen.issued[round];
+        assert!(
+            seen.issued[..round].iter().all(|prior| *prior != table),
+            "round {round}: table handle is not reused before collect"
+        );
+        let key = seen.field_key.expect("self field");
+        let edge = heap::with_heap(&mut vm.host_context(), |heap| heap.edge(table, key))
+            .expect("self edge");
+        assert_eq!(edge, Some(table), "round {round}: self-loop is live");
+        let stats = heap::stats(&mut vm.host_context()).expect("stats after return");
+        assert_eq!(
+            stats.root_slots, baseline.root_slots,
+            "round {round}: root slots must return to the entry baseline"
+        );
+        assert_eq!(
+            stats.live_roots, baseline.live_roots,
+            "round {round}: live roots must return to the entry baseline"
+        );
+        assert_eq!(
+            stats.live_nodes,
+            baseline.live_nodes + 1,
+            "round {round}: the unrooted self-cycle still occupies a node"
+        );
+        assert!(
+            heap_alive(&mut vm, table),
+            "round {round}: completion must not collect the table immediately"
+        );
+        assert!(
+            heap_alive(&mut vm, outer_table),
+            "round {round}: outer root stays live"
+        );
+        let current = heap::with_heap(&mut vm.host_context(), |heap| Ok(heap.current_frame()))
+            .expect("current frame");
+        assert_eq!(
+            current,
+            Some(outer_frame),
+            "round {round}: only the outer frame remains"
+        );
+        assert_eq!(
+            vm.host_context().resource_count(),
+            baseline_resources + 1,
+            "round {round}: the table resource stays until collect"
+        );
+        let omit_post_return_collect = round + 1 == REPEATED_CALLS;
+        if omit_post_return_collect {
+            retained = Some(table);
+            continue;
+        }
+        heap::collect(&mut vm.host_context()).expect("same-scope collect");
+        assert!(
+            !heap_alive(&mut vm, table),
+            "round {round}: explicit collect reclaims the table"
+        );
+        assert!(
+            heap_alive(&mut vm, outer_table),
+            "round {round}: collect keeps the outer root"
+        );
+        let after = heap::stats(&mut vm.host_context()).expect("stats after collect");
+        assert_eq!(after.root_slots, baseline.root_slots);
+        assert_eq!(after.live_roots, baseline.live_roots);
+        assert_eq!(after.live_nodes, baseline.live_nodes);
+        assert_eq!(vm.host_context().resource_count(), baseline_resources);
+    }
+    let retained = retained.expect("one round omitted the post-return collect");
+    assert!(
+        heap_alive(&mut vm, retained),
+        "omitting the post-return collect leaves the self-cycle observable"
+    );
+    assert_eq!(
+        vm.host_context().resource_count(),
+        baseline_resources + 1,
+        "omitting the post-return collect leaves the host resource"
+    );
+    heap::collect(&mut vm.host_context()).expect("final same-scope collect");
+    assert!(!heap_alive(&mut vm, retained));
+    assert!(heap_alive(&mut vm, outer_table));
+    let after = heap::stats(&mut vm.host_context()).expect("stats after final collect");
+    assert_eq!(after.root_slots, baseline.root_slots);
+    assert_eq!(after.live_roots, baseline.live_roots);
+    assert_eq!(after.live_nodes, baseline.live_nodes);
+    assert_eq!(vm.host_context().resource_count(), baseline_resources);
+    let current = heap::with_heap(&mut vm.host_context(), |heap| Ok(heap.current_frame()))
+        .expect("frame after final collect");
+    assert_eq!(current, Some(outer_frame));
+    let host_calls = vm
+        .interpreter_metrics_snapshot()
+        .generic_builtin_call_count
+        .saturating_sub(host_calls_before);
+    assert!(
+        host_calls >= REPEATED_CALLS as u64,
+        "interpreter host calls {host_calls} did not cover {REPEATED_CALLS} rounds"
+    );
+    assert_eq!(
+        host_calls % REPEATED_CALLS as u64,
+        0,
+        "host calls {host_calls} are not uniform across {REPEATED_CALLS} rounds"
+    );
+    eprintln!(
+        "callable-repeated-retirement rounds={REPEATED_CALLS} host_calls={host_calls} per_round={}",
+        host_calls / REPEATED_CALLS as u64
+    );
 }
