@@ -28,6 +28,8 @@ const ENTER_CALLEE: &str = "lua_internal::enter_callee_frame";
 const ROOT_ISSUED: &str = "lua_internal::root_issued";
 const SET_EDGE: &str = "lua_internal::set_edge";
 const GET_EDGE: &str = "lua_internal::get_edge";
+const SET_METATABLE: &str = "lua_internal::set_metatable";
+const GET_METATABLE: &str = "lua_internal::get_metatable";
 pub(super) const FINISH_RETURN: &str = "lua_internal::finish_return";
 pub(super) const RETIRE_CALLEE: &str = "lua_internal::retire_callee";
 pub(super) const RETIRE_CHUNK: &str = "lua_internal::retire_chunk";
@@ -110,6 +112,12 @@ pub(super) fn install_schemas(builder: &mut HostApiBuilder) {
         (SET_EDGE, vec!["from", "key", "to"], HostTypeSchema::Float),
         (GET_EDGE, vec!["table", "key"], HostTypeSchema::Unknown),
         (
+            SET_METATABLE,
+            vec!["owner", "metatable"],
+            HostTypeSchema::Float,
+        ),
+        (GET_METATABLE, vec!["owner"], HostTypeSchema::Unknown),
+        (
             FINISH_RETURN,
             vec!["values", "frame", "publish", "slots", "callee"],
             HostTypeSchema::Unknown,
@@ -149,6 +157,8 @@ pub(super) fn register(
         Op::RootIssued,
         Op::SetEdge,
         Op::GetEdge,
+        Op::SetMetatable,
+        Op::GetMetatable,
         Op::FinishReturn,
         Op::RetireCallee,
         Op::RetireChunk,
@@ -172,6 +182,8 @@ pub(super) fn register(
             Op::RootIssued => ROOT_ISSUED,
             Op::SetEdge => SET_EDGE,
             Op::GetEdge => GET_EDGE,
+            Op::SetMetatable => SET_METATABLE,
+            Op::GetMetatable => GET_METATABLE,
             Op::FinishReturn => FINISH_RETURN,
             Op::RetireCallee => RETIRE_CALLEE,
             Op::RetireChunk => RETIRE_CHUNK,
@@ -205,6 +217,8 @@ enum Op {
     RootIssued,
     SetEdge,
     GetEdge,
+    SetMetatable,
+    GetMetatable,
     FinishReturn,
     RetireCallee,
     RetireChunk,
@@ -380,6 +394,8 @@ impl HostOwnedFunction for Op {
             Self::RootIssued => root_issued(call)?,
             Self::SetEdge => set_edge(call)?,
             Self::GetEdge => get_edge(call)?,
+            Self::SetMetatable => set_metatable(call)?,
+            Self::GetMetatable => get_metatable(call)?,
             Self::FinishReturn => finish_return(call)?,
             Self::RetireCallee => retire_callee(call)?,
             Self::RetireChunk => retire_chunk(call)?,
@@ -781,6 +797,49 @@ fn get_edge(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
     .map_err(heap_error)
 }
 
+fn set_metatable(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
+    let (owner, mt) = match call.args() {
+        [owner, mt] => (owner.clone(), mt.clone()),
+        _ => return Err(host_fault("invalid metatable assignment")),
+    };
+    let owner = match classify(&mut call.vm().host_context(), &owner)? {
+        heap::GuestClass::Table(table) => table,
+        _ => return Err(host_fault("metatable owner is not a table")),
+    };
+    let mt = match &mt {
+        Value::Null => None,
+        other => match classify(&mut call.vm().host_context(), other)? {
+            heap::GuestClass::Table(table) => Some(table),
+            _ => return Err(host_fault("metatable target is not a table")),
+        },
+    };
+    heap::with_heap(&mut call.vm().host_context(), |heap| {
+        heap.set_metatable(owner, mt)
+    })
+    .map_err(heap_error)?;
+    Ok(Value::Float(0.0))
+}
+
+fn get_metatable(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
+    let owner = match call.args() {
+        [owner] => owner.clone(),
+        _ => return Err(host_fault("invalid metatable read")),
+    };
+    let owner = match classify(&mut call.vm().host_context(), &owner)? {
+        heap::GuestClass::Table(table) => table,
+        _ => return Err(host_fault("metatable owner is not a table")),
+    };
+    let target = heap::with_heap(&mut call.vm().host_context(), |heap| heap.metatable(owner))
+        .map_err(heap_error)?;
+    let Some(target) = target else {
+        return Ok(Value::Null);
+    };
+    heap::with_heap(&mut call.vm().host_context(), |heap| {
+        heap.issued_value(target)
+    })
+    .map_err(heap_error)
+}
+
 fn release_result(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
     let (frame_token, slot) = match call.args() {
         [frame, slot] => (frame.clone(), float_u32(slot)?),
@@ -838,10 +897,7 @@ fn note_collect(
             ))
         })
         .map_err(heap_error)?;
-    let swept = heap::take_scan_meter(host)
-        .map_err(heap_error)?
-        .scratch
-        .dead_slots_pushed;
+    let meter = heap::take_scan_meter(host).map_err(heap_error)?;
     let witness = host
         .scope_state_mut::<ReturnWitness>()
         .ok_or_else(|| host_fault("return witness disappeared"))?;
@@ -849,10 +905,14 @@ fn note_collect(
         live_nodes: report.live_nodes,
         marked_nodes: report.marked_nodes,
         live_roots: report.live_roots,
-        swept,
+        swept: meter.scratch.dead_slots_pushed,
         returned_alive,
         discarded_alive,
         returned_edge,
+        metatable_edge_checks: meter.metatable_edge_checks,
+        index_edge_checks: meter.index_edge_checks,
+        outgoing_edge_checks: meter.outgoing_edge_checks,
+        sweep_edge_checks: meter.sweep_edge_checks,
     });
     witness.issued_alive_at_collect.push(latest_alive);
     Ok(())
@@ -1641,6 +1701,22 @@ impl Lower<'_> {
                     });
                     return self.call(COPY_FIELDS, vec![Expr::Var(slot)]);
                 }
+                if name.is("setmetatable")
+                    && let [owner, mt] = args.exprs.as_slice()
+                {
+                    let owner = self.expr(owner)?;
+                    let mt = match mt {
+                        ast::Expr::Nil { .. } => Expr::Null,
+                        other => self.expr(other)?,
+                    };
+                    return self.call(SET_METATABLE, vec![owner, mt]);
+                }
+                if name.is("getmetatable")
+                    && let [owner] = args.exprs.as_slice()
+                {
+                    let owner = self.expr(owner)?;
+                    return self.call(GET_METATABLE, vec![owner]);
+                }
                 if name.is("external_shape") && args.exprs.is_empty() {
                     return self.call(EXTERNAL_SHAPE, vec![]);
                 }
@@ -1935,6 +2011,11 @@ pub(super) struct CollectNote {
     pub returned_alive: bool,
     pub discarded_alive: bool,
     pub returned_edge: EdgeView,
+    /// Metatable references followed from marked nodes. Not a field-edge count.
+    pub metatable_edge_checks: u64,
+    pub index_edge_checks: u64,
+    pub outgoing_edge_checks: u64,
+    pub sweep_edge_checks: u64,
 }
 
 #[derive(Clone, Debug)]

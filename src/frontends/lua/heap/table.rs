@@ -166,6 +166,8 @@ struct Slot {
     /// array so a field can read it back while the node is live. It contains
     /// identity only, not object edges, and does not participate in marking.
     carrier: Option<Arc<Vec<Value>>>,
+    /// Optional metatable. Not a field key and not an `edges` record.
+    metatable: Option<(u32, u32)>,
 }
 
 struct Edge {
@@ -196,6 +198,11 @@ struct Frame {
 /// and it is zero when every live node is marked. Adding those fields is not
 /// a total GC cost.
 ///
+/// A metatable is not in that edge vector. `metatable_edge_checks` counts
+/// stored metatable refs followed from marked nodes. A collect with none
+/// stored does not read those slots, so the three field-edge counters stay
+/// the same as a heap that never had a metatable.
+///
 /// `index_slot_checks` is the one counts-to-offsets walk over index scratch.
 /// Its length is the node-slot vector. It is not a heap-node walk. Heap node
 /// walks are `node_slot_visits`. Root-vector walks are `root_slot_visits`.
@@ -217,6 +224,14 @@ pub struct ScanMeter {
     pub index_slot_checks: u64,
     pub outgoing_edge_checks: u64,
     pub sweep_edge_checks: u64,
+    /// Stored metatable references followed from a marked node.
+    ///
+    /// A metatable is an optional per-slot reference, not a field-edge record
+    /// and not an integer key. It is not included in `index_edge_checks`,
+    /// `outgoing_edge_checks`, or `sweep_edge_checks`. A heap with no stored
+    /// metatable reference does not read this path, so those collects add zero
+    /// and leave the field-edge counts unchanged.
+    pub metatable_edge_checks: u64,
     pub token_slot_checks: u64,
     pub token_closes: u64,
     /// Node-slot reads and writes during mark reset, root liveness, outgoing
@@ -299,6 +314,8 @@ pub struct LuaHeap {
     slots: Vec<Slot>,
     free_list: Vec<u32>,
     edges: Vec<Edge>,
+    /// Stored metatable refs. Zero means mark does not read metatable slots.
+    metatable_edges: u32,
     roots: Vec<Option<TableRef>>,
     frames: Vec<Frame>,
     next_frame_generation: u32,
@@ -320,6 +337,7 @@ impl LuaHeap {
             slots: Vec::new(),
             free_list: Vec::new(),
             edges: Vec::new(),
+            metatable_edges: 0,
             roots: Vec::new(),
             frames: Vec::new(),
             next_frame_generation: 1,
@@ -350,6 +368,7 @@ impl LuaHeap {
             slot.state = SlotState::Live { marked: false };
             slot.token = None;
             slot.carrier = None;
+            slot.metatable = None;
             return Ok(TableRef::table(self.domain, index, slot.generation));
         }
         if self.slots.len() >= self.limits.nodes as usize {
@@ -364,6 +383,7 @@ impl LuaHeap {
             state: SlotState::Live { marked: false },
             token: None,
             carrier: None,
+            metatable: None,
         });
         self.note_node_peak();
         Ok(TableRef::table(self.domain, index, 1))
@@ -482,6 +502,39 @@ impl LuaHeap {
                 None
             }
         }))
+    }
+
+    /// Sets or clears the metatable ref. A table target is not encoded as a
+    /// field key. Replacing one ref does not allocate another record. This
+    /// does not reject a cycle.
+    pub fn set_metatable(
+        &mut self,
+        owner: TableRef,
+        mt: Option<TableRef>,
+    ) -> Result<(), HeapError> {
+        self.require_live(owner)?;
+        if let Some(target) = mt {
+            self.require_live(target)?;
+        }
+        let had = self.slots[owner.slot() as usize].metatable.is_some();
+        let next = mt.map(|target| (target.slot(), target.generation()));
+        if had != next.is_some() {
+            if next.is_some() {
+                self.metatable_edges = self.metatable_edges.saturating_add(1);
+            } else {
+                self.metatable_edges = self.metatable_edges.saturating_sub(1);
+            }
+        }
+        self.slots[owner.slot() as usize].metatable = next;
+        Ok(())
+    }
+
+    /// Reads the stored metatable ref. The caller loads the canonical carrier.
+    pub fn metatable(&self, owner: TableRef) -> Result<Option<TableRef>, HeapError> {
+        self.require_live(owner)?;
+        Ok(self.slots[owner.slot() as usize]
+            .metatable
+            .map(|(slot, generation)| TableRef::table(self.domain, slot, generation)))
     }
 
     /// Clones the slot's issued carrier for a field read. This does not add a root.
@@ -751,6 +804,7 @@ impl LuaHeap {
                 self.mark_slot(handle.slot(), &mut work);
             }
         }
+        let follow_metatables = self.metatable_edges > 0;
         while let Some(slot) = work.pop() {
             let start = index.offsets[slot as usize] as usize;
             let end = index.offsets[slot as usize + 1] as usize;
@@ -762,6 +816,23 @@ impl LuaHeap {
                     self.mark_slot(to_slot, &mut work);
                 }
             }
+            if follow_metatables {
+                self.follow_metatable(slot, &mut work);
+            }
+        }
+    }
+
+    /// Follows one stored metatable ref. Absent refs are not edges and are
+    /// not counted. The caller skips this entirely when no ref is stored.
+    fn follow_metatable(&mut self, slot: u32, work: &mut Vec<u32>) {
+        let Some((to_slot, to_generation)) = self.slots[slot as usize].metatable else {
+            return;
+        };
+        self.scan.metatable_edge_checks += 1;
+        self.scan.node_slot_visits += 1;
+        if self.slot_live(to_slot, to_generation) {
+            self.scan.node_slot_visits += 1;
+            self.mark_slot(to_slot, work);
         }
     }
 
@@ -839,6 +910,9 @@ impl LuaHeap {
     }
 
     fn release_slot(&mut self, index: u32) {
+        if self.slots[index as usize].metatable.take().is_some() {
+            self.metatable_edges = self.metatable_edges.saturating_sub(1);
+        }
         let slot = &mut self.slots[index as usize];
         slot.token = None;
         slot.carrier = None;

@@ -676,3 +676,208 @@ fn reset_drops_the_old_carrier_even_when_fields_match_again() {
         assert!(matches!(class_of(vm, &fresh), heap::GuestClass::Table(_)));
     });
 }
+
+// IR and scope for the metatable graph. `make` publishes only `owner` into the
+// caller root frame, then retire drops the callee frame. `mt` and `payload`
+// were assigned nil in that frame, so they are not chunk live locals. `orphan`
+// drops its frame before the chunk collect, so the self-cycle has no root.
+// `collectgarbage` gathers `live_locals` and `active_temps` only. The read-back
+// names are removed from `live_locals` by `= nil` before detach and the second
+// collect. `host_call` argument slots and `field_read`'s base slot are not
+// added to those lists, so they are not safepoint roots. `observe_table`
+// stores a `TableRef` and a Core token, not a VM `Value`. `read_mt.__index` is
+// the existing physical field read, not `__index` dispatch.
+fn strong_metatable_source(second_collect: bool) -> String {
+    let tail = if second_collect {
+        "collectgarbage(\"collect\")\nlocal unrelated_ok = observe_table(unrelated, 0)\nreturn mt_same\n"
+    } else {
+        "return type(getmetatable(owner))\n"
+    };
+    let source = r#"
+local function orphan()
+  local cycle = {}
+  observe_table(cycle, 0)
+  cycle.self = cycle
+  cycle = nil
+end
+orphan()
+local function make()
+  local owner = {}
+  local mt = {}
+  local payload = {}
+  observe_table(mt, 0)
+  observe_table(payload, 0)
+  mt.__index = payload
+  setmetatable(owner, mt)
+  mt = nil
+  payload = nil
+  return owner
+end
+local owner = make()
+local unrelated = {}
+collectgarbage("collect")
+local read_mt = getmetatable(owner)
+local mt_same = observe_table(read_mt, 0)
+local read_payload = read_mt.__index
+local payload_same = observe_table(read_payload, 0)
+read_mt = nil
+read_payload = nil
+setmetatable(owner, nil)
+"#;
+    format!("{source}{tail}")
+}
+
+fn first_collect_matrix(note: &candidate::CollectNote) -> (u64, u64, u64, u64, u32, u32, u64) {
+    (
+        note.metatable_edge_checks,
+        note.index_edge_checks,
+        note.outgoing_edge_checks,
+        note.sweep_edge_checks,
+        note.marked_nodes,
+        note.live_nodes,
+        note.swept,
+    )
+}
+
+#[test]
+fn lua_candidate_reads_metatable_identity_after_collect_then_reclaims_on_detach() {
+    let source = strong_metatable_source(true);
+    let mut vm = candidate(&source);
+    let status = vm.run();
+    let stack = vm.stack().to_vec();
+    let mut host = vm.host_context();
+    let witness = host.scope_state::<candidate::ReturnWitness>().unwrap();
+    let tables = host.scope_state::<Vec<ObservedTable>>().unwrap();
+    assert!(
+        witness.callee_left,
+        "make returned through the real callee frame"
+    );
+    assert_eq!(
+        witness.discarded,
+        Some(tables[0].table),
+        "the self-cycle was witnessed"
+    );
+    assert!(!witness.collects.is_empty(), "collection did not run");
+    let first = &witness.collects[0];
+    assert!(!first.discarded_alive && first.returned_alive);
+    assert_eq!(first.returned_edge, candidate::EdgeView::Absent);
+    // Field edges are cycle.self and mt.__index. The metatable ref is not one
+    // of them: index is 2 passes x 2 field edges, outgoing follows only the
+    // marked mt field, sweep filters both because the cycle died. The
+    // metatable follow is the separate 1.
+    assert_eq!(
+        first_collect_matrix(first),
+        (1, 4, 1, 2, 4, 4, 1),
+        "metatable follow must stay out of the field-edge counters"
+    );
+    assert_eq!(
+        status.expect("read the metatable after a real collection"),
+        VmStatus::Halted
+    );
+    assert_eq!(tables.len(), 6);
+    let cycle = tables[0];
+    let mt = tables[1];
+    let payload = tables[2];
+    assert_eq!(
+        tables[3], mt,
+        "getmetatable returns the same slot, generation and token"
+    );
+    assert_eq!(
+        tables[4], payload,
+        "the payload identity is the physical __index field"
+    );
+    assert_eq!(stack, [Value::Bool(true)]);
+
+    assert_eq!(witness.collects.len(), 2);
+    let second = &witness.collects[1];
+    assert!(
+        second.returned_alive,
+        "owner stays rooted across the reclaim collect"
+    );
+    assert_eq!(second.returned_edge, candidate::EdgeView::Absent);
+    // Detach removed the only metatable ref. One field edge remains, and the
+    // marked nodes do not own it, so outgoing is 0 and the metatable counter
+    // is 0. Sweep still filters that field edge.
+    assert_eq!(
+        first_collect_matrix(second),
+        (0, 2, 0, 1, 2, 2, 2),
+        "detach does not add a field edge, and the second collect reclaims both targets"
+    );
+    let key = heap::LuaTableResource::key();
+    assert!(
+        host.borrow_resource_with_key::<heap::LuaTableResource>(cycle.token, &key)
+            .is_err()
+    );
+    assert!(
+        host.borrow_resource_with_key::<heap::LuaTableResource>(mt.token, &key)
+            .is_err()
+    );
+    assert!(
+        host.borrow_resource_with_key::<heap::LuaTableResource>(payload.token, &key)
+            .is_err()
+    );
+    assert!(
+        host.borrow_resource_with_key::<heap::LuaTableResource>(tables[5].token, &key)
+            .is_ok()
+    );
+    assert_eq!(host.resource_count(), 2);
+    assert_eq!(heap::stats(&mut host).unwrap().live_roots, 0);
+}
+
+#[test]
+fn lua_candidate_omitting_the_collect_after_detach_keeps_the_metatable_target() {
+    let source = strong_metatable_source(false);
+    let mut vm = candidate(&source);
+    let status = vm.run();
+    let stack = vm.stack().to_vec();
+    let mut host = vm.host_context();
+    let witness = host.scope_state::<candidate::ReturnWitness>().unwrap();
+    let tables = host.scope_state::<Vec<ObservedTable>>().unwrap();
+    assert_eq!(
+        witness.collects.len(),
+        1,
+        "the omitted collect must not run"
+    );
+    let first = &witness.collects[0];
+    assert_eq!(
+        first_collect_matrix(first),
+        (1, 4, 1, 2, 4, 4, 1),
+        "the kept graph is the same one the reclaim test collects a second time"
+    );
+    assert_eq!(
+        status.expect("detach without a second collection"),
+        VmStatus::Halted
+    );
+    assert_eq!(stack, [Value::string("nil")]);
+    assert_eq!(tables.len(), 5);
+    let cycle = tables[0];
+    let mt = tables[1];
+    let payload = tables[2];
+    assert_eq!(tables[3], mt);
+    assert_eq!(tables[4], payload);
+    assert!(
+        heap::with_heap(&mut host, |heap| Ok(heap.alive(mt.table))).unwrap(),
+        "removing the edge does not release the metatable node"
+    );
+    assert!(
+        heap::with_heap(&mut host, |heap| Ok(heap.alive(payload.table))).unwrap(),
+        "removing the edge does not release the payload node"
+    );
+    assert!(!heap::with_heap(&mut host, |heap| Ok(heap.alive(cycle.table))).unwrap());
+    let key = heap::LuaTableResource::key();
+    assert!(
+        host.borrow_resource_with_key::<heap::LuaTableResource>(mt.token, &key)
+            .is_ok()
+    );
+    assert!(
+        host.borrow_resource_with_key::<heap::LuaTableResource>(payload.token, &key)
+            .is_ok()
+    );
+    assert!(
+        host.borrow_resource_with_key::<heap::LuaTableResource>(cycle.token, &key)
+            .is_err()
+    );
+    let stats = heap::stats(&mut host).unwrap();
+    assert_eq!(stats.collections, 1);
+    assert_eq!(stats.live_nodes, 4);
+}
