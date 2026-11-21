@@ -1,4 +1,7 @@
 mod expr;
+mod imports;
+
+pub(crate) use imports::static_module_imports;
 mod support;
 
 // Private syntax modules for the locked LuaJIT 5.2-compat grammar.
