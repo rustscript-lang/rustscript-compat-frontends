@@ -882,6 +882,274 @@ fn lua_candidate_omitting_the_collect_after_detach_keeps_the_metatable_target() 
     assert_eq!(stats.live_nodes, 4);
 }
 
+fn assert_weak_probe(source: &str, result: &str, live: &[bool], edges: u32, collections: u32) {
+    let mut vm = candidate(source);
+    assert_eq!(
+        vm.run().expect("execute weak-table probe"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::string(result)]);
+    let mut host = vm.host_context();
+    let observed = host.scope_state::<Vec<ObservedTable>>().unwrap().clone();
+    assert_eq!(observed.len(), live.len());
+    let resource_key = heap::LuaTableResource::key();
+    for (index, (table, &expected)) in observed.iter().zip(live).enumerate() {
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| Ok(heap.alive(table.table))).unwrap(),
+            expected,
+            "table {index} heap liveness"
+        );
+        assert_eq!(
+            host.borrow_resource_with_key::<heap::LuaTableResource>(table.token, &resource_key)
+                .is_ok(),
+            expected,
+            "table {index} token liveness"
+        );
+    }
+    let stats = heap::stats(&mut host).unwrap();
+    assert_eq!(stats.live_edges, edges, "stored entries after collection");
+    assert_eq!(stats.collections, collections);
+}
+
+#[test]
+fn lua_candidate_weak_values_clear_entries_but_trace_keys() {
+    let source = r#"
+local mt = {}
+mt.__mode = "v"
+local owner = {}
+setmetatable(owner, mt)
+local key = {}
+local extra_key = {}
+local cycle = {}
+cycle.self = cycle
+local other = {}
+local rooted = {}
+owner[key] = cycle
+owner[extra_key] = other
+owner.keep = rooted
+observe_table(mt, 0)
+observe_table(key, 0)
+observe_table(extra_key, 0)
+observe_table(cycle, 0)
+observe_table(other, 0)
+observe_table(rooted, 0)
+mt = nil
+extra_key = nil
+cycle = nil
+other = nil
+collectgarbage("collect")
+observe_table(owner.keep, 0)
+return type(owner[key])
+"#;
+    assert_weak_probe(
+        source,
+        "nil",
+        &[true, true, true, false, false, true, true],
+        2,
+        1,
+    );
+    let control = source.replace("collectgarbage(\"collect\")", "");
+    assert_weak_probe(&control, "table", &[true; 7], 5, 0);
+}
+
+#[test]
+fn lua_candidate_weak_keys_trace_values_with_or_without_a_back_reference() {
+    let source = r#"
+local mt = {}
+mt.__mode = "k"
+local owner = {}
+setmetatable(owner, mt)
+local dead_key = {}
+local traced_value = {}
+local back_key = {}
+local back_value = {}
+local rooted_key = {}
+local rooted_value = {}
+owner[dead_key] = traced_value
+owner[back_key] = back_value
+back_value.back = back_key
+owner[rooted_key] = rooted_value
+observe_table(dead_key, 0)
+observe_table(traced_value, 0)
+observe_table(back_key, 0)
+observe_table(back_value, 0)
+observe_table(rooted_key, 0)
+observe_table(rooted_value, 0)
+dead_key = nil
+traced_value = nil
+back_key = nil
+back_value = nil
+collectgarbage("collect")
+return type(owner[rooted_key])
+"#;
+    assert_weak_probe(
+        source,
+        "table",
+        &[false, true, true, true, true, true],
+        4,
+        1,
+    );
+    let both = source.replace(r#""k""#, r#""kv""#);
+    assert_weak_probe(
+        &both,
+        "table",
+        &[false, false, false, false, true, true],
+        2,
+        1,
+    );
+    let control = both.replace(r#"collectgarbage("collect")"#, "");
+    assert_weak_probe(&control, "table", &[true; 6], 5, 0);
+}
+
+#[test]
+fn lua_candidate_shared_metatable_uses_only_its_current_direct_mode() {
+    let source = r#"
+local inherited = {}
+inherited.__mode = "v"
+local proxy = {}
+proxy.__index = inherited
+local mt = {}
+setmetatable(mt, proxy)
+local one = {}
+local two = {}
+setmetatable(one, mt)
+setmetatable(two, mt)
+local key = {}
+local first = {}
+local second = {}
+local orphan = {}
+one[key] = first
+two[key] = second
+observe_table(first, 0)
+observe_table(second, 0)
+observe_table(orphan, 0)
+first = nil
+second = nil
+orphan = nil
+collectgarbage("collect")
+observe_table(one[key], 0)
+observe_table(two[key], 0)
+@change@
+@collect@
+return type(one[key])
+"#;
+    for (change, collect, result, live, edges) in [
+        (
+            r#"mt.__mode = "v""#,
+            true,
+            "nil",
+            [false, false, false, false, false],
+            3,
+        ),
+        (
+            r#"mt.__mode = "v""#,
+            false,
+            "table",
+            [true, true, false, true, true],
+            5,
+        ),
+        (
+            "setmetatable(one, inherited)",
+            true,
+            "nil",
+            [false, true, false, false, true],
+            3,
+        ),
+        (
+            "mt.__mode = 118",
+            true,
+            "table",
+            [true, true, false, true, true],
+            5,
+        ),
+        (
+            "mt.__mode = inherited",
+            true,
+            "table",
+            [true, true, false, true, true],
+            5,
+        ),
+    ] {
+        let source = source.replace("@change@", change).replace(
+            "@collect@",
+            if collect {
+                r#"collectgarbage("collect")"#
+            } else {
+                ""
+            },
+        );
+        assert_weak_probe(&source, result, &live, edges, 1 + u32::from(collect));
+    }
+}
+
+#[test]
+fn lua_candidate_deleting_shared_mode_restores_strong_edges() {
+    let source = r#"
+local mt = {}
+mt.__mode = "v"
+setmetatable(mt, mt)
+local one = {}
+local two = {}
+setmetatable(one, mt)
+setmetatable(two, mt)
+local key = {}
+local first = {}
+local second = {}
+one[key] = first
+two[key] = second
+observe_table(first, 0)
+observe_table(second, 0)
+collectgarbage("collect")
+@change@
+first = nil
+second = nil
+collectgarbage("collect")
+return type(one[key])
+"#;
+    let read_mode = source
+        .replace("@change@", "")
+        .replace("type(one[key])", "mt.__mode");
+    assert_weak_probe(&read_mode, "v", &[false, false], 1, 2);
+    let removed = source.replace("@change@", "mt.__mode = nil");
+    assert_weak_probe(&removed, "table", &[true, true], 2, 2);
+    let unchanged = source.replace("@change@", "");
+    assert_weak_probe(&unchanged, "nil", &[false, false], 1, 2);
+}
+
+#[test]
+fn shared_weak_mode_is_parsed_once_per_collection() {
+    let mut heap = heap::LuaHeap::new(heap::HeapLimits::production());
+    let mt = heap.alloc().unwrap();
+    let value = heap.alloc().unwrap();
+    let mode = "x".repeat(1024) + "v";
+    heap.set_mode_scalar(mt, Value::string(&mode)).unwrap();
+    let count = 16;
+    let frame = heap.enter_roots(count).unwrap();
+    for slot in 0..count {
+        let owner = heap.alloc().unwrap();
+        heap.set_metatable(owner, Some(mt)).unwrap();
+        heap.set_edge(owner, 1, value).unwrap();
+        heap.write_root(frame, slot, owner).unwrap();
+    }
+
+    assert_eq!(heap.collect().marked_nodes, count + 1);
+    let meter = heap.take_scan_meter();
+    assert_eq!(meter.weak_mode_bytes, mode.len() as u64);
+    assert_eq!(meter.weak_mode_lookups, u64::from(count));
+    assert_eq!(meter.scratch.weak_modes_inited, u64::from(count + 2));
+    assert_eq!(meter.outgoing_edge_checks, u64::from(count + 1));
+    assert_eq!(meter.sweep_edge_checks, u64::from(count + 1));
+    assert_eq!(heap.stats().live_edges, 1);
+
+    heap.set_mode_scalar(mt, Value::Null).unwrap();
+    assert_eq!(heap.collect().marked_nodes, count + 1);
+    let meter = heap.take_scan_meter();
+    assert_eq!(meter.weak_mode_bytes, 0);
+    assert_eq!(meter.weak_mode_lookups, 0);
+    assert_eq!(meter.scratch.weak_modes_inited, 0);
+    assert_eq!(meter.sweep_edge_checks, 0);
+}
+
 /// `owner[key] = value`, a real bracket read, and `owner[key] = nil`.
 /// The key is a live table identity, not a field name or a guest number.
 #[test]

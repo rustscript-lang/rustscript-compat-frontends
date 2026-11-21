@@ -18,7 +18,7 @@ pub struct HeapLimits {
     pub nodes: u32,
     /// Simultaneous explicit root slots.
     pub roots: u32,
-    /// Live reference-edge records.
+    /// Live table-entry records, including a scalar `__mode` field.
     pub edges: u32,
     /// Highest generation a slot may hold. The next release retires it.
     pub max_generation: u32,
@@ -99,7 +99,7 @@ pub struct HeapStats {
     pub live_nodes: u32,
     /// Root slots currently holding a handle.
     pub live_roots: u32,
-    /// Reference edges currently stored.
+    /// Table-entry records currently stored.
     pub live_edges: u32,
     /// Slot vector length. Free and retired slots still occupy it.
     pub node_slots: u32,
@@ -170,14 +170,26 @@ struct Slot {
     metatable: Option<(u32, u32)>,
 }
 
-#[derive(Clone, Copy)]
 struct Edge {
     from: u32,
     /// Field ids and object identities share this record. An object key is the
     /// live slot and generation, not a guest number and not a second edge table.
     key: EdgeKey,
-    to_slot: u32,
-    to_generation: u32,
+    value: EdgeValue,
+}
+
+enum EdgeValue {
+    Table { slot: u32, generation: u32 },
+    ModeScalar(Value),
+}
+
+impl EdgeValue {
+    fn table(&self) -> Option<(u32, u32)> {
+        match self {
+            Self::Table { slot, generation } => Some((*slot, *generation)),
+            Self::ModeScalar(_) => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -212,8 +224,8 @@ struct Frame {
 ///
 /// Edge work stays in its own fields. `index_edge_checks` is the two passes
 /// that build the outgoing index (2E). `outgoing_edge_checks` counts records
-/// followed from marked nodes. An object record has one key and one value
-/// target; each target contributes separately to `node_slot_visits`.
+/// inspected from marked nodes. Each followed object target contributes
+/// separately to `node_slot_visits`; skipped weak targets do not.
 /// `sweep_edge_checks` is the one edge filter,
 /// and it is zero when every live node is marked. Adding those fields is not
 /// a total GC cost.
@@ -252,6 +264,10 @@ pub struct ScanMeter {
     /// metatable reference does not read this path, so those collects add zero
     /// and leave the field-edge counts unchanged.
     pub metatable_edge_checks: u64,
+    /// Bytes examined while parsing direct string modes (including a NUL terminator if present).
+    pub weak_mode_bytes: u64,
+    /// Mode lookups by live metatable slot when a weak mode was indexed.
+    pub weak_mode_lookups: u64,
     pub token_slot_checks: u64,
     pub token_closes: u64,
     /// Node-slot reads and writes during mark reset, root liveness, outgoing
@@ -282,6 +298,8 @@ pub struct ScanScratch {
     pub index_cursor_copied: u64,
     /// Outgoing index entries zero-initialized to the in-range edge total.
     pub index_targets_inited: u64,
+    /// Slot-indexed modes zero-initialized on the first weak mode in the index.
+    pub weak_modes_inited: u64,
     /// Work-stack pushes. One per newly marked node. Not a reserve.
     pub work_pushed: u64,
     /// Pending-close elements appended. Host mark only; pure collect is 0.
@@ -306,6 +324,29 @@ pub(super) struct DoomedToken {
 struct OutgoingIndex {
     offsets: Vec<u32>,
     entries: Vec<u32>,
+    weak_modes: Option<Vec<WeakMode>>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct WeakMode {
+    keys: bool,
+    values: bool,
+}
+
+impl WeakMode {
+    fn parse(mode: &str, bytes: &mut u64) -> Self {
+        let mut weak = Self::default();
+        for byte in mode.bytes() {
+            *bytes += 1;
+            match byte {
+                b'k' => weak.keys = true,
+                b'v' => weak.values = true,
+                0 => break, // LuaJIT scans the NUL-terminated mode string.
+                _ => {}
+            }
+        }
+        weak
+    }
 }
 
 /// Category of one guest value on this heap.
@@ -348,6 +389,9 @@ pub struct LuaHeap {
 }
 
 impl LuaHeap {
+    /// Reserved direct field id for `__mode`; ordinary field ids start at 1.
+    pub const MODE_FIELD: u32 = 0;
+
     /// Creates an empty heap. Slot zero is ordinary storage; handles start at
     /// generation 1 so generation 0 never denotes a live node.
     pub fn new(limits: HeapLimits) -> Self {
@@ -484,7 +528,24 @@ impl LuaHeap {
     /// Writes a reference edge. An existing key is overwritten and does not
     /// consume another edge slot. A new key at the cap fails without insert.
     pub fn set_edge(&mut self, from: TableRef, key: u32, to: TableRef) -> Result<(), HeapError> {
-        self.write_edge(from, EdgeKey::Field(key), to)
+        self.write_table_edge(from, EdgeKey::Field(key), to)
+    }
+
+    /// Writes the non-reference scalar forms of the direct `__mode` field.
+    /// Nil deletes the record; other scalar values occupy the same edge quota.
+    pub fn set_mode_scalar(&mut self, from: TableRef, value: Value) -> Result<(), HeapError> {
+        debug_assert!(matches!(
+            value,
+            Value::Null | Value::String(_) | Value::Float(_) | Value::Bool(_)
+        ));
+        self.require_live(from)?;
+        let key = EdgeKey::Field(Self::MODE_FIELD);
+        if matches!(value, Value::Null) {
+            self.clear_edge(from, key);
+            Ok(())
+        } else {
+            self.write_edge(from, key, EdgeValue::ModeScalar(value))
+        }
     }
 
     /// Writes one object-key edge in the same record and quota as a field edge.
@@ -498,7 +559,7 @@ impl LuaHeap {
         to: TableRef,
     ) -> Result<(), HeapError> {
         self.require_live(key)?;
-        self.write_edge(from, EdgeKey::object(key), to)
+        self.write_table_edge(from, EdgeKey::object(key), to)
     }
 
     /// Removes one object-key record. Another key, including a later generation
@@ -506,22 +567,45 @@ impl LuaHeap {
     pub fn clear_object_edge(&mut self, from: TableRef, key: TableRef) -> Result<(), HeapError> {
         self.require_live(from)?;
         self.require_live(key)?;
-        let key = EdgeKey::object(key);
-        self.edges
-            .retain(|edge| edge.from != from.slot() || edge.key != key);
+        self.clear_edge(from, EdgeKey::object(key));
         Ok(())
     }
 
-    fn write_edge(&mut self, from: TableRef, key: EdgeKey, to: TableRef) -> Result<(), HeapError> {
+    fn clear_edge(&mut self, from: TableRef, key: EdgeKey) {
+        self.edges
+            .retain(|edge| edge.from != from.slot() || edge.key != key);
+    }
+
+    fn write_table_edge(
+        &mut self,
+        from: TableRef,
+        key: EdgeKey,
+        to: TableRef,
+    ) -> Result<(), HeapError> {
         self.require_live(from)?;
         self.require_live(to)?;
+        self.write_edge(
+            from,
+            key,
+            EdgeValue::Table {
+                slot: to.slot(),
+                generation: to.generation(),
+            },
+        )
+    }
+
+    fn write_edge(
+        &mut self,
+        from: TableRef,
+        key: EdgeKey,
+        value: EdgeValue,
+    ) -> Result<(), HeapError> {
         if let Some(edge) = self
             .edges
             .iter_mut()
             .find(|edge| edge.from == from.slot() && edge.key == key)
         {
-            edge.to_slot = to.slot();
-            edge.to_generation = to.generation();
+            edge.value = value;
             return Ok(());
         }
         if self.edges.len() >= self.limits.edges as usize {
@@ -530,16 +614,26 @@ impl LuaHeap {
         self.edges.push(Edge {
             from: from.slot(),
             key,
-            to_slot: to.slot(),
-            to_generation: to.generation(),
+            value,
         });
         self.note_edge_peak();
         Ok(())
     }
 
-    /// Reads a reference edge through either alias of `from`.
+    /// Reads the table target of a direct field through either alias of `from`.
     pub fn edge(&self, from: TableRef, key: u32) -> Result<Option<TableRef>, HeapError> {
-        self.read_edge(from, EdgeKey::Field(key))
+        self.read_table_edge(from, EdgeKey::Field(key))
+    }
+
+    /// Reads a direct field as the guest value without metatable dispatch.
+    pub fn field_value(&self, from: TableRef, key: u32) -> Result<Value, HeapError> {
+        match self.read_edge(from, EdgeKey::Field(key))? {
+            Some(EdgeValue::Table { slot, generation }) => {
+                self.issued_value(TableRef::table(self.domain, *slot, *generation))
+            }
+            Some(EdgeValue::ModeScalar(value)) => Ok(value.clone()),
+            None => Ok(Value::Null),
+        }
     }
 
     /// Reads an object-key edge. The key generation must still be that live slot.
@@ -549,22 +643,23 @@ impl LuaHeap {
         key: TableRef,
     ) -> Result<Option<TableRef>, HeapError> {
         self.require_live(key)?;
-        self.read_edge(from, EdgeKey::object(key))
+        self.read_table_edge(from, EdgeKey::object(key))
     }
 
-    fn read_edge(&self, from: TableRef, key: EdgeKey) -> Result<Option<TableRef>, HeapError> {
+    fn read_table_edge(&self, from: TableRef, key: EdgeKey) -> Result<Option<TableRef>, HeapError> {
+        Ok(self
+            .read_edge(from, key)?
+            .and_then(EdgeValue::table)
+            .map(|(slot, generation)| TableRef::table(self.domain, slot, generation)))
+    }
+
+    fn read_edge(&self, from: TableRef, key: EdgeKey) -> Result<Option<&EdgeValue>, HeapError> {
         self.require_live(from)?;
-        Ok(self.edges.iter().find_map(|edge| {
-            if edge.from == from.slot() && edge.key == key {
-                Some(TableRef::table(
-                    self.domain,
-                    edge.to_slot,
-                    edge.to_generation,
-                ))
-            } else {
-                None
-            }
-        }))
+        Ok(self
+            .edges
+            .iter()
+            .find(|edge| edge.from == from.slot() && edge.key == key)
+            .map(|edge| &edge.value))
     }
 
     /// Sets or clears the metatable ref. A table target is not encoded as a
@@ -869,38 +964,61 @@ impl LuaHeap {
         }
         let follow_metatables = self.metatable_edges > 0;
         while let Some(slot) = work.pop() {
+            let mode = if follow_metatables {
+                self.follow_metatable(slot, &index, &mut work)
+            } else {
+                WeakMode::default()
+            };
             let start = index.offsets[slot as usize] as usize;
             let end = index.offsets[slot as usize + 1] as usize;
             self.scan.outgoing_edge_checks += (end - start) as u64;
             for &entry in &index.entries[start..end] {
-                let edge = self.edges[entry as usize];
-                if let EdgeKey::Object { slot, generation } = edge.key {
+                let edge = &self.edges[entry as usize];
+                let (key, value) = (edge.key, edge.value.table());
+                if !mode.keys
+                    && let EdgeKey::Object { slot, generation } = key
+                {
                     self.follow_target(slot, generation, &mut work);
                 }
-                self.follow_target(edge.to_slot, edge.to_generation, &mut work);
-            }
-            if follow_metatables {
-                self.follow_metatable(slot, &mut work);
+                // LuaJIT traces k-mode values even when their keys are unmarked.
+                if !mode.values
+                    && let Some((slot, generation)) = value
+                {
+                    self.follow_target(slot, generation, &mut work);
+                }
             }
         }
     }
 
     /// Follows one stored metatable ref. Absent refs are not edges and are
     /// not counted. The caller skips this entirely when no ref is stored.
-    fn follow_metatable(&mut self, slot: u32, work: &mut Vec<u32>) {
+    fn follow_metatable(
+        &mut self,
+        slot: u32,
+        index: &OutgoingIndex,
+        work: &mut Vec<u32>,
+    ) -> WeakMode {
         let Some((to_slot, to_generation)) = self.slots[slot as usize].metatable else {
-            return;
+            return WeakMode::default();
         };
         self.scan.metatable_edge_checks += 1;
-        self.follow_target(to_slot, to_generation, work);
+        if self.follow_target(to_slot, to_generation, work)
+            && let Some(modes) = &index.weak_modes
+        {
+            self.scan.weak_mode_lookups += 1;
+            return modes[to_slot as usize];
+        }
+        WeakMode::default()
     }
 
-    fn follow_target(&mut self, to_slot: u32, to_generation: u32, work: &mut Vec<u32>) {
+    fn follow_target(&mut self, to_slot: u32, to_generation: u32, work: &mut Vec<u32>) -> bool {
         self.scan.node_slot_visits += 1;
-        if self.slot_live(to_slot, to_generation) {
-            self.scan.node_slot_visits += 1;
-            self.mark_slot(to_slot, work);
+        if !self.slot_live(to_slot, to_generation) {
+            return false;
         }
+        self.scan.node_slot_visits += 1;
+        self.mark_slot(to_slot, work);
+        true
     }
 
     /// Two passes over the stored edge vector, plus one pass over the counts
@@ -934,6 +1052,7 @@ impl LuaHeap {
         self.scan.scratch.index_cursor_copied += cursor.len() as u64;
         let mut entries = vec![0u32; running as usize];
         self.scan.scratch.index_targets_inited += entries.len() as u64;
+        let mut weak_modes = None;
         for (entry, edge) in self.edges.iter().enumerate() {
             let from = edge.from as usize;
             if from >= slot_count {
@@ -944,8 +1063,25 @@ impl LuaHeap {
                 entries[at] = entry as u32;
                 cursor[from] = cursor[from].saturating_add(1);
             }
+            if self.metatable_edges > 0
+                && edge.key == EdgeKey::Field(Self::MODE_FIELD)
+                && let EdgeValue::ModeScalar(Value::String(mode)) = &edge.value
+            {
+                let mode = WeakMode::parse(mode, &mut self.scan.weak_mode_bytes);
+                if mode.keys || mode.values {
+                    let modes = weak_modes.get_or_insert_with(|| {
+                        self.scan.scratch.weak_modes_inited += slot_count as u64;
+                        vec![WeakMode::default(); slot_count]
+                    });
+                    modes[from] = mode;
+                }
+            }
         }
-        OutgoingIndex { offsets, entries }
+        OutgoingIndex {
+            offsets,
+            entries,
+            weak_modes,
+        }
     }
 
     /// One filter of the edge vector. Skipped when every live node is marked,
@@ -961,9 +1097,11 @@ impl LuaHeap {
         self.scan.scratch.sweep_bitmap_inited += marked.len() as u64;
         self.scan.sweep_edge_checks += self.edges.len() as u64;
         let is_marked = |slot: u32| marked.get(slot as usize).copied().unwrap_or(false);
+        // Strong endpoints of a marked owner were already marked. For weak
+        // edges, either dead object endpoint invalidates the whole entry.
         self.edges.retain(|edge| {
             is_marked(edge.from)
-                && is_marked(edge.to_slot)
+                && edge.value.table().is_none_or(|(slot, _)| is_marked(slot))
                 && match edge.key {
                     EdgeKey::Field(_) => true,
                     EdgeKey::Object { slot, .. } => is_marked(slot),
@@ -999,7 +1137,9 @@ impl LuaHeap {
 
     fn remove_edges_touching(&mut self, slot: u32) {
         self.edges.retain(|edge| {
-            edge.from != slot && edge.to_slot != slot && !edge_key_is_slot(edge.key, slot)
+            edge.from != slot
+                && edge.value.table().is_none_or(|(target, _)| target != slot)
+                && !edge_key_is_slot(edge.key, slot)
         });
     }
 

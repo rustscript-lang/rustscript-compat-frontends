@@ -565,13 +565,25 @@ fn set_edge(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
         Value::Int(key) => {
             // Only the private dot lowering emits an Int field id.
             let key = u32::try_from(key).map_err(|_| host_fault("invalid field id"))?;
-            let to = match classify(&mut call.vm().host_context(), &to_value)? {
-                heap::GuestClass::Table(table) => table,
+            let mut host = call.vm().host_context();
+            match classify(&mut host, &to_value)? {
+                heap::GuestClass::Table(to) => {
+                    heap::with_heap(&mut host, |heap| heap.set_edge(from, key, to))
+                }
+                class
+                    if key == heap::LuaHeap::MODE_FIELD
+                        && (matches!(to_value, Value::Null)
+                            || matches!(
+                                class,
+                                heap::GuestClass::String
+                                    | heap::GuestClass::Number
+                                    | heap::GuestClass::Boolean
+                            )) =>
+                {
+                    heap::with_heap(&mut host, |heap| heap.set_mode_scalar(from, to_value))
+                }
                 _ => return Err(host_fault("edge target is not a table")),
-            };
-            heap::with_heap(&mut call.vm().host_context(), |heap| {
-                heap.set_edge(from, key, to)
-            })
+            }
             .map_err(heap_error)?;
             with_witness(call.vm(), |witness| {
                 if witness.field_key.is_none() {
@@ -815,21 +827,16 @@ fn get_edge(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
         _ => return Err(host_fault("field source is not a table")),
     };
     let mut host = call.vm().host_context();
-    let target = if let Value::Int(key) = key_value {
+    if let Value::Int(key) = key_value {
         let key = u32::try_from(key).map_err(|_| host_fault("invalid field id"))?;
-        heap::with_heap(&mut host, |heap| heap.edge(table, key))
-    } else {
-        let heap::GuestClass::Table(key) = classify(&mut host, &key_value)? else {
-            return Err(host_fault("edge key is not a table"));
-        };
-        heap::with_heap(&mut host, |heap| heap.object_edge(table, key))
+        return heap::with_heap(&mut host, |heap| heap.field_value(table, key)).map_err(heap_error);
     }
-    .map_err(heap_error)?;
-    let Some(target) = target else {
-        return Ok(Value::Null);
+    let heap::GuestClass::Table(key) = classify(&mut host, &key_value)? else {
+        return Err(host_fault("edge key is not a table"));
     };
-    heap::with_heap(&mut call.vm().host_context(), |heap| {
-        heap.issued_value(target)
+    heap::with_heap(&mut host, |heap| match heap.object_edge(table, key)? {
+        Some(target) => heap.issued_value(target),
+        None => Ok(Value::Null),
     })
     .map_err(heap_error)
 }
@@ -1320,11 +1327,20 @@ impl Lower<'_> {
                     ..
                 },
                 _,
-            ) if self.in_function => {
+            ) => {
                 let key = self.field_key(&name.bytes);
+                let temp_base = self.active_temps.len();
                 let from = self.expr(table)?;
-                let to = self.expr(value)?;
-                let expr = self.call(SET_EDGE, vec![from, Expr::Int(i64::from(key)), to])?;
+                let from = self.index_operand_slot(from, span)?;
+                let to = match value {
+                    ast::Expr::Nil { .. } => Expr::Null,
+                    other => self.expr(other)?,
+                };
+                self.active_temps.truncate(temp_base);
+                let expr = self.call(
+                    SET_EDGE,
+                    vec![Expr::Var(from), Expr::Int(i64::from(key)), to],
+                )?;
                 self.emit_ignored(expr, self.line(span))
             }
             (
@@ -1683,6 +1699,9 @@ impl Lower<'_> {
     }
 
     fn field_key(&mut self, name: &[u8]) -> u32 {
+        if name == b"__mode" {
+            return heap::LuaHeap::MODE_FIELD;
+        }
         if let Some(key) = self.field_keys.get(name).copied() {
             return key;
         }
@@ -1717,6 +1736,9 @@ impl Lower<'_> {
     fn expr(&mut self, expr: &ast::Expr) -> Result<Expr, ParseError> {
         match expr {
             ast::Expr::Table { fields, .. } if fields.is_empty() => self.call(NEW_TABLE, vec![]),
+            ast::Expr::String { bytes, .. } => String::from_utf8(bytes.clone())
+                .map(Expr::String)
+                .map_err(|_| self.unsupported(expr.span())),
             ast::Expr::Number {
                 raw,
                 kind: ast::NumberKind::Integer | ast::NumberKind::Float,
