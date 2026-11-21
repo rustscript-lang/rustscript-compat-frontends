@@ -167,10 +167,32 @@ struct Frame {
 
 /// Counts the loops one collect actually ran.
 ///
-/// Production keeps these counters. Each add sits on an edge or slot the
-/// collector already visits. They are not a second graph, and reading them
-/// does not sweep or close tokens. Host collection still closes tokens before
-/// sweep; there is no public sweep that skips that close.
+/// Production keeps these counters. Each add sits on an edge, node slot, or
+/// root slot the collector already visits. They are not a second graph.
+/// `stats` and `take_scan_meter` do not collect, and they do not add to these
+/// counts. A test query after the take is not part of the collection that was
+/// taken.
+///
+/// Edge work stays in its own fields. `index_edge_checks` is the two passes
+/// that build the outgoing index (2E). `outgoing_edge_checks` is the edges
+/// followed from marked nodes. `sweep_edge_checks` is the one edge filter,
+/// and it is zero when every live node is marked. Adding those fields is not
+/// a total GC cost.
+///
+/// `index_slot_checks` is the one counts-to-offsets walk over index scratch.
+/// Its length is the node-slot vector. It is not a heap-node walk. Heap node
+/// walks are `node_slot_visits`. Root-vector walks are `root_slot_visits`.
+/// Token identity checks stay in `token_slot_checks`.
+///
+/// `scratch` records element counts the collector asked Rust to initialize,
+/// copy, reserve, or push. Those are measured requests. They are not allocator
+/// capacity, process RSS, or a byte size. A `Vec` may reserve more than the
+/// request; this meter does not observe that. The ordinary meter also does
+/// not include Core's close implementation, the process allocator, or wall
+/// clock time.
+///
+/// Host collection still closes tokens before sweep. There is no public sweep
+/// that skips that close.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScanMeter {
     pub mark_passes: u64,
@@ -180,6 +202,42 @@ pub struct ScanMeter {
     pub sweep_edge_checks: u64,
     pub token_slot_checks: u64,
     pub token_closes: u64,
+    /// Node-slot reads and writes during mark reset, root liveness, outgoing
+    /// target checks, mark updates, pending-close enumeration, sweep
+    /// selection, the marked bitmap, slot release, and dead-root liveness.
+    pub node_slot_visits: u64,
+    /// Root-slot reads during root enumeration and the dead-root sweep.
+    pub root_slot_visits: u64,
+    pub scratch: ScanScratch,
+}
+
+/// Measured scratch requests for the collects since the previous take.
+///
+/// Initialization is a zeroed buffer. A copy duplicates an existing buffer.
+/// A reserve is the capacity passed to `Vec::with_capacity`, not the
+/// allocator's allocation. A push count is elements appended, not a capacity
+/// upper bound above that count. Length fields are the sizes observed after
+/// the request. This is not an observation of RSS or global allocation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScanScratch {
+    /// `counts` zero-initialized to the node-slot length.
+    pub index_counts_inited: u64,
+    /// Capacity requested for `offsets` (`slots + 1`).
+    pub index_offsets_reserved: u64,
+    /// Elements pushed into `offsets`.
+    pub index_offsets_pushed: u64,
+    /// Elements copied into `cursor` from `offsets`.
+    pub index_cursor_copied: u64,
+    /// `targets` zero-initialized to the running in-range edge total.
+    pub index_targets_inited: u64,
+    /// Work-stack pushes. One per newly marked node. Not a reserve.
+    pub work_pushed: u64,
+    /// Pending-close elements appended. Host mark only; pure collect is 0.
+    pub pending_close_pushed: u64,
+    /// Dead-slot indices appended during sweep selection. 0 if sweep did not run.
+    pub dead_slots_pushed: u64,
+    /// Mark bitmap zero-initialized when the edge filter runs. 0 when skipped.
+    pub sweep_bitmap_inited: u64,
 }
 
 /// A stored token identified while marking. Close checks this slot and
@@ -239,6 +297,7 @@ impl LuaHeap {
     }
 
     /// Returns the counts since the previous take and clears them.
+    /// Does not collect, and does not record this read as collection work.
     pub fn take_scan_meter(&mut self) -> ScanMeter {
         let meter = self.scan;
         self.scan = ScanMeter::default();
@@ -435,7 +494,8 @@ impl LuaHeap {
     /// [`Self::sweep_marked`] uses this same mark.
     pub(super) fn mark_and_doomed_tokens(&mut self) -> Vec<DoomedToken> {
         self.mark_reachable();
-        self.slots
+        let doomed: Vec<DoomedToken> = self
+            .slots
             .iter()
             .enumerate()
             .filter_map(|(index, slot)| match slot.state {
@@ -446,7 +506,10 @@ impl LuaHeap {
                 }),
                 _ => None,
             })
-            .collect()
+            .collect();
+        self.scan.node_slot_visits += self.slots.len() as u64;
+        self.scan.scratch.pending_close_pushed += doomed.len() as u64;
+        doomed
     }
 
     /// Non-moving mark from explicit roots, then one sweep of unmarked nodes.
@@ -462,34 +525,37 @@ impl LuaHeap {
     }
 
     /// Releases nodes the current mark did not reach. Does not mark again.
+    ///
+    /// Selection and the marked count share one slot pass. After that pass,
+    /// every unmarked live node is released, so remaining live nodes are the
+    /// marked count. The report uses that count instead of walking the slot
+    /// vector again.
     pub(super) fn sweep_marked(&mut self) -> CollectReport {
-        let swept: Vec<u32> = self
-            .slots
-            .iter()
-            .enumerate()
-            .filter_map(|(index, slot)| match slot.state {
-                SlotState::Live { marked: false } => Some(index as u32),
-                _ => None,
-            })
-            .collect();
-        let marked_nodes = self
-            .slots
-            .iter()
-            .filter(|slot| matches!(slot.state, SlotState::Live { marked: true }))
-            .count() as u32;
+        let mut swept = Vec::new();
+        let mut marked_nodes = 0u32;
+        self.scan.node_slot_visits += self.slots.len() as u64;
+        for (index, slot) in self.slots.iter().enumerate() {
+            match slot.state {
+                SlotState::Live { marked: false } => swept.push(index as u32),
+                SlotState::Live { marked: true } => marked_nodes += 1,
+                SlotState::Free | SlotState::Retired => {}
+            }
+        }
+        self.scan.scratch.dead_slots_pushed += swept.len() as u64;
         if !swept.is_empty() {
             self.sweep_edges_once();
             for index in swept {
+                self.scan.node_slot_visits += 1;
                 self.release_slot(index);
             }
         }
-        self.clear_dead_roots();
+        let live_roots = self.clear_dead_roots();
         self.collections = self.collections.saturating_add(1);
         self.last_marked = marked_nodes;
         CollectReport {
-            live_nodes: self.live_nodes(),
+            live_nodes: marked_nodes,
             marked_nodes,
-            live_roots: self.live_roots(),
+            live_roots,
         }
     }
 
@@ -499,6 +565,7 @@ impl LuaHeap {
     }
 
     /// Current occupancy. Peaks count storage, not only live objects.
+    /// Does not collect and does not add scan counts.
     pub fn stats(&self) -> HeapStats {
         HeapStats {
             live_nodes: self.live_nodes(),
@@ -537,6 +604,7 @@ impl LuaHeap {
 
     fn mark_reachable(&mut self) {
         self.scan.mark_passes += 1;
+        self.scan.node_slot_visits += self.slots.len() as u64;
         for slot in &mut self.slots {
             if let SlotState::Live { marked } = &mut slot.state {
                 *marked = false;
@@ -544,9 +612,12 @@ impl LuaHeap {
         }
         let index = self.build_outgoing_index();
         let mut work = Vec::new();
+        self.scan.root_slot_visits += self.roots.len() as u64;
         let rooted: Vec<TableRef> = self.roots.iter().copied().flatten().collect();
         for handle in rooted {
+            self.scan.node_slot_visits += 1;
             if self.alive(handle) {
+                self.scan.node_slot_visits += 1;
                 self.mark_slot(handle.slot(), &mut work);
             }
         }
@@ -555,36 +626,46 @@ impl LuaHeap {
             let end = index.offsets[slot as usize + 1] as usize;
             self.scan.outgoing_edge_checks += (end - start) as u64;
             for &(to_slot, to_generation) in &index.targets[start..end] {
+                self.scan.node_slot_visits += 1;
                 if self.slot_live(to_slot, to_generation) {
+                    self.scan.node_slot_visits += 1;
                     self.mark_slot(to_slot, &mut work);
                 }
             }
         }
     }
 
-    /// Two passes over the stored edge vector, plus one pass over slots to
-    /// turn counts into offsets. The index is dropped at the end of mark.
+    /// Two passes over the stored edge vector, plus one pass over the counts
+    /// scratch to turn those counts into offsets. `index_slot_checks` is that
+    /// scratch pass. Heap node walks are counted separately. The index is
+    /// dropped at the end of mark.
     fn build_outgoing_index(&mut self) -> OutgoingIndex {
         let slot_count = self.slots.len();
         let edge_count = self.edges.len();
         self.scan.index_edge_checks += edge_count as u64;
         let mut counts = vec![0u32; slot_count];
+        self.scan.scratch.index_counts_inited += counts.len() as u64;
         for edge in &self.edges {
             if let Some(count) = counts.get_mut(edge.from as usize) {
                 *count = count.saturating_add(1);
             }
         }
         self.scan.index_slot_checks += slot_count as u64;
-        let mut offsets = Vec::with_capacity(slot_count + 1);
+        let offset_request = slot_count + 1;
+        self.scan.scratch.index_offsets_reserved += offset_request as u64;
+        let mut offsets = Vec::with_capacity(offset_request);
         offsets.push(0);
         let mut running = 0u32;
         for count in &counts {
             running = running.saturating_add(*count);
             offsets.push(running);
         }
+        self.scan.scratch.index_offsets_pushed += offsets.len() as u64;
         self.scan.index_edge_checks += edge_count as u64;
         let mut cursor = offsets.clone();
+        self.scan.scratch.index_cursor_copied += cursor.len() as u64;
         let mut targets = vec![(0u32, 0u32); running as usize];
+        self.scan.scratch.index_targets_inited += targets.len() as u64;
         for edge in &self.edges {
             let from = edge.from as usize;
             if from >= slot_count {
@@ -600,13 +681,16 @@ impl LuaHeap {
     }
 
     /// One filter of the edge vector. Skipped when every live node is marked,
-    /// so an all-live collect does not walk edges again.
+    /// so an all-live collect does not walk edges again and does not build
+    /// the mark bitmap.
     fn sweep_edges_once(&mut self) {
         let marked: Vec<bool> = self
             .slots
             .iter()
             .map(|slot| matches!(slot.state, SlotState::Live { marked: true }))
             .collect();
+        self.scan.node_slot_visits += marked.len() as u64;
+        self.scan.scratch.sweep_bitmap_inited += marked.len() as u64;
         self.scan.sweep_edge_checks += self.edges.len() as u64;
         self.edges.retain(|edge| {
             marked.get(edge.from as usize).copied().unwrap_or(false)
@@ -619,6 +703,7 @@ impl LuaHeap {
             if !*marked {
                 *marked = true;
                 work.push(index);
+                self.scan.scratch.work_pushed += 1;
             }
         }
     }
@@ -649,16 +734,22 @@ impl LuaHeap {
         }
     }
 
-    fn clear_dead_roots(&mut self) {
+    fn clear_dead_roots(&mut self) -> u32 {
+        let mut live = 0u32;
         let len = self.roots.len();
+        self.scan.root_slot_visits += len as u64;
         for index in 0..len {
             let Some(handle) = self.roots[index] else {
                 continue;
             };
-            if !self.alive(handle) {
+            self.scan.node_slot_visits += 1;
+            if self.alive(handle) {
+                live += 1;
+            } else {
                 self.roots[index] = None;
             }
         }
+        live
     }
 
     fn frame(&self, id: RootFrameId) -> Result<&Frame, HeapError> {

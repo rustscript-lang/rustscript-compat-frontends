@@ -109,8 +109,14 @@ pub fn with_heap<T>(
 /// are retired: the identified slot is cleared and the sweep continues. A
 /// successor in a reused core slot is not closed, and a different lua slot is
 /// not cleared. Any other structured error, including a wrong table or a type
-/// mismatch, stops the sweep. Tokens already cleared stay cleared. The sweep
-/// does not run, so a later collection marks again and retries the remainder.
+/// mismatch, returns immediately. Tokens already cleared stay cleared. Tokens
+/// not yet closed stay open, including every token after the failing one.
+/// Sweep does not run, so those nodes stay allocated and the scope quota for
+/// the unclosed suffix is not returned. A later collection marks again from
+/// the current roots. It does not resume after the failing token. If that
+/// token is still bound, the later collection can fail again at the same
+/// obstacle, and it does not close the suffix or return the prefix quota a
+/// second time. Removing the obstacle is outside this collector.
 ///
 /// `LuaTableResource` uses the default synchronous close, which returns Ready.
 /// A Pending result is an error. This type has no path that starts an
@@ -170,12 +176,14 @@ fn retired_lua_token(error: &vm::HostContextError) -> bool {
     }
 }
 
-/// Reads occupancy counters from the scope heap.
+/// Reads occupancy counters from the scope heap. This does not collect and
+/// does not add scan counts.
 pub fn stats(host: &mut HostContext) -> Result<HeapStats, HeapError> {
     with_heap(host, |heap| Ok(heap.stats()))
 }
 
-/// Reads and clears the scan counts from the scope heap. This does not collect.
+/// Reads and clears the scan counts from the scope heap. This does not collect
+/// and does not record the read as collection work.
 pub fn take_scan_meter(host: &mut HostContext) -> Result<ScanMeter, HeapError> {
     with_heap(host, |heap| Ok(heap.take_scan_meter()))
 }

@@ -808,25 +808,33 @@ fn reachable_outgoing(shape: &ScanShape, plan: &[(u32, u32, u32)]) -> u64 {
 }
 
 /// The meter is the observation. Graph size is only the budget, not a stand-in
-/// for the counts.
+/// for the counts. Edge fields stay separate from node, root, and scratch
+/// requests. Scratch lengths are measured requests, not allocator capacity,
+/// RSS, Core close work, or wall time.
 fn assert_linear_meter(
     label: &str,
     meter: &heap::ScanMeter,
     slots: u64,
+    roots: u64,
+    occupied_roots: u64,
     edges: u64,
     outgoing: u64,
     dead: u64,
+    marked: u64,
     doomed_tokens: u64,
+    enumerates_doomed: bool,
 ) {
     assert_eq!(
         meter.mark_passes,
         1,
-        "{label} marks once (outgoing={} budget={outgoing} sweep={} token_slots={} closes={} index_edges={})",
+        "{label} marks once (outgoing={} budget={outgoing} sweep={} token_slots={} closes={} index_edges={} node_slots={} root_slots={})",
         meter.outgoing_edge_checks,
         meter.sweep_edge_checks,
         meter.token_slot_checks,
         meter.token_closes,
-        meter.index_edge_checks
+        meter.index_edge_checks,
+        meter.node_slot_visits,
+        meter.root_slot_visits
     );
     assert_eq!(
         meter.outgoing_edge_checks, outgoing,
@@ -840,7 +848,7 @@ fn assert_linear_meter(
     );
     assert_eq!(
         meter.index_slot_checks, slots,
-        "{label} index build examines each slot once"
+        "{label} index build examines the counts scratch once"
     );
     let sweep_budget = if dead == 0 { 0 } else { edges };
     assert_eq!(
@@ -848,10 +856,91 @@ fn assert_linear_meter(
         "{label} sweep filters the edge vector once"
     );
     assert_eq!(meter.token_closes, doomed_tokens, "{label} closes");
-    assert!(
-        meter.token_slot_checks <= doomed_tokens.saturating_mul(3),
-        "{label} token slot checks {} are not direct lookups for {doomed_tokens} tokens (slots={slots})",
-        meter.token_slot_checks
+    assert_eq!(
+        meter.token_slot_checks,
+        doomed_tokens.saturating_mul(2),
+        "{label} token slot checks are two per close"
+    );
+    // These graphs store only live targets, so each outgoing edge reads the
+    // target slot and then updates it. Occupied roots are live at mark time.
+    let mut node_visits = slots + occupied_roots.saturating_mul(2) + outgoing.saturating_mul(2);
+    if enumerates_doomed {
+        node_visits += slots;
+    }
+    node_visits += slots;
+    if dead > 0 {
+        node_visits += slots + dead;
+    }
+    node_visits += occupied_roots;
+    assert_eq!(
+        meter.node_slot_visits, node_visits,
+        "{label} node slot visits"
+    );
+    assert_eq!(
+        meter.root_slot_visits,
+        roots.saturating_mul(2),
+        "{label} root slot visits"
+    );
+    let scratch = &meter.scratch;
+    assert_eq!(
+        scratch.index_counts_inited, slots,
+        "{label} counts init is the measured request, not allocator capacity"
+    );
+    assert_eq!(
+        scratch.index_offsets_reserved,
+        slots + 1,
+        "{label} offsets reserve"
+    );
+    assert_eq!(
+        scratch.index_offsets_pushed,
+        slots + 1,
+        "{label} offsets pushed"
+    );
+    assert_eq!(
+        scratch.index_cursor_copied,
+        slots + 1,
+        "{label} cursor copy"
+    );
+    assert_eq!(
+        scratch.index_targets_inited, edges,
+        "{label} targets init is the measured in-range edge total"
+    );
+    assert_eq!(scratch.work_pushed, marked, "{label} work pushes");
+    let pending = if enumerates_doomed { doomed_tokens } else { 0 };
+    assert_eq!(
+        scratch.pending_close_pushed, pending,
+        "{label} pending close"
+    );
+    assert_eq!(scratch.dead_slots_pushed, dead, "{label} dead slots");
+    let bitmap = if dead == 0 { 0 } else { slots };
+    assert_eq!(
+        scratch.sweep_bitmap_inited, bitmap,
+        "{label} bitmap init is skipped when nothing is dead"
+    );
+}
+
+fn eprintln_meter(label: &str, meter: &heap::ScanMeter) {
+    let scratch = &meter.scratch;
+    eprintln!(
+        "meter {label} mark={} index_edges={} index_slots={} outgoing={} sweep={} token_slots={} closes={} node_slots={} root_slots={} counts={} offsets_res={} offsets_pushed={} cursor={} targets={} work={} pending={} dead={} bitmap={}",
+        meter.mark_passes,
+        meter.index_edge_checks,
+        meter.index_slot_checks,
+        meter.outgoing_edge_checks,
+        meter.sweep_edge_checks,
+        meter.token_slot_checks,
+        meter.token_closes,
+        meter.node_slot_visits,
+        meter.root_slot_visits,
+        scratch.index_counts_inited,
+        scratch.index_offsets_reserved,
+        scratch.index_offsets_pushed,
+        scratch.index_cursor_copied,
+        scratch.index_targets_inited,
+        scratch.work_pushed,
+        scratch.pending_close_pushed,
+        scratch.dead_slots_pushed,
+        scratch.sweep_bitmap_inited
     );
 }
 
@@ -925,17 +1014,7 @@ fn collect_pure_shape(shape: &ScanShape) {
         eprintln!("time {} nanos={}", shape.name, started.elapsed().as_nanos());
     }
     let meter = heap.take_scan_meter();
-    eprintln!(
-        "meter {} mark={} index_edges={} index_slots={} outgoing={} sweep={} token_slots={} closes={}",
-        shape.name,
-        meter.mark_passes,
-        meter.index_edge_checks,
-        meter.index_slot_checks,
-        meter.outgoing_edge_checks,
-        meter.sweep_edge_checks,
-        meter.token_slot_checks,
-        meter.token_closes
-    );
+    eprintln_meter(shape.name, &meter);
     assert_eq!(report.live_nodes, shape.reachable, "{}", shape.name);
     assert_eq!(report.marked_nodes, shape.reachable, "{}", shape.name);
     assert_pure_kept(&heap, &nodes, shape, &plan);
@@ -943,10 +1022,14 @@ fn collect_pure_shape(shape: &ScanShape) {
         shape.name,
         &meter,
         u64::from(before.node_slots),
+        u64::from(before.root_slots),
+        u64::from(before.live_roots),
         u64::from(before.live_edges),
         reachable_outgoing(shape, &plan),
         u64::from(shape.nodes - shape.reachable),
+        u64::from(shape.reachable),
         0,
+        false,
     );
 }
 
@@ -1004,17 +1087,7 @@ fn collect_host_shape(shape: &ScanShape, share_resource: bool) {
         }
         let resources_after = host.resource_count();
         let meter = heap::take_scan_meter(&mut host).expect("meter");
-        eprintln!(
-            "meter {} mark={} index_edges={} index_slots={} outgoing={} sweep={} token_slots={} closes={}",
-            shape.name,
-            meter.mark_passes,
-            meter.index_edge_checks,
-            meter.index_slot_checks,
-            meter.outgoing_edge_checks,
-            meter.sweep_edge_checks,
-            meter.token_slot_checks,
-            meter.token_closes
-        );
+        eprintln_meter(shape.name, &meter);
         let shared = usize::from(share_resource);
         assert_eq!(report.live_nodes, shape.reachable, "{}", shape.name);
         assert_eq!(report.marked_nodes, shape.reachable, "{}", shape.name);
@@ -1073,12 +1146,23 @@ fn collect_host_shape(shape: &ScanShape, share_resource: bool) {
             shape.name,
             &meter,
             u64::from(before.node_slots),
+            u64::from(before.root_slots),
+            u64::from(before.live_roots),
             u64::from(before.live_edges),
             reachable_outgoing(shape, &plan),
             u64::from(shape.nodes - shape.reachable),
+            u64::from(shape.reachable),
             u64::from(shape.nodes - shape.reachable),
+            true,
         );
     });
+}
+
+/// One small pure collect accounts node slots, root slots, and scratch
+/// requests separately from the index's one scratch pass.
+#[test]
+fn collect_meter_accounts_node_root_and_scratch_work() {
+    collect_pure_shape(&scan_shape("account-small", 4, 1, 1, 2, true));
 }
 
 #[test]
@@ -1188,20 +1272,12 @@ fn collect_scan_retired_tokens_check_the_identified_slot() {
                 .expect("successor slot")
         );
 
-        let before_slots = heap::stats(&mut host).expect("slots").node_slots;
+        let before = heap::stats(&mut host).expect("slots");
+        let before_slots = before.node_slots;
         let report = heap::collect(&mut host).expect("retired tokens do not stop collection");
         let meter = heap::take_scan_meter(&mut host).expect("meter");
-        eprintln!(
-            "meter retired-slot mark={} index_edges={} index_slots={} outgoing={} sweep={} token_slots={} closes={} slots={}",
-            meter.mark_passes,
-            meter.index_edge_checks,
-            meter.index_slot_checks,
-            meter.outgoing_edge_checks,
-            meter.sweep_edge_checks,
-            meter.token_slot_checks,
-            meter.token_closes,
-            before_slots
-        );
+        eprintln_meter("retired-slot", &meter);
+        eprintln!("meter retired-slot slots={before_slots}");
         assert!(
             before_slots > 3,
             "the slot vector must be wider than a direct lookup"
@@ -1223,18 +1299,32 @@ fn collect_scan_retired_tokens_check_the_identified_slot() {
             .is_ok(),
             "successor token stays usable"
         );
-        assert!(
-            meter.token_slot_checks <= meter.token_closes.saturating_mul(3),
-            "retired close checked {} slots for {} closes; a full scan of {before_slots} slots would exceed this",
+        assert_eq!(
             meter.token_slot_checks,
-            meter.token_closes
+            meter.token_closes.saturating_mul(2),
+            "retired close checks the identified slot twice per close"
         );
         assert_eq!(meter.mark_passes, 1, "retired close still marks once");
+        assert_linear_meter(
+            "retired-slot",
+            &meter,
+            u64::from(before.node_slots),
+            u64::from(before.root_slots),
+            u64::from(before.live_roots),
+            0,
+            0,
+            u64::from(before.live_nodes - report.live_nodes),
+            u64::from(report.marked_nodes),
+            u64::from(meter.token_closes),
+            true,
+        );
     });
 }
 
-/// A non-retired close error leaves the swept prefix closed, does not sweep,
-/// and the next collect marks again. A node rooted after the failure stays.
+/// A non-retired close error keeps the closed prefix, leaves the later token
+/// open, and does not sweep. Another collect marks from the current roots and
+/// fails again while the foreign token remains. Unbinding that token is a
+/// test fixture, not a recovery path in the collector.
 #[test]
 fn collect_scan_failed_close_retries_after_remark() {
     with_idle_vm(|vm| {
@@ -1257,30 +1347,15 @@ fn collect_scan_failed_close_retries_after_remark() {
             Ok(node)
         })
         .expect("bind a foreign token");
+        let suffix_raw = publish_raw(&mut host);
+        let suffix = table_ref(&host, suffix_raw);
         let before_nodes = heap::stats(&mut host).expect("before").live_nodes;
         let before_resources = host.resource_count();
 
         let error = heap::collect(&mut host).expect_err("type mismatch must propagate");
-        match &error {
-            heap::HeapError::Scope(message) => {
-                assert!(
-                    message.contains("resource_type_mismatch"),
-                    "other close errors propagate, got {message}"
-                );
-            }
-            other => panic!("expected a scope close error, got {other:?}"),
-        }
+        assert_type_mismatch(&error);
         let failed = heap::take_scan_meter(&mut host).expect("failed meter");
-        eprintln!(
-            "meter failed-close mark={} index_edges={} index_slots={} outgoing={} sweep={} token_slots={} closes={}",
-            failed.mark_passes,
-            failed.index_edge_checks,
-            failed.index_slot_checks,
-            failed.outgoing_edge_checks,
-            failed.sweep_edge_checks,
-            failed.token_slot_checks,
-            failed.token_closes
-        );
+        eprintln_meter("failed-close", &failed);
         assert_eq!(
             heap::stats(&mut host).expect("after error").live_nodes,
             before_nodes
@@ -1291,12 +1366,25 @@ fn collect_scan_failed_close_retries_after_remark() {
             "an incomplete collect does not sweep"
         );
         assert_eq!(failed.mark_passes, 1);
-        assert!(
-            failed.token_slot_checks <= failed.token_closes.saturating_mul(3),
-            "the failed close checked {} slots for {} closes; a direct lookup stays within 3 per close",
-            failed.token_slot_checks,
-            failed.token_closes
+        assert_eq!(
+            failed.token_closes, 3,
+            "prefix, other, and the foreign attempt"
         );
+        assert_eq!(
+            failed.token_slot_checks, 4,
+            "the two successful closes check twice; the failing close does not"
+        );
+        assert_eq!(
+            failed.node_slot_visits, 12,
+            "reset, root checks, and doomed enum"
+        );
+        assert_eq!(
+            failed.root_slot_visits, 1,
+            "mark enumerates roots; sweep does not"
+        );
+        assert_eq!(failed.scratch.pending_close_pushed, 4);
+        assert_eq!(failed.scratch.dead_slots_pushed, 0);
+        assert_eq!(failed.scratch.sweep_bitmap_inited, 0);
         assert!(
             host.resource(&unrelated).is_ok(),
             "the foreign resource is not closed"
@@ -1317,26 +1405,97 @@ fn collect_scan_failed_close_retries_after_remark() {
             .is_err(),
             "the second prefix token stays closed"
         );
-        assert_eq!(host.resource_count(), before_resources - 2);
+        assert!(
+            host.typed_resource_with_key::<LuaTableResource>(
+                resource_handle(suffix_raw),
+                &LuaTableResource::key(),
+            )
+            .is_ok(),
+            "the suffix after the failing token stays open"
+        );
+        let resources_after_failure = host.resource_count();
+        assert_eq!(resources_after_failure, before_resources - 2);
         assert!(heap::with_heap(&mut host, |heap| Ok(heap.alive(prefix))).expect("prefix node"));
         assert!(heap::with_heap(&mut host, |heap| Ok(heap.alive(doomed))).expect("doomed node"));
+        assert!(heap::with_heap(&mut host, |heap| Ok(heap.alive(suffix))).expect("suffix node"));
 
-        heap::with_heap(&mut host, |heap| heap.unbind_token(doomed))
-            .expect("drop the foreign token binding");
-        root_table(&mut host, prefix);
-        let report = heap::collect(&mut host).expect("retry after the token is exact again");
-        let retry = heap::take_scan_meter(&mut host).expect("retry meter");
-        eprintln!(
-            "meter retry mark={} index_edges={} index_slots={} outgoing={} sweep={} token_slots={} closes={}",
-            retry.mark_passes,
-            retry.index_edge_checks,
-            retry.index_slot_checks,
-            retry.outgoing_edge_checks,
-            retry.sweep_edge_checks,
-            retry.token_slot_checks,
-            retry.token_closes
+        let again = heap::collect(&mut host).expect_err("the same obstacle fails again");
+        assert_type_mismatch(&again);
+        let again_meter = heap::take_scan_meter(&mut host).expect("second failure meter");
+        eprintln_meter("failed-close-again", &again_meter);
+        assert_eq!(
+            again_meter.mark_passes, 1,
+            "the later collect marks from the current roots"
         );
-        assert_eq!(retry.mark_passes, 1, "the retry marks again");
+        assert_eq!(
+            again_meter.sweep_edge_checks, 0,
+            "the later collect still does not sweep"
+        );
+        assert_eq!(
+            again_meter.token_closes, 1,
+            "only the foreign token is attempted"
+        );
+        assert_eq!(
+            again_meter.token_slot_checks, 0,
+            "the failing close does not check a slot or advance the suffix"
+        );
+        assert_eq!(
+            again_meter.node_slot_visits, 12,
+            "the later mark walks the same node slots and does not sweep"
+        );
+        assert_eq!(
+            again_meter.root_slot_visits, 1,
+            "the later mark reads the current roots and does not sweep them"
+        );
+        assert_eq!(
+            again_meter.scratch.pending_close_pushed, 2,
+            "foreign token and suffix"
+        );
+        assert_eq!(again_meter.scratch.dead_slots_pushed, 0);
+        assert_eq!(
+            host.resource_count(),
+            resources_after_failure,
+            "the closed prefix quota is not returned again"
+        );
+        assert_eq!(
+            heap::stats(&mut host).expect("still unswept").collections,
+            0
+        );
+        assert!(
+            host.typed_resource_with_key::<LuaTableResource>(
+                resource_handle(suffix_raw),
+                &LuaTableResource::key(),
+            )
+            .is_ok(),
+            "the unprocessed suffix stays open"
+        );
+        assert!(heap::with_heap(&mut host, |heap| Ok(heap.alive(suffix))).expect("suffix stays"));
+        assert!(heap::with_heap(&mut host, |heap| Ok(heap.alive(other))).expect("other stays"));
+        assert!(
+            host.resource(&unrelated).is_ok(),
+            "the foreign resource stays open"
+        );
+
+        // Test fixture only. The collector does not unbind an obstacle or
+        // resume a remainder. This removes the foreign binding so the next
+        // collect can finish; it is not a production recovery path.
+        heap::with_heap(&mut host, |heap| heap.unbind_token(doomed))
+            .expect("fixture drops the foreign token binding");
+        root_table(&mut host, prefix);
+        let report = heap::collect(&mut host)
+            .expect("collect finishes after the fixture removes the foreign binding");
+        let retry = heap::take_scan_meter(&mut host).expect("fixture meter");
+        eprintln_meter("fixture-after-unbind", &retry);
+        assert_eq!(retry.mark_passes, 1, "the fixture collect marks again");
+        assert_eq!(
+            retry.token_closes, 1,
+            "only the still-open suffix is closed"
+        );
+        assert_eq!(
+            retry.token_slot_checks,
+            retry.token_closes.saturating_mul(2),
+            "the suffix close checks its slot twice"
+        );
         assert_eq!(
             report.live_nodes, 2,
             "keeper and the newly rooted prefix stay"
@@ -1347,6 +1506,16 @@ fn collect_scan_failed_close_retries_after_remark() {
         );
         assert!(!heap::with_heap(&mut host, |heap| Ok(heap.alive(other))).expect("other swept"));
         assert!(!heap::with_heap(&mut host, |heap| Ok(heap.alive(doomed))).expect("doomed swept"));
+        assert!(!heap::with_heap(&mut host, |heap| Ok(heap.alive(suffix))).expect("suffix swept"));
+        assert!(
+            host.typed_resource_with_key::<LuaTableResource>(
+                resource_handle(suffix_raw),
+                &LuaTableResource::key(),
+            )
+            .is_err(),
+            "the suffix closes only after the fixture removes the obstacle"
+        );
+        assert_eq!(host.resource_count(), resources_after_failure - 1);
         assert!(host.resource(&unrelated).is_ok(), "shared resource remains");
         assert!(
             host.typed_resource_with_key::<LuaTableResource>(
@@ -1356,4 +1525,16 @@ fn collect_scan_failed_close_retries_after_remark() {
             .is_ok()
         );
     });
+}
+
+fn assert_type_mismatch(error: &heap::HeapError) {
+    match error {
+        heap::HeapError::Scope(message) => {
+            assert!(
+                message.contains("resource_type_mismatch"),
+                "other close errors propagate, got {message}"
+            );
+        }
+        other => panic!("expected a scope close error, got {other:?}"),
+    }
 }
