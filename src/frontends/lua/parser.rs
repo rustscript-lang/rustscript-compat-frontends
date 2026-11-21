@@ -201,7 +201,7 @@ impl<'a> Parser<'a> {
         let end = if stmts.is_empty() {
             start
         } else {
-            stmts.last().map(|stmt| stmt_span(stmt)).unwrap_or(start)
+            stmts.last().map(stmt_span).unwrap_or(start)
         };
         Ok(Block {
             span: start.cover(end),

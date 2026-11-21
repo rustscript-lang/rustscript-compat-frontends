@@ -189,10 +189,11 @@ impl<'a> Scan<'a> {
     fn finish_newline(&mut self) {
         let old = self.cur();
         self.advance();
-        if let Some(next) = self.cur() {
-            if Self::is_eol(next) && Some(next) != old {
-                self.advance();
-            }
+        if let Some(next) = self.cur()
+            && Self::is_eol(next)
+            && Some(next) != old
+        {
+            self.advance();
         }
         self.line = self.line.saturating_add(1);
     }
@@ -1064,10 +1065,8 @@ fn classify_number(raw: &[u8]) -> Result<NumberKind, ()> {
                 }
             }
             if p < raw.len() && (raw[p] | 0x20) == b'u' && (!saw_u || saw_ll) {
-                if !saw_u || saw_ll {
-                    p += 1;
-                    saw_u = true;
-                }
+                p += 1;
+                saw_u = true;
             }
             if saw_u && !saw_ll {
                 return Err(());

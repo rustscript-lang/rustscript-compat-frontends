@@ -236,13 +236,11 @@ impl Cx {
                 if is_loop {
                     continue;
                 }
-                if !function_root {
-                    if let Some(parent) = self.scopes.last_mut() {
-                        let mut propagated = jump;
-                        propagated.slot = scope.start_local as u32;
-                        parent.jumps.push(propagated);
-                        continue;
-                    }
+                if !function_root && let Some(parent) = self.scopes.last_mut() {
+                    let mut propagated = jump;
+                    propagated.slot = scope.start_local as u32;
+                    parent.jumps.push(propagated);
+                    continue;
                 }
                 if jump.kind == JumpKind::Break {
                     self.resolution
@@ -419,18 +417,17 @@ impl Cx {
             None
         };
         let mut resolved = false;
-        if kind == JumpKind::Goto {
-            if let Some(label) = self
+        if kind == JumpKind::Goto
+            && let Some(label) = self
                 .scopes
                 .last()
                 .and_then(|scope| scope.labels.iter().find(|label| label.name == name))
-            {
-                let index = label.index;
-                if let Some(goto_index) = goto_index {
-                    self.resolution.gotos[goto_index].target = Some(index);
-                }
-                resolved = true;
+        {
+            let index = label.index;
+            if let Some(goto_index) = goto_index {
+                self.resolution.gotos[goto_index].target = Some(index);
             }
+            resolved = true;
         }
         self.scopes.last_mut().expect("scope").jumps.push(JumpRec {
             kind,
@@ -791,8 +788,8 @@ fn trailing_labels(block: &Block, adjust: bool) -> Vec<bool> {
     if !adjust {
         return flags;
     }
-    for index in 0..block.stmts.len() {
-        if !matches!(block.stmts[index], Stmt::Label { .. }) {
+    for (index, stmt) in block.stmts.iter().enumerate() {
+        if !matches!(stmt, Stmt::Label { .. }) {
             continue;
         }
         let rest_are_labels = block.stmts[index + 1..]
