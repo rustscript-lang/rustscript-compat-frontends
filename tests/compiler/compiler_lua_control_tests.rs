@@ -613,6 +613,87 @@ fn assert_private_slots(ir: &FrontendIr, guest_names: &[&str]) {
     assert_eq!(unique.len(), user.len(), "user slots alias: {user:?}");
 }
 
+fn repeat_flag_bindings(ir: &FrontendIr) -> Vec<(&str, LocalSlot)> {
+    ir.local_bindings
+        .iter()
+        .filter(|(name, _)| name.starts_with("$lua_repeat_again_"))
+        .map(|(name, slot)| (name.as_str(), *slot))
+        .collect()
+}
+
+fn assert_repeat_fors(ir: &FrontendIr, expected: usize) {
+    let flags = repeat_flag_bindings(ir);
+    assert_eq!(
+        flags.len(),
+        expected,
+        "one private flag per repeat, bindings={flags:?}"
+    );
+    for (name, _) in &flags {
+        assert!(!is_lua_ident(name), "{name} is a guest identifier");
+    }
+    let mut slots: Vec<LocalSlot> = flags.iter().map(|(_, slot)| *slot).collect();
+    slots.sort_unstable();
+    slots.dedup();
+    assert_eq!(slots.len(), expected, "repeat flags alias: {flags:?}");
+    let mut seen = 0;
+    walk_stmts(&ir.stmts, &mut |stmt| {
+        if let Stmt::For {
+            init,
+            condition,
+            post,
+            ..
+        } = stmt
+        {
+            seen += 1;
+            let Stmt::Let {
+                index,
+                expr: init_expr,
+                ..
+            } = init.as_ref()
+            else {
+                panic!("repeat init is not one flag let: {init:?}");
+            };
+            assert!(
+                matches!(init_expr, Expr::Bool(true)),
+                "repeat flag must start true so the body runs before until: {init_expr:?}"
+            );
+            assert!(
+                flags.iter().any(|(_, slot)| slot == index),
+                "repeat flag {index:?} is not a private repeat slot: {flags:?}"
+            );
+            assert!(
+                matches!(condition, Expr::Var(slot) if slot == index),
+                "repeat condition must be the flag, not a second until: {condition:?}"
+            );
+            let Stmt::Assign {
+                index: assigned,
+                expr: post_expr,
+                ..
+            } = post.as_ref()
+            else {
+                panic!("repeat post is not the until store: {post:?}");
+            };
+            assert_eq!(assigned, index, "until must update the same repeat flag");
+            assert!(
+                matches!(
+                    post_expr,
+                    Expr::Not(outer)
+                        if matches!(
+                            outer.as_ref(),
+                            Expr::Not(inner)
+                                if matches!(
+                                    inner.as_ref(),
+                                    Expr::Eq(_, rhs) if matches!(rhs.as_ref(), Expr::Bool(false))
+                                )
+                        )
+                ),
+                "until must be stored once as not core_truthy: {post_expr:?}"
+            );
+        }
+    });
+    assert_eq!(seen, expected, "each repeat is one for, not a copied body");
+}
+
 #[test]
 fn backward_goto_stops_after_three_trips() {
     // One trip is 11, two is 22, four is 44. An open loop exhausts fuel.
@@ -1119,4 +1200,404 @@ fn oracle_harness_runs_the_fixture_once_under_joff() {
     assert_eq!(business_twice.lines, business_once.lines * 2);
     assert_eq!(business_once.value, business_twice.value);
     assert_eq!(business_once.value, TRUTH_EXPECTED);
+}
+
+// 921: outer scoped stays 9, two rounds, continue skips the second observed write.
+// The low digits are the scoped combination 21. 911 means until read the outer
+// scoped. 922 means continue fell through. 221 means the inner scoped leaked.
+// Fuel exhaustion means until was skipped or stayed false after round two.
+const REPEAT_SHADOW_LOOP: &str = "\
+repeat\n\
+  n = n + 1\n\
+  local scoped = n\n\
+  if n == 2 then\n\
+    continue\n\
+  end\n\
+  observed = observed + 1\n\
+until scoped > 1\n\
+";
+
+fn repeat_shadow_direct() -> String {
+    [
+        "local n = 0\n",
+        "local observed = 0\n",
+        "local scoped = 9\n",
+        REPEAT_SHADOW_LOOP,
+        "return scoped * 100 + n * 10 + observed\n",
+    ]
+    .concat()
+}
+
+fn repeat_shadow_dispatch() -> String {
+    [
+        "local skipped = 0\n",
+        "local n = 0\n",
+        "local observed = 0\n",
+        "local scoped = 9\n",
+        "goto enter\n",
+        "skipped = 1\n",
+        "::enter::\n",
+        REPEAT_SHADOW_LOOP,
+        "return skipped * 1000 + scoped * 100 + n * 10 + observed\n",
+    ]
+    .concat()
+}
+
+const REPEAT_COMBINATION: &str = "\
+local n = 0\n\
+local observed = 0\n\
+repeat\n\
+  n = n + 1\n\
+  local scoped = n\n\
+  if n == 2 then\n\
+    continue\n\
+  end\n\
+  observed = observed + 1\n\
+until scoped > 1\n\
+return n * 10 + observed\n\
+";
+
+const REPEAT_UNTIL_ZERO: &str = "\
+local n = 0\n\
+repeat\n\
+  n = n + 1\n\
+until 0\n\
+return n\n\
+";
+
+const REPEAT_BREAK_FALSE: &str = "\
+local n = 0\n\
+local after = 0\n\
+repeat\n\
+  n = n + 1\n\
+  if true then\n\
+    break\n\
+  end\n\
+  n = n + 50\n\
+until false\n\
+after = 1\n\
+return n * 10 + after\n\
+";
+
+const REPEAT_BREAK_FALSE_DISPATCH: &str = "\
+local skipped = 0\n\
+local n = 0\n\
+local after = 0\n\
+goto enter\n\
+skipped = 1\n\
+::enter::\n\
+repeat\n\
+  n = n + 1\n\
+  if true then\n\
+    break\n\
+  end\n\
+  n = n + 50\n\
+until false\n\
+after = 1\n\
+return skipped * 100 + n * 10 + after\n\
+";
+
+const NESTED_REPEAT_BREAK_ELEVEN: &str = "\
+local n = 0\n\
+local inner = 0\n\
+repeat\n\
+  n = n + 1\n\
+  repeat\n\
+    inner = inner + 1\n\
+    break\n\
+  until false\n\
+until n > 0\n\
+return n * 10 + inner\n\
+";
+
+const NESTED_REPEAT_BREAK: &str = "\
+local outer = 0\n\
+local inner = 0\n\
+local after_inner = 0\n\
+local after = 0\n\
+repeat\n\
+  outer = outer + 1\n\
+  repeat\n\
+    inner = inner + 1\n\
+    break\n\
+  until false\n\
+  after_inner = 1\n\
+  break\n\
+until false\n\
+after = 1\n\
+return outer * 1000 + inner * 100 + after_inner * 10 + after\n\
+";
+
+const NESTED_REPEAT_BREAK_DISPATCH: &str = "\
+local skipped = 0\n\
+goto enter\n\
+skipped = 1\n\
+::enter::\n\
+local outer = 0\n\
+local inner = 0\n\
+local after_inner = 0\n\
+local after = 0\n\
+repeat\n\
+  outer = outer + 1\n\
+  repeat\n\
+    inner = inner + 1\n\
+    break\n\
+  until false\n\
+  after_inner = 1\n\
+  break\n\
+until false\n\
+after = 1\n\
+return skipped * 10000 + outer * 1000 + inner * 100 + after_inner * 10 + after\n\
+";
+
+const REPEAT_CONTINUE_PAIR: &str = "\
+local a = 0\n\
+local atails = 0\n\
+repeat\n\
+  a = a + 1\n\
+  if a == 2 then\n\
+    continue\n\
+  end\n\
+  atails = atails + 1\n\
+until a > 1\n\
+local b = 0\n\
+local btails = 0\n\
+repeat\n\
+  b = b + 1\n\
+  if b == 1 then\n\
+    continue\n\
+  end\n\
+  btails = btails + 1\n\
+until b > 2\n\
+return a * 1000 + atails * 100 + b * 10 + btails\n\
+";
+
+const REPEAT_CONTINUE_PAIR_DISPATCH: &str = "\
+local skipped = 0\n\
+goto enter\n\
+skipped = 1\n\
+::enter::\n\
+local a = 0\n\
+local atails = 0\n\
+repeat\n\
+  a = a + 1\n\
+  if a == 2 then\n\
+    continue\n\
+  end\n\
+  atails = atails + 1\n\
+until a > 1\n\
+local b = 0\n\
+local btails = 0\n\
+repeat\n\
+  b = b + 1\n\
+  if b == 1 then\n\
+    continue\n\
+  end\n\
+  btails = btails + 1\n\
+until b > 2\n\
+return skipped * 10000 + a * 1000 + atails * 100 + b * 10 + btails\n\
+";
+
+const NESTED_WHILE_IN_REPEAT: &str = "\
+local outer = 0\n\
+local inner = 0\n\
+local inner_tails = 0\n\
+local outer_tails = 0\n\
+local after = 0\n\
+repeat\n\
+  outer = outer + 1\n\
+  while inner < 2 do\n\
+    inner = inner + 1\n\
+    if inner == 1 then\n\
+      continue\n\
+    end\n\
+    inner_tails = inner_tails + 1\n\
+  end\n\
+  if outer == 1 then\n\
+    continue\n\
+  end\n\
+  outer_tails = outer_tails + 1\n\
+until outer > 1\n\
+after = 1\n\
+return after * 10000 + outer * 1000 + inner * 100 + inner_tails * 10 + outer_tails\n\
+";
+
+const REPEAT_IN_WHILE: &str = "\
+local w = 0\n\
+local r = 0\n\
+local rtail = 0\n\
+while w < 1 do\n\
+  w = w + 1\n\
+  repeat\n\
+    r = r + 1\n\
+    if r == 1 then\n\
+      continue\n\
+    end\n\
+    rtail = rtail + 1\n\
+  until r > 1\n\
+end\n\
+return w * 100 + r * 10 + rtail\n\
+";
+
+const REPEAT_SKIP_LOCAL: &str = "\
+repeat if true then continue end; local skipped = 1 until skipped == 1; return 0\n\
+";
+
+#[test]
+fn direct_repeat_until_reads_the_round_local_and_continue_skips_the_tail() {
+    let source = repeat_shadow_direct();
+    let path = write_fixture("repeat_shadow", &source);
+    assert!(path.extension().is_some_and(|ext| ext == "lua"));
+    expect_number("repeat_shadow", &source, 921.0);
+    expect_number("repeat_combination", REPEAT_COMBINATION, 21.0);
+    let ir = lowered(&source);
+    assert!(slot_named(&ir, "$lua_dispatch_state").is_none());
+    assert_eq!(source_while_count(&ir.stmts, None), 0);
+    assert_repeat_fors(&ir, 1);
+    assert_private_slots(&ir, &["n", "observed", "scoped"]);
+}
+
+#[test]
+fn same_repeat_block_runs_direct_and_after_an_outer_goto() {
+    let direct_source = repeat_shadow_direct();
+    let dispatch_source = repeat_shadow_dispatch();
+    assert!(
+        direct_source.contains(REPEAT_SHADOW_LOOP) && dispatch_source.contains(REPEAT_SHADOW_LOOP)
+    );
+    expect_number("repeat_shadow_direct", &direct_source, 921.0);
+    expect_number("repeat_shadow_dispatch", &dispatch_source, 921.0);
+    let direct = lowered(&direct_source);
+    let dispatch = lowered(&dispatch_source);
+    assert!(slot_named(&direct, "$lua_dispatch_state").is_none());
+    assert_repeat_fors(&direct, 1);
+    let state = slot_named(&dispatch, "$lua_dispatch_state").expect("dispatch state");
+    assert!(!is_lua_ident("$lua_dispatch_state"));
+    assert_eq!(dispatch_while_count(&dispatch.stmts, state), 1);
+    assert_eq!(source_while_count(&dispatch.stmts, Some(state)), 0);
+    assert_repeat_fors(&dispatch, 1);
+    assert_private_slots(&dispatch, &["skipped", "n", "observed", "scoped", "enter"]);
+}
+
+#[test]
+fn until_zero_is_truthy_and_the_body_runs_once() {
+    expect_number("repeat_until_zero", REPEAT_UNTIL_ZERO, 1.0);
+    let ir = lowered(REPEAT_UNTIL_ZERO);
+    assert_repeat_fors(&ir, 1);
+    assert!(slot_named(&ir, "$lua_dispatch_state").is_none());
+}
+
+#[test]
+fn repeat_break_skips_a_false_until_and_stays_inside_dispatch() {
+    // 11: one body, break, then the statement after the repeat. 10 means the
+    // break also skipped that statement. 61 means break did not fire. A
+    // dispatch break that leaves the state loop does not reach `after`.
+    expect_number("repeat_break_false", REPEAT_BREAK_FALSE, 11.0);
+    expect_number(
+        "repeat_break_false_dispatch",
+        REPEAT_BREAK_FALSE_DISPATCH,
+        11.0,
+    );
+    let direct = lowered(REPEAT_BREAK_FALSE);
+    let dispatch = lowered(REPEAT_BREAK_FALSE_DISPATCH);
+    assert_repeat_fors(&direct, 1);
+    assert_repeat_fors(&dispatch, 1);
+    let state = slot_named(&dispatch, "$lua_dispatch_state").expect("dispatch state");
+    assert_eq!(dispatch_while_count(&dispatch.stmts, state), 1);
+}
+
+#[test]
+fn nested_repeat_break_stays_in_the_inner_loop() {
+    // 11: inner break then outer until. 1111: inner break still runs
+    // after_inner, then the outer break still runs after. 1101 means the
+    // inner break left the outer repeat. 1110 means the outer break left a
+    // dispatcher before `after`.
+    expect_number(
+        "nested_repeat_break_eleven",
+        NESTED_REPEAT_BREAK_ELEVEN,
+        11.0,
+    );
+    expect_number("nested_repeat_break", NESTED_REPEAT_BREAK, 1111.0);
+    expect_number(
+        "nested_repeat_break_dispatch",
+        NESTED_REPEAT_BREAK_DISPATCH,
+        1111.0,
+    );
+    let direct = lowered(NESTED_REPEAT_BREAK);
+    let dispatch = lowered(NESTED_REPEAT_BREAK_DISPATCH);
+    assert_repeat_fors(&direct, 2);
+    assert_repeat_fors(&dispatch, 2);
+    assert_eq!(source_while_count(&direct.stmts, None), 0);
+    let state = slot_named(&dispatch, "$lua_dispatch_state").expect("dispatch state");
+    assert_eq!(dispatch_while_count(&dispatch.stmts, state), 1);
+    assert_eq!(source_while_count(&dispatch.stmts, Some(state)), 0);
+}
+
+#[test]
+fn repeat_continue_reaches_until_instead_of_skipping_or_exiting() {
+    // 2132: continue on a true until stops, continue on a false until loops.
+    // 3232 means continue skipped until and took an extra round. 2110 means
+    // continue exited before a false until. Dispatch adds no ten-thousands
+    // digit when the outer goto is taken.
+    expect_number("repeat_continue_pair", REPEAT_CONTINUE_PAIR, 2132.0);
+    expect_number(
+        "repeat_continue_pair_dispatch",
+        REPEAT_CONTINUE_PAIR_DISPATCH,
+        2132.0,
+    );
+    let direct = lowered(REPEAT_CONTINUE_PAIR);
+    let dispatch = lowered(REPEAT_CONTINUE_PAIR_DISPATCH);
+    assert_repeat_fors(&direct, 2);
+    assert_repeat_fors(&dispatch, 2);
+    assert!(slot_named(&direct, "$lua_dispatch_state").is_none());
+    let state = slot_named(&dispatch, "$lua_dispatch_state").expect("dispatch state");
+    assert_eq!(dispatch_while_count(&dispatch.stmts, state), 1);
+}
+
+#[test]
+fn nested_while_and_repeat_keep_transfers_on_the_nearest_loop() {
+    // 12211: inner while continue does not consume the outer repeat continue.
+    // 121: repeat continue inside while does not restart the while.
+    expect_number("nested_while_in_repeat", NESTED_WHILE_IN_REPEAT, 12211.0);
+    expect_number("repeat_in_while", REPEAT_IN_WHILE, 121.0);
+    let outer = lowered(NESTED_WHILE_IN_REPEAT);
+    let inner = lowered(REPEAT_IN_WHILE);
+    assert!(slot_named(&outer, "$lua_dispatch_state").is_none());
+    assert!(slot_named(&inner, "$lua_dispatch_state").is_none());
+    assert_repeat_fors(&outer, 1);
+    assert_repeat_fors(&inner, 1);
+    assert_eq!(source_while_count(&outer.stmts, None), 1);
+    assert_eq!(source_while_count(&inner.stmts, None), 1);
+}
+
+#[test]
+fn repeat_continue_past_a_local_is_rejected_at_load() {
+    let error = control::lower_source(REPEAT_SKIP_LOCAL).expect_err("resolver rejection");
+    let text = error.to_string();
+    assert!(
+        text.contains("jump into the scope of local skipped"),
+        "{text}"
+    );
+    let path = write_fixture("repeat_skip_local", REPEAT_SKIP_LOCAL);
+    let compiled = compile_source_file_with_options(&path, candidate_options());
+    assert!(
+        compiled.is_err(),
+        "continue past a local must not produce a program"
+    );
+    let Ok(oracle) = std::env::var("LUAJIT_ORACLE") else {
+        eprintln!("LUAJIT_ORACLE is unset; repeat skip-local is not a differential result");
+        return;
+    };
+    let output = oracle_load_rejection(&oracle, &path);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let code = output.status.code();
+    assert_eq!(
+        code,
+        Some(2),
+        "text-mode load rejection is exit 2; a process failure has a different status={} stderr={stderr}",
+        output.status
+    );
+    assert!(
+        stderr.contains("LOAD_REJECT"),
+        "load rejection marker missing; this is not a full-text match: {stderr}"
+    );
 }

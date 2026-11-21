@@ -5,16 +5,22 @@
 //! not a file entry and not a fallback to the line lowerer.
 //!
 //! A chunk with no goto and no early return is emitted as ordinary
-//! statements, including a source `while`. Any goto, or a return that is not
-//! the chunk tail, becomes a private integer state loop. Each basic block is
-//! one state. A transfer assigns that state and `Continue`s the dispatch
+//! statements, including a source `while` or `repeat`. Any goto, or a return
+//! that is not the chunk tail, becomes a private integer state loop. Each basic
+//! block is one state. A transfer assigns that state and `Continue`s the dispatch
 //! loop, so it is emitted only in the dispatch arm, never inside a nested
 //! source loop. `break` and `continue` inside a source loop stay Core
-//! statements of that loop. User values are binary64 or bool. The state id
-//! is a private Core int and is not a Lua number. In this numeric/bool slice
-//! only `false` is falsy: `0` and every other number are truthy. `if`,
-//! `elseif`, `while`, and `not` / `!` pass the operand through `core_truthy`
-//! before a Core branch or `Not`. The operand expression is placed once.
+//! statements of that loop. A source `repeat` is one Core `for`, not a copied
+//! body. Its private bool starts true, so the body runs before `until`. The
+//! `for` post stores whether another round is required. Fallthrough and
+//! `continue` both reach that post; `break` skips it and leaves this `for`,
+//! not an outer dispatch loop. `until` is placed once and can read the
+//! same-round body locals. In this numeric/bool slice only `false` is falsy:
+//! `0` and every other number are truthy, so `until 0` stops after one body.
+//! `if`, `elseif`, `while`, and `not` / `!` pass the operand through
+//! `core_truthy` before a Core branch or `Not`. `until` does the same, once,
+//! in the `for` post. The operand expression is placed once. The state id is
+//! a private Core int and is not a Lua number.
 
 use super::ast::{self, BinOp, Block, Chunk, Expr, Name, NumberKind, Span, Stmt, UnOp};
 use super::lexer;
@@ -54,6 +60,7 @@ struct Lower<'a> {
     state: Option<LocalSlot>,
     result: Option<LocalSlot>,
     label_state: Vec<Option<i64>>,
+    repeat_flags: u32,
 }
 
 struct BlockBuf {
@@ -106,6 +113,7 @@ impl<'a> Lower<'a> {
             state: None,
             result: None,
             label_state,
+            repeat_flags: 0,
         }
     }
 
@@ -223,6 +231,9 @@ impl<'a> Lower<'a> {
                 span,
             } => self.if_item(arms, else_body.as_ref(), *span),
             Stmt::While { cond, body, span } => Ok(Item::Core(self.while_stmt(cond, body, *span)?)),
+            Stmt::Repeat { body, until, span } => {
+                Ok(Item::Core(self.repeat_stmt(body, until, *span)?))
+            }
             Stmt::Break { span } | Stmt::Continue { span } => {
                 Err(self.fail(*span, "break or continue outside a source loop"))
             }
@@ -353,6 +364,44 @@ impl<'a> Lower<'a> {
         })
     }
 
+    fn repeat_stmt(
+        &mut self,
+        body: &Block,
+        until: &Expr,
+        span: Span,
+    ) -> Result<CoreStmt, ParseError> {
+        if contains_transfer(body) || contains_label(body) {
+            return Err(self.fail(
+                span,
+                "goto, label, or return inside a loop is not in this slice",
+            ));
+        }
+        let (body_stmts, value) = self.straight(&body.stmts, true)?;
+        if value.is_some() {
+            return Err(self.fail(span, "return inside a loop is not in this slice"));
+        }
+        let line = self.line(span);
+        let again = self.alloc_repeat_flag()?;
+        let until_value = self.expr(until)?;
+        // Core `while` tests its condition before the body and sends
+        // `continue` there, so `until` cannot live in that condition: it
+        // would run before the body locals exist, and a Core `continue`
+        // would skip it. A `for` post is reached only after the body or a
+        // `continue`, and a `break` in the body skips the post. The private
+        // flag is a Core bool, not a Lua value.
+        Ok(CoreStmt::For {
+            init: Box::new(let_expr(again, CoreExpr::Bool(true), line)),
+            condition: CoreExpr::Var(again),
+            post: Box::new(set_slot(
+                again,
+                CoreExpr::Not(Box::new(core_truthy(until_value))),
+                line,
+            )),
+            body: body_stmts,
+            line,
+        })
+    }
+
     fn straight(
         &mut self,
         stmts: &[Stmt],
@@ -422,6 +471,7 @@ impl<'a> Lower<'a> {
                 span,
             } => self.if_core(arms, else_body.as_ref(), *span, in_loop),
             Stmt::While { cond, body, span } => self.while_stmt(cond, body, *span),
+            Stmt::Repeat { body, until, span } => self.repeat_stmt(body, until, *span),
             Stmt::Break { span } if in_loop => Ok(CoreStmt::Break {
                 line: self.line(*span),
             }),
@@ -681,6 +731,12 @@ impl<'a> Lower<'a> {
 
     fn alloc_private(&mut self, name: &str) -> Result<LocalSlot, ParseError> {
         self.builder.alloc_local_named(name)
+    }
+
+    fn alloc_repeat_flag(&mut self) -> Result<LocalSlot, ParseError> {
+        let name = format!("$lua_repeat_again_{}", self.repeat_flags);
+        self.repeat_flags += 1;
+        self.alloc_private(&name)
     }
 
     fn goto_target(&self, span: Span) -> Result<usize, ParseError> {
