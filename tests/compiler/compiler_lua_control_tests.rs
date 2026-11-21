@@ -3208,3 +3208,177 @@ fn loop_outward_goto_same_arm_backward_reenters() {
     );
     assert_eq!(dispatch_while_count(&ir.stmts, state), 1);
 }
+
+// One chunk, selected by pick. Observation is the chunk return, not IR shape.
+// 1000 is the back arm's chunk goto to done: trace 1, no loop, no tail.
+// 101010 is the first goto left: one body, the left mark, tail skipped.
+// 201010 is the other outward target, right, with that mark instead of left.
+// 103010 is the second source goto to left; the +2 is that source's own write.
+// 2010 is the cross-arm jump back to ::back::. The second visit sees trace 2
+// and leaves by the chunk goto there. One visit is 1010. Running the mid tail
+// or falling into left is 102011 or 101011.
+// 61 is the loop return. A later goto replacing it is a packed value, not 61.
+// 21021 is that return missed: two body writes, the tail, then the chunk goto
+// skips left and right. Falling into left is 121021.
+fn outward_combination(pick: i64) -> String {
+    format!(
+        "\
+local pick = {pick}
+local n = 0
+local trace = 0
+local tail = 0
+::back::
+trace = trace + 1
+if trace == 2 then
+  goto done
+end
+if pick == 1 then
+  goto done
+end
+goto mid
+::mid::
+if pick == 2 then
+  while n < 4 do
+    n = n + 1
+    if n == 1 then
+      goto left
+    end
+    trace = trace + 10
+  end
+  tail = tail + 1
+end
+if pick == 4 then
+  while n < 4 do
+    n = n + 1
+    if n == 1 then
+      trace = trace + 2
+      goto left
+    end
+    trace = trace + 10
+  end
+  tail = tail + 1
+end
+if pick == 3 then
+  while n < 4 do
+    n = n + 1
+    if n == 1 then
+      goto right
+    end
+    trace = trace + 10
+  end
+  tail = tail + 1
+end
+if pick == 5 then
+  while n < 1 do
+    n = n + 1
+    if n == 1 then
+      goto back
+    end
+    trace = trace + 10
+  end
+  tail = tail + 1
+end
+if pick == 6 then
+  while n < 4 do
+    n = n + 1
+    if n == 1 then
+      return n + 60
+    end
+    trace = trace + 10
+  end
+  tail = tail + 1
+  goto done
+end
+if pick == 7 then
+  while n < 2 do
+    n = n + 1
+    if n == 9 then
+      return n + 60
+    end
+    trace = trace + 10
+  end
+  tail = tail + 1
+  goto done
+end
+::left::
+trace = trace + 100
+goto done
+::right::
+trace = trace + 200
+::done::
+return trace * 1000 + n * 10 + tail
+"
+    )
+}
+
+#[test]
+fn loop_outward_combination_selects_each_scalar_path() {
+    expect_number("outward_combo_chunk_goto", &outward_combination(1), 1000.0);
+    expect_number("outward_combo_left", &outward_combination(2), 101010.0);
+    expect_number("outward_combo_right", &outward_combination(3), 201010.0);
+    expect_number(
+        "outward_combo_left_again",
+        &outward_combination(4),
+        103010.0,
+    );
+    expect_number("outward_combo_back", &outward_combination(5), 2010.0);
+    expect_number("outward_combo_return", &outward_combination(6), 61.0);
+    expect_number(
+        "outward_combo_return_miss",
+        &outward_combination(7),
+        21021.0,
+    );
+}
+
+// Legal LuaJIT: the label and its goto share the loop block and enter no
+// local. The private slice still refuses an in-loop label. This records that
+// current boundary. jump_into_local_is_a_static_rejection already covers the
+// resolver's refusal to enter a local, so this test does not repeat it.
+const IN_LOOP_LABEL: &str = "\
+local n = 0
+while n < 2 do
+  n = n + 1
+  if n == 1 then
+    goto inside
+  end
+  ::inside::
+  n = n + 10
+end
+return n
+";
+
+#[test]
+fn in_loop_label_fails_closed_outside_the_private_slice() {
+    let chunk = parser::parse_chunk(IN_LOOP_LABEL.as_bytes()).expect("parse in-loop label");
+    let resolution = resolve::resolve(&chunk);
+    assert!(
+        resolution.errors.is_empty(),
+        "an in-loop label that enters no local is legal: {:?}",
+        resolution.errors
+    );
+    let error = control::lower_source(IN_LOOP_LABEL).expect_err("private slice");
+    let text = error.to_string();
+    assert!(
+        text.contains("not in this slice"),
+        "in-loop label must fail closed at the private slice, not as another class: {text}"
+    );
+    assert!(
+        !text.contains("jump into the scope of local"),
+        "this source does not enter a local: {text}"
+    );
+    let path = write_fixture("in_loop_label", IN_LOOP_LABEL);
+    let compiled = compile_source_file_with_options(&path, candidate_options());
+    assert!(
+        compiled.is_err(),
+        "in-loop label must not produce a program"
+    );
+    let Ok(oracle) = std::env::var("LUAJIT_ORACLE") else {
+        eprintln!("LUAJIT_ORACLE is unset; in-loop label acceptance is not a differential result");
+        return;
+    };
+    let observed = oracle_return(&oracle, &path);
+    assert_eq!(
+        observed, 11.0,
+        "LuaJIT accepts the in-loop label; candidate refusal is the private slice"
+    );
+}
