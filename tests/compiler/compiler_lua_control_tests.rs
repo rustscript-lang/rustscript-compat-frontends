@@ -747,6 +747,7 @@ fn assert_repeat_fors(ir: &FrontendIr, expected: usize) {
     slots.dedup();
     assert_eq!(slots.len(), expected, "repeat flags alias: {flags:?}");
     let mut seen = 0;
+    let mut total_fors = 0;
     walk_stmts(&ir.stmts, &mut |stmt| {
         if let Stmt::For {
             init,
@@ -755,6 +756,7 @@ fn assert_repeat_fors(ir: &FrontendIr, expected: usize) {
             ..
         } = stmt
         {
+            total_fors += 1;
             let Stmt::Let {
                 index,
                 expr: init_expr,
@@ -806,6 +808,12 @@ fn assert_repeat_fors(ir: &FrontendIr, expected: usize) {
         }
     });
     assert_eq!(seen, expected, "each repeat is one for, not a copied body");
+    // These call sites are pure repeat shapes. The same walk counts every
+    // For, including one whose init is not the private flag.
+    assert_eq!(
+        total_fors, expected,
+        "pure repeat shape must count every for; flag matching alone misses a non-flag for, flags={flags:?}"
+    );
 }
 
 #[test]
@@ -2024,6 +2032,44 @@ end
 return skipped * 10 + sum
 ";
 
+const NUMERIC_FOR_ARM_LOOP: &str = "\
+  for i = base + 1, 3 do
+    sum = sum * 10 + i
+  end
+";
+
+const NUMERIC_FOR_ARM_DIRECT: &str = "\
+local base = 0
+local mark = 0
+local sum = 0
+local tail = 0
+if true then
+  for i = base + 1, 3 do
+    sum = sum * 10 + i
+  end
+  mark = 7
+end
+tail = 1
+return mark * 10000 + sum * 10 + tail
+";
+
+const NUMERIC_FOR_ARM_JUMP: &str = "\
+local base = 0
+local mark = 0
+local sum = 0
+local tail = 0
+if true then
+  for i = base + 1, 3 do
+    sum = sum * 10 + i
+  end
+  goto leave
+  mark = 7
+end
+tail = 1
+::leave::
+return mark * 10000 + sum * 10 + tail
+";
+
 const NUMERIC_FOR_BAD_STEP: &str = "\
 local bad = false
 local seen = 0
@@ -2121,6 +2167,42 @@ fn numeric_for_header_expression_is_materialized_once() {
 }
 
 #[test]
+fn numeric_for_in_a_transferred_if_arm_skips_the_following_write() {
+    // 71231 is the un-jumped arm: the loop packs 123, then the arm stores 7
+    // and the statement after the if stores 1. 1230 is the same loop with the
+    // goto after it skipping both writes. 0 means the loop was dropped.
+    assert!(
+        NUMERIC_FOR_ARM_DIRECT.contains(NUMERIC_FOR_ARM_LOOP)
+            && NUMERIC_FOR_ARM_JUMP.contains(NUMERIC_FOR_ARM_LOOP),
+        "direct and jumped sources must share the numeric loop text"
+    );
+    expect_numeric("numeric_for_arm_direct", NUMERIC_FOR_ARM_DIRECT, 71_231.0);
+    expect_numeric("numeric_for_arm_jump", NUMERIC_FOR_ARM_JUMP, 1_230.0);
+    let direct = lowered_numeric(NUMERIC_FOR_ARM_DIRECT);
+    let jumped = lowered_numeric(NUMERIC_FOR_ARM_JUMP);
+    assert!(
+        slot_named(&direct, "$lua_dispatch_state").is_none(),
+        "direct control must stay off the dispatch path"
+    );
+    assert_eq!(
+        numeric_for_count(&direct),
+        1,
+        "direct arm copied the numeric for"
+    );
+    assert_eq!(
+        numeric_for_count(&jumped),
+        1,
+        "transferred arm copied the numeric for"
+    );
+    let state = slot_named(&jumped, "$lua_dispatch_state").expect("dispatch state");
+    assert_eq!(dispatch_while_count(&jumped.stmts, state), 1);
+    assert!(
+        numeric_for_sits_in_transferring_if_arm(&jumped.stmts, state),
+        "numeric for is not in the if arm that transfers"
+    );
+}
+
+#[test]
 fn numeric_for_rejects_a_non_float_header_instead_of_an_empty_loop() {
     assert_numeric_header_rejected("numeric_for_bad_step", NUMERIC_FOR_BAD_STEP);
     assert_numeric_header_rejected("numeric_for_bad_start", NUMERIC_FOR_BAD_START);
@@ -2177,6 +2259,81 @@ fn numeric_for_count(ir: &FrontendIr) -> usize {
         }
     });
     seen
+}
+
+fn numeric_for_sits_in_transferring_if_arm(stmts: &[Stmt], state: LocalSlot) -> bool {
+    fn is_true_condition(condition: &Expr) -> bool {
+        matches!(
+            condition,
+            Expr::Not(outer)
+                if matches!(
+                    outer.as_ref(),
+                    Expr::Eq(lhs, rhs)
+                        if matches!(lhs.as_ref(), Expr::Bool(true))
+                            && matches!(rhs.as_ref(), Expr::Bool(false))
+                )
+        )
+    }
+
+    fn is_numeric_for(stmt: &Stmt) -> bool {
+        matches!(
+            stmt,
+            Stmt::For { init, .. } if matches!(init.as_ref(), Stmt::Noop { .. })
+        )
+    }
+
+    fn transfers_after_for(arm: &[Stmt], state: LocalSlot) -> bool {
+        let Some(at) = arm.iter().position(is_numeric_for) else {
+            return false;
+        };
+        // The goto is the state store and Continue immediately after the for.
+        // A later unreachable store is not part of this shape.
+        matches!(
+            arm.get(at + 1),
+            Some(Stmt::Assign {
+                index,
+                expr: Expr::Int(target),
+                ..
+            }) if *index == state && *target != 0
+        ) && matches!(arm.get(at + 2), Some(Stmt::Continue { .. }))
+    }
+
+    fn walk(stmts: &[Stmt], state: LocalSlot, in_dispatch: bool) -> bool {
+        for stmt in stmts {
+            match stmt {
+                Stmt::While {
+                    condition, body, ..
+                } => {
+                    let nested = in_dispatch || is_dispatch_state_while(condition, state);
+                    if walk(body, state, nested) {
+                        return true;
+                    }
+                }
+                Stmt::IfElse {
+                    condition,
+                    then_branch,
+                    else_branch,
+                    ..
+                } => {
+                    if in_dispatch
+                        && is_true_condition(condition)
+                        && transfers_after_for(then_branch, state)
+                    {
+                        return true;
+                    }
+                    if walk(then_branch, state, in_dispatch)
+                        || walk(else_branch, state, in_dispatch)
+                    {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    walk(stmts, state, false)
 }
 
 fn break_count(ir: &FrontendIr) -> usize {
