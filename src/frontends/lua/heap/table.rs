@@ -1,8 +1,8 @@
 //! Non-moving mark/sweep table storage, explicit root frames, and hard caps.
 
 use std::fmt;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
 
 use vm::{HostContextError, Value};
 
@@ -162,10 +162,10 @@ struct Slot {
     /// Raw resource handle for this node. Ownership metadata only: the mark
     /// phase does not read it, so the token is not a GC root.
     token: Option<u64>,
-    /// Weak identity of the VM array issued for this generation. Not a GC
-    /// root and not a strong reference: dropping the guest value drops the
-    /// array even while this slot is live.
-    carrier: Weak<Vec<Value>>,
+    /// Canonical VM array for this generation, if issued. The slot owns the
+    /// array so a field can read it back while the node is live. It contains
+    /// identity only, not object edges, and does not participate in marking.
+    carrier: Option<Arc<Vec<Value>>>,
 }
 
 struct Edge {
@@ -349,7 +349,7 @@ impl LuaHeap {
             }
             slot.state = SlotState::Live { marked: false };
             slot.token = None;
-            slot.carrier = Weak::new();
+            slot.carrier = None;
             return Ok(TableRef::table(self.domain, index, slot.generation));
         }
         if self.slots.len() >= self.limits.nodes as usize {
@@ -363,7 +363,7 @@ impl LuaHeap {
             generation: 1,
             state: SlotState::Live { marked: false },
             token: None,
-            carrier: Weak::new(),
+            carrier: None,
         });
         self.note_node_peak();
         Ok(TableRef::table(self.domain, index, 1))
@@ -382,14 +382,12 @@ impl LuaHeap {
 
     /// Issues the guest array for a live table.
     ///
-    /// The slot stores only a weak pointer to that array. The pointer is not
-    /// a root and does not keep the array alive. A second issue while the
-    /// first array is still alive is refused, so assignment and `Value` clone
-    /// keep one identity.
+    /// The slot keeps one array until release. A second issue for that live
+    /// generation is refused, so assignment and field reads keep one identity.
     pub fn issue_carrier(&mut self, table: TableRef) -> Result<Value, HeapError> {
         self.require_live(table)?;
         let index = table.slot() as usize;
-        if self.slots[index].carrier.upgrade().is_some() {
+        if self.slots[index].carrier.is_some() {
             return Err(HeapError::StaleHandle);
         }
         let value = Value::array(vec![
@@ -397,10 +395,10 @@ impl LuaHeap {
             Value::Int(i64::from(table.generation())),
         ]);
         let carrier = match &value {
-            Value::Array(issued) => Arc::downgrade(issued),
+            Value::Array(issued) => Arc::clone(issued),
             _ => unreachable!("Value::array returns an array"),
         };
-        self.slots[index].carrier = carrier;
+        self.slots[index].carrier = Some(carrier);
         Ok(value)
     }
 
@@ -408,10 +406,8 @@ impl LuaHeap {
     ///
     /// A table result requires the live slot, the issued generation, and the
     /// same VM array. Field equality is not enough. An integer resource token
-    /// is not consulted. This is one slot index, one generation compare, one
-    /// weak upgrade, and one pointer compare. It does not add a root and does
-    /// not increment scan counts. It is the experimental guest check for this
-    /// slice, not a measured production collection scheme.
+    /// is not consulted. The slot lookup, generation check, and pointer
+    /// comparison do not add a root or increment scan counts.
     pub fn guest_class(&self, value: &Value) -> GuestClass {
         match value {
             Value::Float(_) => GuestClass::Number,
@@ -438,8 +434,8 @@ impl LuaHeap {
         if !matches!(stored.state, SlotState::Live { .. }) {
             return None;
         }
-        let current = stored.carrier.upgrade()?;
-        if !Arc::ptr_eq(&current, issued) {
+        let current = stored.carrier.as_ref()?;
+        if !Arc::ptr_eq(current, issued) {
             return None;
         }
         Some(TableRef::table(self.domain, slot, generation))
@@ -488,14 +484,14 @@ impl LuaHeap {
         }))
     }
 
-    /// Upgrades the slot's weak carrier for a field read. The upgrade is not a root.
+    /// Clones the slot's issued carrier for a field read. This does not add a root.
     pub fn issued_value(&self, table: TableRef) -> Result<Value, HeapError> {
         self.require_live(table)?;
         let carrier = self.slots[table.slot() as usize]
             .carrier
-            .upgrade()
+            .as_ref()
             .ok_or(HeapError::StaleHandle)?;
-        Ok(Value::Array(carrier))
+        Ok(Value::Array(Arc::clone(carrier)))
     }
 
     /// Opens a root frame of `width` slots. Failure does not grow root storage.
@@ -845,7 +841,7 @@ impl LuaHeap {
     fn release_slot(&mut self, index: u32) {
         let slot = &mut self.slots[index as usize];
         slot.token = None;
-        slot.carrier = Weak::new();
+        slot.carrier = None;
         if slot.generation >= self.limits.max_generation {
             slot.state = SlotState::Retired;
             return;

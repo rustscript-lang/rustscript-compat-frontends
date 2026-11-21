@@ -125,6 +125,13 @@ struct Entries {
     numbers: usize,
 }
 
+// Identity metadata only: recording a borrowed table does not keep its carrier alive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ObservedTable {
+    table: heap::TableRef,
+    token: vm::ResourceHandle,
+}
+
 fn entries(vm: &mut vm::Vm) -> Entries {
     vm.host_context()
         .scope_state::<Entries>()
@@ -286,6 +293,12 @@ impl vm::HostOwnedFunction for Witness {
                     .unwrap()
                     .table();
                 let live = heap::with_heap(&mut host, |heap| Ok(heap.alive(table))).unwrap();
+                host.scope_state_or_insert_with(Vec::<ObservedTable>::new)
+                    .unwrap()
+                    .push(ObservedTable {
+                        table,
+                        token: handle,
+                    });
                 assert_eq!(args[1 - *index], Value::Float(0.0));
                 Value::Bool(live)
             }
@@ -428,6 +441,76 @@ fn lua_candidate_alias_remains_the_issued_table_across_collection() {
     assert_eq!(stats.live_roots, 0);
 }
 
+#[test]
+fn lua_candidate_reads_original_table_kept_only_by_a_strong_field() {
+    let source = r#"
+local function make()
+  local owner = {}
+  local child = {}
+  observe_table(child, 0)
+  owner.field = child
+  child = nil
+  return owner
+end
+local owner = make()
+local unrelated = {}
+local discarded = type({})
+collectgarbage("collect")
+local read_ok = observe_table(owner.field, 0)
+owner = nil
+collectgarbage("collect")
+observe_table(unrelated, 0)
+return read_ok
+"#;
+    let mut vm = candidate(source);
+    let status = vm.run();
+    let mut host = vm.host_context();
+    let witness = host.scope_state::<candidate::ReturnWitness>().unwrap();
+    let tables = host.scope_state::<Vec<ObservedTable>>().unwrap();
+    let original = tables[0];
+    assert!(witness.callee_left);
+    assert_eq!(witness.discarded, Some(original.table));
+    let first = &witness.collects[0];
+    assert_eq!(
+        first.returned_edge,
+        candidate::EdgeView::Live(original.table)
+    );
+    assert!(first.returned_alive && first.discarded_alive);
+    assert_eq!(
+        (first.marked_nodes, first.live_nodes, first.swept),
+        (3, 3, 1)
+    );
+    assert_eq!(
+        status.expect("read the field after a real collection"),
+        VmStatus::Halted
+    );
+    assert_eq!(tables.len(), 3);
+    assert_eq!(
+        tables[1], original,
+        "the same slot, generation and Core token"
+    );
+
+    assert_eq!(witness.collects.len(), 2);
+    let second = &witness.collects[1];
+    assert!(!second.returned_alive && !second.discarded_alive);
+    assert_eq!(
+        (second.marked_nodes, second.live_nodes, second.swept),
+        (1, 1, 2)
+    );
+    assert_eq!(host.resource_count(), 1);
+    let key = heap::LuaTableResource::key();
+    assert!(
+        host.borrow_resource_with_key::<heap::LuaTableResource>(original.token, &key)
+            .is_err()
+    );
+    assert!(
+        host.borrow_resource_with_key::<heap::LuaTableResource>(tables[2].token, &key)
+            .is_ok()
+    );
+    assert_eq!(heap::stats(&mut host).unwrap().live_roots, 0);
+    assert_eq!(vm.stack(), &[Value::Bool(true)]);
+}
+
 fn live_nodes(vm: &mut vm::Vm) -> u32 {
     heap::with_heap(&mut vm.host_context(), |heap| Ok(heap.stats().live_nodes)).unwrap()
 }
@@ -485,10 +568,21 @@ fn issued_carrier_keeps_identity_without_adding_a_root() {
         let weak = Arc::downgrade(issued);
         drop(carrier);
         drop(alias);
-        assert!(
-            weak.upgrade().is_none(),
-            "the slot weak pointer must not keep the array alive"
-        );
+        {
+            let original = weak.upgrade().expect("the live slot owns the issued array");
+            let read = heap::with_heap(&mut vm.host_context(), |heap| heap.issued_value(table))
+                .expect("read the original carrier");
+            let Value::Array(read) = read else {
+                panic!("issued carrier is an array");
+            };
+            assert!(Arc::ptr_eq(&original, &read));
+        }
+        let report = heap::collect(&mut vm.host_context()).unwrap();
+        assert_eq!(report.marked_nodes, 0);
+        assert_eq!(report.live_nodes, 0);
+        assert_eq!(report.live_roots, 0);
+        assert_eq!(vm.host_context().resource_count(), 0);
+        assert!(weak.upgrade().is_none(), "sweeping drops the slot's array");
     });
 }
 
