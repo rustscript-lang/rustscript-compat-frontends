@@ -19,13 +19,17 @@ const RETURN_SCALAR: &str = "lua_internal::return_scalar";
 
 const TABLE_ARG: &str = "lua_internal::table_arg";
 const NUMBER_ARG: &str = "lua_internal::number_arg";
+const BOOL_ARG: &str = "lua_internal::bool_arg";
+const STRING_ARG: &str = "lua_internal::string_arg";
 const GATHER_ROOT: &str = "lua_internal::gather_root";
 pub(super) const COLLECT: &str = "lua_internal::collect";
 const ENTER_RESULT: &str = "lua_internal::enter_result_frame";
 const ENTER_CALLEE: &str = "lua_internal::enter_callee_frame";
 const ROOT_ISSUED: &str = "lua_internal::root_issued";
 const SET_EDGE: &str = "lua_internal::set_edge";
+const GET_EDGE: &str = "lua_internal::get_edge";
 pub(super) const FINISH_RETURN: &str = "lua_internal::finish_return";
+pub(super) const RETIRE_CALLEE: &str = "lua_internal::retire_callee";
 const RELEASE_RESULT: &str = "lua_internal::release_result";
 // Test-only witnesses. They place an ordinary VM array on the source path.
 // They are not Lua syntax and are not registered on the production entry.
@@ -79,6 +83,8 @@ pub(super) fn install_schemas(builder: &mut HostApiBuilder) {
     for (name, result) in [
         (TABLE_ARG, HostTypeSchema::Resource(key)),
         (NUMBER_ARG, HostTypeSchema::Float),
+        (BOOL_ARG, HostTypeSchema::Bool),
+        (STRING_ARG, HostTypeSchema::String),
         (COLLECT, HostTypeSchema::Float),
     ] {
         builder.function(HostFunctionSchema::with_return(
@@ -87,13 +93,23 @@ pub(super) fn install_schemas(builder: &mut HostApiBuilder) {
             result,
         ));
     }
-    for (name, params) in [
-        (ENTER_RESULT, vec![]),
-        (ENTER_CALLEE, vec!["width"]),
-        (ROOT_ISSUED, vec!["value", "slot", "role"]),
-        (SET_EDGE, vec!["from", "key", "to"]),
-        (FINISH_RETURN, vec!["values", "publish"]),
-        (RELEASE_RESULT, vec![]),
+    for (name, params, result) in [
+        (ENTER_RESULT, vec![], HostTypeSchema::Unknown),
+        (ENTER_CALLEE, vec!["width"], HostTypeSchema::Float),
+        (
+            ROOT_ISSUED,
+            vec!["value", "slot", "role"],
+            HostTypeSchema::Float,
+        ),
+        (SET_EDGE, vec!["from", "key", "to"], HostTypeSchema::Float),
+        (GET_EDGE, vec!["table", "key"], HostTypeSchema::Unknown),
+        (
+            FINISH_RETURN,
+            vec!["values", "frame", "publish", "index", "callee"],
+            HostTypeSchema::Unknown,
+        ),
+        (RETIRE_CALLEE, vec!["flag", "frame"], HostTypeSchema::Float),
+        (RELEASE_RESULT, vec!["frame"], HostTypeSchema::Float),
     ] {
         builder.function(HostFunctionSchema::with_return(
             name,
@@ -101,7 +117,7 @@ pub(super) fn install_schemas(builder: &mut HostApiBuilder) {
                 .into_iter()
                 .map(|param| HostParamSchema::value(param, HostTypeSchema::Unknown))
                 .collect(),
-            HostTypeSchema::Float,
+            result,
         ));
     }
 }
@@ -117,13 +133,17 @@ pub(super) fn register(
         Op::ReturnScalar,
         Op::TableArg,
         Op::NumberArg,
+        Op::BoolArg,
+        Op::StringArg,
         Op::GatherRoot,
         Op::Collect,
         Op::EnterResult,
         Op::EnterCallee,
         Op::RootIssued,
         Op::SetEdge,
+        Op::GetEdge,
         Op::FinishReturn,
+        Op::RetireCallee,
         Op::ReleaseResult,
         Op::CopyFields,
         Op::ExternalShape,
@@ -135,13 +155,17 @@ pub(super) fn register(
             Op::ReturnScalar => RETURN_SCALAR,
             Op::TableArg => TABLE_ARG,
             Op::NumberArg => NUMBER_ARG,
+            Op::BoolArg => BOOL_ARG,
+            Op::StringArg => STRING_ARG,
             Op::GatherRoot => GATHER_ROOT,
             Op::Collect => COLLECT,
             Op::EnterResult => ENTER_RESULT,
             Op::EnterCallee => ENTER_CALLEE,
             Op::RootIssued => ROOT_ISSUED,
             Op::SetEdge => SET_EDGE,
+            Op::GetEdge => GET_EDGE,
             Op::FinishReturn => FINISH_RETURN,
+            Op::RetireCallee => RETIRE_CALLEE,
             Op::ReleaseResult => RELEASE_RESULT,
             Op::CopyFields => COPY_FIELDS,
             Op::ExternalShape => EXTERNAL_SHAPE,
@@ -163,13 +187,17 @@ enum Op {
     ReturnScalar,
     TableArg,
     NumberArg,
+    BoolArg,
+    StringArg,
     GatherRoot,
     Collect,
     EnterResult,
     EnterCallee,
     RootIssued,
     SetEdge,
+    GetEdge,
     FinishReturn,
+    RetireCallee,
     ReleaseResult,
     CopyFields,
     ExternalShape,
@@ -187,6 +215,9 @@ impl HostOwnedFunction for Op {
                         return Err(VmError::HostError("invalid private Lua value".to_string()));
                     }
                 };
+                if matches!(value, Value::Null) {
+                    return Ok(CallOutcome::Return(CallReturn::one(Value::string("nil"))));
+                }
                 let name = match classify(&mut call.vm().host_context(), &value)? {
                     heap::GuestClass::Table(_) => "table",
                     heap::GuestClass::Number => "number",
@@ -230,7 +261,9 @@ impl HostOwnedFunction for Op {
                 }
             }
             Self::ReturnScalar => match call.args() {
-                [value @ (Value::Float(_) | Value::String(_) | Value::Bool(_))] => value.clone(),
+                [value @ (Value::Float(_) | Value::String(_) | Value::Bool(_) | Value::Null)] => {
+                    value.clone()
+                }
                 _ => {
                     return Err(VmError::HostError(
                         "Lua result needs a typed adapter".to_string(),
@@ -260,6 +293,14 @@ impl HostOwnedFunction for Op {
             Self::NumberArg => match call.args() {
                 [Value::Float(number)] => Value::Float(*number),
                 _ => return Err(VmError::HostError("expected Lua number".to_string())),
+            },
+            Self::BoolArg => match call.args() {
+                [Value::Bool(value)] => Value::Bool(*value),
+                _ => return Err(VmError::HostError("expected Lua boolean".to_string())),
+            },
+            Self::StringArg => match call.args() {
+                [Value::String(value)] => Value::string(value.as_str()),
+                _ => return Err(VmError::HostError("expected Lua string".to_string())),
             },
             Self::GatherRoot => {
                 let value = match call.args() {
@@ -328,7 +369,9 @@ impl HostOwnedFunction for Op {
             Self::EnterCallee => enter_callee(call)?,
             Self::RootIssued => root_issued(call)?,
             Self::SetEdge => set_edge(call)?,
+            Self::GetEdge => get_edge(call)?,
             Self::FinishReturn => finish_return(call)?,
+            Self::RetireCallee => retire_callee(call)?,
             Self::ReleaseResult => release_result(call)?,
             Self::CopyFields => match call.args() {
                 [Value::Array(fields)] => Value::array(fields.iter().cloned().collect()),
@@ -380,11 +423,43 @@ fn read_edge(
     heap: &heap::LuaHeap,
     table: Option<heap::TableRef>,
     key: Option<u32>,
-) -> Option<heap::TableRef> {
-    match (table, key) {
-        (Some(table), Some(key)) => heap.edge(table, key).ok().flatten(),
-        _ => None,
+) -> Result<EdgeView, heap::HeapError> {
+    let (Some(table), Some(key)) = (table, key) else {
+        return Ok(EdgeView::Absent);
+    };
+    match heap.edge(table, key) {
+        Ok(Some(target)) => Ok(EdgeView::Live(target)),
+        Ok(None) => Ok(EdgeView::Absent),
+        Err(heap::HeapError::StaleHandle) => Ok(EdgeView::Stale),
+        Err(error) => Err(error),
     }
+}
+
+fn decode_frame(call: &mut OwnedHostCall<'_>, token: &Value) -> Result<heap::RootFrameId, VmError> {
+    if matches!(
+        classify(&mut call.vm().host_context(), token)?,
+        heap::GuestClass::Table(_)
+    ) {
+        return Err(host_fault("caller frame token is not a private array"));
+    }
+    let Value::Array(parts) = token else {
+        return Err(host_fault("caller frame token is not a private array"));
+    };
+    let [Value::Float(index), Value::Float(generation)] = parts.as_slice() else {
+        return Err(host_fault("caller frame token is not a private array"));
+    };
+    Ok(heap::RootFrameId::from_parts(
+        float_u32(&Value::Float(*index))?,
+        float_u32(&Value::Float(*generation))?,
+    ))
+}
+
+fn frame_token(frame: heap::RootFrameId) -> Value {
+    let (index, generation) = frame.parts();
+    Value::array(vec![
+        Value::Float(index as f64),
+        Value::Float(generation as f64),
+    ])
 }
 
 fn enter_result(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
@@ -392,10 +467,9 @@ fn enter_result(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
         .map_err(heap_error)?;
     let depth = call.vm().call_depth();
     with_witness(call.vm(), |witness| {
-        witness.caller_frame = Some(frame);
         witness.caller_depth = Some(depth);
     })?;
-    Ok(Value::Float(0.0))
+    Ok(frame_token(frame))
 }
 
 fn enter_callee(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
@@ -403,20 +477,15 @@ fn enter_callee(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
         [value] => float_u32(value)?,
         _ => return Err(host_fault("invalid callee frame width")),
     };
-    let frame = if width == 0 {
-        None
-    } else {
-        Some(
-            heap::with_heap(&mut call.vm().host_context(), |heap| {
-                heap.enter_roots(width)
-            })
-            .map_err(heap_error)?,
-        )
-    };
+    if width > 0 {
+        heap::with_heap(&mut call.vm().host_context(), |heap| {
+            heap.enter_roots(width)
+        })
+        .map_err(heap_error)?;
+    }
     let depth = call.vm().call_depth();
     with_witness(call.vm(), |witness| {
         witness.callee_depth = Some(depth);
-        witness.callee_frame = frame;
     })?;
     Ok(Value::Float(0.0))
 }
@@ -430,21 +499,22 @@ fn root_issued(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
         heap::GuestClass::Table(table) => table,
         _ => return Err(host_fault("issued root is not a table")),
     };
-    let frame = with_witness(call.vm(), |witness| {
-        let frame = witness.callee_frame?;
+    let frame = heap::with_heap(&mut call.vm().host_context(), |heap| {
+        heap.current_frame().ok_or(heap::HeapError::StaleFrame)
+    })
+    .map_err(heap_error)?;
+    heap::with_heap(&mut call.vm().host_context(), |heap| {
+        heap.write_root(frame, slot, table)
+    })
+    .map_err(heap_error)?;
+    with_witness(call.vm(), |witness| {
         if role == 0 {
             witness.returned = Some(table);
             witness.returned_carrier = carrier_ptr(&value);
         } else if witness.discarded.is_none() {
             witness.discarded = Some(table);
         }
-        Some(frame)
-    })?
-    .ok_or_else(|| host_fault("no callee root frame"))?;
-    heap::with_heap(&mut call.vm().host_context(), |heap| {
-        heap.write_root(frame, slot, table)
-    })
-    .map_err(heap_error)?;
+    })?;
     Ok(Value::Float(0.0))
 }
 
@@ -474,70 +544,98 @@ fn set_edge(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
 }
 
 fn finish_return(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
-    let (values, publish) = match call.args() {
-        [Value::Array(values), Value::Float(flag)] => (values.clone(), *flag != 0.0),
+    let (values, frame_token, publish, table_at, callee_flag) = match call.args() {
+        [
+            Value::Array(values),
+            frame,
+            Value::Float(publish),
+            index,
+            Value::Float(flag),
+        ] => (
+            values.clone(),
+            frame.clone(),
+            *publish != 0.0,
+            float_u32(index)?,
+            *flag != 0.0,
+        ),
         _ => return Err(host_fault("Lua return transport is not one array")),
     };
+    let transport = Value::Array(values.clone());
+    if matches!(
+        classify(&mut call.vm().host_context(), &transport)?,
+        heap::GuestClass::Table(_)
+    ) {
+        return Err(host_fault(
+            "Lua return transport must stay an unissued array",
+        ));
+    }
+    // Core has already executed Ret. The callee Lua root frame, if any, is still current.
     let depth = call.vm().call_depth();
     let mut elements = Vec::with_capacity(values.len());
-    let mut returned_value = None;
     for value in values.iter() {
-        elements.push(return_element(call, value, &mut returned_value)?);
+        elements.push(return_element(call, value)?);
     }
-    let (returned, discarded, key, caller_frame, callee_frame) =
-        with_witness(call.vm(), |witness| {
-            (
-                witness.returned,
-                witness.discarded,
-                witness.field_key,
-                witness.caller_frame,
-                witness.callee_frame,
-            )
-        })?;
-    let (returned_edge, discarded_edge) = heap::with_heap(&mut call.vm().host_context(), |heap| {
-        Ok((
-            read_edge(heap, returned, key),
-            read_edge(heap, discarded, key),
-        ))
-    })
-    .map_err(heap_error)?;
-    let mut published = false;
-    if publish && let (Some(frame), Some(table)) = (caller_frame, returned_value) {
+    if publish {
+        let element = values
+            .get(table_at as usize)
+            .ok_or_else(|| host_fault("published return is not an issued table"))?;
+        let table = match classify(&mut call.vm().host_context(), element)? {
+            heap::GuestClass::Table(table) => table,
+            _ => return Err(host_fault("published return is not an issued table")),
+        };
+        let frame = decode_frame(call, &frame_token)?;
+        // Publish the caller root before any later retire removes the callee frame.
         heap::with_heap(&mut call.vm().host_context(), |heap| {
             heap.write_root(frame, 0, table)
         })
         .map_err(heap_error)?;
-        published = true;
     }
-    let mut callee_left = false;
-    if let Some(frame) = callee_frame {
+    let lua_frame_alive = if callee_flag {
         heap::with_heap(&mut call.vm().host_context(), |heap| {
-            heap.leave_roots(frame)
+            Ok(heap.current_frame().is_some())
         })
-        .map_err(heap_error)?;
-        callee_left = true;
-    }
-    let top_is_caller = heap::with_heap(&mut call.vm().host_context(), |heap| {
-        Ok(caller_frame.is_some() && heap.current_frame() == caller_frame)
+        .map_err(heap_error)?
+    } else {
+        false
+    };
+    let (returned, discarded, key, callee_depth) = with_witness(call.vm(), |witness| {
+        (
+            witness.returned,
+            witness.discarded,
+            witness.field_key,
+            witness.callee_depth,
+        )
+    })?;
+    let (returned_edge, discarded_edge) = heap::with_heap(&mut call.vm().host_context(), |heap| {
+        Ok((
+            read_edge(heap, returned, key)?,
+            read_edge(heap, discarded, key)?,
+        ))
     })
     .map_err(heap_error)?;
     with_witness(call.vm(), |witness| {
-        witness.elements = elements;
-        witness.published_root = published;
-        witness.callee_left = callee_left;
-        witness.top_is_caller_after_handoff = top_is_caller;
+        witness.elements = elements.clone();
+        witness.published_root = publish;
         witness.handoff_depth = Some(depth);
+        witness.lua_frame_alive_at_publish = lua_frame_alive;
         witness.returned_edge_at_handoff = returned_edge;
         witness.discarded_edge_at_handoff = discarded_edge;
+        witness.handoffs.push(Handoff {
+            elements,
+            published_root: publish,
+            callee_left: false,
+            top_is_caller_after_handoff: false,
+            lua_frame_alive_at_publish: lua_frame_alive,
+            handoff_depth: Some(depth),
+            callee_depth,
+            returned_edge,
+            discarded_edge,
+        });
     })?;
-    Ok(Value::Float(values.len() as f64))
+    Ok(transport)
 }
 
-fn return_element(
-    call: &mut OwnedHostCall<'_>,
-    value: &Value,
-    returned_value: &mut Option<heap::TableRef>,
-) -> Result<ReturnedElement, VmError> {
+fn return_element(call: &mut OwnedHostCall<'_>, value: &Value) -> Result<ReturnedElement, VmError> {
     match value {
         Value::Null => Ok(ReturnedElement::Nil),
         Value::Float(number) => Ok(ReturnedElement::Number(*number)),
@@ -554,9 +652,6 @@ fn return_element(
                 );
                 (same_ref, same_carrier)
             })?;
-            if same_ref {
-                *returned_value = Some(table);
-            }
             Ok(ReturnedElement::Table {
                 same_ref,
                 same_carrier,
@@ -565,15 +660,77 @@ fn return_element(
     }
 }
 
-fn release_result(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
-    let (returned, key, frame) = with_witness(call.vm(), |witness| {
-        (witness.returned, witness.field_key, witness.caller_frame)
+fn retire_callee(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
+    let (flag, frame_token) = match call.args() {
+        [Value::Float(flag), frame] => (*flag != 0.0, frame.clone()),
+        _ => return Err(host_fault("invalid callee retire")),
+    };
+    let caller = if matches!(frame_token, Value::Null) {
+        None
+    } else {
+        Some(decode_frame(call, &frame_token)?)
+    };
+    let mut left = false;
+    if flag {
+        let callee = heap::with_heap(&mut call.vm().host_context(), |heap| {
+            heap.current_frame().ok_or(heap::HeapError::StaleFrame)
+        })
+        .map_err(heap_error)?;
+        if caller == Some(callee) {
+            return Err(host_fault("would retire the caller result frame"));
+        }
+        heap::with_heap(&mut call.vm().host_context(), |heap| {
+            heap.leave_roots(callee)
+        })
+        .map_err(heap_error)?;
+        left = true;
+    }
+    let top_is_caller = heap::with_heap(&mut call.vm().host_context(), |heap| {
+        Ok(caller.is_some() && heap.current_frame() == caller)
+    })
+    .map_err(heap_error)?;
+    with_witness(call.vm(), |witness| {
+        witness.callee_left = left;
+        witness.top_is_caller_after_handoff = top_is_caller;
+        if let Some(last) = witness.handoffs.last_mut() {
+            last.callee_left = left;
+            last.top_is_caller_after_handoff = top_is_caller;
+        }
     })?;
-    let frame = frame.ok_or_else(|| host_fault("no caller result frame"))?;
+    Ok(Value::Float(0.0))
+}
+
+fn get_edge(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
+    let (from, key) = match call.args() {
+        [from, key] => (from.clone(), float_u32(key)?),
+        _ => return Err(host_fault("invalid field read")),
+    };
+    let table = match classify(&mut call.vm().host_context(), &from)? {
+        heap::GuestClass::Table(table) => table,
+        _ => return Err(host_fault("field source is not a table")),
+    };
+    let target = heap::with_heap(&mut call.vm().host_context(), |heap| heap.edge(table, key))
+        .map_err(heap_error)?;
+    let Some(target) = target else {
+        return Ok(Value::Null);
+    };
+    heap::with_heap(&mut call.vm().host_context(), |heap| {
+        heap.issued_value(target)
+    })
+    .map_err(heap_error)
+}
+
+fn release_result(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
+    let frame_token = match call.args() {
+        [frame] => frame.clone(),
+        _ => return Err(host_fault("invalid result release")),
+    };
+    let frame = decode_frame(call, &frame_token)?;
+    let (returned, key) = with_witness(call.vm(), |witness| (witness.returned, witness.field_key))?;
     let (alive, edge) = heap::with_heap(&mut call.vm().host_context(), |heap| {
         Ok((
             returned.is_some_and(|table| heap.alive(table)),
-            read_edge(heap, returned, key),
+            read_edge(heap, returned, key)?,
         ))
     })
     .map_err(heap_error)?;
@@ -585,7 +742,6 @@ fn release_result(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
         .map_err(heap_error)?
         .live_roots;
     with_witness(call.vm(), |witness| {
-        witness.caller_frame = None;
         witness.release = Some(ReleaseNote {
             returned_alive: alive,
             returned_edge: edge,
@@ -609,7 +765,7 @@ fn note_collect(
         Ok((
             returned.is_some_and(|table| heap.alive(table)),
             discarded.is_some_and(|table| heap.alive(table)),
-            read_edge(heap, returned, key),
+            read_edge(heap, returned, key)?,
         ))
     })
     .map_err(heap_error)?;
@@ -688,12 +844,12 @@ pub(super) fn lower_returning(
         stmts: Vec::new(),
         functions: HashMap::new(),
         function_impls: HashMap::new(),
-        result_bindings: HashSet::new(),
+        result_frames: HashMap::new(),
+        table_locals: HashSet::new(),
         field_keys: HashMap::new(),
         publish_results,
         in_function: false,
         return_names: HashSet::new(),
-        function_returns_table: false,
         root_slot: 0,
         ignored_slot: None,
     };
@@ -718,12 +874,12 @@ struct Lower<'a> {
     stmts: Vec<Stmt>,
     functions: HashMap<Vec<u8>, FuncInfo>,
     function_impls: HashMap<u16, FunctionImpl>,
-    result_bindings: HashSet<Vec<u8>>,
+    result_frames: HashMap<Vec<u8>, LocalSlot>,
+    table_locals: HashSet<Vec<u8>>,
     field_keys: HashMap<Vec<u8>, u32>,
     publish_results: bool,
     in_function: bool,
     return_names: HashSet<Vec<u8>>,
-    function_returns_table: bool,
     root_slot: u32,
     ignored_slot: Option<LocalSlot>,
 }
@@ -731,7 +887,9 @@ struct Lower<'a> {
 #[derive(Clone, Copy)]
 struct FuncInfo {
     index: u16,
-    returns_table: bool,
+    callee_width: u32,
+    table_at: Option<u32>,
+    return_count: u32,
 }
 
 impl Lower<'_> {
@@ -740,6 +898,15 @@ impl Lower<'_> {
             ast::Stmt::LocalFunction {
                 span, name, func, ..
             } => self.lower_function(name, func, *span),
+            ast::Stmt::Local {
+                span,
+                names,
+                values,
+            } if values.exprs.len() == 1
+                && self.direct_function_call(&values.exprs[0]).is_some() =>
+            {
+                self.lower_call_local(*span, names, &values.exprs[0])
+            }
             ast::Stmt::Local {
                 span,
                 names,
@@ -781,17 +948,12 @@ impl Lower<'_> {
         name: &ast::Name,
         value: &ast::Expr,
     ) -> Result<(), ParseError> {
-        let returns_call = self.direct_function_call(value).is_some();
         let expr = self.expr(value)?;
         let index = self
             .builder
             .alloc_local_named(&format!("#{}", span.start))?;
         self.locals.insert(name.bytes.clone(), index);
-        if returns_call {
-            self.result_bindings.insert(name.bytes.clone());
-        } else {
-            self.live_locals.push(index);
-        }
+        self.live_locals.push(index);
         self.stmts.push(Stmt::Let {
             index,
             declared_schema: None,
@@ -800,8 +962,8 @@ impl Lower<'_> {
         });
         if self.in_function && matches!(value, ast::Expr::Table { fields, .. } if fields.is_empty())
         {
+            self.table_locals.insert(name.bytes.clone());
             let role = if self.return_names.contains(&name.bytes) {
-                self.function_returns_table = true;
                 0.0
             } else {
                 1.0
@@ -828,11 +990,24 @@ impl Lower<'_> {
         value: &ast::Expr,
     ) -> Result<(), ParseError> {
         match (target, value) {
-            (ast::AssignTarget::Name(name), ast::Expr::Nil { .. })
-                if self.result_bindings.contains(&name.bytes) =>
-            {
-                let expr = self.call(RELEASE_RESULT, vec![])?;
-                self.emit_ignored(expr, self.line(span))
+            (ast::AssignTarget::Name(name), ast::Expr::Nil { .. }) => {
+                let slot = self
+                    .locals
+                    .get(&name.bytes)
+                    .copied()
+                    .ok_or_else(|| self.unsupported(span))?;
+                self.stmts.push(Stmt::Assign {
+                    kind: AssignmentKind::Set,
+                    index: slot,
+                    expr: Expr::Null,
+                    line: self.line(span),
+                });
+                self.live_locals.retain(|local| *local != slot);
+                if let Some(frame) = self.result_frames.remove(&name.bytes) {
+                    let release = self.call(RELEASE_RESULT, vec![Expr::Var(frame)])?;
+                    self.emit_ignored(release, self.line(span))?;
+                }
+                Ok(())
             }
             (
                 ast::AssignTarget::Field {
@@ -876,7 +1051,8 @@ impl Lower<'_> {
         let saved_live = std::mem::take(&mut self.live_locals);
         let saved_temps = std::mem::take(&mut self.active_temps);
         let saved_stmts = std::mem::take(&mut self.stmts);
-        let saved_results = std::mem::take(&mut self.result_bindings);
+        let saved_results = std::mem::take(&mut self.result_frames);
+        let saved_tables = std::mem::take(&mut self.table_locals);
         let saved_return_names = std::mem::replace(
             &mut self.return_names,
             returns
@@ -887,11 +1063,9 @@ impl Lower<'_> {
                 })
                 .collect(),
         );
-        let saved_returns_table = self.function_returns_table;
         let saved_root_slot = self.root_slot;
         let saved_ignored = self.ignored_slot;
         let saved_in_function = self.in_function;
-        self.function_returns_table = false;
         self.root_slot = 0;
         self.ignored_slot = None;
         self.in_function = true;
@@ -905,14 +1079,27 @@ impl Lower<'_> {
         }
         let body_expr = self.pack_return(returns)?;
         let body_stmts = std::mem::take(&mut self.stmts);
-        let returns_table = self.function_returns_table;
+        let table_positions: Vec<u32> = returns
+            .iter()
+            .enumerate()
+            .filter_map(|(index, expr)| match expr {
+                ast::Expr::Name { name, .. } if self.table_locals.contains(&name.bytes) => {
+                    Some(index as u32)
+                }
+                _ => None,
+            })
+            .collect();
+        if table_positions.len() > 1 {
+            return Err(self.unsupported(span));
+        }
+        let table_at = table_positions.first().copied();
         self.locals = saved_locals;
         self.live_locals = saved_live;
         self.active_temps = saved_temps;
         self.stmts = saved_stmts;
-        self.result_bindings = saved_results;
+        self.result_frames = saved_results;
+        self.table_locals = saved_tables;
         self.return_names = saved_return_names;
-        self.function_returns_table = saved_returns_table;
         self.root_slot = saved_root_slot;
         self.ignored_slot = saved_ignored;
         self.in_function = saved_in_function;
@@ -930,7 +1117,9 @@ impl Lower<'_> {
             name.bytes.clone(),
             FuncInfo {
                 index,
-                returns_table,
+                callee_width: width,
+                table_at,
+                return_count: u32::try_from(returns.len()).expect("return count"),
             },
         );
         Ok(())
@@ -985,23 +1174,132 @@ impl Lower<'_> {
         }
     }
 
-    fn finish_call(&mut self, name: &[u8], span: ast::Span) -> Result<Expr, ParseError> {
+    fn lower_call_local(
+        &mut self,
+        span: ast::Span,
+        names: &[ast::LocalName],
+        call: &ast::Expr,
+    ) -> Result<(), ParseError> {
+        let callee = self
+            .direct_function_call(call)
+            .ok_or_else(|| self.unsupported(span))?;
         let info = self
             .functions
-            .get(name)
+            .get(&callee.bytes)
             .copied()
             .ok_or_else(|| self.unsupported(span))?;
-        if info.returns_table {
-            let enter = self.call(ENTER_RESULT, vec![])?;
-            self.emit_ignored(enter, self.line(span))?;
+        let line = self.line(span);
+        let mut slots = Vec::with_capacity(names.len());
+        for (offset, name) in names.iter().enumerate() {
+            let index = self
+                .builder
+                .alloc_local_named(&format!("#{}:{offset}", span.start))?;
+            self.locals.insert(name.name.bytes.clone(), index);
+            slots.push((name.name.bytes.clone(), index));
         }
-        let call = Expr::Call(info.index, vec![], vec![], None, None);
-        let publish = if self.publish_results && info.returns_table {
+        let frame_slot = if info.table_at.is_some() {
+            let slot = self
+                .builder
+                .alloc_local_named(&format!("#frame:{}", span.start))?;
+            let enter = self.call(ENTER_RESULT, vec![])?;
+            self.stmts.push(Stmt::Let {
+                index: slot,
+                declared_schema: None,
+                expr: enter,
+                line,
+            });
+            Some(slot)
+        } else {
+            None
+        };
+        let transport = self
+            .builder
+            .alloc_local_named(&format!("#ret:{}", span.start))?;
+        let call_expr = Expr::Call(info.index, vec![], vec![], None, None);
+        let publish = if self.publish_results && info.table_at.is_some() {
             1.0
         } else {
             0.0
         };
-        self.call(FINISH_RETURN, vec![call, Expr::Float(publish)])
+        let frame_expr = frame_slot.map(Expr::Var).unwrap_or(Expr::Null);
+        // The script call is the transport argument. Core Ret runs inside that
+        // call. finish_return then publishes, while the callee Lua frame is still current.
+        let finish = self.call(
+            FINISH_RETURN,
+            vec![
+                call_expr,
+                frame_expr.clone(),
+                Expr::Float(publish),
+                Expr::Float(info.table_at.unwrap_or(0) as f64),
+                Expr::Float(if info.callee_width > 0 { 1.0 } else { 0.0 }),
+            ],
+        )?;
+        self.stmts.push(Stmt::Let {
+            index: transport,
+            declared_schema: None,
+            expr: finish,
+            line,
+        });
+        let get = vm::BuiltinFunction::Get.call_index();
+        for (index, (_, slot)) in slots.iter().enumerate() {
+            let expr = if (index as u32) < info.return_count {
+                Expr::Call(
+                    get,
+                    vec![],
+                    vec![Expr::Var(transport), Expr::Int(index as i64)],
+                    None,
+                    None,
+                )
+            } else {
+                Expr::Null
+            };
+            self.stmts.push(Stmt::Let {
+                index: *slot,
+                declared_schema: None,
+                expr,
+                line,
+            });
+        }
+        if let (Some(at), Some(frame)) = (info.table_at, frame_slot)
+            && let Some((name, _)) = slots.get(at as usize)
+        {
+            self.result_frames.insert(name.clone(), frame);
+        }
+        let retire = self.call(
+            RETIRE_CALLEE,
+            vec![
+                Expr::Float(if info.callee_width > 0 { 1.0 } else { 0.0 }),
+                frame_expr,
+            ],
+        )?;
+        self.emit_ignored(retire, line)?;
+        if slots.is_empty()
+            && let Some(frame) = frame_slot
+        {
+            let release = self.call(RELEASE_RESULT, vec![Expr::Var(frame)])?;
+            self.emit_ignored(release, line)?;
+        }
+        Ok(())
+    }
+
+    fn field_read(
+        &mut self,
+        base: &ast::Expr,
+        key_name: &[u8],
+        span: ast::Span,
+    ) -> Result<Expr, ParseError> {
+        let table = self.expr(base)?;
+        let slot = self
+            .builder
+            .alloc_local_named(&format!("#field:{}", self.stmts.len()))?;
+        self.stmts.push(Stmt::Let {
+            index: slot,
+            declared_schema: None,
+            expr: table,
+            line: self.line(span),
+        });
+        let key = self.field_key(key_name);
+        self.call(GET_EDGE, vec![Expr::Var(slot), Expr::Float(key as f64)])
     }
 
     fn field_key(&mut self, name: &[u8]) -> u32 {
@@ -1076,6 +1374,25 @@ impl Lower<'_> {
                 }
                 Ok(left)
             }
+            ast::Expr::SuffixChain { steps, span, .. }
+                if steps
+                    .iter()
+                    .any(|step| matches!(step, ast::Suffix::Index { .. })) =>
+            {
+                Err(ParseError::at_line(
+                    self.line(*span) as usize,
+                    "numeric table keys are not in this field-key subset",
+                ))
+            }
+            ast::Expr::SuffixChain { base, steps, span }
+                if let [
+                    ast::Suffix::Field {
+                        name, nav: false, ..
+                    },
+                ] = steps.as_slice() =>
+            {
+                self.field_read(base, &name.bytes, *span)
+            }
             ast::Expr::SuffixChain { base, steps, .. }
                 if let ast::Expr::Name { name, .. } = base.as_ref()
                     && !self.locals.contains_key(&name.bytes)
@@ -1091,7 +1408,8 @@ impl Lower<'_> {
                     if !args.exprs.is_empty() {
                         return Err(self.unsupported(expr.span()));
                     }
-                    return self.finish_call(&name.bytes, expr.span());
+                    self.lower_call_local(expr.span(), &[], expr)?;
+                    return Ok(Expr::Null);
                 }
                 if name.is("type")
                     && let [arg] = args.exprs.as_slice()
@@ -1153,6 +1471,8 @@ impl Lower<'_> {
         for (arg, param) in args.iter().zip(&function.params) {
             let adapter = match (&param.ty, param.passing) {
                 (HostTypeSchema::Float, vm::HostParamPassing::Value) => NUMBER_ARG,
+                (HostTypeSchema::Bool, vm::HostParamPassing::Value) => BOOL_ARG,
+                (HostTypeSchema::String, vm::HostParamPassing::Value) => STRING_ARG,
                 (HostTypeSchema::Resource(key), vm::HostParamPassing::Borrow)
                     if *key == heap::LuaTableResource::key() =>
                 {
@@ -1326,16 +1646,39 @@ pub(super) struct ReturnWitness {
     pub discarded: Option<heap::TableRef>,
     pub returned_carrier: Option<usize>,
     pub field_key: Option<u32>,
-    pub returned_edge_at_handoff: Option<heap::TableRef>,
-    pub discarded_edge_at_handoff: Option<heap::TableRef>,
+    pub returned_edge_at_handoff: EdgeView,
+    pub discarded_edge_at_handoff: EdgeView,
     pub elements: Vec<ReturnedElement>,
     pub published_root: bool,
     pub callee_left: bool,
     pub top_is_caller_after_handoff: bool,
+    /// True when the callee Lua frame was still current after the caller root was written.
+    /// Core's `Ret` has already run; this is not the same fact.
+    pub lua_frame_alive_at_publish: bool,
     pub collects: Vec<CollectNote>,
     pub release: Option<ReleaseNote>,
-    caller_frame: Option<heap::RootFrameId>,
-    callee_frame: Option<heap::RootFrameId>,
+    pub handoffs: Vec<Handoff>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum EdgeView {
+    #[default]
+    Absent,
+    Live(heap::TableRef),
+    Stale,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct Handoff {
+    pub elements: Vec<ReturnedElement>,
+    pub published_root: bool,
+    pub callee_left: bool,
+    pub top_is_caller_after_handoff: bool,
+    pub lua_frame_alive_at_publish: bool,
+    pub handoff_depth: Option<usize>,
+    pub callee_depth: Option<usize>,
+    pub returned_edge: EdgeView,
+    pub discarded_edge: EdgeView,
 }
 
 #[derive(Clone, Debug)]
@@ -1353,13 +1696,13 @@ pub(super) struct CollectNote {
     pub swept: u64,
     pub returned_alive: bool,
     pub discarded_alive: bool,
-    pub returned_edge: Option<heap::TableRef>,
+    pub returned_edge: EdgeView,
 }
 
 #[derive(Clone, Debug)]
 pub(super) struct ReleaseNote {
     pub returned_alive: bool,
-    pub returned_edge: Option<heap::TableRef>,
+    pub returned_edge: EdgeView,
     pub live_roots: u32,
 }
 

@@ -137,6 +137,18 @@ pub struct RootFrameId {
     generation: u32,
 }
 
+impl RootFrameId {
+    /// Parts a private IR argument can carry without the witness owning the frame.
+    pub fn parts(self) -> (u32, u32) {
+        (self.index, self.generation)
+    }
+
+    /// Rebuilds a frame id from those IR parts. A stale pair fails at use.
+    pub fn from_parts(index: u32, generation: u32) -> Self {
+        Self { index, generation }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum SlotState {
     Free,
@@ -474,6 +486,16 @@ impl LuaHeap {
                 None
             }
         }))
+    }
+
+    /// Upgrades the slot's weak carrier for a field read. The upgrade is not a root.
+    pub fn issued_value(&self, table: TableRef) -> Result<Value, HeapError> {
+        self.require_live(table)?;
+        let carrier = self.slots[table.slot() as usize]
+            .carrier
+            .upgrade()
+            .ok_or(HeapError::StaleHandle)?;
+        Ok(Value::Array(carrier))
     }
 
     /// Opens a root frame of `width` slots. Failure does not grow root storage.

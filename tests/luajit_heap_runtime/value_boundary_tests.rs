@@ -152,6 +152,18 @@ pub(super) fn catalog() -> &'static Arc<vm::HostApiCatalog> {
             vec![HostParamSchema::value("number", HostTypeSchema::Float)],
             HostTypeSchema::Float,
         ));
+        builder.function(HostFunctionSchema::with_return(
+            "lua_host::caller_reads",
+            vec![
+                HostParamSchema::value("field_same", HostTypeSchema::Bool),
+                HostParamSchema::value("gap", HostTypeSchema::String),
+                HostParamSchema::value("missing", HostTypeSchema::String),
+                HostParamSchema::value("single", HostTypeSchema::String),
+                HostParamSchema::value("total", HostTypeSchema::Float),
+                HostParamSchema::value("cleared", HostTypeSchema::String),
+            ],
+            HostTypeSchema::String,
+        ));
         for (name, reverse) in [
             ("lua_host::observe_table", false),
             ("lua_host::observe_table_after", true),
@@ -177,7 +189,10 @@ pub(super) fn catalog() -> &'static Arc<vm::HostApiCatalog> {
     })
 }
 
-fn register_witnesses(registry: &mut HostFunctionRegistry, catalog: &vm::HostApiCatalog) {
+pub(super) fn register_witnesses(
+    registry: &mut HostFunctionRegistry,
+    catalog: &vm::HostApiCatalog,
+) {
     for (name, op) in [
         ("lua_host::same_table", Witness::Tables),
         ("lua_host::observe_number", Witness::Number),
