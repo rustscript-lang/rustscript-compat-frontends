@@ -72,6 +72,183 @@ impl vm::HostOwnedFunction for CallerReadsHost {
     }
 }
 
+#[derive(Clone, Copy)]
+enum BindingObs {
+    Record,
+    Bool,
+    Text,
+    Stage,
+    Snap,
+}
+
+fn register_binding_obs(registry: &mut HostFunctionRegistry, catalog: &vm::HostApiCatalog) {
+    for (name, op) in [
+        ("lua_host::record_binding", BindingObs::Record),
+        ("lua_host::note_bool", BindingObs::Bool),
+        ("lua_host::note_text", BindingObs::Text),
+        ("lua_host::note_stage", BindingObs::Stage),
+        ("lua_host::snapshot_bindings", BindingObs::Snap),
+    ] {
+        let function = catalog.function(name).expect(name);
+        registry
+            .register_exact_owned(
+                name,
+                function.params.len() as u8,
+                vm::HostImportSchema::from_function(catalog, function),
+                move |_| Box::new(op),
+            )
+            .expect(name);
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct ObsLog {
+    stage: f64,
+    bools: Vec<(f64, bool)>,
+    texts: Vec<(f64, String)>,
+    bindings: Vec<(f64, heap::TableRef)>,
+    snaps: Vec<BindingSnap>,
+}
+
+#[derive(Clone, Debug)]
+struct BindingSnap {
+    tag: f64,
+    live_nodes: u32,
+    live_roots: u32,
+    collections: u32,
+    alive: Vec<(f64, bool)>,
+}
+
+impl vm::HostOwnedFunction for BindingObs {
+    fn call(&mut self, call: &mut vm::OwnedHostCall<'_>) -> Result<vm::CallOutcome, vm::VmError> {
+        let args = call.args().to_vec();
+        let mut host = call.vm().host_context();
+        let result = match self {
+            Self::Record => {
+                let [Value::Float(tag), token] = args.as_slice() else {
+                    return Err(obs_fault("record_binding needs a tag and a table"));
+                };
+                let table = borrowed_table(&mut host, token)?;
+                let tag = *tag;
+                host.scope_state_or_insert_with(ObsLog::default)
+                    .map_err(|error| vm::VmError::HostError(error.to_string()))?
+                    .bindings
+                    .push((tag, table));
+                Value::Bool(true)
+            }
+            Self::Bool => {
+                let [Value::Float(tag), Value::Bool(value)] = args.as_slice() else {
+                    return Err(obs_fault("note_bool needs a tag and a boolean"));
+                };
+                let noted = (*tag, *value);
+                host.scope_state_or_insert_with(ObsLog::default)
+                    .map_err(|error| vm::VmError::HostError(error.to_string()))?
+                    .bools
+                    .push(noted);
+                Value::Bool(true)
+            }
+            Self::Text => {
+                let [Value::Float(tag), Value::String(value)] = args.as_slice() else {
+                    return Err(obs_fault("note_text needs a tag and a string"));
+                };
+                let noted = (*tag, value.to_string());
+                host.scope_state_or_insert_with(ObsLog::default)
+                    .map_err(|error| vm::VmError::HostError(error.to_string()))?
+                    .texts
+                    .push(noted);
+                Value::Bool(true)
+            }
+            Self::Stage => {
+                let [Value::Float(tag)] = args.as_slice() else {
+                    return Err(obs_fault("note_stage needs a tag"));
+                };
+                let tag = *tag;
+                host.scope_state_or_insert_with(ObsLog::default)
+                    .map_err(|error| vm::VmError::HostError(error.to_string()))?
+                    .stage = tag;
+                Value::Bool(true)
+            }
+            Self::Snap => {
+                let [Value::Float(tag)] = args.as_slice() else {
+                    return Err(obs_fault("snapshot_bindings needs a tag"));
+                };
+                let tag = *tag;
+                let recorded = host
+                    .scope_state::<ObsLog>()
+                    .map(|log| log.bindings.clone())
+                    .unwrap_or_default();
+                let (alive, live_nodes, live_roots, collections) =
+                    heap::with_heap(&mut host, |heap| {
+                        Ok((
+                            recorded
+                                .iter()
+                                .map(|(binding, table)| (*binding, heap.alive(*table)))
+                                .collect::<Vec<_>>(),
+                            heap.stats().live_nodes,
+                            heap.stats().live_roots,
+                            heap.stats().collections,
+                        ))
+                    })
+                    .map_err(|error| vm::VmError::HostError(error.to_string()))?;
+                host.scope_state_or_insert_with(ObsLog::default)
+                    .map_err(|error| vm::VmError::HostError(error.to_string()))?
+                    .snaps
+                    .push(BindingSnap {
+                        tag,
+                        live_nodes,
+                        live_roots,
+                        collections,
+                        alive,
+                    });
+                Value::Bool(true)
+            }
+        };
+        Ok(vm::CallOutcome::Return(vm::CallReturn::one(result)))
+    }
+}
+
+fn borrowed_table(
+    host: &mut vm::HostContext<'_>,
+    value: &Value,
+) -> Result<heap::TableRef, vm::VmError> {
+    let Value::Int(raw) = value else {
+        return Err(obs_fault("expected Lua table"));
+    };
+    let raw = u64::try_from(*raw).map_err(|_| obs_fault("expected Lua table"))?;
+    let handle = vm::ResourceHandle::from_raw(raw).map_err(|_| obs_fault("expected Lua table"))?;
+    let key = heap::LuaTableResource::key();
+    host.borrow_resource_with_key::<heap::LuaTableResource>(handle, &key)
+        .map(|resource| resource.table())
+        .map_err(|error| vm::VmError::HostError(error.to_string()))
+}
+
+fn obs_fault(message: &str) -> vm::VmError {
+    vm::VmError::HostError(message.to_string())
+}
+
+fn obs_log(vm: &mut vm::Vm) -> ObsLog {
+    vm.host_context()
+        .scope_state::<ObsLog>()
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn require_halted(vm: &mut vm::Vm) {
+    match vm.run() {
+        Ok(VmStatus::Halted) => {}
+        Ok(other) => panic!(
+            "status {other:?} after stage {}; log={:?}",
+            obs_log(vm).stage,
+            obs_log(vm)
+        ),
+        Err(error) => panic!(
+            "run failed after stage {}: {error}; log={:?}",
+            obs_log(vm).stage,
+            obs_log(vm)
+        ),
+    }
+}
+
 struct PublishingReturn;
 struct UnpublishedReturn;
 
@@ -127,6 +304,7 @@ fn run(source: &str, publish_results: bool) -> vm::Vm {
     candidate::register(&mut registry, &catalog).expect("register candidate runtime");
     register_witnesses(&mut registry, &catalog);
     register_caller_reads(&mut registry, &catalog);
+    register_binding_obs(&mut registry, &catalog);
     registry
         .bind_vm_cached(&mut vm)
         .expect("bind candidate runtime");
@@ -481,6 +659,396 @@ fn unpublished_consume_source_still_reclaims_on_first_collect() {
     assert!(!witness.handoffs[0].published_root);
     assert!(witness.handoffs[0].lua_frame_alive_at_publish);
     assert_eq!(first.returned_edge, EdgeView::Stale);
+}
+
+const ALIAS_RETURN: &str = r#"
+local function make()
+  local returned = {}
+  local discarded = {}
+  local alias = returned
+  alias.self = returned
+  discarded.self = discarded
+  return alias
+end
+local kept = make()
+record_binding(1, kept)
+note_bool(2, same_table(kept, kept.self))
+note_stage(10)
+collectgarbage("collect")
+snapshot_bindings(30)
+note_stage(30)
+note_bool(3, same_table(kept, kept.self))
+record_binding(4, kept)
+kept = nil
+note_text(5, type(kept))
+collectgarbage("collect")
+snapshot_bindings(50)
+"#;
+
+const ALIAS_PAIR: &str = r#"
+local function make()
+  local returned = {}
+  local discarded = {}
+  local alias = returned
+  alias.self = returned
+  discarded.self = discarded
+  return alias, nil, alias
+end
+local first, gap, last = make()
+record_binding(1, first)
+record_binding(2, last)
+note_bool(3, same_table(first, last))
+note_text(4, type(gap))
+note_bool(5, same_table(first, first.self))
+note_stage(10)
+collectgarbage("collect")
+snapshot_bindings(30)
+note_stage(30)
+note_bool(6, same_table(first, first.self))
+note_bool(7, same_table(last, last.self))
+first = nil
+collectgarbage("collect")
+snapshot_bindings(31)
+note_stage(31)
+note_bool(8, same_table(last, last.self))
+record_binding(9, last)
+last = nil
+note_text(11, type(last))
+collectgarbage("collect")
+snapshot_bindings(50)
+"#;
+
+const MIXED_CLEAR_FIRST: &str = r#"
+local function make()
+  local returned = {}
+  local discarded = {}
+  local alias = returned
+  alias.self = returned
+  discarded.self = discarded
+  return returned, nil, alias
+end
+local first, gap, last = make()
+record_binding(1, first)
+record_binding(2, last)
+note_bool(3, same_table(first, last))
+note_text(4, type(gap))
+note_bool(5, same_table(first, first.self))
+note_stage(10)
+first = nil
+note_stage(20)
+collectgarbage("collect")
+snapshot_bindings(30)
+note_stage(30)
+note_bool(8, same_table(last, last.self))
+record_binding(9, last)
+last = nil
+note_text(11, type(last))
+collectgarbage("collect")
+snapshot_bindings(50)
+"#;
+
+const MIXED_CLEAR_LAST: &str = r#"
+local function make()
+  local returned = {}
+  local discarded = {}
+  local alias = returned
+  alias.self = returned
+  discarded.self = discarded
+  return returned, nil, alias
+end
+local first, gap, last = make()
+record_binding(1, first)
+record_binding(2, last)
+note_bool(3, same_table(first, last))
+note_text(4, type(gap))
+note_bool(5, same_table(last, last.self))
+snapshot_bindings(11)
+note_stage(10)
+last = nil
+note_stage(20)
+collectgarbage("collect")
+snapshot_bindings(30)
+note_stage(30)
+note_bool(8, same_table(first, first.self))
+record_binding(9, first)
+first = nil
+note_text(11, type(first))
+collectgarbage("collect")
+snapshot_bindings(50)
+"#;
+
+const SIBLING_CALLS: &str = r#"
+local function make()
+  local returned = {}
+  local discarded = {}
+  returned.self = returned
+  discarded.self = discarded
+  return returned
+end
+local a = make()
+local b = make()
+record_binding(1, a)
+record_binding(2, b)
+note_bool(3, same_table(a, b))
+note_bool(4, same_table(a, a.self))
+note_bool(5, same_table(b, b.self))
+note_stage(10)
+a = nil
+note_stage(20)
+collectgarbage("collect")
+snapshot_bindings(30)
+note_stage(30)
+note_bool(6, same_table(b, b.self))
+record_binding(7, b)
+b = nil
+note_text(8, type(b))
+collectgarbage("collect")
+snapshot_bindings(50)
+"#;
+
+#[test]
+fn alias_return_keeps_the_caller_binding_until_that_local_is_cleared() {
+    let (mut vm, log) = run_obs(ALIAS_RETURN, true);
+    let witness = witness(&mut vm);
+    assert!(
+        witness.returned.is_none(),
+        "the alias is not selected from the constructor name"
+    );
+    assert!(witness.handoffs[0].published_root);
+    assert!(witness.handoffs[0].lua_frame_alive_at_publish);
+    assert!(witness.callee_left);
+    assert!(bool_at(&log, 2.0), "setup field read");
+    let kept = binding_at(&log, 1.0);
+    let after = binding_at(&log, 4.0);
+    assert_eq!(
+        kept, after,
+        "the guest binding is the same table after collect"
+    );
+    let first = snap_at(&log, 30.0);
+    assert!(alive_at(first, 1.0), "caller binding keeps the alias");
+    assert_eq!(first.live_nodes, 1, "the unreturned cycle is collected");
+    assert_eq!(first.live_roots, 1);
+    assert_eq!(first.collections, 1);
+    assert!(bool_at(&log, 3.0), "field read after collect");
+    assert_eq!(text_at(&log, 5.0), "nil");
+    let cleared = snap_at(&log, 50.0);
+    assert!(!alive_at(cleared, 1.0));
+    assert_eq!(cleared.live_nodes, 0);
+    assert_eq!(cleared.live_roots, 0);
+    assert_eq!(cleared.collections, 2);
+    assert_real_return_window(vm.program());
+}
+
+#[test]
+fn alias_pair_keeps_either_binding_until_the_last_one_is_cleared() {
+    let (vm, log) = run_obs(ALIAS_PAIR, true);
+    assert!(bool_at(&log, 3.0), "both positions are the same table");
+    assert_eq!(text_at(&log, 4.0), "nil");
+    assert!(bool_at(&log, 5.0));
+    let first_id = binding_at(&log, 1.0);
+    let last_id = binding_at(&log, 2.0);
+    assert_eq!(first_id, last_id);
+    let both = snap_at(&log, 30.0);
+    assert!(alive_at(both, 1.0) && alive_at(both, 2.0));
+    assert_eq!(both.live_nodes, 1);
+    assert_eq!(
+        both.live_roots, 2,
+        "each consumed position has its own slot"
+    );
+    assert!(bool_at(&log, 6.0) && bool_at(&log, 7.0));
+    let one_left = snap_at(&log, 31.0);
+    assert!(alive_at(one_left, 1.0));
+    assert_eq!(one_left.live_roots, 1);
+    assert_eq!(one_left.live_nodes, 1);
+    assert!(
+        bool_at(&log, 8.0),
+        "the remaining local still reads the field"
+    );
+    assert_eq!(binding_at(&log, 9.0), last_id);
+    assert_eq!(text_at(&log, 11.0), "nil");
+    let gone = snap_at(&log, 50.0);
+    assert!(!alive_at(gone, 1.0));
+    assert_eq!(gone.live_nodes, 0);
+    assert_eq!(gone.live_roots, 0);
+    assert_real_return_window(vm.program());
+}
+
+#[test]
+fn mixed_return_keeps_the_alias_when_the_constructor_binding_is_cleared() {
+    let (vm, log) = run_obs(MIXED_CLEAR_FIRST, true);
+    assert!(bool_at(&log, 3.0));
+    assert_eq!(text_at(&log, 4.0), "nil");
+    assert!(bool_at(&log, 5.0));
+    let shared = binding_at(&log, 1.0);
+    assert_eq!(shared, binding_at(&log, 2.0));
+    let after_first = snap_at(&log, 30.0);
+    assert!(
+        alive_at(after_first, 2.0),
+        "clearing the first local must not drop the alias"
+    );
+    assert_eq!(after_first.live_roots, 1);
+    assert_eq!(after_first.live_nodes, 1);
+    assert!(bool_at(&log, 8.0));
+    assert_eq!(binding_at(&log, 9.0), shared);
+    assert_eq!(text_at(&log, 11.0), "nil");
+    let gone = snap_at(&log, 50.0);
+    assert!(!alive_at(gone, 1.0));
+    assert_eq!(gone.live_nodes, 0);
+    assert_eq!(gone.live_roots, 0);
+    assert_real_return_window(vm.program());
+}
+
+#[test]
+fn mixed_return_keeps_the_constructor_binding_when_the_alias_is_cleared() {
+    let (vm, log) = run_obs(MIXED_CLEAR_LAST, true);
+    assert!(bool_at(&log, 3.0));
+    assert_eq!(text_at(&log, 4.0), "nil");
+    let shared = binding_at(&log, 1.0);
+    assert_eq!(shared, binding_at(&log, 2.0));
+    let before = snap_at(&log, 11.0);
+    assert_eq!(
+        before.live_roots, 2,
+        "the alias position is rooted before either clear"
+    );
+    assert!(alive_at(before, 1.0) && alive_at(before, 2.0));
+    let after_last = snap_at(&log, 30.0);
+    assert!(alive_at(after_last, 1.0));
+    assert_eq!(after_last.live_roots, 1);
+    assert_eq!(after_last.live_nodes, 1);
+    assert!(bool_at(&log, 8.0));
+    assert_eq!(binding_at(&log, 9.0), shared);
+    assert_eq!(text_at(&log, 11.0), "nil");
+    let gone = snap_at(&log, 50.0);
+    assert!(!alive_at(gone, 1.0));
+    assert_eq!(gone.live_nodes, 0);
+    assert_eq!(gone.live_roots, 0);
+    assert_real_return_window(vm.program());
+}
+
+#[test]
+fn earlier_sibling_call_can_be_cleared_without_collecting_the_later_table() {
+    let (mut vm, log) = run_obs(SIBLING_CALLS, true);
+    let a = binding_at(&log, 1.0);
+    let b = binding_at(&log, 2.0);
+    assert_ne!(
+        a, b,
+        "two calls of the same function allocate different tables"
+    );
+    assert!(!bool_at(&log, 3.0));
+    assert!(bool_at(&log, 4.0) && bool_at(&log, 5.0));
+    let witness = witness(&mut vm);
+    assert_eq!(witness.handoffs.len(), 2);
+    assert!(witness.handoffs[0].published_root && witness.handoffs[1].published_root);
+    assert_eq!(
+        witness.returned,
+        Some(b),
+        "the witness field is only the last call; the guest binding selects a"
+    );
+    let after_a = snap_at(&log, 30.0);
+    assert!(!alive_at(after_a, 1.0), "clearing a collects only a");
+    assert!(alive_at(after_a, 2.0));
+    assert_eq!(after_a.live_nodes, 1);
+    assert_eq!(after_a.live_roots, 1);
+    assert!(bool_at(&log, 6.0), "b is still readable");
+    assert_eq!(binding_at(&log, 7.0), b, "b did not become a");
+    assert_ne!(binding_at(&log, 7.0), a);
+    assert_eq!(text_at(&log, 8.0), "nil");
+    let gone = snap_at(&log, 50.0);
+    assert!(!alive_at(gone, 1.0) && !alive_at(gone, 2.0));
+    assert_eq!(gone.live_nodes, 0);
+    assert_eq!(gone.live_roots, 0);
+    assert_eq!(gone.collections, 2);
+    assert_real_return_window(vm.program());
+}
+
+const UNPUBLISHED_ALIAS: &str = r#"
+local function make()
+  local returned = {}
+  local discarded = {}
+  local alias = returned
+  alias.self = returned
+  discarded.self = discarded
+  return alias
+end
+local kept = make()
+record_binding(1, kept)
+note_bool(2, same_table(kept, kept.self))
+note_stage(10)
+collectgarbage("collect")
+snapshot_bindings(30)
+note_stage(30)
+"#;
+
+#[test]
+fn unpublished_alias_return_is_collected_while_the_caller_binding_remains() {
+    let (mut vm, log) = run_obs(UNPUBLISHED_ALIAS, false);
+    let witness = witness(&mut vm);
+    assert!(!witness.published_root);
+    assert!(!witness.handoffs[0].published_root);
+    assert!(witness.handoffs[0].lua_frame_alive_at_publish);
+    assert!(witness.callee_left);
+    let kept = binding_at(&log, 1.0);
+    let after = snap_at(&log, 30.0);
+    assert!(
+        !alive_at(after, 1.0),
+        "skipping publish must not leave another root"
+    );
+    assert!(!heap_alive(&mut vm, kept));
+    assert_eq!(after.live_nodes, 0);
+    assert_eq!(after.live_roots, 0);
+    assert_eq!(after.collections, 1);
+    assert_real_return_window(vm.program());
+}
+
+fn run_obs(source: &str, publish: bool) -> (vm::Vm, ObsLog) {
+    let mut vm = run(source, publish);
+    require_halted(&mut vm);
+    let log = obs_log(&mut vm);
+    (vm, log)
+}
+
+fn bool_at(log: &ObsLog, tag: f64) -> bool {
+    log.bools
+        .iter()
+        .find(|(found, _)| *found == tag)
+        .unwrap_or_else(|| panic!("missing bool {tag} in {log:?}"))
+        .1
+}
+
+fn text_at(log: &ObsLog, tag: f64) -> String {
+    log.texts
+        .iter()
+        .find(|(found, _)| *found == tag)
+        .unwrap_or_else(|| panic!("missing text {tag} in {log:?}"))
+        .1
+        .clone()
+}
+
+fn binding_at(log: &ObsLog, tag: f64) -> heap::TableRef {
+    log.bindings
+        .iter()
+        .find(|(found, _)| *found == tag)
+        .unwrap_or_else(|| panic!("missing binding {tag} in {log:?}"))
+        .1
+}
+
+fn snap_at(log: &ObsLog, tag: f64) -> &BindingSnap {
+    log.snaps
+        .iter()
+        .find(|snap| snap.tag == tag)
+        .unwrap_or_else(|| panic!("missing snap {tag} in {log:?}"))
+}
+
+fn alive_at(snap: &BindingSnap, tag: f64) -> bool {
+    snap.alive
+        .iter()
+        .find(|(found, _)| *found == tag)
+        .unwrap_or_else(|| panic!("missing alive {tag} in {snap:?}"))
+        .1
+}
+
+fn heap_alive(vm: &mut vm::Vm, table: heap::TableRef) -> bool {
+    heap::with_heap(&mut vm.host_context(), |heap| Ok(heap.alive(table))).expect("heap")
 }
 
 fn assert_value_oracle() {

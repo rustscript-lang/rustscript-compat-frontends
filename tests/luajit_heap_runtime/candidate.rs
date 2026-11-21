@@ -94,7 +94,7 @@ pub(super) fn install_schemas(builder: &mut HostApiBuilder) {
         ));
     }
     for (name, params, result) in [
-        (ENTER_RESULT, vec![], HostTypeSchema::Unknown),
+        (ENTER_RESULT, vec!["width"], HostTypeSchema::Unknown),
         (ENTER_CALLEE, vec!["width"], HostTypeSchema::Float),
         (
             ROOT_ISSUED,
@@ -105,11 +105,11 @@ pub(super) fn install_schemas(builder: &mut HostApiBuilder) {
         (GET_EDGE, vec!["table", "key"], HostTypeSchema::Unknown),
         (
             FINISH_RETURN,
-            vec!["values", "frame", "publish", "index", "callee"],
+            vec!["values", "frame", "publish", "slots", "callee"],
             HostTypeSchema::Unknown,
         ),
         (RETIRE_CALLEE, vec!["flag", "frame"], HostTypeSchema::Float),
-        (RELEASE_RESULT, vec!["frame"], HostTypeSchema::Float),
+        (RELEASE_RESULT, vec!["frame", "slot"], HostTypeSchema::Float),
     ] {
         builder.function(HostFunctionSchema::with_return(
             name,
@@ -463,8 +463,14 @@ fn frame_token(frame: heap::RootFrameId) -> Value {
 }
 
 fn enter_result(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
-    let frame = heap::with_heap(&mut call.vm().host_context(), |heap| heap.enter_roots(1))
-        .map_err(heap_error)?;
+    let width = match call.args() {
+        [value] => float_u32(value)?,
+        _ => return Err(host_fault("invalid caller frame width")),
+    };
+    let frame = heap::with_heap(&mut call.vm().host_context(), |heap| {
+        heap.enter_roots(width)
+    })
+    .map_err(heap_error)?;
     let depth = call.vm().call_depth();
     with_witness(call.vm(), |witness| {
         witness.caller_depth = Some(depth);
@@ -544,21 +550,26 @@ fn set_edge(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
 }
 
 fn finish_return(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
-    let (values, frame_token, publish, table_at, callee_flag) = match call.args() {
+    let (values, frame_token, publish, slots, callee_flag) = match call.args() {
         [
             Value::Array(values),
             frame,
             Value::Float(publish),
-            index,
+            slots,
             Value::Float(flag),
         ] => (
             values.clone(),
             frame.clone(),
             *publish != 0.0,
-            float_u32(index)?,
+            slots.clone(),
             *flag != 0.0,
         ),
         _ => return Err(host_fault("Lua return transport is not one array")),
+    };
+    let root_slots = match &slots {
+        Value::Array(items) => items.as_slice().to_vec(),
+        Value::Null => Vec::new(),
+        _ => return Err(host_fault("caller root slots are not a private array")),
     };
     let transport = Value::Array(values.clone());
     if matches!(
@@ -575,21 +586,9 @@ fn finish_return(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
     for value in values.iter() {
         elements.push(return_element(call, value)?);
     }
-    if publish {
-        let element = values
-            .get(table_at as usize)
-            .ok_or_else(|| host_fault("published return is not an issued table"))?;
-        let table = match classify(&mut call.vm().host_context(), element)? {
-            heap::GuestClass::Table(table) => table,
-            _ => return Err(host_fault("published return is not an issued table")),
-        };
-        let frame = decode_frame(call, &frame_token)?;
-        // Publish the caller root before any later retire removes the callee frame.
-        heap::with_heap(&mut call.vm().host_context(), |heap| {
-            heap.write_root(frame, 0, table)
-        })
-        .map_err(heap_error)?;
-    }
+    // Classify each consumed position. Nil, scalars, and the transport array
+    // do not become roots. The callee source name is not consulted.
+    let wrote = publish_consumed_tables(call, &values, &frame_token, publish, &root_slots)?;
     let lua_frame_alive = if callee_flag {
         heap::with_heap(&mut call.vm().host_context(), |heap| {
             Ok(heap.current_frame().is_some())
@@ -615,14 +614,14 @@ fn finish_return(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
     .map_err(heap_error)?;
     with_witness(call.vm(), |witness| {
         witness.elements = elements.clone();
-        witness.published_root = publish;
+        witness.published_root = wrote;
         witness.handoff_depth = Some(depth);
         witness.lua_frame_alive_at_publish = lua_frame_alive;
         witness.returned_edge_at_handoff = returned_edge;
         witness.discarded_edge_at_handoff = discarded_edge;
         witness.handoffs.push(Handoff {
             elements,
-            published_root: publish,
+            published_root: wrote,
             callee_left: false,
             top_is_caller_after_handoff: false,
             lua_frame_alive_at_publish: lua_frame_alive,
@@ -633,6 +632,43 @@ fn finish_return(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
         });
     })?;
     Ok(transport)
+}
+
+fn publish_consumed_tables(
+    call: &mut OwnedHostCall<'_>,
+    values: &[Value],
+    frame_token: &Value,
+    publish: bool,
+    root_slots: &[Value],
+) -> Result<bool, VmError> {
+    if !publish {
+        return Ok(false);
+    }
+    if matches!(frame_token, Value::Null) {
+        if root_slots.is_empty() {
+            return Ok(false);
+        }
+        return Err(host_fault("missing caller root frame"));
+    }
+    let frame = decode_frame(call, frame_token)?;
+    let mut wrote = false;
+    for (index, slot_value) in root_slots.iter().enumerate() {
+        let Some(element) = values.get(index) else {
+            continue;
+        };
+        let heap::GuestClass::Table(table) = classify(&mut call.vm().host_context(), element)?
+        else {
+            continue;
+        };
+        let slot = float_u32(slot_value)?;
+        // Publish before any later retire removes the callee frame.
+        heap::with_heap(&mut call.vm().host_context(), |heap| {
+            heap.write_root(frame, slot, table)
+        })
+        .map_err(heap_error)?;
+        wrote = true;
+    }
+    Ok(wrote)
 }
 
 fn return_element(call: &mut OwnedHostCall<'_>, value: &Value) -> Result<ReturnedElement, VmError> {
@@ -721,8 +757,8 @@ fn get_edge(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
 }
 
 fn release_result(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
-    let frame_token = match call.args() {
-        [frame] => frame.clone(),
+    let (frame_token, slot) = match call.args() {
+        [frame, slot] => (frame.clone(), float_u32(slot)?),
         _ => return Err(host_fault("invalid result release")),
     };
     let frame = decode_frame(call, &frame_token)?;
@@ -735,7 +771,7 @@ fn release_result(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
     })
     .map_err(heap_error)?;
     heap::with_heap(&mut call.vm().host_context(), |heap| {
-        heap.leave_roots(frame)
+        heap.clear_root(frame, slot)
     })
     .map_err(heap_error)?;
     let live_roots = heap::stats(&mut call.vm().host_context())
@@ -844,7 +880,10 @@ pub(super) fn lower_returning(
         stmts: Vec::new(),
         functions: HashMap::new(),
         function_impls: HashMap::new(),
-        result_frames: HashMap::new(),
+        caller_frame: None,
+        receiver_roots: HashMap::new(),
+        next_receiver_slot: 0,
+        receiver_width: chunk_receiver_width(&chunk.body.stmts),
         table_locals: HashSet::new(),
         field_keys: HashMap::new(),
         publish_results,
@@ -853,6 +892,17 @@ pub(super) fn lower_returning(
         root_slot: 0,
         ignored_slot: None,
     };
+    if lower.receiver_width > 0 {
+        let slot = lower.builder.alloc_local_named("#caller-frame")?;
+        let enter = lower.call(ENTER_RESULT, vec![Expr::Float(lower.receiver_width as f64)])?;
+        lower.stmts.push(Stmt::Let {
+            index: slot,
+            declared_schema: None,
+            expr: enter,
+            line: 1,
+        });
+        lower.caller_frame = Some(slot);
+    }
     if let Some(error) = resolve::resolve(&chunk).errors.first() {
         return Err(ParseError::at_line(1, format!("{error:?}")));
     }
@@ -874,7 +924,10 @@ struct Lower<'a> {
     stmts: Vec<Stmt>,
     functions: HashMap<Vec<u8>, FuncInfo>,
     function_impls: HashMap<u16, FunctionImpl>,
-    result_frames: HashMap<Vec<u8>, LocalSlot>,
+    caller_frame: Option<LocalSlot>,
+    receiver_roots: HashMap<Vec<u8>, u32>,
+    next_receiver_slot: u32,
+    receiver_width: u32,
     table_locals: HashSet<Vec<u8>>,
     field_keys: HashMap<Vec<u8>, u32>,
     publish_results: bool,
@@ -888,7 +941,6 @@ struct Lower<'a> {
 struct FuncInfo {
     index: u16,
     callee_width: u32,
-    table_at: Option<u32>,
     return_count: u32,
 }
 
@@ -1003,8 +1055,12 @@ impl Lower<'_> {
                     line: self.line(span),
                 });
                 self.live_locals.retain(|local| *local != slot);
-                if let Some(frame) = self.result_frames.remove(&name.bytes) {
-                    let release = self.call(RELEASE_RESULT, vec![Expr::Var(frame)])?;
+                if let Some(root_slot) = self.receiver_roots.remove(&name.bytes) {
+                    let frame = self.caller_frame.ok_or_else(|| self.unsupported(span))?;
+                    let release = self.call(
+                        RELEASE_RESULT,
+                        vec![Expr::Var(frame), Expr::Float(root_slot as f64)],
+                    )?;
                     self.emit_ignored(release, self.line(span))?;
                 }
                 Ok(())
@@ -1051,7 +1107,10 @@ impl Lower<'_> {
         let saved_live = std::mem::take(&mut self.live_locals);
         let saved_temps = std::mem::take(&mut self.active_temps);
         let saved_stmts = std::mem::take(&mut self.stmts);
-        let saved_results = std::mem::take(&mut self.result_frames);
+        let saved_roots = std::mem::take(&mut self.receiver_roots);
+        let saved_frame = self.caller_frame.take();
+        let saved_next = self.next_receiver_slot;
+        self.next_receiver_slot = 0;
         let saved_tables = std::mem::take(&mut self.table_locals);
         let saved_return_names = std::mem::replace(
             &mut self.return_names,
@@ -1092,12 +1151,13 @@ impl Lower<'_> {
         if table_positions.len() > 1 {
             return Err(self.unsupported(span));
         }
-        let table_at = table_positions.first().copied();
         self.locals = saved_locals;
         self.live_locals = saved_live;
         self.active_temps = saved_temps;
         self.stmts = saved_stmts;
-        self.result_frames = saved_results;
+        self.receiver_roots = saved_roots;
+        self.caller_frame = saved_frame;
+        self.next_receiver_slot = saved_next;
         self.table_locals = saved_tables;
         self.return_names = saved_return_names;
         self.root_slot = saved_root_slot;
@@ -1118,7 +1178,6 @@ impl Lower<'_> {
             FuncInfo {
                 index,
                 callee_width: width,
-                table_at,
                 return_count: u32::try_from(returns.len()).expect("return count"),
             },
         );
@@ -1180,6 +1239,9 @@ impl Lower<'_> {
         names: &[ast::LocalName],
         call: &ast::Expr,
     ) -> Result<(), ParseError> {
+        if self.in_function {
+            return Err(self.unsupported(span));
+        }
         let callee = self
             .direct_function_call(call)
             .ok_or_else(|| self.unsupported(span))?;
@@ -1190,47 +1252,49 @@ impl Lower<'_> {
             .ok_or_else(|| self.unsupported(span))?;
         let line = self.line(span);
         let mut slots = Vec::with_capacity(names.len());
+        let mut root_slots = Vec::with_capacity(names.len());
         for (offset, name) in names.iter().enumerate() {
             let index = self
                 .builder
                 .alloc_local_named(&format!("#{}:{offset}", span.start))?;
             self.locals.insert(name.name.bytes.clone(), index);
-            slots.push((name.name.bytes.clone(), index));
+            if self.next_receiver_slot >= self.receiver_width {
+                return Err(self.unsupported(span));
+            }
+            let root_slot = self.next_receiver_slot;
+            self.next_receiver_slot += 1;
+            self.receiver_roots
+                .insert(name.name.bytes.clone(), root_slot);
+            slots.push(index);
+            root_slots.push(Expr::Float(root_slot as f64));
         }
-        let frame_slot = if info.table_at.is_some() {
-            let slot = self
-                .builder
-                .alloc_local_named(&format!("#frame:{}", span.start))?;
-            let enter = self.call(ENTER_RESULT, vec![])?;
-            self.stmts.push(Stmt::Let {
-                index: slot,
-                declared_schema: None,
-                expr: enter,
-                line,
-            });
-            Some(slot)
-        } else {
-            None
-        };
+        // The slot list is a previous statement, so its array calls cannot
+        // sit between Core Ret and the publish that follows it.
+        let slots_local = self
+            .builder
+            .alloc_local_named(&format!("#slots:{}", span.start))?;
+        self.stmts.push(Stmt::Let {
+            index: slots_local,
+            declared_schema: None,
+            expr: pack_array(root_slots),
+            line,
+        });
         let transport = self
             .builder
             .alloc_local_named(&format!("#ret:{}", span.start))?;
         let call_expr = Expr::Call(info.index, vec![], vec![], None, None);
-        let publish = if self.publish_results && info.table_at.is_some() {
-            1.0
-        } else {
-            0.0
-        };
-        let frame_expr = frame_slot.map(Expr::Var).unwrap_or(Expr::Null);
+        let publish = if self.publish_results { 1.0 } else { 0.0 };
+        let frame_expr = self.caller_frame.map(Expr::Var).unwrap_or(Expr::Null);
         // The script call is the transport argument. Core Ret runs inside that
-        // call. finish_return then publishes, while the callee Lua frame is still current.
+        // call. finish_return then publishes into this chunk's one caller
+        // frame, while the callee Lua frame is still current.
         let finish = self.call(
             FINISH_RETURN,
             vec![
                 call_expr,
                 frame_expr.clone(),
                 Expr::Float(publish),
-                Expr::Float(info.table_at.unwrap_or(0) as f64),
+                Expr::Var(slots_local),
                 Expr::Float(if info.callee_width > 0 { 1.0 } else { 0.0 }),
             ],
         )?;
@@ -1241,7 +1305,7 @@ impl Lower<'_> {
             line,
         });
         let get = vm::BuiltinFunction::Get.call_index();
-        for (index, (_, slot)) in slots.iter().enumerate() {
+        for (index, slot) in slots.iter().enumerate() {
             let expr = if (index as u32) < info.return_count {
                 Expr::Call(
                     get,
@@ -1260,11 +1324,6 @@ impl Lower<'_> {
                 line,
             });
         }
-        if let (Some(at), Some(frame)) = (info.table_at, frame_slot)
-            && let Some((name, _)) = slots.get(at as usize)
-        {
-            self.result_frames.insert(name.clone(), frame);
-        }
         let retire = self.call(
             RETIRE_CALLEE,
             vec![
@@ -1273,12 +1332,6 @@ impl Lower<'_> {
             ],
         )?;
         self.emit_ignored(retire, line)?;
-        if slots.is_empty()
-            && let Some(frame) = frame_slot
-        {
-            let release = self.call(RELEASE_RESULT, vec![Expr::Var(frame)])?;
-            self.emit_ignored(release, line)?;
-        }
         Ok(())
     }
 
@@ -1626,6 +1679,37 @@ fn rooted_table_count(stmts: &[ast::Stmt]) -> u32 {
             )
         })
         .count() as u32
+}
+
+fn chunk_receiver_width(stmts: &[ast::Stmt]) -> u32 {
+    stmts.iter().fold(0u32, |count, stmt| {
+        let ast::Stmt::Local { names, values, .. } = stmt else {
+            return count;
+        };
+        let [call] = values.exprs.as_slice() else {
+            return count;
+        };
+        if !syntactic_direct_call(call) {
+            return count;
+        }
+        count.saturating_add(u32::try_from(names.len()).unwrap_or(u32::MAX))
+    })
+}
+
+fn syntactic_direct_call(expr: &ast::Expr) -> bool {
+    matches!(
+        expr,
+        ast::Expr::SuffixChain { base, steps, .. }
+            if matches!(base.as_ref(), ast::Expr::Name { .. })
+                && matches!(
+                    steps.as_slice(),
+                    [ast::Suffix::Call {
+                        args: ast::Args::List(args),
+                        nav: false,
+                        ..
+                    }] if args.exprs.is_empty()
+                )
+    )
 }
 
 fn pack_array(values: Vec<Expr>) -> Expr {

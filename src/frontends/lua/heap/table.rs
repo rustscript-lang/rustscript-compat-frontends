@@ -548,6 +548,20 @@ impl LuaHeap {
         Ok(())
     }
 
+    /// Clears one slot of an open frame. The frame does not have to be the
+    /// top frame. Other slots, including another slot holding the same table,
+    /// stay. A stale id or an out-of-range slot is refused. An empty slot
+    /// stays empty.
+    pub fn clear_root(&mut self, frame: RootFrameId, slot: u32) -> Result<(), HeapError> {
+        let found = self.frame(frame)?;
+        if slot >= found.width {
+            return Err(HeapError::StaleFrame);
+        }
+        let index = found.start as usize + slot as usize;
+        self.roots[index] = None;
+        Ok(())
+    }
+
     /// Drops the top frame. A frame that is not top is refused.
     pub fn leave_roots(&mut self, frame: RootFrameId) -> Result<(), HeapError> {
         let top = self.frames.last().ok_or(HeapError::NoRootFrame)?;

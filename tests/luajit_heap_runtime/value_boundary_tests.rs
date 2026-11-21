@@ -164,6 +164,38 @@ pub(super) fn catalog() -> &'static Arc<vm::HostApiCatalog> {
             ],
             HostTypeSchema::String,
         ));
+        let table = HostTypeSchema::Resource(heap::LuaTableResource::key());
+        builder.function(HostFunctionSchema::with_return(
+            "lua_host::record_binding",
+            vec![
+                HostParamSchema::value("tag", HostTypeSchema::Float),
+                HostParamSchema::with_passing("table", table, HostParamPassing::Borrow),
+            ],
+            HostTypeSchema::Bool,
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            "lua_host::note_bool",
+            vec![
+                HostParamSchema::value("tag", HostTypeSchema::Float),
+                HostParamSchema::value("value", HostTypeSchema::Bool),
+            ],
+            HostTypeSchema::Bool,
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            "lua_host::note_text",
+            vec![
+                HostParamSchema::value("tag", HostTypeSchema::Float),
+                HostParamSchema::value("value", HostTypeSchema::String),
+            ],
+            HostTypeSchema::Bool,
+        ));
+        for name in ["lua_host::note_stage", "lua_host::snapshot_bindings"] {
+            builder.function(HostFunctionSchema::with_return(
+                name,
+                vec![HostParamSchema::value("tag", HostTypeSchema::Float)],
+                HostTypeSchema::Bool,
+            ));
+        }
         for (name, reverse) in [
             ("lua_host::observe_table", false),
             ("lua_host::observe_table_after", true),
