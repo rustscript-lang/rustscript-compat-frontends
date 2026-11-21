@@ -77,13 +77,6 @@ impl SourcePlugin for LuaPlugin {
     }
 }
 
-/// Candidate import list for the new Lua lowerer and file hook.
-///
-/// Production `LuaPlugin` does not call this. Path mapping stays in Core.
-pub fn lua_static_module_imports(source: &str) -> Result<Vec<ModuleImport>, SourcePathError> {
-    lua::static_module_imports(source)
-}
-
 pub fn compile_options() -> vm::CompileSourceFileOptions {
     plugins()
         .into_iter()

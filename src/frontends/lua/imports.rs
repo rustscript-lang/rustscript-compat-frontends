@@ -1,15 +1,16 @@
-//! Top-level static `.rss` links for the new Lua lowerer and file hook.
+//! Top-level static RSS links for the new Lua lowerer and file hook.
 //!
 //! Production `LuaPlugin` still uses the line scanner. This walk uses the
-//! parsed chunk so a string, comment, uncalled function, shadow, or alias
-//! cannot enter the module graph. Path mapping stays in Core.
+//! parsed chunk so a string, comment, uncalled function, shadow, or ordinary
+//! call cannot enter the module graph. A named link binds the declared local
+//! alias. Path mapping stays in Core, including an extensionless relative spec.
 
 use super::ast::{Args, AssignTarget, Expr, Stmt, Suffix};
 use super::lexer;
 use super::parser;
 use vm::{ImportClause, ModuleImport, NamedImport, ParseError, SourceError, SourcePathError};
 
-pub(crate) fn static_module_imports(source: &str) -> Result<Vec<ModuleImport>, SourcePathError> {
+pub(super) fn static_module_imports(source: &str) -> Result<Vec<ModuleImport>, SourcePathError> {
     let chunk = parser::parse_chunk(source.as_bytes()).map_err(syntax_to_path_error)?;
     let mut imports = Vec::new();
     let mut require_shadowed = false;
@@ -46,8 +47,10 @@ fn local_static_link(source: &str, stmt: &Stmt) -> Option<ModuleImport> {
     let clause = match link.member {
         None => ImportClause::Namespace(alias),
         Some(member) => ImportClause::Named(vec![NamedImport {
-            imported: member.clone(),
-            local: member,
+            // Core binds this local name. The export stays in `imported`,
+            // matching the line scanner's declared-name split.
+            imported: member,
+            local: alias,
         }]),
     };
     Some(ModuleImport {
@@ -107,7 +110,22 @@ fn rss_spec(args: &Args) -> Option<String> {
         return None;
     };
     let spec = utf8_bytes(bytes)?;
-    spec.ends_with(".rss").then_some(spec)
+    is_static_rss_spec(&spec).then_some(spec)
+}
+
+fn is_static_rss_spec(spec: &str) -> bool {
+    if spec.ends_with(".rss") {
+        return true;
+    }
+    // Pinned Core appends `.rss` when a relative specifier has no extension.
+    // Keep the source text. Explicit `.lua`, host names, and other short
+    // forms stay ordinary calls.
+    let relative = spec.starts_with("./") || spec.starts_with("../");
+    if !relative {
+        return false;
+    }
+    let file = spec.rsplit('/').next().unwrap_or(spec);
+    !file.is_empty() && !file.contains('.')
 }
 
 fn binds_require(stmt: &Stmt) -> bool {
