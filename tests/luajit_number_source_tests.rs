@@ -1,8 +1,8 @@
 //! Standard Lua numeric fragments through the source seam.
 //!
-//! The trial plugin lives here. It is not a product entry and it does not
-//! register hosts. Each executed sample is real Lua source, lowered by the
-//! seam, then compiled with `SourcePlugin` and run on the VM.
+//! The trial plugin lives here. Each executed sample is real Lua source,
+//! lowered by the private seam, compiled with `SourcePlugin`, and run on the VM.
+//! The bitwise imports are bound only by the test harness.
 
 // This test compiles the production AST through a path module. Four helpers
 // (`Name::is`, `ExprList::tail_multi`, `AssignTarget::span`/`has_nav`,
@@ -11,6 +11,8 @@
 #[allow(dead_code)]
 #[path = "../src/frontends/lua/ast.rs"]
 mod ast;
+#[path = "luajit_number/bitwise.rs"]
+mod bitwise;
 #[path = "../src/frontends/lua/lexer.rs"]
 mod lexer;
 #[path = "../src/frontends/lua/number.rs"]
@@ -24,8 +26,10 @@ mod resolve;
 
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 
 use number_source::NumberSourceError;
+use vm::compiler::HostCallResolver;
 use vm::{
     CompileSourceFileOptions, FrontendImportSyntax, FrontendIr, ParseError, SourceFlavor,
     SourcePlugin, Value, Vm, VmStatus,
@@ -177,6 +181,142 @@ fn proven_binary64_sources_run_through_the_plugin() {
 }
 
 #[test]
+fn numeric_bitwise_sources_return_binary64() {
+    for &(name, source, expected) in bitwise_cases() {
+        let run = run_plugin(source)
+            .unwrap_or_else(|failure| panic!("{name} at {}: {}", failure.layer, failure.detail));
+        assert_eq!(run.stack.len(), 1, "{name}");
+        assert_bits(&run.stack[0], expected.to_bits(), name);
+    }
+}
+
+fn bitwise_cases() -> &'static [(&'static str, &'static str, f64)] {
+    &[
+        ("and", "return 6 & 3", 2.0),
+        ("or", "return 4 | 3", 7.0),
+        ("xor", "return 6 ~ 3", 5.0),
+        ("not", "return ~0", -1.0),
+        ("signed-bit", "return 1 << 31", -2147483648.0),
+        ("wrapped-count", "return 1 << 32", 1.0),
+        ("negative-count", "return 1 << -1", -2147483648.0),
+        ("logical-right", "return -1 >> 1", 2147483647.0),
+        ("logical-result-signed", "return -1 >> 32", -1.0),
+        ("arithmetic-right", "return -4 ~>> 1", -2.0),
+        ("fractional-count", "return 1 << 1.5", 4.0),
+        ("nan-count", "local count = 0/0; return 3 << count", 3.0),
+        ("tie-down", "return 2.5 & 3", 2.0),
+        ("tie-up", "return 1.5 & 3", 2.0),
+        ("negative-tie", "return -1.5 | 0", -2.0),
+        ("wrap-32", "return 4294967296 | 1", 1.0),
+        ("negative-zero", "local n = -0; return n | 0", 0.0),
+        ("nan", "local n = 0/0; return n | 1", 1.0),
+        ("infinity", "local n = 1/0; return n | 7", 7.0),
+        ("negative-infinity", "local n = -1/0; return n | 7", 7.0),
+        ("large-precision", "return 9007199254740992 | 0", 0.0),
+        ("positive-bias", "return 9007199254740994 | 0", 1.0),
+        ("negative-bias", "return -9007199254740990 | 0", -8.0),
+        (
+            "evaluated-large-operands",
+            "local a = 2^53 + 2; local b = -2^53 + 2; return (a | 0) * 10 + (b | 0)",
+            2.0,
+        ),
+        (
+            "locals-and-arithmetic",
+            "local left = 7/2; local right = 2+1; return (left & right) / 2",
+            0.0,
+        ),
+        (
+            "bit-result-binding",
+            "local n = ~(-4 ~>> 1); return n / 2",
+            0.5,
+        ),
+        ("left-associative-shift", "return 4 << 1 >> 2", 2.0),
+        ("arithmetic-precedence", "return 1 + 2 << 1 + 1", 12.0),
+    ]
+}
+
+#[test]
+fn bitwise_source_rejections_keep_their_layers() {
+    use number_source::UnsupportedReason;
+
+    for (source, layer) in [
+        ("return (-4) >>> 1", RejectLayer::Syntax),
+        (
+            "return 1LL | 0",
+            RejectLayer::NotFloat(ast::NumberKind::Signed64),
+        ),
+        (
+            r#"return "3" & 1"#,
+            RejectLayer::Unsupported(UnsupportedReason::Expression),
+        ),
+        (
+            "return true | 0",
+            RejectLayer::Unsupported(UnsupportedReason::Expression),
+        ),
+        (
+            "return 1 & nil",
+            RejectLayer::Unsupported(UnsupportedReason::Expression),
+        ),
+        (
+            "return ~{}",
+            RejectLayer::Unsupported(UnsupportedReason::Expression),
+        ),
+        (
+            "return 1 << count",
+            RejectLayer::Unsupported(UnsupportedReason::UnprovenName),
+        ),
+    ] {
+        assert_eq!(reject_layer(source), layer, "{source}");
+        assert!(run_plugin(source).is_err(), "{source}");
+    }
+}
+
+#[test]
+fn configured_bitwise_oracle_matches_numeric_sources() {
+    let Ok(path) = std::env::var("LUAJIT_ORACLE") else {
+        println!("bitwise oracle not configured; compared=0");
+        return;
+    };
+    assert_oracle_baseline(&path);
+    let architecture = spawn_oracle(
+        &path,
+        &[
+            "-E",
+            "-joff",
+            "-e",
+            "assert(jit.arch == 'x64' and not jit.status())",
+        ],
+        None,
+    );
+    require_success(&path, &architecture, "x64 bitwise oracle");
+    for &(name, source, _) in bitwise_cases() {
+        compare_oracle(&path, source, name);
+    }
+    assert!(!oracle_load(&path, "return (-4) >>> 1"));
+    let output = spawn_oracle(
+        &path,
+        &[
+            "-E",
+            "-joff",
+            "-e",
+            r#"
+local chunk = assert(load(io.read('*a'), '@bitwise-string', 't'))
+local ok, err = pcall(chunk)
+assert(not ok and type(err) == 'string' and err:find('a string value', 1, true))
+io.write('runtime-error:string\n')
+"#,
+        ],
+        Some(br#"return "3" & 1"#),
+    );
+    require_success(&path, &output, "string runtime-error oracle");
+    assert_eq!(output.stdout, b"runtime-error:string\n");
+    println!(
+        "bitwise oracle compared={} syntax-reject=1 runtime-error=1",
+        bitwise_cases().len()
+    );
+}
+
+#[test]
 fn legal_uncovered_sources_are_not_syntax_rejections() {
     let cases = negative_cases();
     let mut syntax = 0usize;
@@ -227,7 +367,12 @@ fn reject_layer(source: &str) -> RejectLayer {
         Err(_) => RejectLayer::Syntax,
         Ok(chunk) => {
             let resolution = resolve::resolve(&chunk);
-            match number_source::lower_proven_chunk(source, &chunk, &resolution) {
+            match number_source::lower_proven_chunk(
+                source,
+                &chunk,
+                &resolution,
+                HostCallResolver::new(bitwise::catalog()),
+            ) {
                 Err(NumberSourceError::Syntax { .. }) => RejectLayer::Syntax,
                 Err(NumberSourceError::NotFloat { kind }) => RejectLayer::NotFloat(kind),
                 Err(NumberSourceError::CompileUnsupported { reason }) => {
@@ -674,8 +819,13 @@ fn lower_source(source: &str) -> Result<OwnedLowered, ParseError> {
     let chunk = parser::parse_chunk(source.as_bytes())
         .map_err(|error| ParseError::new(format!("lua number syntax: {}", error.message)))?;
     let resolution = resolve::resolve(&chunk);
-    let lowered =
-        number_source::lower_proven_chunk(source, &chunk, &resolution).map_err(source_error)?;
+    let lowered = number_source::lower_proven_chunk(
+        source,
+        &chunk,
+        &resolution,
+        HostCallResolver::new(bitwise::catalog()),
+    )
+    .map_err(source_error)?;
     Ok(OwnedLowered {
         logical_slots: lowered.logical_slots,
         binding_names: lowered.binding_names,
@@ -702,7 +852,9 @@ fn run_plugin(source: &str) -> Result<Run, LayerFailure> {
     let compiled = vm::compile_source_with_flavor_and_options(
         source,
         SourceFlavor::Lua,
-        CompileSourceFileOptions::new().with_source_plugin(&NUMERIC_PLUGIN),
+        CompileSourceFileOptions::new()
+            .with_source_plugin(&NUMERIC_PLUGIN)
+            .with_host_api_catalog(Arc::clone(bitwise::catalog())),
     );
     let compiled = match compiled {
         Ok(compiled) => compiled,
@@ -710,6 +862,10 @@ fn run_plugin(source: &str) -> Result<Run, LayerFailure> {
     };
     let frame_slots = compiled.program.local_count;
     let mut vm = Vm::new(compiled.program);
+    bitwise::bind(&mut vm).map_err(|error| LayerFailure {
+        layer: "bind",
+        detail: error.to_string(),
+    })?;
     match vm.run() {
         Err(error) => Err(LayerFailure {
             layer: "run",

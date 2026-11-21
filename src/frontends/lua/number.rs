@@ -24,7 +24,59 @@
 //! temp is a typed reference returned by the operation that just emitted the
 //! binding. There is no constructor from an arbitrary `Expr` or `LocalSlot`.
 
-use vm::{BuiltinFunction, Expr, LocalIrBuilder, LocalSlot, ParseError, Stmt};
+use vm::compiler::HostCallResolver;
+use vm::{BuiltinFunction, Expr, LocalIrBuilder, LocalSlot, ParseError, Stmt, TypeSchema};
+
+pub(crate) const BIT_NOT: &str = "lua_number::bit_not";
+
+#[derive(Clone, Copy)]
+pub(crate) enum BitwiseBinary {
+    And,
+    Or,
+    Xor,
+    Shl,
+    Shr,
+    Sar,
+}
+
+impl BitwiseBinary {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::And => "lua_number::bit_and",
+            Self::Or => "lua_number::bit_or",
+            Self::Xor => "lua_number::bit_xor",
+            Self::Shl => "lua_number::bit_shl",
+            Self::Shr => "lua_number::bit_shr",
+            Self::Sar => "lua_number::bit_sar",
+        }
+    }
+
+    pub(crate) fn evaluate(self, left: f64, right: f64) -> f64 {
+        let left = tobit(left);
+        let right = tobit(right);
+        // Rust's wrapping shifts mask the count to the low five bits for i32/u32.
+        let result = match self {
+            Self::And => left & right,
+            Self::Or => left | right,
+            Self::Xor => left ^ right,
+            Self::Shl => left.wrapping_shl(right as u32),
+            Self::Shr => (left as u32).wrapping_shr(right as u32) as i32,
+            Self::Sar => left.wrapping_shr(right as u32),
+        };
+        f64::from(result)
+    }
+}
+
+pub(crate) fn bit_not(value: f64) -> f64 {
+    f64::from(!tobit(value))
+}
+
+/// The pinned LuaJIT x64 `vm_tobit` adds 2^52 + 2^51 in binary64, then
+/// reads the low 32 bits of the sum. Large values observe the rounding of
+/// the addition itself, so rounding the input and reducing modulo 2^32 differs.
+fn tobit(value: f64) -> i32 {
+    (value + 6_755_399_441_055_744.0).to_bits() as i32
+}
 
 /// A Lua number built only from a binary64 literal or from an operation on one.
 #[derive(Clone, Debug)]
@@ -146,6 +198,64 @@ impl<'a> NumberLowering<'a> {
     /// Name lookups performed by `alloc_temp` on this lowering.
     pub(crate) fn name_probes(&self) -> u64 {
         self.name_probes
+    }
+
+    pub(crate) fn bitwise_not(
+        &mut self,
+        resolver: &HostCallResolver<'_>,
+        operand: ClassifiedNumber,
+    ) -> Result<ClassifiedNumber, ParseError> {
+        self.bit_call(resolver, BIT_NOT, [operand])
+    }
+
+    pub(crate) fn bitwise_binary(
+        &mut self,
+        resolver: &HostCallResolver<'_>,
+        op: BitwiseBinary,
+        lhs: ClassifiedNumber,
+        rhs: ClassifiedNumber,
+    ) -> Result<ClassifiedNumber, ParseError> {
+        self.bit_call(resolver, op.name(), [lhs, rhs])
+    }
+
+    fn bit_call<const N: usize>(
+        &mut self,
+        resolver: &HostCallResolver<'_>,
+        name: &str,
+        operands: [ClassifiedNumber; N],
+    ) -> Result<ClassifiedNumber, ParseError> {
+        let signature = [const { TypeSchema::Float }; N];
+        let resolved = resolver
+            .resolve(name, &signature)
+            .map_err(|error| ParseError::new(error.to_string()))?;
+        if resolved.return_type != TypeSchema::Float
+            || !resolved
+                .params
+                .iter()
+                .map(|param| &param.schema)
+                .eq(&signature)
+        {
+            return Err(ParseError::new(format!(
+                "invalid Lua bitwise signature for {name}"
+            )));
+        }
+        self.builder.declare_function(name, Some(N as u8))?;
+        let index = self
+            .builder
+            .function_index(name)
+            .expect("declared bitwise operation");
+        Ok(ClassifiedNumber {
+            expr: Expr::Call(
+                index,
+                Vec::new(),
+                operands
+                    .into_iter()
+                    .map(ClassifiedNumber::into_expr)
+                    .collect(),
+                Some(Box::new(resolved)),
+                None,
+            ),
+        })
     }
 
     /// Lua `%` on binary64: `lhs - floor(lhs / rhs) * rhs`.

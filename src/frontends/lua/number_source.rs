@@ -5,11 +5,13 @@
 //! floats share one conversion. `LL`, `ULL`, imaginary suffixes, and names
 //! this walk did not prove stay outside it. Chains are hoisted with the
 //! kernel's temps so a flat source spine does not become an unbounded Core
-//! expression. Slot reuse stays with Core.
+//! expression. Slot reuse stays with Core. Bitwise calls use the private
+//! numeric imports resolved by the caller.
 
 use super::ast::{BinOp, Chunk, Expr, ExprList, LocalName, NumberKind, Span, Stmt, UnOp};
-use super::number::{ClassifiedNumber, NumberLowering};
+use super::number::{BitwiseBinary, ClassifiedNumber, NumberLowering};
 use super::resolve::Resolution;
+use vm::compiler::HostCallResolver;
 use vm::{FrontendIr, LocalIrBuilder, ParseError, Stmt as CoreStmt};
 
 pub(crate) struct LoweredNumberChunk {
@@ -45,10 +47,16 @@ struct ProvenLocal {
     value: ClassifiedNumber,
 }
 
+struct NumberSource<'a> {
+    locals: Vec<ProvenLocal>,
+    resolver: HostCallResolver<'a>,
+}
+
 pub(crate) fn lower_proven_chunk(
     source: &str,
     chunk: &Chunk,
     resolution: &Resolution,
+    resolver: HostCallResolver<'_>,
 ) -> Result<LoweredNumberChunk, NumberSourceError> {
     if let Some(error) = resolution.errors.first() {
         return Err(NumberSourceError::Syntax {
@@ -59,7 +67,10 @@ pub(crate) fn lower_proven_chunk(
     let mut stmts = Vec::new();
     let name_probes = {
         let mut lowering = NumberLowering::new(&mut builder);
-        let mut env = Vec::new();
+        let mut env = NumberSource {
+            locals: Vec::new(),
+            resolver,
+        };
         for stmt in &chunk.body.stmts {
             lower_stmt(source, stmt, &mut lowering, &mut stmts, &mut env)?;
         }
@@ -85,7 +96,7 @@ fn lower_stmt(
     stmt: &Stmt,
     lowering: &mut NumberLowering<'_>,
     stmts: &mut Vec<CoreStmt>,
-    env: &mut Vec<ProvenLocal>,
+    env: &mut NumberSource<'_>,
 ) -> Result<(), NumberSourceError> {
     match stmt {
         Stmt::Empty { .. } => Ok(()),
@@ -114,7 +125,7 @@ fn lower_local(
     values: &ExprList,
     lowering: &mut NumberLowering<'_>,
     stmts: &mut Vec<CoreStmt>,
-    env: &mut Vec<ProvenLocal>,
+    env: &mut NumberSource<'_>,
 ) -> Result<(), NumberSourceError> {
     if names.len() != 1 || values.exprs.len() != 1 {
         return Err(unsupported(UnsupportedReason::NotSingle));
@@ -126,7 +137,7 @@ fn lower_local(
     let bound = lowering
         .bind_named(text, lowered, line_of(source, span), stmts)
         .map_err(kernel_error)?;
-    env.push(ProvenLocal {
+    env.locals.push(ProvenLocal {
         name: name.bytes.clone(),
         value: bound,
     });
@@ -138,28 +149,28 @@ fn lower_expr(
     expr: &Expr,
     lowering: &mut NumberLowering<'_>,
     stmts: &mut Vec<CoreStmt>,
-    env: &[ProvenLocal],
+    env: &NumberSource<'_>,
 ) -> Result<ClassifiedNumber, NumberSourceError> {
     match expr {
         Expr::Number { raw, kind, .. } => lower_number(raw, *kind),
-        Expr::Name { name, .. } => lookup_proven(name.bytes.as_slice(), env),
+        Expr::Name { name, .. } => lookup_proven(name.bytes.as_slice(), &env.locals),
         Expr::Paren { inner, .. } => lower_expr(source, inner, lowering, stmts, env),
         Expr::Unary { op, expr, .. } => lower_unary(*op, expr, source, lowering, stmts, env),
         Expr::Binary {
             op, left, right, ..
         } => {
             let lhs = lower_expr(source, left, lowering, stmts, env)?;
+            // Finish the left value before emitting any right operand temps.
+            let lhs = lowering.materialize(lhs, stmts).map_err(kernel_error)?;
             let rhs = lower_expr(source, right, lowering, stmts, env)?;
-            apply(*op, lhs, rhs, lowering, stmts)
+            apply(*op, lhs, rhs, lowering, stmts, &env.resolver)
         }
         Expr::BinaryChain { base, steps, .. } => {
             let mut acc = lower_expr(source, base, lowering, stmts, env)?;
-            for (index, step) in steps.iter().enumerate() {
+            for step in steps {
+                acc = lowering.materialize(acc, stmts).map_err(kernel_error)?;
                 let rhs = lower_expr(source, &step.expr, lowering, stmts, env)?;
-                acc = apply(step.op, acc, rhs, lowering, stmts)?;
-                if index + 1 != steps.len() {
-                    acc = lowering.materialize(acc, stmts).map_err(kernel_error)?;
-                }
+                acc = apply(step.op, acc, rhs, lowering, stmts, &env.resolver)?;
             }
             Ok(acc)
         }
@@ -173,14 +184,20 @@ fn lower_unary(
     source: &str,
     lowering: &mut NumberLowering<'_>,
     stmts: &mut Vec<CoreStmt>,
-    env: &[ProvenLocal],
+    env: &NumberSource<'_>,
 ) -> Result<ClassifiedNumber, NumberSourceError> {
-    if op != UnOp::Neg {
+    if !matches!(op, UnOp::Neg | UnOp::BNot) {
         return Err(unsupported(UnsupportedReason::Operator));
     }
     let inner = lower_expr(source, expr, lowering, stmts, env)?;
     let inner = lowering.materialize(inner, stmts).map_err(kernel_error)?;
-    Ok(inner.neg())
+    if op == UnOp::Neg {
+        Ok(inner.neg())
+    } else {
+        lowering
+            .bitwise_not(&env.resolver, inner)
+            .map_err(kernel_error)
+    }
 }
 
 fn apply(
@@ -189,18 +206,27 @@ fn apply(
     rhs: ClassifiedNumber,
     lowering: &mut NumberLowering<'_>,
     stmts: &mut Vec<CoreStmt>,
+    resolver: &HostCallResolver<'_>,
 ) -> Result<ClassifiedNumber, NumberSourceError> {
-    let lhs = lowering.materialize(lhs, stmts).map_err(kernel_error)?;
     let rhs = lowering.materialize(rhs, stmts).map_err(kernel_error)?;
-    match op {
-        BinOp::Add => Ok(lhs.add(rhs)),
-        BinOp::Sub => Ok(lhs.sub(rhs)),
-        BinOp::Mul => Ok(lhs.mul(rhs)),
-        BinOp::Div => Ok(lhs.div(rhs)),
-        BinOp::Pow => Ok(lhs.pow(rhs)),
-        BinOp::Mod => lowering.floor_mod(lhs, rhs).map_err(kernel_error),
-        _ => Err(unsupported(UnsupportedReason::Operator)),
-    }
+    let bitwise = match op {
+        BinOp::Add => return Ok(lhs.add(rhs)),
+        BinOp::Sub => return Ok(lhs.sub(rhs)),
+        BinOp::Mul => return Ok(lhs.mul(rhs)),
+        BinOp::Div => return Ok(lhs.div(rhs)),
+        BinOp::Pow => return Ok(lhs.pow(rhs)),
+        BinOp::Mod => return lowering.floor_mod(lhs, rhs).map_err(kernel_error),
+        BinOp::Band => BitwiseBinary::And,
+        BinOp::Bor => BitwiseBinary::Or,
+        BinOp::BXor => BitwiseBinary::Xor,
+        BinOp::Shl => BitwiseBinary::Shl,
+        BinOp::Shr => BitwiseBinary::Shr,
+        BinOp::Sar => BitwiseBinary::Sar,
+        _ => return Err(unsupported(UnsupportedReason::Operator)),
+    };
+    lowering
+        .bitwise_binary(resolver, bitwise, lhs, rhs)
+        .map_err(kernel_error)
 }
 
 fn lower_number(raw: &str, kind: NumberKind) -> Result<ClassifiedNumber, NumberSourceError> {

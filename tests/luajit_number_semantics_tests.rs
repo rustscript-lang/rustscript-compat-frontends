@@ -4,10 +4,13 @@
 //! expected bits were observed on locked LuaJIT 96f7b297326e9fd454b7186c6858b2773f94a0dc
 //! with `-joff`. NaN is compared by category only.
 
+#[path = "luajit_number/bitwise.rs"]
+mod bitwise;
 #[path = "../src/frontends/lua/number.rs"]
 mod number;
 
-use number::{ClassifiedNumber, NumberLowering};
+use number::{BitwiseBinary, ClassifiedNumber, NumberLowering};
+use vm::compiler::HostCallResolver;
 use vm::{AssignmentKind, Compiler, Expr, LocalIrBuilder, LocalSlot, Stmt, Value, Vm};
 
 const PROTOCOL_06: [&str; 4] = ["3.5", "1", "-1", "-2.5"];
@@ -191,6 +194,50 @@ fn operands_are_evaluated_once_left_then_right() {
         |_, lhs, rhs| lhs.pow(rhs),
     );
     assert_unary_eval_once();
+}
+
+#[test]
+fn bitwise_operands_are_evaluated_once_left_then_right() {
+    let resolver = HostCallResolver::new(bitwise::catalog());
+    for (op, lhs, rhs, result) in [
+        (BitwiseBinary::And, 6.0, 3.0, "2"),
+        (BitwiseBinary::Or, 4.0, 3.0, "7"),
+        (BitwiseBinary::Xor, 6.0, 3.0, "5"),
+        (BitwiseBinary::Shl, 1.0, 31.0, "-2147483648"),
+        (BitwiseBinary::Shr, -1.0, 1.0, "2147483647"),
+        (BitwiseBinary::Sar, -4.0, 1.0, "-2"),
+    ] {
+        assert_binary_eval_once(
+            op.name(),
+            lhs,
+            rhs,
+            result,
+            result.parse::<f64>().unwrap().to_bits(),
+            |lowering, left, right| {
+                lowering
+                    .bitwise_binary(&resolver, op, left, right)
+                    .expect("lower bitwise operation")
+            },
+        );
+    }
+
+    let mut builder = LocalIrBuilder::new();
+    let sequence = builder.alloc_local_named("sequence").expect("sequence");
+    let mark = builder.alloc_local_named("mark").expect("mark");
+    let value = NumberLowering::new(&mut builder)
+        .bitwise_not(&resolver, observed_count(sequence, mark, 0.0))
+        .expect("lower complement");
+    let ran = run(
+        builder,
+        vec![
+            let_int(sequence, 0),
+            let_int(mark, 0),
+            expr_stmt(value.into_expr()),
+        ],
+    );
+    assert_eq!(local_int(&ran, sequence), 1);
+    assert_eq!(local_int(&ran, mark), 1);
+    assert_protocol_number(&ran.stack[0], "-1", (-1.0f64).to_bits());
 }
 
 #[test]
@@ -414,7 +461,7 @@ fn assert_binary_eval_once(
     rhs: f64,
     text: &str,
     bits: u64,
-    op: fn(&mut NumberLowering<'_>, ClassifiedNumber, ClassifiedNumber) -> ClassifiedNumber,
+    op: impl FnOnce(&mut NumberLowering<'_>, ClassifiedNumber, ClassifiedNumber) -> ClassifiedNumber,
 ) {
     let mut builder = LocalIrBuilder::new();
     let sequence = builder.alloc_local_named("sequence").expect("sequence");
@@ -508,6 +555,7 @@ fn run_stmts(local_count: usize, stmts: Vec<Stmt>) -> Ran {
         .compile_program(&stmts)
         .unwrap_or_else(|error| panic!("compile failed: {error}"));
     let mut vm = Vm::new(program);
+    bitwise::bind(&mut vm).expect("bind bitwise test imports");
     vm.run()
         .unwrap_or_else(|error| panic!("run failed: {error}"));
     Ran {
