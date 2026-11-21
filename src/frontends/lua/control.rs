@@ -8,10 +8,17 @@
 //! statements, including a source `while` or `repeat`. Any goto, or a return
 //! that is not the chunk tail, becomes a private integer state loop. Each basic
 //! block is one state. A transfer assigns that state and `Continue`s the dispatch
-//! loop, so it is emitted only in the dispatch arm, never inside a nested
-//! source loop. `break` and `continue` inside a source loop stay Core
-//! statements of that loop. A source `repeat` is one Core `for`, not a copied
-//! body. Its private bool starts true, so the body runs before `until`. The
+//! loop, so that Continue is emitted only in the dispatch arm, never inside a
+//! nested source loop. `break` and `continue` inside a source loop stay Core
+//! statements of that loop. A `return` in `while`, `repeat`, or numeric `for`
+//! writes the one result, stores the exit state, and `Break`s that source loop
+//! so its post does not run. After every loop that can return, an exit-state
+//! guard `Break`s an enclosing source loop, or `Continue`s the dispatch loop
+//! once the source loop is already in the dispatch arm. A later arm transfer
+//! therefore cannot overwrite the exit state. A loop that cannot return is
+//! unchanged. `goto` and labels inside a loop are not in this slice. A source
+//! `repeat` is one Core `for`, not a copied body. Its private bool starts
+//! true, so the body runs before `until`. The
 //! `for` post stores whether another round is required. Fallthrough and
 //! `continue` both reach that post; `break` skips it and leaves this `for`,
 //! not an outer dispatch loop. `until` is placed once and can read the
@@ -174,6 +181,15 @@ impl<'a> Lower<'a> {
 
     fn lower_dispatch(&mut self, chunk: &Chunk) -> Result<Vec<CoreStmt>, ParseError> {
         self.dispatching = true;
+        // A loop return assigns these slots while its body is lowered. Allocate
+        // them before walking so that assign can name the same slots the root
+        // `let` declares below. The `let` still dominates every arm.
+        let state = self.alloc_private(STATE_SLOT)?;
+        self.state = Some(state);
+        if contains_return_block(&chunk.body) {
+            let result = self.alloc_private(RESULT_SLOT)?;
+            self.result = Some(result);
+        }
         let mut blocks = BlockBuf::new();
         self.walk_list(&chunk.body.stmts, &mut blocks)?;
         blocks.finish();
@@ -184,12 +200,6 @@ impl<'a> Lower<'a> {
             if let Some(label) = block.label {
                 self.label_state[label] = Some(self.state_id_of(index));
             }
-        }
-        let state = self.alloc_private(STATE_SLOT)?;
-        self.state = Some(state);
-        if contains_return_block(&chunk.body) {
-            let result = self.alloc_private(RESULT_SLOT)?;
-            self.result = Some(result);
         }
         let mut arms = Vec::with_capacity(blocks.finished.len());
         for (index, block) in blocks.finished.iter().enumerate() {
@@ -256,6 +266,16 @@ impl<'a> Lower<'a> {
                         line: self.line(*span),
                     });
                 }
+                Stmt::While { cond, body, span } => {
+                    for stmt in self.while_stmt(cond, body, *span, false)? {
+                        blocks.current.push(Item::Core(stmt));
+                    }
+                }
+                Stmt::Repeat { body, until, span } => {
+                    for stmt in self.repeat_stmt(body, until, *span, false)? {
+                        blocks.current.push(Item::Core(stmt));
+                    }
+                }
                 Stmt::NumericFor {
                     name,
                     start,
@@ -264,9 +284,9 @@ impl<'a> Lower<'a> {
                     body,
                     span,
                 } => {
-                    for stmt in
-                        self.numeric_for_stmts(name, start, limit, step.as_ref(), body, *span)?
-                    {
+                    let stmts =
+                        self.numeric_for_stmts(name, start, limit, step.as_ref(), body, *span)?;
+                    for stmt in self.with_return_guard(stmts, body, self.line(*span), false)? {
                         blocks.current.push(Item::Core(stmt));
                     }
                 }
@@ -294,10 +314,6 @@ impl<'a> Lower<'a> {
                 else_body,
                 span,
             } => self.if_item(arms, else_body.as_ref(), *span),
-            Stmt::While { cond, body, span } => Ok(Item::Core(self.while_stmt(cond, body, *span)?)),
-            Stmt::Repeat { body, until, span } => {
-                Ok(Item::Core(self.repeat_stmt(body, until, *span)?))
-            }
             Stmt::Break { span } | Stmt::Continue { span } => {
                 Err(self.fail(*span, "break or continue outside a source loop"))
             }
@@ -330,6 +346,18 @@ impl<'a> Lower<'a> {
                 items.extend(self.branch_items(&body.stmts)?);
                 continue;
             }
+            if let Stmt::While { cond, body, span } = stmt {
+                for core in self.while_stmt(cond, body, *span, false)? {
+                    items.push(Item::Core(core));
+                }
+                continue;
+            }
+            if let Stmt::Repeat { body, until, span } = stmt {
+                for core in self.repeat_stmt(body, until, *span, false)? {
+                    items.push(Item::Core(core));
+                }
+                continue;
+            }
             if let Stmt::NumericFor {
                 name,
                 start,
@@ -339,9 +367,9 @@ impl<'a> Lower<'a> {
                 span,
             } = stmt
             {
-                for core in
-                    self.numeric_for_stmts(name, start, limit, step.as_ref(), body, *span)?
-                {
+                let cores =
+                    self.numeric_for_stmts(name, start, limit, step.as_ref(), body, *span)?;
+                for core in self.with_return_guard(cores, body, self.line(*span), false)? {
                     items.push(Item::Core(core));
                 }
                 continue;
@@ -426,22 +454,20 @@ impl<'a> Lower<'a> {
         cond: &Expr,
         body: &Block,
         span: Span,
-    ) -> Result<CoreStmt, ParseError> {
-        if contains_transfer(body) || contains_label(body) {
-            return Err(self.fail(
-                span,
-                "goto, label, or return inside a loop is not in this slice",
-            ));
-        }
+        enclosing_loop: bool,
+    ) -> Result<Vec<CoreStmt>, ParseError> {
+        self.reject_loop_transfer(body, span)?;
         let (body_stmts, value) = self.straight(&body.stmts, true)?;
         if value.is_some() {
             return Err(self.fail(span, "return inside a loop is not in this slice"));
         }
-        Ok(CoreStmt::While {
+        let line = self.line(span);
+        let stmt = CoreStmt::While {
             condition: core_truthy(self.expr(cond)?),
             body: body_stmts,
-            line: self.line(span),
-        })
+            line,
+        };
+        self.with_return_guard(vec![stmt], body, line, enclosing_loop)
     }
 
     fn repeat_stmt(
@@ -449,13 +475,9 @@ impl<'a> Lower<'a> {
         body: &Block,
         until: &Expr,
         span: Span,
-    ) -> Result<CoreStmt, ParseError> {
-        if contains_transfer(body) || contains_label(body) {
-            return Err(self.fail(
-                span,
-                "goto, label, or return inside a loop is not in this slice",
-            ));
-        }
+        enclosing_loop: bool,
+    ) -> Result<Vec<CoreStmt>, ParseError> {
+        self.reject_loop_transfer(body, span)?;
         let (body_stmts, value) = self.straight(&body.stmts, true)?;
         if value.is_some() {
             return Err(self.fail(span, "return inside a loop is not in this slice"));
@@ -469,7 +491,7 @@ impl<'a> Lower<'a> {
         // would skip it. A `for` post is reached only after the body or a
         // `continue`, and a `break` in the body skips the post. The private
         // flag is a Core bool, not a Lua value.
-        Ok(CoreStmt::For {
+        let stmt = CoreStmt::For {
             init: Box::new(let_expr(again, CoreExpr::Bool(true), line)),
             condition: CoreExpr::Var(again),
             post: Box::new(set_slot(
@@ -479,7 +501,8 @@ impl<'a> Lower<'a> {
             )),
             body: body_stmts,
             line,
-        })
+        };
+        self.with_return_guard(vec![stmt], body, line, enclosing_loop)
     }
 
     fn numeric_for_stmts(
@@ -491,12 +514,7 @@ impl<'a> Lower<'a> {
         body: &Block,
         span: Span,
     ) -> Result<Vec<CoreStmt>, ParseError> {
-        if contains_transfer(body) || contains_label(body) {
-            return Err(self.fail(
-                span,
-                "goto, label, or return inside a loop is not in this slice",
-            ));
-        }
+        self.reject_loop_transfer(body, span)?;
         let (body_stmts, value) = self.straight(&body.stmts, true)?;
         if value.is_some() {
             return Err(self.fail(span, "return inside a loop is not in this slice"));
@@ -519,7 +537,7 @@ impl<'a> Lower<'a> {
         };
         let mut loop_body = vec![set_slot(visible, CoreExpr::Var(hidden), line)];
         loop_body.extend(body_stmts);
-        Ok(vec![
+        let stmts = vec![
             set_slot(hidden, start_expr, line),
             set_slot(limit_slot, limit_expr, line),
             set_slot(step_slot, step_expr, line),
@@ -537,6 +555,74 @@ impl<'a> Lower<'a> {
                 body: loop_body,
                 line,
             },
+        ];
+        Ok(stmts)
+    }
+
+    fn reject_loop_transfer(&self, body: &Block, span: Span) -> Result<(), ParseError> {
+        if contains_goto(body) || contains_label(body) {
+            return Err(self.fail(span, "goto or label inside a loop is not in this slice"));
+        }
+        Ok(())
+    }
+
+    fn with_return_guard(
+        &self,
+        mut stmts: Vec<CoreStmt>,
+        body: &Block,
+        line: u32,
+        enclosing_loop: bool,
+    ) -> Result<Vec<CoreStmt>, ParseError> {
+        if contains_return_block(body) {
+            stmts.push(self.exit_propagation(line, enclosing_loop)?);
+        }
+        Ok(stmts)
+    }
+
+    fn exit_propagation(&self, line: u32, enclosing_loop: bool) -> Result<CoreStmt, ParseError> {
+        let Some(state) = self.state else {
+            return Err(self.fail_line(line, "return leaves a loop without a dispatch state"));
+        };
+        // Break leaves the enclosing source loop and skips its post. Continue
+        // is only legal in the dispatch arm: it is the same exit a chunk
+        // return already uses, and it runs before a later transfer can store
+        // another state.
+        let leave = if enclosing_loop {
+            CoreStmt::Break { line }
+        } else {
+            CoreStmt::Continue { line }
+        };
+        Ok(CoreStmt::IfElse {
+            condition: CoreExpr::Eq(
+                Box::new(CoreExpr::Var(state)),
+                Box::new(CoreExpr::Int(EXIT_STATE)),
+            ),
+            then_branch: vec![leave],
+            else_branch: Vec::new(),
+            line,
+        })
+    }
+
+    fn loop_return(
+        &mut self,
+        values: &ast::ExprList,
+        span: Span,
+    ) -> Result<Vec<CoreStmt>, ParseError> {
+        let expr = self.one_value(values, span)?;
+        let line = self.line(span);
+        let Some(result) = self.result else {
+            return Err(self.fail(span, "return without a result slot"));
+        };
+        let Some(state) = self.state else {
+            return Err(self.fail(span, "return leaves a loop without a dispatch state"));
+        };
+        // Continue would resume this source loop and run its post. Break
+        // skips that post. The expression is the assign operand, so it runs
+        // once, before the exit state is stored.
+        Ok(vec![
+            set_slot(result, expr, line),
+            set_slot(state, CoreExpr::Int(EXIT_STATE), line),
+            CoreStmt::Break { line },
         ])
     }
 
@@ -596,6 +682,10 @@ impl<'a> Lower<'a> {
             match stmt {
                 Stmt::Empty { .. } => {}
                 Stmt::Return { values, span } => {
+                    if in_loop && self.dispatching {
+                        out.extend(self.loop_return(values, *span)?);
+                        return Ok((out, None));
+                    }
                     if !last || in_loop {
                         return Err(self.fail(*span, "early return needs dispatch"));
                     }
@@ -630,6 +720,12 @@ impl<'a> Lower<'a> {
                 Stmt::Goto { span, .. } | Stmt::Label { span, .. } => {
                     return Err(self.fail(*span, "goto or label in a direct statement"));
                 }
+                Stmt::While { cond, body, span } => {
+                    out.extend(self.while_stmt(cond, body, *span, in_loop)?);
+                }
+                Stmt::Repeat { body, until, span } => {
+                    out.extend(self.repeat_stmt(body, until, *span, in_loop)?);
+                }
                 Stmt::NumericFor {
                     name,
                     start,
@@ -638,14 +734,9 @@ impl<'a> Lower<'a> {
                     body,
                     span,
                 } => {
-                    out.extend(self.numeric_for_stmts(
-                        name,
-                        start,
-                        limit,
-                        step.as_ref(),
-                        body,
-                        *span,
-                    )?);
+                    let stmts =
+                        self.numeric_for_stmts(name, start, limit, step.as_ref(), body, *span)?;
+                    out.extend(self.with_return_guard(stmts, body, self.line(*span), in_loop)?);
                 }
                 other => out.push(self.straight_stmt(other, in_loop)?),
             }
@@ -670,8 +761,6 @@ impl<'a> Lower<'a> {
                 else_body,
                 span,
             } => self.if_core(arms, else_body.as_ref(), *span, in_loop),
-            Stmt::While { cond, body, span } => self.while_stmt(cond, body, *span),
-            Stmt::Repeat { body, until, span } => self.repeat_stmt(body, until, *span),
             Stmt::Break { span } if in_loop => Ok(CoreStmt::Break {
                 line: self.line(*span),
             }),

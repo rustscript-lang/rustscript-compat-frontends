@@ -2654,3 +2654,256 @@ fn repeat_continue_past_a_local_is_rejected_at_load() {
         "load rejection marker missing; this is not a full-text match: {stderr}"
     );
 }
+
+fn private_binding_count(ir: &FrontendIr, name: &str) -> usize {
+    ir.local_bindings
+        .iter()
+        .filter(|(binding, _)| binding == name)
+        .count()
+}
+
+fn assert_one_dispatch_and_result(ir: &FrontendIr) -> LocalSlot {
+    assert_eq!(
+        private_binding_count(ir, "$lua_dispatch_state"),
+        1,
+        "dispatch state was duplicated: {:?}",
+        ir.local_bindings
+    );
+    assert_eq!(
+        private_binding_count(ir, "$lua_return_value"),
+        1,
+        "return result was duplicated: {:?}",
+        ir.local_bindings
+    );
+    let state = slot_named(ir, "$lua_dispatch_state").expect("dispatch state");
+    assert_eq!(
+        dispatch_while_count(&ir.stmts, state),
+        1,
+        "source return must reuse the one dispatch loop"
+    );
+    state
+}
+
+// 12 is the taken return n + 10. 4 is the finished loop's tail return.
+// 2 would mean the add was dropped. An open back-edge cannot hide in 12:
+// the condition stops at 4.
+const WHILE_RETURN_HIT: &str = "\
+local n = 0
+while n < 4 do
+  n = n + 1
+  if n == 2 then
+    return n + 10
+  end
+end
+return n
+";
+
+const WHILE_RETURN_MISS: &str = "\
+local n = 0
+while n < 4 do
+  n = n + 1
+  if n == 9 then
+    return n + 10
+  end
+end
+return n
+";
+
+#[test]
+fn while_return_leaves_the_chunk_and_a_false_condition_continues() {
+    expect_number("while_return_hit", WHILE_RETURN_HIT, 12.0);
+    expect_number("while_return_miss", WHILE_RETURN_MISS, 4.0);
+    let hit = lowered(WHILE_RETURN_HIT);
+    let state = assert_one_dispatch_and_result(&hit);
+    assert_eq!(
+        source_while_count(&hit.stmts, Some(state)),
+        1,
+        "while return copied the source loop"
+    );
+    let miss = lowered(WHILE_RETURN_MISS);
+    let miss_state = assert_one_dispatch_and_result(&miss);
+    assert_eq!(source_while_count(&miss.stmts, Some(miss_state)), 1);
+}
+
+// 21 is n + 20 on the first body. 1 is the tail return after leaving the
+// repeat without using that expression. until false repeats forever if the
+// return continues this loop; fuel exhaustion is that back-edge, not a value.
+// 7 is two finished trips plus the tail add, with the return condition false.
+const REPEAT_RETURN_HIT: &str = "\
+local n = 0
+repeat
+  n = n + 1
+  if n == 1 then
+    return n + 20
+  end
+until false
+return n
+";
+
+const REPEAT_RETURN_MISS: &str = "\
+local n = 0
+repeat
+  n = n + 1
+  if n == 9 then
+    return n + 20
+  end
+until n == 2
+return n + 5
+";
+
+#[test]
+fn repeat_return_leaves_before_until_false_and_a_finished_repeat_continues() {
+    expect_number("repeat_return_hit", REPEAT_RETURN_HIT, 21.0);
+    expect_number("repeat_return_miss", REPEAT_RETURN_MISS, 7.0);
+    let hit = lowered(REPEAT_RETURN_HIT);
+    assert_one_dispatch_and_result(&hit);
+    assert_repeat_fors(&hit, 1);
+    let miss = lowered(REPEAT_RETURN_MISS);
+    assert_one_dispatch_and_result(&miss);
+    assert_repeat_fors(&miss, 1);
+}
+
+// 33 is s + 30 after i = 1 then i = 2 (s = 3). 10 is the finished 1+2+3+4.
+// 3 would drop the add. A step after the return would reach the tail 10.
+const NUMERIC_FOR_RETURN_HIT: &str = "\
+local s = 0
+for i = 1, 4 do
+  s = s + i
+  if i == 2 then
+    return s + 30
+  end
+end
+return s
+";
+
+const NUMERIC_FOR_RETURN_MISS: &str = "\
+local s = 0
+for i = 1, 4 do
+  s = s + i
+  if i == 9 then
+    return s + 30
+  end
+end
+return s
+";
+
+#[test]
+fn numeric_for_return_leaves_before_the_step_and_a_finished_for_continues() {
+    expect_numeric("numeric_for_return_hit", NUMERIC_FOR_RETURN_HIT, 33.0);
+    expect_numeric("numeric_for_return_miss", NUMERIC_FOR_RETURN_MISS, 10.0);
+    let hit = lowered_numeric(NUMERIC_FOR_RETURN_HIT);
+    assert_one_dispatch_and_result(&hit);
+    assert_eq!(
+        numeric_for_count(&hit),
+        1,
+        "numeric for return copied the source loop"
+    );
+    let miss = lowered_numeric(NUMERIC_FOR_RETURN_MISS);
+    assert_one_dispatch_and_result(&miss);
+    assert_eq!(numeric_for_count(&miss), 1);
+}
+
+// 42 is wave + i + 40 on the first numeric trip (1 + 1 + 40).
+// 1 is the chunk tail if the while exits before its own trailing add.
+// 51 is that trailing add plus the chunk tail, so the repeat body after the
+// for ran. until false exhausts fuel if the numeric return only breaks the
+// inner for and the repeat back-edge still runs.
+const NESTED_LOOP_RETURN: &str = "\
+local wave = 0
+while wave < 3 do
+  wave = wave + 1
+  repeat
+    for i = 1, 2 do
+      if wave == 1 then
+        if i == 1 then
+          return wave + i + 40
+        end
+      end
+    end
+  until false
+  wave = wave + 50
+end
+return wave
+";
+
+#[test]
+fn inner_return_skips_outer_loop_body_and_chunk_tail() {
+    expect_numeric("nested_loop_return", NESTED_LOOP_RETURN, 42.0);
+    let ir = lowered_numeric(NESTED_LOOP_RETURN);
+    let state = assert_one_dispatch_and_result(&ir);
+    assert_eq!(
+        source_while_count(&ir.stmts, Some(state)),
+        1,
+        "nested return copied the while"
+    );
+    assert_eq!(
+        repeat_flag_bindings(&ir).len(),
+        1,
+        "nested return copied the repeat"
+    );
+    assert_eq!(
+        numeric_for_count(&ir),
+        1,
+        "nested return copied the numeric for"
+    );
+}
+
+// 61 is the loop return n + 60. 141 is n + 40 then goto done then n + 100,
+// which is the following write replacing the return. 108 is the else goto.
+// 143 is the same arm with the return condition false: the while finishes,
+// the following write runs, and the external goto still reaches done.
+const LOOP_RETURN_GOTO_HIT: &str = "\
+local pick = 1
+local n = 0
+if pick == 1 then
+  while n < 3 do
+    n = n + 1
+    if n == 1 then
+      return n + 60
+    end
+  end
+  n = n + 40
+  goto done
+else
+  n = 8
+  goto done
+end
+::done::
+return n + 100
+";
+
+const LOOP_RETURN_GOTO_MISS: &str = "\
+local pick = 1
+local n = 0
+if pick == 1 then
+  while n < 3 do
+    n = n + 1
+    if n == 9 then
+      return n + 60
+    end
+  end
+  n = n + 40
+  goto done
+else
+  n = 8
+  goto done
+end
+::done::
+return n + 100
+";
+
+#[test]
+fn return_inside_dispatch_if_arm_is_not_replaced_by_the_following_goto() {
+    expect_number("loop_return_goto_hit", LOOP_RETURN_GOTO_HIT, 61.0);
+    expect_number("loop_return_goto_miss", LOOP_RETURN_GOTO_MISS, 143.0);
+    let hit = lowered(LOOP_RETURN_GOTO_HIT);
+    let state = assert_one_dispatch_and_result(&hit);
+    assert_eq!(
+        source_while_count(&hit.stmts, Some(state)),
+        1,
+        "goto arm copied the while"
+    );
+    let miss = lowered(LOOP_RETURN_GOTO_MISS);
+    let miss_state = assert_one_dispatch_and_result(&miss);
+    assert_eq!(source_while_count(&miss.stmts, Some(miss_state)), 1);
+}
