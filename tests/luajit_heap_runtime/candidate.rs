@@ -1008,6 +1008,10 @@ pub(super) fn lower_returning(
 ) -> Result<FrontendIr, ParseError> {
     let chunk = parser::parse_chunk(source.as_bytes())
         .map_err(|error| ParseError::at_line(error.line as usize, error.message))?;
+    let resolution = resolve::resolve(&chunk);
+    if let Some(error) = resolution.errors.first() {
+        return Err(ParseError::at_line(1, format!("{error:?}")));
+    }
     let mut lower = Lower {
         source,
         catalog,
@@ -1029,6 +1033,8 @@ pub(super) fn lower_returning(
         return_names: HashSet::new(),
         root_slot: 0,
         ignored_slot: None,
+        resolution: &resolution,
+        binding_slots: vec![None; resolution.bindings.len()],
     };
     if lower.receiver_width > 0 {
         let slot = lower.builder.alloc_local_named("#caller-frame")?;
@@ -1040,9 +1046,6 @@ pub(super) fn lower_returning(
             line: 1,
         });
         lower.caller_frame = Some(slot);
-    }
-    if let Some(error) = resolve::resolve(&chunk).errors.first() {
-        return Err(ParseError::at_line(1, format!("{error:?}")));
     }
     for stmt in &chunk.body.stmts {
         lower.lower_stmt(stmt)?;
@@ -1188,6 +1191,8 @@ struct Lower<'a> {
     return_names: HashSet<Vec<u8>>,
     root_slot: u32,
     ignored_slot: Option<LocalSlot>,
+    resolution: &'a resolve::Resolution,
+    binding_slots: Vec<Option<LocalSlot>>,
 }
 
 #[derive(Clone, Copy)]
@@ -1240,11 +1245,107 @@ impl Lower<'_> {
                 Ok(())
             }
             ast::Stmt::Empty { .. } => Ok(()),
+            ast::Stmt::Do { span, body } if !self.in_function => self.lower_do(*span, body),
             other => Err(ParseError::at_line(
                 self.line(stmt_span(other)) as usize,
                 "Lua statement not lowered yet",
             )),
         }
+    }
+
+    /// Normal exit of one chunk `do`. Slots declared in this block leave
+    /// `live_locals`. Same-name outer slots stay where they are, including a
+    /// slot already removed by `= nil`. A function body is not this path.
+    fn lower_do(&mut self, span: ast::Span, body: &ast::Block) -> Result<(), ParseError> {
+        for stmt in &body.stmts {
+            self.lower_stmt(stmt)?;
+        }
+        self.retire_block(span, body)
+    }
+
+    fn retire_block(&mut self, span: ast::Span, body: &ast::Block) -> Result<(), ParseError> {
+        let Some(scope_id) = self.block_scope(span, body) else {
+            return Ok(());
+        };
+        let ended: Vec<usize> = self
+            .resolution
+            .bindings
+            .iter()
+            .enumerate()
+            .filter(|(_, binding)| binding.function_id == 0 && binding.scope_id == scope_id)
+            .map(|(index, _)| index)
+            .collect();
+        for index in ended {
+            let Some(slot) = self.binding_slots[index] else {
+                continue;
+            };
+            self.live_locals.retain(|local| *local != slot);
+            let name = self.resolution.bindings[index].name.clone();
+            if self.locals.get(&name).copied() == Some(slot) {
+                if let Some(outer) = self.visible_slot(&name, span.end) {
+                    self.locals.insert(name, outer);
+                } else {
+                    self.locals.remove(&name);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Scope of the locals this `do` itself declares. Nested blocks have a
+    /// different `visible_to`, and the chunk scope can share this statement's
+    /// end byte when the block is last.
+    fn block_scope(&self, span: ast::Span, body: &ast::Block) -> Option<u32> {
+        self.resolution.bindings.iter().find_map(|binding| {
+            let inside = binding.span.start >= body.span.start && binding.span.end <= body.span.end;
+            if binding.function_id == 0 && inside && binding.visible_to == span.end {
+                Some(binding.scope_id)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn visible_slot(&self, name: &[u8], at: u32) -> Option<LocalSlot> {
+        let mut best: Option<(usize, u32)> = None;
+        for (index, binding) in self.resolution.bindings.iter().enumerate() {
+            if binding.function_id != 0 || binding.name != name {
+                continue;
+            }
+            if at < binding.visible_from || at >= binding.visible_to {
+                continue;
+            }
+            if best.is_none_or(|(_, from)| binding.visible_from >= from) {
+                best = Some((index, binding.visible_from));
+            }
+        }
+        best.and_then(|(index, _)| self.binding_slots[index])
+    }
+
+    fn remember_binding(
+        &mut self,
+        span: ast::Span,
+        name: &ast::Name,
+        slot: LocalSlot,
+    ) -> Result<(), ParseError> {
+        if !self.in_function {
+            let index = self.chunk_binding(name, span)?;
+            self.binding_slots[index] = Some(slot);
+        }
+        self.locals.insert(name.bytes.clone(), slot);
+        Ok(())
+    }
+
+    fn chunk_binding(&self, name: &ast::Name, span: ast::Span) -> Result<usize, ParseError> {
+        self.resolution
+            .bindings
+            .iter()
+            .position(|binding| {
+                binding.function_id == 0
+                    && binding.name == name.bytes
+                    && binding.visible_from == span.end
+            })
+            .ok_or_else(|| self.unsupported(span))
     }
 
     fn lower_local(
@@ -1257,7 +1358,7 @@ impl Lower<'_> {
         let index = self
             .builder
             .alloc_local_named(&format!("#{}", span.start))?;
-        self.locals.insert(name.bytes.clone(), index);
+        self.remember_binding(span, name, index)?;
         self.live_locals.push(index);
         self.stmts.push(Stmt::Let {
             index,
@@ -1600,7 +1701,7 @@ impl Lower<'_> {
             let index = self
                 .builder
                 .alloc_local_named(&format!("#{}:{offset}", span.start))?;
-            self.locals.insert(name.name.bytes.clone(), index);
+            self.remember_binding(span, &name.name, index)?;
             if self.next_receiver_slot >= self.receiver_width {
                 return Err(self.unsupported(span));
             }

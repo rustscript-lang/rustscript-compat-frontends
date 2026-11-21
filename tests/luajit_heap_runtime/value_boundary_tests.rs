@@ -1453,3 +1453,192 @@ key = nil
         assert_eq!(host.resource_count(), if second_collect { 1 } else { 3 });
     }
 }
+
+fn assert_table_lifetime(host: &mut vm::HostContext<'_>, table: ObservedTable, alive: bool) {
+    let resource_key = heap::LuaTableResource::key();
+    assert_eq!(
+        heap::with_heap(host, |heap| Ok(heap.alive(table.table))).unwrap(),
+        alive,
+        "heap node {table:?}"
+    );
+    assert_eq!(
+        host.borrow_resource_with_key::<heap::LuaTableResource>(table.token, &resource_key)
+            .is_ok(),
+        alive,
+        "resource token {table:?}"
+    );
+}
+
+// Chunk `do` normal exit. The inner `value` is a different binding from the
+// outer one. An explicit collect inside the block must keep both, because the
+// outer binding is still in its lifetime while shadowed. Leaving the block
+// removes only the inner slot from the safepoint roots. It does not assign nil
+// and does not roll the root list back. The weak `drop` entry therefore dies
+// only on the next explicit collect; omitting that collect leaves the same table.
+#[test]
+fn lua_candidate_chunk_do_normal_exit_releases_shadow() {
+    let source = r#"
+local mt = {}
+mt.__mode = "v"
+local owner = {}
+setmetatable(owner, mt)
+local value = {}
+owner.keep = value
+observe_table(value, 0)
+do
+  local value = {}
+  owner.drop = value
+  observe_table(value, 0)
+  collectgarbage("collect")
+  observe_table(owner.keep, 0)
+  observe_table(owner.drop, 0)
+end
+@after@
+"#;
+    let collect_after = "\
+collectgarbage(\"collect\")
+observe_table(value, 0)
+observe_table(owner.keep, 0)
+return type(owner.drop)
+";
+    let omit_after = "\
+observe_table(value, 0)
+observe_table(owner.keep, 0)
+observe_table(owner.drop, 0)
+return type(owner.drop)
+";
+    for (after, result, collections, live_nodes, live_edges, resources) in [
+        (collect_after, "nil", 2, 3, 2, 3),
+        (omit_after, "table", 1, 4, 3, 4),
+    ] {
+        let mut vm = candidate(&source.replace("@after@", after));
+        assert_eq!(vm.run().expect("run chunk do"), VmStatus::Halted);
+        assert_eq!(vm.stack(), &[Value::string(result)], "{result}");
+        let mut host = vm.host_context();
+        let tables = host.scope_state::<Vec<ObservedTable>>().unwrap().clone();
+        let outer = tables[0];
+        let inner = tables[1];
+        let keep_inside = tables[2];
+        let drop_inside = tables[3];
+        let outer_after = tables[4];
+        let keep_after = tables[5];
+        assert_eq!(
+            keep_inside, outer,
+            "in-block collect keeps the outer object"
+        );
+        assert_eq!(
+            drop_inside, inner,
+            "in-block collect keeps the inner object"
+        );
+        assert_eq!(outer_after, outer, "the restored name is the outer object");
+        assert_eq!(keep_after, outer, "owner.keep is the outer object");
+        let drop_alive = result == "table";
+        if drop_alive {
+            assert_eq!(tables[6], inner, "omitted collect leaves the inner object");
+        }
+        for (table, alive) in [
+            (outer, true),
+            (inner, drop_alive),
+            (keep_inside, true),
+            (drop_inside, drop_alive),
+            (outer_after, true),
+            (keep_after, true),
+        ] {
+            assert_table_lifetime(&mut host, table, alive);
+        }
+        if drop_alive {
+            assert_table_lifetime(&mut host, tables[6], true);
+        }
+        let stats = heap::stats(&mut host).unwrap();
+        assert_eq!(stats.collections, collections, "{result}");
+        assert_eq!(stats.live_nodes, live_nodes, "{result}");
+        assert_eq!(stats.live_edges, live_edges, "{result}");
+        assert_eq!(stats.live_roots, 0, "{result}");
+        assert_eq!(host.resource_count(), resources, "{result}");
+    }
+}
+
+// Nested normal exit retires only that block's slot. Clearing a non-shadowed
+// outer local stays cleared: leaving the block must not put that slot back.
+#[test]
+fn lua_candidate_chunk_do_normal_exit_keeps_cleared_outer_dead() {
+    let source = r#"
+local mt = {}
+mt.__mode = "v"
+local owner = {}
+setmetatable(owner, mt)
+local value = {}
+local cleared = {}
+owner.keep = value
+owner.cleared = cleared
+observe_table(value, 0)
+observe_table(cleared, 0)
+do
+  cleared = nil
+  local mid = {}
+  owner.mid = mid
+  observe_table(mid, 0)
+  do
+    local value = {}
+    owner.drop = value
+    observe_table(value, 0)
+  end
+  collectgarbage("collect")
+  observe_table(owner.keep, 0)
+  observe_table(owner.mid, 0)
+end
+collectgarbage("collect")
+observe_table(value, 0)
+observe_table(owner.keep, 0)
+return type(owner.mid)
+"#;
+    let mut vm = candidate(source);
+    assert_eq!(vm.run().expect("run nested chunk do"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("nil")]);
+    let mut host = vm.host_context();
+    let tables = host.scope_state::<Vec<ObservedTable>>().unwrap().clone();
+    let [
+        outer,
+        cleared,
+        mid,
+        inner,
+        keep_inside,
+        mid_inside,
+        outer_after,
+        keep_after,
+    ] = tables.as_slice()
+    else {
+        panic!("expected eight observed tables, got {}", tables.len());
+    };
+    assert_eq!(
+        *keep_inside, *outer,
+        "shadowed outer stays live inside the block"
+    );
+    assert_eq!(*mid_inside, *mid, "the mid binding is still in scope");
+    assert_eq!(*outer_after, *outer);
+    assert_eq!(*keep_after, *outer);
+    for (table, alive) in [
+        (*outer, true),
+        (*cleared, false),
+        (*mid, false),
+        (*inner, false),
+        (*keep_inside, true),
+        (*mid_inside, false),
+        (*outer_after, true),
+        (*keep_after, true),
+    ] {
+        assert_table_lifetime(&mut host, table, alive);
+    }
+    let stats = heap::stats(&mut host).unwrap();
+    // First collect drops cleared and the nested value. Second collect drops mid.
+    assert_eq!(
+        (
+            stats.collections,
+            stats.live_nodes,
+            stats.live_edges,
+            stats.live_roots
+        ),
+        (2, 3, 2, 0)
+    );
+    assert_eq!(host.resource_count(), 3);
+}
