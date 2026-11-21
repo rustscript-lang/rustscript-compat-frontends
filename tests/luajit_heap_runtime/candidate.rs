@@ -553,27 +553,55 @@ fn root_issued(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
 }
 
 fn set_edge(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
-    let (from, key, to) = match call.args() {
-        [from, key, to] => (from.clone(), float_u32(key)?, to.clone()),
+    let (from, key_value, to_value) = match call.args() {
+        [from, key, to] => (from.clone(), key.clone(), to.clone()),
         _ => return Err(host_fault("invalid table edge")),
     };
     let from = match classify(&mut call.vm().host_context(), &from)? {
         heap::GuestClass::Table(table) => table,
         _ => return Err(host_fault("edge source is not a table")),
     };
-    let to = match classify(&mut call.vm().host_context(), &to)? {
-        heap::GuestClass::Table(table) => table,
-        _ => return Err(host_fault("edge target is not a table")),
-    };
-    heap::with_heap(&mut call.vm().host_context(), |heap| {
-        heap.set_edge(from, key, to)
-    })
-    .map_err(heap_error)?;
-    with_witness(call.vm(), |witness| {
-        if witness.field_key.is_none() {
-            witness.field_key = Some(key);
+    match key_value {
+        Value::Int(key) => {
+            // Only the private dot lowering emits an Int field id.
+            let key = u32::try_from(key).map_err(|_| host_fault("invalid field id"))?;
+            let to = match classify(&mut call.vm().host_context(), &to_value)? {
+                heap::GuestClass::Table(table) => table,
+                _ => return Err(host_fault("edge target is not a table")),
+            };
+            heap::with_heap(&mut call.vm().host_context(), |heap| {
+                heap.set_edge(from, key, to)
+            })
+            .map_err(heap_error)?;
+            with_witness(call.vm(), |witness| {
+                if witness.field_key.is_none() {
+                    witness.field_key = Some(key);
+                }
+            })?;
         }
-    })?;
+        other => {
+            let heap::GuestClass::Table(key) = classify(&mut call.vm().host_context(), &other)?
+            else {
+                return Err(host_fault("edge key is not a table"));
+            };
+            if matches!(to_value, Value::Null) {
+                heap::with_heap(&mut call.vm().host_context(), |heap| {
+                    heap.clear_object_edge(from, key)
+                })
+                .map_err(heap_error)?;
+            } else {
+                let heap::GuestClass::Table(to) =
+                    classify(&mut call.vm().host_context(), &to_value)?
+                else {
+                    return Err(host_fault("edge target is not a table"));
+                };
+                heap::with_heap(&mut call.vm().host_context(), |heap| {
+                    heap.set_object_edge(from, key, to)
+                })
+                .map_err(heap_error)?;
+            }
+        }
+    }
     Ok(Value::Float(0.0))
 }
 
@@ -778,16 +806,25 @@ fn retire_chunk(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
 }
 
 fn get_edge(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
-    let (from, key) = match call.args() {
-        [from, key] => (from.clone(), float_u32(key)?),
+    let (from, key_value) = match call.args() {
+        [from, key] => (from.clone(), key.clone()),
         _ => return Err(host_fault("invalid field read")),
     };
     let table = match classify(&mut call.vm().host_context(), &from)? {
         heap::GuestClass::Table(table) => table,
         _ => return Err(host_fault("field source is not a table")),
     };
-    let target = heap::with_heap(&mut call.vm().host_context(), |heap| heap.edge(table, key))
-        .map_err(heap_error)?;
+    let mut host = call.vm().host_context();
+    let target = if let Value::Int(key) = key_value {
+        let key = u32::try_from(key).map_err(|_| host_fault("invalid field id"))?;
+        heap::with_heap(&mut host, |heap| heap.edge(table, key))
+    } else {
+        let heap::GuestClass::Table(key) = classify(&mut host, &key_value)? else {
+            return Err(host_fault("edge key is not a table"));
+        };
+        heap::with_heap(&mut host, |heap| heap.object_edge(table, key))
+    }
+    .map_err(heap_error)?;
     let Some(target) = target else {
         return Ok(Value::Null);
     };
@@ -1287,11 +1324,91 @@ impl Lower<'_> {
                 let key = self.field_key(&name.bytes);
                 let from = self.expr(table)?;
                 let to = self.expr(value)?;
-                let expr = self.call(SET_EDGE, vec![from, Expr::Float(key as f64), to])?;
+                let expr = self.call(SET_EDGE, vec![from, Expr::Int(i64::from(key)), to])?;
                 self.emit_ignored(expr, self.line(span))
             }
+            (
+                ast::AssignTarget::Index {
+                    table,
+                    key,
+                    nav: false,
+                    ..
+                },
+                _,
+            ) => self.lower_index_assign(span, table, key, value),
             _ => Err(self.unsupported(span)),
         }
+    }
+
+    /// Evaluate the receiver and key before the RHS and keep their temporary
+    /// slots visible to explicit collection during later operand evaluation.
+    fn lower_index_assign(
+        &mut self,
+        span: ast::Span,
+        table: &ast::Expr,
+        key: &ast::Expr,
+        value: &ast::Expr,
+    ) -> Result<(), ParseError> {
+        let temp_base = self.active_temps.len();
+        let (from, key_slot) = self.index_operands(table, key, span)?;
+        let to = match value {
+            ast::Expr::Nil { .. } => Expr::Null,
+            other => self.expr(other)?,
+        };
+        self.active_temps.truncate(temp_base);
+        let expr = self.call(SET_EDGE, vec![Expr::Var(from), Expr::Var(key_slot), to])?;
+        self.emit_ignored(expr, self.line(span))
+    }
+
+    fn index_read(
+        &mut self,
+        base: &ast::Expr,
+        key: &ast::Expr,
+        span: ast::Span,
+    ) -> Result<Expr, ParseError> {
+        let temp_base = self.active_temps.len();
+        let (table, key_slot) = self.index_operands(base, key, span)?;
+        self.active_temps.truncate(temp_base);
+        self.call(GET_EDGE, vec![Expr::Var(table), Expr::Var(key_slot)])
+    }
+
+    fn index_operands(
+        &mut self,
+        base: &ast::Expr,
+        key: &ast::Expr,
+        span: ast::Span,
+    ) -> Result<(LocalSlot, LocalSlot), ParseError> {
+        if index_key_is_number(key) {
+            return Err(ParseError::at_line(
+                self.line(span) as usize,
+                "numeric table keys are not in this field-key subset",
+            ));
+        }
+        if !matches!(key, ast::Expr::Name { .. } | ast::Expr::Paren { .. }) {
+            return Err(self.unsupported(key.span()));
+        }
+        let table = self.expr(base)?;
+        let table = self.index_operand_slot(table, span)?;
+        let key = self.expr(key)?;
+        let key = self.index_operand_slot(key, span)?;
+        Ok((table, key))
+    }
+
+    fn index_operand_slot(&mut self, expr: Expr, span: ast::Span) -> Result<LocalSlot, ParseError> {
+        if let Expr::Var(slot) = expr {
+            return Ok(slot);
+        }
+        let slot = self
+            .builder
+            .alloc_local_named(&format!("#index:{}", self.stmts.len()))?;
+        self.stmts.push(Stmt::Let {
+            index: slot,
+            declared_schema: None,
+            expr,
+            line: self.line(span),
+        });
+        self.active_temps.push(slot);
+        Ok(slot)
     }
 
     fn lower_function(
@@ -1562,7 +1679,7 @@ impl Lower<'_> {
             line: self.line(span),
         });
         let key = self.field_key(key_name);
-        self.call(GET_EDGE, vec![Expr::Var(slot), Expr::Float(key as f64)])
+        self.call(GET_EDGE, vec![Expr::Var(slot), Expr::Int(i64::from(key))])
     }
 
     fn field_key(&mut self, name: &[u8]) -> u32 {
@@ -1637,15 +1754,14 @@ impl Lower<'_> {
                 }
                 Ok(left)
             }
-            ast::Expr::SuffixChain { steps, span, .. }
-                if steps
-                    .iter()
-                    .any(|step| matches!(step, ast::Suffix::Index { .. })) =>
+            ast::Expr::SuffixChain { base, steps, span }
+                if let [
+                    ast::Suffix::Index {
+                        key, nav: false, ..
+                    },
+                ] = steps.as_slice() =>
             {
-                Err(ParseError::at_line(
-                    self.line(*span) as usize,
-                    "numeric table keys are not in this field-key subset",
-                ))
+                self.index_read(base, key, *span)
             }
             ast::Expr::SuffixChain { base, steps, span }
                 if let [
@@ -1920,6 +2036,14 @@ fn chunk_receiver_width(stmts: &[ast::Stmt]) -> u32 {
         }
         count.saturating_add(u32::try_from(names.len()).unwrap_or(u32::MAX))
     })
+}
+
+fn index_key_is_number(key: &ast::Expr) -> bool {
+    match key {
+        ast::Expr::Number { .. } => true,
+        ast::Expr::Paren { inner, .. } => index_key_is_number(inner),
+        _ => false,
+    }
 }
 
 fn syntactic_direct_call(expr: &ast::Expr) -> bool {

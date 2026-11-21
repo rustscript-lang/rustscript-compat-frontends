@@ -170,11 +170,29 @@ struct Slot {
     metatable: Option<(u32, u32)>,
 }
 
+#[derive(Clone, Copy)]
 struct Edge {
     from: u32,
-    key: u32,
+    /// Field ids and object identities share this record. An object key is the
+    /// live slot and generation, not a guest number and not a second edge table.
+    key: EdgeKey,
     to_slot: u32,
     to_generation: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EdgeKey {
+    Field(u32),
+    Object { slot: u32, generation: u32 },
+}
+
+impl EdgeKey {
+    fn object(key: TableRef) -> Self {
+        Self::Object {
+            slot: key.slot(),
+            generation: key.generation(),
+        }
+    }
 }
 
 struct Frame {
@@ -193,8 +211,10 @@ struct Frame {
 /// taken.
 ///
 /// Edge work stays in its own fields. `index_edge_checks` is the two passes
-/// that build the outgoing index (2E). `outgoing_edge_checks` is the edges
-/// followed from marked nodes. `sweep_edge_checks` is the one edge filter,
+/// that build the outgoing index (2E). `outgoing_edge_checks` counts records
+/// followed from marked nodes. An object record has one key and one value
+/// target; each target contributes separately to `node_slot_visits`.
+/// `sweep_edge_checks` is the one edge filter,
 /// and it is zero when every live node is marked. Adding those fields is not
 /// a total GC cost.
 ///
@@ -260,7 +280,7 @@ pub struct ScanScratch {
     pub index_offsets_pushed: u64,
     /// Elements copied into `cursor` from `offsets`.
     pub index_cursor_copied: u64,
-    /// `targets` zero-initialized to the running in-range edge total.
+    /// Outgoing index entries zero-initialized to the in-range edge total.
     pub index_targets_inited: u64,
     /// Work-stack pushes. One per newly marked node. Not a reserve.
     pub work_pushed: u64,
@@ -285,7 +305,7 @@ pub(super) struct DoomedToken {
 /// Not stored on the heap, so it is not a second persistent graph.
 struct OutgoingIndex {
     offsets: Vec<u32>,
-    targets: Vec<(u32, u32)>,
+    entries: Vec<u32>,
 }
 
 /// Category of one guest value on this heap.
@@ -464,6 +484,35 @@ impl LuaHeap {
     /// Writes a reference edge. An existing key is overwritten and does not
     /// consume another edge slot. A new key at the cap fails without insert.
     pub fn set_edge(&mut self, from: TableRef, key: u32, to: TableRef) -> Result<(), HeapError> {
+        self.write_edge(from, EdgeKey::Field(key), to)
+    }
+
+    /// Writes one object-key edge in the same record and quota as a field edge.
+    ///
+    /// The key is the live slot and generation. A structurally equal carrier is
+    /// not a key: the caller classifies the issued array before this call.
+    pub fn set_object_edge(
+        &mut self,
+        from: TableRef,
+        key: TableRef,
+        to: TableRef,
+    ) -> Result<(), HeapError> {
+        self.require_live(key)?;
+        self.write_edge(from, EdgeKey::object(key), to)
+    }
+
+    /// Removes one object-key record. Another key, including a later generation
+    /// of the same slot, is a different identity and stays.
+    pub fn clear_object_edge(&mut self, from: TableRef, key: TableRef) -> Result<(), HeapError> {
+        self.require_live(from)?;
+        self.require_live(key)?;
+        let key = EdgeKey::object(key);
+        self.edges
+            .retain(|edge| edge.from != from.slot() || edge.key != key);
+        Ok(())
+    }
+
+    fn write_edge(&mut self, from: TableRef, key: EdgeKey, to: TableRef) -> Result<(), HeapError> {
         self.require_live(from)?;
         self.require_live(to)?;
         if let Some(edge) = self
@@ -490,6 +539,20 @@ impl LuaHeap {
 
     /// Reads a reference edge through either alias of `from`.
     pub fn edge(&self, from: TableRef, key: u32) -> Result<Option<TableRef>, HeapError> {
+        self.read_edge(from, EdgeKey::Field(key))
+    }
+
+    /// Reads an object-key edge. The key generation must still be that live slot.
+    pub fn object_edge(
+        &self,
+        from: TableRef,
+        key: TableRef,
+    ) -> Result<Option<TableRef>, HeapError> {
+        self.require_live(key)?;
+        self.read_edge(from, EdgeKey::object(key))
+    }
+
+    fn read_edge(&self, from: TableRef, key: EdgeKey) -> Result<Option<TableRef>, HeapError> {
         self.require_live(from)?;
         Ok(self.edges.iter().find_map(|edge| {
             if edge.from == from.slot() && edge.key == key {
@@ -809,12 +872,12 @@ impl LuaHeap {
             let start = index.offsets[slot as usize] as usize;
             let end = index.offsets[slot as usize + 1] as usize;
             self.scan.outgoing_edge_checks += (end - start) as u64;
-            for &(to_slot, to_generation) in &index.targets[start..end] {
-                self.scan.node_slot_visits += 1;
-                if self.slot_live(to_slot, to_generation) {
-                    self.scan.node_slot_visits += 1;
-                    self.mark_slot(to_slot, &mut work);
+            for &entry in &index.entries[start..end] {
+                let edge = self.edges[entry as usize];
+                if let EdgeKey::Object { slot, generation } = edge.key {
+                    self.follow_target(slot, generation, &mut work);
                 }
+                self.follow_target(edge.to_slot, edge.to_generation, &mut work);
             }
             if follow_metatables {
                 self.follow_metatable(slot, &mut work);
@@ -829,6 +892,10 @@ impl LuaHeap {
             return;
         };
         self.scan.metatable_edge_checks += 1;
+        self.follow_target(to_slot, to_generation, work);
+    }
+
+    fn follow_target(&mut self, to_slot: u32, to_generation: u32, work: &mut Vec<u32>) {
         self.scan.node_slot_visits += 1;
         if self.slot_live(to_slot, to_generation) {
             self.scan.node_slot_visits += 1;
@@ -865,20 +932,20 @@ impl LuaHeap {
         self.scan.index_edge_checks += edge_count as u64;
         let mut cursor = offsets.clone();
         self.scan.scratch.index_cursor_copied += cursor.len() as u64;
-        let mut targets = vec![(0u32, 0u32); running as usize];
-        self.scan.scratch.index_targets_inited += targets.len() as u64;
-        for edge in &self.edges {
+        let mut entries = vec![0u32; running as usize];
+        self.scan.scratch.index_targets_inited += entries.len() as u64;
+        for (entry, edge) in self.edges.iter().enumerate() {
             let from = edge.from as usize;
             if from >= slot_count {
                 continue;
             }
             let at = cursor[from] as usize;
-            if at < targets.len() {
-                targets[at] = (edge.to_slot, edge.to_generation);
+            if at < entries.len() {
+                entries[at] = entry as u32;
                 cursor[from] = cursor[from].saturating_add(1);
             }
         }
-        OutgoingIndex { offsets, targets }
+        OutgoingIndex { offsets, entries }
     }
 
     /// One filter of the edge vector. Skipped when every live node is marked,
@@ -893,9 +960,14 @@ impl LuaHeap {
         self.scan.node_slot_visits += marked.len() as u64;
         self.scan.scratch.sweep_bitmap_inited += marked.len() as u64;
         self.scan.sweep_edge_checks += self.edges.len() as u64;
+        let is_marked = |slot: u32| marked.get(slot as usize).copied().unwrap_or(false);
         self.edges.retain(|edge| {
-            marked.get(edge.from as usize).copied().unwrap_or(false)
-                && marked.get(edge.to_slot as usize).copied().unwrap_or(false)
+            is_marked(edge.from)
+                && is_marked(edge.to_slot)
+                && match edge.key {
+                    EdgeKey::Field(_) => true,
+                    EdgeKey::Object { slot, .. } => is_marked(slot),
+                }
         });
     }
 
@@ -926,8 +998,9 @@ impl LuaHeap {
     }
 
     fn remove_edges_touching(&mut self, slot: u32) {
-        self.edges
-            .retain(|edge| edge.from != slot && edge.to_slot != slot);
+        self.edges.retain(|edge| {
+            edge.from != slot && edge.to_slot != slot && !edge_key_is_slot(edge.key, slot)
+        });
     }
 
     fn clear_roots_to(&mut self, handle: TableRef) {
@@ -985,4 +1058,8 @@ impl LuaHeap {
     fn note_edge_peak(&mut self) {
         self.peak_edges = self.peak_edges.max(self.edges.len() as u32);
     }
+}
+
+fn edge_key_is_slot(key: EdgeKey, slot: u32) -> bool {
+    matches!(key, EdgeKey::Object { slot: key_slot, .. } if key_slot == slot)
 }

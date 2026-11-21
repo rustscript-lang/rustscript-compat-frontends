@@ -881,3 +881,235 @@ fn lua_candidate_omitting_the_collect_after_detach_keeps_the_metatable_target() 
     assert_eq!(stats.collections, 1);
     assert_eq!(stats.live_nodes, 4);
 }
+
+/// `owner[key] = value`, a real bracket read, and `owner[key] = nil`.
+/// The key is a live table identity, not a field name or a guest number.
+#[test]
+fn lua_candidate_assigns_reads_and_clears_a_table_object_key() {
+    let source = r#"
+local owner = {}
+local alias_owner = owner
+local key = {}
+local alias_key = key
+local other_key = {}
+local value = {}
+local replacement = {}
+observe_table(value, 0)
+observe_table(replacement, 0)
+owner[key] = value
+alias_owner[other_key] = nil
+observe_table(alias_owner[alias_key], 0)
+owner[other_key] = value
+alias_owner[alias_key] = replacement
+observe_table(owner[key], 0)
+alias_owner[alias_key] = nil
+observe_table(owner[other_key], 0)
+return type(owner[alias_key])
+"#;
+    let mut vm = candidate(source);
+    assert_eq!(
+        vm.run().expect("assign, read, and nil a table object key"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::string("nil")]);
+    let tables = vm
+        .host_context()
+        .scope_state::<Vec<ObservedTable>>()
+        .unwrap()
+        .clone();
+    let [value, replacement, via_alias, overwritten, other] = tables.as_slice() else {
+        panic!("expected five observed tables");
+    };
+    assert_eq!(via_alias, value, "aliases address the same entry");
+    assert_eq!(overwritten, replacement, "an overwrite replaces the value");
+    assert_eq!(other, value, "deletion leaves the distinct key alone");
+    assert_eq!(heap::stats(&mut vm.host_context()).unwrap().live_edges, 1);
+}
+
+#[test]
+fn lua_candidate_bracket_numbers_do_not_alias_private_field_ids() {
+    let source = r#"
+local function make()
+  local owner = {}
+  local value = {}
+  owner.field = value
+  return owner
+end
+local owner = make()
+local number = 1
+return type(owner[number])
+"#;
+    let mut vm = candidate(source);
+    assert!(matches!(vm.run(), Err(vm::VmError::HostError(message))
+        if message == "edge key is not a table"));
+}
+
+#[test]
+fn lua_candidate_collect_marks_object_key_and_value_from_owner_alone() {
+    let source = r#"
+local function make()
+  local owner = {}
+  local key = {}
+  local value = {}
+  local child = {}
+  local orphan = {}
+  key.child = child
+  value.self = value
+  orphan.self = orphan
+  owner[key] = value
+  observe_table(owner, 0)
+  observe_table(key, 0)
+  observe_table(value, 0)
+  observe_table(child, 0)
+  observe_table(orphan, 0)
+  return owner
+end
+local owner = make()
+collectgarbage("collect")
+return type(owner)
+"#;
+    let mut vm = candidate(source);
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("table")]);
+    let mut host = vm.host_context();
+    let tables = host.scope_state::<Vec<ObservedTable>>().unwrap().clone();
+    let [owner, key, value, child, orphan] = tables.as_slice() else {
+        panic!("expected five observed tables");
+    };
+    let resource_key = heap::LuaTableResource::key();
+    for table in [owner, key, value, child] {
+        assert!(
+            host.borrow_resource_with_key::<heap::LuaTableResource>(table.token, &resource_key)
+                .is_ok(),
+            "only the owner root should keep {table:?} alive"
+        );
+    }
+    assert!(
+        host.borrow_resource_with_key::<heap::LuaTableResource>(orphan.token, &resource_key)
+            .is_err()
+    );
+    assert_eq!(
+        heap::with_heap(&mut host, |heap| heap.object_edge(owner.table, key.table)).unwrap(),
+        Some(value.table)
+    );
+    let witness = host.scope_state::<candidate::ReturnWitness>().unwrap();
+    let [first] = witness.collects.as_slice() else {
+        panic!("expected one completed collection");
+    };
+    assert_eq!(first_collect_matrix(first), (0, 8, 3, 4, 4, 4, 1));
+    assert_eq!(host.resource_count(), 4);
+    let stats = heap::stats(&mut host).unwrap();
+    assert_eq!(stats.live_edges, 3);
+    assert_eq!(stats.live_roots, 0);
+}
+
+#[test]
+fn lua_candidate_collection_keeps_pending_index_receiver_and_key() {
+    let source = r#"
+local orphan = {}
+observe_table(orphan, 0)
+orphan = nil
+({})[({})] = collectgarbage("collect")
+"#;
+    let mut vm = candidate(source);
+    // The collector returns a number. Reaching the value error proves both
+    // already evaluated table operands survived validation.
+    assert!(matches!(vm.run(), Err(vm::VmError::HostError(message))
+        if message == "edge target is not a table"));
+    let mut host = vm.host_context();
+    let orphan = host.scope_state::<Vec<ObservedTable>>().unwrap()[0];
+    assert!(
+        host.borrow_resource_with_key::<heap::LuaTableResource>(
+            orphan.token,
+            &heap::LuaTableResource::key()
+        )
+        .is_err()
+    );
+    let stats = heap::stats(&mut host).unwrap();
+    assert_eq!(
+        (stats.collections, stats.live_nodes, stats.live_edges),
+        (1, 2, 0)
+    );
+}
+
+#[test]
+fn lua_candidate_nil_deletion_reclaims_key_and_value_only_on_next_collect() {
+    let source = r#"
+local function payload()
+  local value = {}
+  local orphan = {}
+  value.self = value
+  orphan.self = orphan
+  observe_table(value, 0)
+  observe_table(orphan, 0)
+  return value
+end
+local owner = {}
+local key = {}
+observe_table(owner, 0)
+observe_table(key, 0)
+local value = payload()
+owner[key] = value
+value = nil
+collectgarbage("collect")
+local read = owner[key]
+observe_table(read, 0)
+owner[key] = nil
+local missing = type(owner[key])
+read = nil
+key = nil
+"#;
+    // The key is needed for guest indexing and is explicitly released
+    // before the second collect. The value has no direct root at the first.
+    for second_collect in [false, true] {
+        let collect = if second_collect {
+            "collectgarbage(\"collect\")\n"
+        } else {
+            ""
+        };
+        let mut vm = candidate(&format!("{source}{collect}return missing\n"));
+        assert_eq!(vm.run().unwrap(), VmStatus::Halted, "{second_collect}");
+        assert_eq!(vm.stack(), &[Value::string("nil")]);
+        let mut host = vm.host_context();
+        let tables = host.scope_state::<Vec<ObservedTable>>().unwrap().clone();
+        let [owner, key, value, orphan, via_owner] = tables.as_slice() else {
+            panic!("expected five observed tables");
+        };
+        assert_eq!(via_owner, value, "the edge retained the issued VM carrier");
+        let witness = host.scope_state::<candidate::ReturnWitness>().unwrap();
+        assert_eq!(witness.collects.len(), if second_collect { 2 } else { 1 });
+        assert_eq!(
+            first_collect_matrix(&witness.collects[0]),
+            (0, 6, 2, 3, 3, 3, 1)
+        );
+        if second_collect {
+            assert_eq!(
+                first_collect_matrix(&witness.collects[1]),
+                (0, 2, 0, 1, 1, 1, 2)
+            );
+        }
+        let resource_key = heap::LuaTableResource::key();
+        for (table, alive) in [
+            (owner, true),
+            (key, !second_collect),
+            (value, !second_collect),
+            (orphan, false),
+        ] {
+            assert_eq!(
+                host.borrow_resource_with_key::<heap::LuaTableResource>(table.token, &resource_key)
+                    .is_ok(),
+                alive,
+                "resource lifetime after deletion for {table:?}"
+            );
+            assert_eq!(
+                heap::with_heap(&mut host, |heap| Ok(heap.alive(table.table))).unwrap(),
+                alive,
+                "heap lifetime after deletion for {table:?}"
+            );
+        }
+        let stats = heap::stats(&mut host).unwrap();
+        assert_eq!(stats.live_edges, u32::from(!second_collect));
+        assert_eq!(stats.live_roots, 0);
+        assert_eq!(host.resource_count(), if second_collect { 1 } else { 3 });
+    }
+}
