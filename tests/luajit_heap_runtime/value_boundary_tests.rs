@@ -882,7 +882,13 @@ fn lua_candidate_omitting_the_collect_after_detach_keeps_the_metatable_target() 
     assert_eq!(stats.live_nodes, 4);
 }
 
-fn assert_weak_probe(source: &str, result: &str, live: &[bool], edges: u32, collections: u32) {
+fn assert_weak_probe(
+    source: &str,
+    result: &str,
+    live: &[bool],
+    edges: u32,
+    collections: u32,
+) -> Vec<ObservedTable> {
     let mut vm = candidate(source);
     assert_eq!(
         vm.run().expect("execute weak-table probe"),
@@ -909,6 +915,7 @@ fn assert_weak_probe(source: &str, result: &str, live: &[bool], edges: u32, coll
     let stats = heap::stats(&mut host).unwrap();
     assert_eq!(stats.live_edges, edges, "stored entries after collection");
     assert_eq!(stats.collections, collections);
+    observed
 }
 
 #[test]
@@ -950,6 +957,32 @@ return type(owner[key])
     );
     let control = source.replace("collectgarbage(\"collect\")", "");
     assert_weak_probe(&control, "table", &[true; 7], 5, 0);
+}
+
+#[test]
+fn lua_candidate_weak_value_in_a_dot_field_is_released() {
+    let source = r#"
+local mt = {}
+mt.__mode = "v"
+local owner = {}
+setmetatable(owner, mt)
+local value = {}
+owner.keep = value
+observe_table(value, 0)
+value = nil
+collectgarbage("collect")
+return type(owner.keep)
+"#;
+    assert_weak_probe(source, "nil", &[false], 1, 1);
+
+    let control = source.replace(r#"collectgarbage("collect")"#, "");
+    assert_weak_probe(&control, "table", &[true], 2, 0);
+    let readback = control.replace(
+        "return type(owner.keep)",
+        "observe_table(owner.keep, 0)\nreturn type(owner.keep)",
+    );
+    let observed = assert_weak_probe(&readback, "table", &[true, true], 2, 0);
+    assert_eq!(observed[0], observed[1], "original weak field referent");
 }
 
 #[test]
@@ -1114,6 +1147,45 @@ return type(one[key])
     assert_weak_probe(&removed, "table", &[true, true], 2, 2);
     let unchanged = source.replace("@change@", "");
     assert_weak_probe(&unchanged, "nil", &[false, false], 1, 2);
+}
+
+#[test]
+fn lua_candidate_deleting_shared_mode_does_not_restore_a_cleared_entry() {
+    let setup = r#"
+local mt = {}
+mt.__mode = "v"
+local owner = {}
+local peer = {}
+setmetatable(owner, mt)
+setmetatable(peer, mt)
+local key = {}
+local value = {}
+local kept = {}
+owner[key] = value
+peer[key] = kept
+observe_table(value, 0)
+observe_table(kept, 0)
+value = nil
+"#;
+    let collect = r#"collectgarbage("collect")"#;
+    let read = "return type(owner[key])";
+    let first = format!("{setup}{collect}\nobserve_table(kept, 0)\n{read}");
+    assert_weak_probe(&first, "nil", &[false, true, true], 2, 1);
+
+    // The peer stays rooted through the first collection, then relies on its now strong entry.
+    let change = r#"
+mt.__mode = nil
+kept = nil
+collectgarbage("collect")
+observe_table(peer[key], 0)
+"#;
+    let source = format!("{setup}{collect}{change}{read}");
+    let observed = assert_weak_probe(&source, "nil", &[false, true, true], 1, 2);
+    assert_eq!(observed[1], observed[2], "original peer referent");
+
+    let control = format!("{setup}{change}{read}");
+    let observed = assert_weak_probe(&control, "table", &[true, true, true], 2, 1);
+    assert_eq!(observed[1], observed[2], "original peer referent");
 }
 
 #[test]
