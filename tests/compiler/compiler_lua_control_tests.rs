@@ -331,6 +331,11 @@ fn oracle_return(oracle: &str, path: &Path) -> f64 {
     assert!(run.lines > 0, "line hook saw no fixture execution");
     assert_eq!(run.argc, 0, "fixture path was passed as a script argument");
     assert_eq!(run.arg0, "nil", "fixture path leaked into arg[0]");
+    eprintln!(
+        "LUA_CONTROL oracle fixture={} jit=off value={}",
+        path.display(),
+        run.value
+    );
     run.value
 }
 
@@ -3330,10 +3335,6 @@ fn loop_outward_combination_selects_each_scalar_path() {
     );
 }
 
-// Legal LuaJIT: the label and its goto share the loop block and enter no
-// local. The private slice still refuses an in-loop label. This records that
-// current boundary. jump_into_local_is_a_static_rejection already covers the
-// resolver's refusal to enter a local, so this test does not repeat it.
 const IN_LOOP_LABEL: &str = "\
 local n = 0
 while n < 2 do
@@ -3348,37 +3349,147 @@ return n
 ";
 
 #[test]
-fn in_loop_label_fails_closed_outside_the_private_slice() {
-    let chunk = parser::parse_chunk(IN_LOOP_LABEL.as_bytes()).expect("parse in-loop label");
-    let resolution = resolve::resolve(&chunk);
+fn in_loop_label_runs_in_the_private_slice() {
+    expect_number("in_loop_label", IN_LOOP_LABEL, 11.0);
+}
+
+#[test]
+fn in_loop_label_while_backedge_stays_in_the_current_iteration() {
+    expect_number(
+        "while_iteration_backedge",
+        "\
+local n = 0
+local visits = 0
+while n < 2 do
+  visits = visits + 1
+  do
+    ::again::
+    n = n + 1
+    if n == 1 then continue end
+    if n == 2 then goto again end
+    n = n + 10
+  end
+end
+return visits * 100 + n
+",
+        213.0,
+    );
+}
+
+#[test]
+fn in_loop_label_repeat_keeps_until_on_the_source_loop() {
+    // Route 1 must stop on continue. Route 2 must reach n == 3 before
+    // testing `stop`. Route 3 must break even though `stop` is false.
+    for (route, expected) in [(1, 101.0), (2, 203.0), (3, 203.0)] {
+        expect_number(
+            &format!("repeat_iteration_post_{route}"),
+            &format!(
+                "\
+local route = {route}
+local rounds = 0
+local n = 0
+repeat
+  rounds = rounds + 1
+  local stop = route == 1
+  ::again::
+  n = n + 1
+  if n == 1 then continue end
+  if n == 2 then
+    stop = route == 2
+    goto again
+  end
+  if route == 3 then break end
+  if n > 3 then break end
+until stop
+return rounds * 100 + n
+",
+            ),
+            expected,
+        );
+    }
+}
+
+#[test]
+fn in_loop_label_numeric_for_goto_keeps_visible_index_until_post() {
+    expect_numeric(
+        "numeric_iteration_index",
+        "\
+local trace = 0
+for i = 1, 5 do
+  if i == 1 then continue end
+  if i == 4 then break end
+  trace = trace * 10 + i
+  i = i + 10
+  do goto mark end
+  trace = 999
+  ::mark::
+  trace = trace * 100 + i
+end
+return trace
+",
+        212313.0,
+    );
+}
+
+#[test]
+fn in_loop_label_coexists_with_nested_loop_controls_and_chunk_exits() {
+    for (route, expected) in [(1, 102.0), (2, 202.0), (3, 302.0), (4, 102.0)] {
+        expect_number(
+            &format!("iteration_and_chunk_exit_{route}"),
+            &format!(
+                "\
+local n = 0
+local route = {route}
+goto start
+n = 999
+::start::
+repeat
+  goto body
+  n = 999
+  ::body::
+  while true do
+    n = n + 1
+    if n == 1 then continue end
+    if route == 1 then goto done end
+    if route == 2 then return 200 + n end
+    break
+  end
+  if route == 4 then goto done end
+  return 300 + n
+until true
+do return 999 end
+::done::
+return 100 + n
+"
+            ),
+            expected,
+        );
+    }
+}
+
+#[test]
+fn in_loop_label_does_not_allow_jumping_into_a_local() {
+    let source = "\
+while true do
+  goto inside
+  local hidden = 42
+  ::inside::
+  return hidden
+end
+";
+    let path = write_fixture("loop_jump_into_local", source);
+    let error = compile_source_file_with_options(&path, candidate_options())
+        .err()
+        .expect("a goto cannot enter a local binding");
     assert!(
-        resolution.errors.is_empty(),
-        "an in-loop label that enters no local is legal: {:?}",
-        resolution.errors
+        error
+            .to_string()
+            .contains("jump into the scope of local hidden"),
+        "{error}"
     );
-    let error = control::lower_source(IN_LOOP_LABEL).expect_err("private slice");
-    let text = error.to_string();
-    assert!(
-        text.contains("not in this slice"),
-        "in-loop label must fail closed at the private slice, not as another class: {text}"
-    );
-    assert!(
-        !text.contains("jump into the scope of local"),
-        "this source does not enter a local: {text}"
-    );
-    let path = write_fixture("in_loop_label", IN_LOOP_LABEL);
-    let compiled = compile_source_file_with_options(&path, candidate_options());
-    assert!(
-        compiled.is_err(),
-        "in-loop label must not produce a program"
-    );
-    let Ok(oracle) = std::env::var("LUAJIT_ORACLE") else {
-        eprintln!("LUAJIT_ORACLE is unset; in-loop label acceptance is not a differential result");
-        return;
-    };
-    let observed = oracle_return(&oracle, &path);
-    assert_eq!(
-        observed, 11.0,
-        "LuaJIT accepts the in-loop label; candidate refusal is the private slice"
-    );
+    if let Ok(oracle) = std::env::var("LUAJIT_ORACLE") {
+        let output = oracle_load_rejection(&oracle, &path);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("LOAD_REJECT"));
+    }
 }

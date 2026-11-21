@@ -5,18 +5,18 @@
 //! not a file entry and not a fallback to the line lowerer.
 //!
 //! A chunk with no goto and no early return is emitted as ordinary
-//! statements, including a source `while` or `repeat`. Any goto, or a return
-//! that is not the chunk tail, becomes a private integer state loop. Each basic
-//! block is one state. A transfer assigns that state and `Continue`s the dispatch
-//! loop, so that Continue is emitted only in the dispatch arm, never inside a
-//! nested source loop. `break` and `continue` inside a source loop stay Core
-//! statements of that loop. A `return` in `while`, `repeat`, or numeric `for`
-//! writes the one result, stores the exit state, and `Break`s that source loop
-//! so its post does not run. After every loop that can return or jump outward,
-//! an exit-state guard `Break`s an enclosing source loop, or `Continue`s the
+//! statements, including a source `while` or `repeat`. Gotos and early returns
+//! use private integer state to dispatch basic blocks. A same-loop goto uses a
+//! separate dispatcher for the current iteration, reset at the start of each
+//! iteration. The source condition and post stay outside that dispatcher.
+//! A source `continue` ends the iteration dispatcher normally, reaching the
+//! post or next condition; `break` also leaves the source loop. Loops without
+//! same-loop gotos need no iteration dispatcher.
+//! A `return` in `while`, `repeat`, or numeric `for` writes the one result,
+//! stores the exit state, and `Break`s the nearest Core loop. Exit-state guards
+//! then `Break` through enclosing loops so their posts do not run, or `Continue` the
 //! dispatch loop once the source loop is already in the dispatch arm. A later
-//! arm transfer therefore cannot overwrite the exit state. A loop that cannot
-//! return and has no outward goto is unchanged. A `goto` in `while`, `repeat`,
+//! arm transfer therefore cannot overwrite the exit state. A `goto` in `while`, `repeat`,
 //! or numeric `for` may target a label the resolver has already accepted outside
 //! source loop. That goto stores a negative state — the resolver label index,
 //! not an arm id — and `Break`s, so this loop's tail and post do not run.
@@ -27,11 +27,11 @@
 //! negative carrier is required because the loop body is lowered before arm
 //! ids exist. Storing the positive id inside the loop would compare equal to
 //! the current arm when the label is that arm's own entry, and the statements
-//! after the loop would overwrite the jump. A label inside a loop, or a goto
-//! whose target is still inside a loop, is not in this slice. A source
-//! `repeat` is one Core `for`, not a copied body. Its private bool starts
-//! true, so the body runs before `until`. The
-//! `for` post stores whether another round is required. Fallthrough and
+//! after the loop would overwrite the jump. A goto targeting a different
+//! source loop, or a target label inside an `if` branch of the same region,
+//! remains outside this slice. A source `repeat` is one Core `for`, not a
+//! copied body. Its private bool starts true, so the body runs before `until`.
+//! The `for` post stores whether another round is required. Fallthrough and
 //! `continue` both reach that post; `break` skips it and leaves this `for`,
 //! not an outer dispatch loop. `until` is placed once and can read the
 //! same-round body locals. In this numeric/bool slice only `false` is falsy:
@@ -67,6 +67,7 @@ use vm::{
 const STATE_SLOT: &str = "$lua_dispatch_state";
 const RESULT_SLOT: &str = "$lua_return_value";
 const EXIT_STATE: i64 = 0;
+const ITERATION_BREAK: i64 = -1;
 
 pub(super) const NUMERIC_FOR_HOLDS: &str = "lua_control::numeric_for_holds";
 
@@ -88,7 +89,7 @@ pub(super) fn lower_source_with(
         source,
         &resolution,
         holds,
-        labels_inside_loops(&chunk, &resolution),
+        label_loop_owners(&chunk, &resolution),
     );
     let stmts = if needs_dispatch(&chunk) {
         lower.lower_dispatch(&chunk)?
@@ -112,8 +113,14 @@ struct Lower<'a> {
     nfor_slots: Vec<LocalSlot>,
     for_indexes: Vec<LocalSlot>,
     holds: Option<&'a HostCallResolver<'a>>,
-    labels_in_loops: Vec<bool>,
+    label_loops: Vec<Option<Span>>,
     pending_labels: Vec<usize>,
+}
+
+#[derive(Clone, Copy)]
+struct Iteration {
+    owner: Span,
+    state: LocalSlot,
 }
 
 struct BlockBuf {
@@ -158,7 +165,7 @@ impl<'a> Lower<'a> {
         source: &'a str,
         resolution: &'a Resolution,
         holds: Option<&'a HostCallResolver<'a>>,
-        labels_in_loops: Vec<bool>,
+        label_loops: Vec<Option<Span>>,
     ) -> Self {
         let slots = vec![None; resolution.bindings.len()];
         let label_state = vec![None; resolution.labels.len()];
@@ -176,7 +183,7 @@ impl<'a> Lower<'a> {
             nfor_slots: Vec::new(),
             for_indexes: Vec::new(),
             holds,
-            labels_in_loops,
+            label_loops,
             pending_labels: Vec::new(),
         }
     }
@@ -213,24 +220,8 @@ impl<'a> Lower<'a> {
             self.result = Some(result);
         }
         let mut blocks = BlockBuf::new();
-        self.walk_list(&chunk.body.stmts, &mut blocks)?;
-        blocks.finish();
-        if blocks.finished.is_empty() {
-            return Err(self.fail_line(1, "empty dispatch chunk"));
-        }
-        for (index, block) in blocks.finished.iter().enumerate() {
-            if let Some(label) = block.label {
-                self.label_state[label] = Some(self.state_id_of(index));
-            }
-        }
-        let mut arms = Vec::with_capacity(blocks.finished.len());
-        for (index, block) in blocks.finished.iter().enumerate() {
-            let state_id = index as i64 + 1;
-            let mut body = self.emit_items(&block.items)?;
-            body.extend(self.emit_exit(&block.exit, index, blocks.finished.len())?);
-            arms.push((state_id, body));
-        }
-        let chain = dispatch_chain(state, arms);
+        self.walk_list(&chunk.body.stmts, &mut blocks, None)?;
+        let chain = self.emit_dispatch(blocks, state)?;
         // An outward goto carries a negative label index until this point.
         // Arm ids exist only after the walk, so the rewrite stays here, on
         // the one dispatch loop, and only when a loop goto needs it.
@@ -253,14 +244,7 @@ impl<'a> Lower<'a> {
         if let Some(result) = self.result {
             root.push(let_expr(result, CoreExpr::Null, 1));
         }
-        root.push(CoreStmt::While {
-            condition: CoreExpr::Not(Box::new(CoreExpr::Eq(
-                Box::new(CoreExpr::Var(state)),
-                Box::new(CoreExpr::Int(EXIT_STATE)),
-            ))),
-            body: dispatch_body,
-            line: 1,
-        });
+        root.push(dispatch_loop(state, dispatch_body, 1));
         if let Some(result) = self.result {
             root.push(CoreStmt::Expr {
                 expr: CoreExpr::Var(result),
@@ -274,38 +258,60 @@ impl<'a> Lower<'a> {
         i64::try_from(block_index).expect("block index") + 1
     }
 
-    fn walk_list(&mut self, stmts: &[Stmt], blocks: &mut BlockBuf) -> Result<(), ParseError> {
+    fn walk_list(
+        &mut self,
+        stmts: &[Stmt],
+        blocks: &mut BlockBuf,
+        iteration: Option<Iteration>,
+    ) -> Result<(), ParseError> {
         for stmt in stmts {
             match stmt {
                 Stmt::Empty { .. } => {}
-                Stmt::Do { body, .. } => self.walk_list(&body.stmts, blocks)?,
+                Stmt::Do { body, .. } => self.walk_list(&body.stmts, blocks, iteration)?,
                 Stmt::Label { name, .. } => {
                     let index = self.label_index(name)?;
                     blocks.split_label(index);
                 }
                 Stmt::Goto { span, .. } => {
                     let label = self.goto_target(*span)?;
-                    blocks.flush(Exit::Goto {
-                        label,
-                        line: self.line(*span),
-                    });
+                    if self.label_loops[label] == iteration.map(|iteration| iteration.owner) {
+                        blocks.flush(Exit::Goto {
+                            label,
+                            line: self.line(*span),
+                        });
+                    } else {
+                        self.append_items(stmt, &mut blocks.current, iteration)?;
+                    }
                 }
-                Stmt::Return { values, span } => {
+                Stmt::Return { values, span } if iteration.is_none() => {
                     blocks.flush(Exit::Return {
                         expr: self.one_value(values, *span)?,
                         line: self.line(*span),
                     });
                 }
-                Stmt::While { cond, body, span } => {
-                    for stmt in self.while_stmt(cond, body, *span, false)? {
-                        blocks.current.push(Item::Core(stmt));
-                    }
-                }
-                Stmt::Repeat { body, until, span } => {
-                    for stmt in self.repeat_stmt(body, until, *span, false)? {
-                        blocks.current.push(Item::Core(stmt));
-                    }
-                }
+                other => self.append_items(other, &mut blocks.current, iteration)?,
+            }
+        }
+        Ok(())
+    }
+
+    fn append_items(
+        &mut self,
+        stmt: &Stmt,
+        items: &mut Vec<Item>,
+        iteration: Option<Iteration>,
+    ) -> Result<(), ParseError> {
+        // Inside an iteration dispatcher, a nested source loop's exit guard
+        // breaks that dispatcher before the outer source loop can unwind.
+        let enclosing_loop = iteration.is_some();
+        let cores = match (stmt, iteration) {
+            (Stmt::While { cond, body, span }, _) => {
+                self.while_stmt(cond, body, *span, enclosing_loop)?
+            }
+            (Stmt::Repeat { body, until, span }, _) => {
+                self.repeat_stmt(body, until, *span, enclosing_loop)?
+            }
+            (
                 Stmt::NumericFor {
                     name,
                     start,
@@ -313,20 +319,47 @@ impl<'a> Lower<'a> {
                     step,
                     body,
                     span,
-                } => {
-                    let stmts =
-                        self.numeric_for_stmts(name, start, limit, step.as_ref(), body, *span)?;
-                    for stmt in self.with_return_guard(stmts, body, self.line(*span), false)? {
-                        blocks.current.push(Item::Core(stmt));
-                    }
-                }
-                other => blocks.current.push(self.arm_item(other)?),
+                },
+                _,
+            ) => {
+                let cores =
+                    self.numeric_for_stmts(name, start, limit, step.as_ref(), body, *span)?;
+                self.with_return_guard(cores, body, self.line(*span), enclosing_loop)?
             }
-        }
+            (Stmt::Break { span } | Stmt::Continue { span }, Some(iteration)) => {
+                let line = self.line(*span);
+                let target = if matches!(stmt, Stmt::Break { .. }) {
+                    ITERATION_BREAK
+                } else {
+                    EXIT_STATE
+                };
+                vec![
+                    set_slot(iteration.state, CoreExpr::Int(target), line),
+                    CoreStmt::Break { line },
+                ]
+            }
+            (Stmt::Goto { span, .. }, Some(iteration)) => {
+                let label = self.goto_target(*span)?;
+                if self.label_loops[label] == Some(iteration.owner) {
+                    items.push(Item::Goto {
+                        label,
+                        line: self.line(*span),
+                    });
+                    return Ok(());
+                }
+                self.loop_goto(label, *span)?
+            }
+            (Stmt::Return { values, span }, Some(_)) => self.loop_return(values, *span)?,
+            (other, iteration) => {
+                items.push(self.arm_item(other, iteration)?);
+                return Ok(());
+            }
+        };
+        items.extend(cores.into_iter().map(Item::Core));
         Ok(())
     }
 
-    fn arm_item(&mut self, stmt: &Stmt) -> Result<Item, ParseError> {
+    fn arm_item(&mut self, stmt: &Stmt, iteration: Option<Iteration>) -> Result<Item, ParseError> {
         match stmt {
             Stmt::Empty { .. } => Ok(Item::Core(CoreStmt::Noop { line: 1 })),
             Stmt::Local {
@@ -343,7 +376,7 @@ impl<'a> Lower<'a> {
                 arms,
                 else_body,
                 span,
-            } => self.if_item(arms, else_body.as_ref(), *span),
+            } => self.if_item(arms, else_body.as_ref(), *span, iteration),
             Stmt::Break { span } | Stmt::Continue { span } => {
                 Err(self.fail(*span, "break or continue outside a source loop"))
             }
@@ -366,45 +399,21 @@ impl<'a> Lower<'a> {
         }
     }
 
-    fn branch_items(&mut self, stmts: &[Stmt]) -> Result<Vec<Item>, ParseError> {
+    fn branch_items(
+        &mut self,
+        stmts: &[Stmt],
+        iteration: Option<Iteration>,
+    ) -> Result<Vec<Item>, ParseError> {
         let mut items = Vec::new();
         for stmt in stmts {
             if matches!(stmt, Stmt::Empty { .. }) {
                 continue;
             }
             if let Stmt::Do { body, .. } = stmt {
-                items.extend(self.branch_items(&body.stmts)?);
-                continue;
+                items.extend(self.branch_items(&body.stmts, iteration)?);
+            } else {
+                self.append_items(stmt, &mut items, iteration)?;
             }
-            if let Stmt::While { cond, body, span } = stmt {
-                for core in self.while_stmt(cond, body, *span, false)? {
-                    items.push(Item::Core(core));
-                }
-                continue;
-            }
-            if let Stmt::Repeat { body, until, span } = stmt {
-                for core in self.repeat_stmt(body, until, *span, false)? {
-                    items.push(Item::Core(core));
-                }
-                continue;
-            }
-            if let Stmt::NumericFor {
-                name,
-                start,
-                limit,
-                step,
-                body,
-                span,
-            } = stmt
-            {
-                let cores =
-                    self.numeric_for_stmts(name, start, limit, step.as_ref(), body, *span)?;
-                for core in self.with_return_guard(cores, body, self.line(*span), false)? {
-                    items.push(Item::Core(core));
-                }
-                continue;
-            }
-            items.push(self.arm_item(stmt)?);
         }
         Ok(items)
     }
@@ -414,6 +423,7 @@ impl<'a> Lower<'a> {
         arms: &[ast::IfArm],
         else_body: Option<&Block>,
         span: Span,
+        iteration: Option<Iteration>,
     ) -> Result<Item, ParseError> {
         if arms.is_empty() {
             return Err(self.fail(span, "if has no arm"));
@@ -421,16 +431,16 @@ impl<'a> Lower<'a> {
         if if_has_label(arms, else_body) {
             return Err(self.fail(span, "a label inside if is not in this slice"));
         }
-        if !if_has_transfer(arms, else_body) {
+        if iteration.is_none() && !if_has_transfer(arms, else_body) {
             return Ok(Item::Core(self.if_core(arms, else_body, span, false)?));
         }
         let line = self.line(span);
         let mut else_body_items = match else_body {
-            Some(body) => self.branch_items(&body.stmts)?,
+            Some(body) => self.branch_items(&body.stmts, iteration)?,
             None => Vec::new(),
         };
         for arm in arms.iter().rev() {
-            let then_body = self.branch_items(&arm.body.stmts)?;
+            let then_body = self.branch_items(&arm.body.stmts, iteration)?;
             let cond = core_truthy(self.expr(&arm.cond)?);
             else_body_items = vec![Item::If {
                 cond,
@@ -486,11 +496,7 @@ impl<'a> Lower<'a> {
         span: Span,
         enclosing_loop: bool,
     ) -> Result<Vec<CoreStmt>, ParseError> {
-        self.reject_loop_transfer(body, span)?;
-        let (body_stmts, value) = self.straight(&body.stmts, true)?;
-        if value.is_some() {
-            return Err(self.fail(span, "return inside a loop is not in this slice"));
-        }
+        let body_stmts = self.loop_body(body, span)?;
         let line = self.line(span);
         let stmt = CoreStmt::While {
             condition: core_truthy(self.expr(cond)?),
@@ -507,11 +513,7 @@ impl<'a> Lower<'a> {
         span: Span,
         enclosing_loop: bool,
     ) -> Result<Vec<CoreStmt>, ParseError> {
-        self.reject_loop_transfer(body, span)?;
-        let (body_stmts, value) = self.straight(&body.stmts, true)?;
-        if value.is_some() {
-            return Err(self.fail(span, "return inside a loop is not in this slice"));
-        }
+        let body_stmts = self.loop_body(body, span)?;
         let line = self.line(span);
         let again = self.alloc_repeat_flag()?;
         let until_value = self.expr(until)?;
@@ -544,11 +546,7 @@ impl<'a> Lower<'a> {
         body: &Block,
         span: Span,
     ) -> Result<Vec<CoreStmt>, ParseError> {
-        self.reject_loop_transfer(body, span)?;
-        let (body_stmts, value) = self.straight(&body.stmts, true)?;
-        if value.is_some() {
-            return Err(self.fail(span, "return inside a loop is not in this slice"));
-        }
+        let body_stmts = self.loop_body(body, span)?;
         let line = self.line(span);
         let visible = self.slot(self.binding_for_index(name, body)?)?;
         if !self.dispatching {
@@ -589,11 +587,40 @@ impl<'a> Lower<'a> {
         Ok(stmts)
     }
 
-    fn reject_loop_transfer(&self, body: &Block, span: Span) -> Result<(), ParseError> {
-        if contains_label(body) || self.block_has_goto(body, false) {
-            return Err(self.fail(span, "goto or label inside a loop is not in this slice"));
+    fn loop_body(&mut self, body: &Block, owner: Span) -> Result<Vec<CoreStmt>, ParseError> {
+        if !self.block_has_goto(body, Some(owner)) {
+            let (stmts, value) = self.straight(&body.stmts, true)?;
+            debug_assert!(value.is_none());
+            return Ok(stmts);
         }
-        Ok(())
+        let line = self.line(owner);
+        let state = self.alloc_private(&format!("$lua_iteration_state_{}", owner.start))?;
+        let mut blocks = BlockBuf::new();
+        self.walk_list(&body.stmts, &mut blocks, Some(Iteration { owner, state }))?;
+        let chain = self.emit_dispatch(blocks, state)?;
+        let mut stmts = vec![
+            let_expr(state, CoreExpr::Int(1), line),
+            dispatch_loop(state, vec![chain], line),
+            CoreStmt::IfElse {
+                condition: CoreExpr::Eq(
+                    Box::new(CoreExpr::Var(state)),
+                    Box::new(CoreExpr::Int(ITERATION_BREAK)),
+                ),
+                then_branch: vec![CoreStmt::Break { line }],
+                else_branch: Vec::new(),
+                line,
+            },
+        ];
+        // A return or outward goto may have left the dispatcher directly, or
+        // via a nested loop's guard. Leave the source loop before its post.
+        if self.loop_can_exit_chunk_arm(body) {
+            stmts.push(self.exit_propagation(line, true)?);
+        }
+        Ok(stmts)
+    }
+
+    fn loop_can_exit_chunk_arm(&self, body: &Block) -> bool {
+        contains_return_block(body) || self.block_has_goto(body, None)
     }
 
     fn with_return_guard(
@@ -603,7 +630,7 @@ impl<'a> Lower<'a> {
         line: u32,
         enclosing_loop: bool,
     ) -> Result<Vec<CoreStmt>, ParseError> {
-        if contains_return_block(body) || self.block_has_goto(body, true) {
+        if self.loop_can_exit_chunk_arm(body) {
             stmts.push(self.exit_propagation(line, enclosing_loop)?);
         }
         Ok(stmts)
@@ -613,10 +640,9 @@ impl<'a> Lower<'a> {
         let Some(state) = self.state else {
             return Err(self.fail_line(line, "return leaves a loop without a dispatch state"));
         };
-        // Break leaves the enclosing source loop and skips its post. Continue
-        // is only legal in the dispatch arm: it is the same exit a chunk
-        // return already uses, and it runs before a later transfer can store
-        // another state.
+        // Break leaves the nearest source loop or iteration dispatcher.
+        // In a chunk dispatch arm, Continue takes the pending transfer before
+        // a later store can overwrite it.
         let leave = if enclosing_loop {
             CoreStmt::Break { line }
         } else {
@@ -650,9 +676,8 @@ impl<'a> Lower<'a> {
         let Some(state) = self.state else {
             return Err(self.fail(span, "return leaves a loop without a dispatch state"));
         };
-        // Continue would resume this source loop and run its post. Break
-        // skips that post. The expression is the assign operand, so it runs
-        // once, before the exit state is stored.
+        // Exit the nearest Core loop; the guards skip each source loop's post.
+        // Evaluate the result once, before recording the pending return.
         Ok(vec![
             set_slot(result, expr, line),
             set_slot(state, CoreExpr::Int(EXIT_STATE), line),
@@ -660,10 +685,12 @@ impl<'a> Lower<'a> {
         ])
     }
 
-    fn loop_goto(&mut self, span: Span) -> Result<Vec<CoreStmt>, ParseError> {
-        let label = self.goto_target(span)?;
-        if self.label_in_loop(label) {
-            return Err(self.fail(span, "goto or label inside a loop is not in this slice"));
+    fn loop_goto(&mut self, label: usize, span: Span) -> Result<Vec<CoreStmt>, ParseError> {
+        if self.label_loops[label].is_some() {
+            return Err(self.fail(
+                span,
+                "goto targeting a different source loop is not in this slice",
+            ));
         }
         let Some(state) = self.state else {
             return Err(self.fail(span, "goto leaves a loop without a dispatch state"));
@@ -688,42 +715,33 @@ impl<'a> Lower<'a> {
         index.ok_or_else(|| self.fail(span, "loop goto label index does not fit in a state"))
     }
 
-    fn label_in_loop(&self, label: usize) -> bool {
-        self.labels_in_loops.get(label).copied().unwrap_or(true)
-    }
-
-    fn block_has_goto(&self, block: &Block, outward: bool) -> bool {
+    fn block_has_goto(&self, block: &Block, owner: Option<Span>) -> bool {
         block
             .stmts
             .iter()
-            .any(|stmt| self.stmt_has_goto(stmt, outward))
+            .any(|stmt| self.stmt_has_goto(stmt, owner))
     }
 
-    fn stmt_has_goto(&self, stmt: &Stmt, outward: bool) -> bool {
+    fn stmt_has_goto(&self, stmt: &Stmt, owner: Option<Span>) -> bool {
         match stmt {
-            Stmt::Goto { span, .. } => self.goto_is_outward(*span) == outward,
+            Stmt::Goto { span, .. } => self
+                .goto_target(*span)
+                .is_ok_and(|label| self.label_loops[label] == owner),
             Stmt::Do { body, .. }
             | Stmt::While { body, .. }
             | Stmt::Repeat { body, .. }
             | Stmt::NumericFor { body, .. }
-            | Stmt::GenericFor { body, .. } => self.block_has_goto(body, outward),
+            | Stmt::GenericFor { body, .. } => self.block_has_goto(body, owner),
             Stmt::If {
                 arms, else_body, ..
             } => {
-                arms.iter()
-                    .any(|arm| self.block_has_goto(&arm.body, outward))
+                arms.iter().any(|arm| self.block_has_goto(&arm.body, owner))
                     || else_body
                         .as_ref()
-                        .is_some_and(|body| self.block_has_goto(body, outward))
+                        .is_some_and(|body| self.block_has_goto(body, owner))
             }
             _ => false,
         }
-    }
-
-    fn goto_is_outward(&self, span: Span) -> bool {
-        self.goto_target(span)
-            .ok()
-            .is_some_and(|label| !self.label_in_loop(label))
     }
 
     fn resolve_pending_labels(&self, state: LocalSlot) -> Result<CoreStmt, ParseError> {
@@ -853,9 +871,11 @@ impl<'a> Lower<'a> {
                     if !in_loop {
                         return Err(self.fail(*span, "goto or label in a direct statement"));
                     }
-                    out.extend(self.loop_goto(*span)?);
+                    let label = self.goto_target(*span)?;
+                    out.extend(self.loop_goto(label, *span)?);
                     return Ok((out, None));
                 }
+                Stmt::Label { .. } if in_loop => {}
                 Stmt::Label { span, .. } => {
                     return Err(self.fail(*span, "goto or label in a direct statement"));
                 }
@@ -1036,15 +1056,35 @@ impl<'a> Lower<'a> {
         Ok(CoreExpr::Float(value))
     }
 
-    fn emit_items(&self, items: &[Item]) -> Result<Vec<CoreStmt>, ParseError> {
+    fn emit_dispatch(
+        &mut self,
+        mut blocks: BlockBuf,
+        state: LocalSlot,
+    ) -> Result<CoreStmt, ParseError> {
+        blocks.finish();
+        for (index, block) in blocks.finished.iter().enumerate() {
+            if let Some(label) = block.label {
+                self.label_state[label] = Some(self.state_id_of(index));
+            }
+        }
+        let mut arms = Vec::with_capacity(blocks.finished.len());
+        for (index, block) in blocks.finished.iter().enumerate() {
+            let mut body = self.emit_items(&block.items, state)?;
+            body.extend(self.emit_exit(&block.exit, index, blocks.finished.len(), state)?);
+            arms.push((self.state_id_of(index), body));
+        }
+        Ok(dispatch_chain(state, arms))
+    }
+
+    fn emit_items(&self, items: &[Item], state: LocalSlot) -> Result<Vec<CoreStmt>, ParseError> {
         let mut out = Vec::new();
         for item in items {
-            out.extend(self.emit_item(item)?);
+            out.extend(self.emit_item(item, state)?);
         }
         Ok(out)
     }
 
-    fn emit_item(&self, item: &Item) -> Result<Vec<CoreStmt>, ParseError> {
+    fn emit_item(&self, item: &Item, state: LocalSlot) -> Result<Vec<CoreStmt>, ParseError> {
         match item {
             Item::Core(stmt) => Ok(vec![stmt.clone()]),
             Item::If {
@@ -1054,12 +1094,12 @@ impl<'a> Lower<'a> {
                 line,
             } => Ok(vec![CoreStmt::IfElse {
                 condition: cond.clone(),
-                then_branch: self.emit_items(then_body)?,
-                else_branch: self.emit_items(else_body)?,
+                then_branch: self.emit_items(then_body, state)?,
+                else_branch: self.emit_items(else_body, state)?,
                 line: *line,
             }]),
-            Item::Goto { label, line } => Ok(self.transfer(self.label_state_id(*label)?, *line)),
-            Item::Return { expr, line } => Ok(self.return_transfer(expr.clone(), *line)?),
+            Item::Goto { label, line } => Ok(transfer(state, self.label_state_id(*label)?, *line)),
+            Item::Return { expr, line } => self.return_transfer(state, expr.clone(), *line),
         }
     }
 
@@ -1068,6 +1108,7 @@ impl<'a> Lower<'a> {
         exit: &Exit,
         index: usize,
         len: usize,
+        state: LocalSlot,
     ) -> Result<Vec<CoreStmt>, ParseError> {
         match exit {
             Exit::Fallthrough => {
@@ -1076,28 +1117,25 @@ impl<'a> Lower<'a> {
                 } else {
                     EXIT_STATE
                 };
-                Ok(self.transfer(next, 1))
+                Ok(transfer(state, next, 1))
             }
-            Exit::Goto { label, line } => Ok(self.transfer(self.label_state_id(*label)?, *line)),
-            Exit::Return { expr, line } => self.return_transfer(expr.clone(), *line),
-            Exit::Stop => Ok(self.transfer(EXIT_STATE, 1)),
+            Exit::Goto { label, line } => Ok(transfer(state, self.label_state_id(*label)?, *line)),
+            Exit::Return { expr, line } => self.return_transfer(state, expr.clone(), *line),
+            Exit::Stop => Ok(transfer(state, EXIT_STATE, 1)),
         }
     }
 
-    fn transfer(&self, target: i64, line: u32) -> Vec<CoreStmt> {
-        let state = self.state.expect("dispatch state");
-        vec![
-            set_slot(state, CoreExpr::Int(target), line),
-            CoreStmt::Continue { line },
-        ]
-    }
-
-    fn return_transfer(&self, expr: CoreExpr, line: u32) -> Result<Vec<CoreStmt>, ParseError> {
+    fn return_transfer(
+        &self,
+        state: LocalSlot,
+        expr: CoreExpr,
+        line: u32,
+    ) -> Result<Vec<CoreStmt>, ParseError> {
         let Some(result) = self.result else {
             return Err(self.fail_line(line, "return without a result slot"));
         };
         let mut stmts = vec![set_slot(result, expr, line)];
-        stmts.extend(self.transfer(EXIT_STATE, line));
+        stmts.extend(transfer(state, EXIT_STATE, line));
         Ok(stmts)
     }
 
@@ -1256,6 +1294,24 @@ impl BlockBuf {
     }
 }
 
+fn transfer(state: LocalSlot, target: i64, line: u32) -> Vec<CoreStmt> {
+    vec![
+        set_slot(state, CoreExpr::Int(target), line),
+        CoreStmt::Continue { line },
+    ]
+}
+
+fn dispatch_loop(state: LocalSlot, body: Vec<CoreStmt>, line: u32) -> CoreStmt {
+    CoreStmt::While {
+        condition: CoreExpr::Not(Box::new(CoreExpr::Eq(
+            Box::new(CoreExpr::Var(state)),
+            Box::new(CoreExpr::Int(EXIT_STATE)),
+        ))),
+        body,
+        line,
+    }
+}
+
 fn dispatch_chain(state: LocalSlot, arms: Vec<(i64, Vec<CoreStmt>)>) -> CoreStmt {
     let mut pending = vec![CoreStmt::Break { line: 1 }];
     for (state_id, body) in arms.into_iter().rev() {
@@ -1398,44 +1454,44 @@ fn contains_label(block: &Block) -> bool {
     block.stmts.iter().any(stmt_contains_label)
 }
 
-fn labels_inside_loops(chunk: &Chunk, resolution: &Resolution) -> Vec<bool> {
-    let mut inside = vec![false; resolution.labels.len()];
-    mark_labels_in_loops(&chunk.body, false, resolution, &mut inside);
-    inside
+fn label_loop_owners(chunk: &Chunk, resolution: &Resolution) -> Vec<Option<Span>> {
+    let mut owners = vec![None; resolution.labels.len()];
+    mark_label_owners(&chunk.body, None, resolution, &mut owners);
+    owners
 }
 
-fn mark_labels_in_loops(
+fn mark_label_owners(
     block: &Block,
-    in_loop: bool,
+    owner: Option<Span>,
     resolution: &Resolution,
-    inside: &mut [bool],
+    owners: &mut [Option<Span>],
 ) {
     for stmt in &block.stmts {
         match stmt {
-            Stmt::Label { name, .. } if in_loop => {
+            Stmt::Label { name, .. } if owner.is_some() => {
                 if let Some(index) = resolution
                     .labels
                     .iter()
                     .position(|label| label.span == name.span)
                 {
-                    inside[index] = true;
+                    owners[index] = owner;
                 }
             }
-            Stmt::Do { body, .. } => mark_labels_in_loops(body, in_loop, resolution, inside),
-            Stmt::While { body, .. } | Stmt::Repeat { body, .. } => {
-                mark_labels_in_loops(body, true, resolution, inside);
-            }
-            Stmt::NumericFor { body, .. } | Stmt::GenericFor { body, .. } => {
-                mark_labels_in_loops(body, true, resolution, inside);
+            Stmt::Do { body, .. } => mark_label_owners(body, owner, resolution, owners),
+            Stmt::While { body, span, .. }
+            | Stmt::Repeat { body, span, .. }
+            | Stmt::NumericFor { body, span, .. }
+            | Stmt::GenericFor { body, span, .. } => {
+                mark_label_owners(body, Some(*span), resolution, owners);
             }
             Stmt::If {
                 arms, else_body, ..
             } => {
                 for arm in arms {
-                    mark_labels_in_loops(&arm.body, in_loop, resolution, inside);
+                    mark_label_owners(&arm.body, owner, resolution, owners);
                 }
                 if let Some(body) = else_body {
-                    mark_labels_in_loops(body, in_loop, resolution, inside);
+                    mark_label_owners(body, owner, resolution, owners);
                 }
             }
             _ => {}
@@ -1446,16 +1502,14 @@ fn mark_labels_in_loops(
 fn stmt_contains_label(stmt: &Stmt) -> bool {
     match stmt {
         Stmt::Label { .. } => true,
-        Stmt::Do { body, .. } | Stmt::While { body, .. } | Stmt::Repeat { body, .. } => {
-            contains_label(body)
-        }
+        Stmt::Do { body, .. } => contains_label(body),
         Stmt::If {
             arms, else_body, ..
         } => {
             arms.iter().any(|arm| contains_label(&arm.body))
                 || else_body.as_ref().is_some_and(contains_label)
         }
-        Stmt::NumericFor { body, .. } | Stmt::GenericFor { body, .. } => contains_label(body),
+        // Nested loops own their labels and lower them in their own regions.
         _ => false,
     }
 }
