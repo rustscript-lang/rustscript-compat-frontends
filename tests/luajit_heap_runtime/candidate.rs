@@ -1280,6 +1280,7 @@ impl Lower<'_> {
                 continue;
             };
             self.live_locals.retain(|local| *local != slot);
+            self.release_receiver_root(span, slot)?;
             let name = self.resolution.bindings[index].name.clone();
             if self.locals.get(&name).copied() == Some(slot) {
                 if let Some(outer) = self.visible_slot(&name, span.end) {
@@ -1290,6 +1291,26 @@ impl Lower<'_> {
             }
         }
         Ok(())
+    }
+
+    /// Drops one published caller-frame root when its local slot leaves scope
+    /// or is assigned nil. A slot already cleared is absent from the map and
+    /// is left alone. This is the caller frame recorded for the chunk, not
+    /// the frame that is current while a callee runs.
+    fn release_receiver_root(
+        &mut self,
+        span: ast::Span,
+        slot: LocalSlot,
+    ) -> Result<(), ParseError> {
+        let Some(root_slot) = self.receiver_roots.remove(&slot) else {
+            return Ok(());
+        };
+        let frame = self.caller_frame.ok_or_else(|| self.unsupported(span))?;
+        let release = self.call(
+            RELEASE_RESULT,
+            vec![Expr::Var(frame), Expr::Float(root_slot as f64)],
+        )?;
+        self.emit_ignored(release, self.line(span))
     }
 
     /// Scope of the locals this `do` itself declares. Nested blocks have a
@@ -1410,14 +1431,7 @@ impl Lower<'_> {
                 });
                 self.live_locals.retain(|local| *local != slot);
                 // The name may now denote a shadow. Release the root of this slot only.
-                if let Some(root_slot) = self.receiver_roots.remove(&slot) {
-                    let frame = self.caller_frame.ok_or_else(|| self.unsupported(span))?;
-                    let release = self.call(
-                        RELEASE_RESULT,
-                        vec![Expr::Var(frame), Expr::Float(root_slot as f64)],
-                    )?;
-                    self.emit_ignored(release, self.line(span))?;
-                }
+                self.release_receiver_root(span, slot)?;
                 Ok(())
             }
             (
@@ -2148,17 +2162,26 @@ fn rooted_table_count(stmts: &[ast::Stmt]) -> u32 {
 
 fn chunk_receiver_width(stmts: &[ast::Stmt]) -> u32 {
     stmts.iter().fold(0u32, |count, stmt| {
-        let ast::Stmt::Local { names, values, .. } = stmt else {
-            return count;
-        };
-        let [call] = values.exprs.as_slice() else {
-            return count;
-        };
-        if !syntactic_direct_call(call) {
-            return count;
-        }
-        count.saturating_add(u32::try_from(names.len()).unwrap_or(u32::MAX))
+        count.saturating_add(statement_receiver_width(stmt))
     })
+}
+
+/// Direct multi-return receivers, including those declared in a chunk `do`.
+/// A function body is a different frame and is not counted here.
+fn statement_receiver_width(stmt: &ast::Stmt) -> u32 {
+    match stmt {
+        ast::Stmt::Local { names, values, .. } => {
+            let [call] = values.exprs.as_slice() else {
+                return 0;
+            };
+            if !syntactic_direct_call(call) {
+                return 0;
+            }
+            u32::try_from(names.len()).unwrap_or(u32::MAX)
+        }
+        ast::Stmt::Do { body, .. } => chunk_receiver_width(&body.stmts),
+        _ => 0,
+    }
 }
 
 fn index_key_is_number(key: &ast::Expr) -> bool {

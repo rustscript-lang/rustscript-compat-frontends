@@ -1642,3 +1642,332 @@ return type(owner.mid)
     );
     assert_eq!(host.resource_count(), 3);
 }
+
+// Chunk `do` receives two tables from one synchronous call. The caller frame
+// roots stay live through an explicit collect inside the block, so both weak
+// entries keep the same identity. Leaving the block drops those two slots.
+// The next collect clears the entries and closes their nodes and tokens.
+// Omitting that collect leaves both entries. The outer call result is a
+// different slot and stays. This is not a function body and not a goto.
+#[test]
+fn lua_candidate_chunk_do_releases_multi_return_roots() {
+    let source = r#"
+local function pair()
+  local left = {}
+  local right = {}
+  local a = left
+  local b = right
+  return a, b
+end
+local function hold()
+  local kept = {}
+  local alias = kept
+  return alias
+end
+local mt = {}
+mt.__mode = "v"
+local owner = {}
+setmetatable(owner, mt)
+local kept = hold()
+owner.keep = kept
+observe_table(kept, 0)
+do
+  local left, right = pair()
+  owner.left = left
+  owner.right = right
+  observe_table(left, 0)
+  observe_table(right, 0)
+  collectgarbage("collect")
+  observe_table(owner.left, 0)
+  observe_table(owner.right, 0)
+  observe_table(owner.keep, 0)
+end
+@after@
+"#;
+    let collect_after = "\
+collectgarbage(\"collect\")
+observe_table(kept, 0)
+observe_table(owner.keep, 0)
+return type(owner.@field@)
+";
+    let omit_after = "\
+observe_table(owner.left, 0)
+observe_table(owner.right, 0)
+observe_table(kept, 0)
+observe_table(owner.keep, 0)
+return type(owner.@field@)
+";
+    for (after, result, collections, live_nodes, live_edges, resources) in [
+        (collect_after, "nil", 2u32, 3u32, 2u32, 3usize),
+        (omit_after, "table", 1, 5, 4, 5),
+    ] {
+        for field in ["left", "right"] {
+            let mut vm = candidate(&source.replace("@after@", &after.replace("@field@", field)));
+            assert_eq!(
+                vm.run().expect("run do multi-return"),
+                VmStatus::Halted,
+                "{result} {field}"
+            );
+            assert_eq!(vm.stack(), &[Value::string(result)], "{result} {field}");
+            let mut host = vm.host_context();
+            let tables = host.scope_state::<Vec<ObservedTable>>().unwrap().clone();
+            let kept = tables[0];
+            let left = tables[1];
+            let right = tables[2];
+            let left_inside = tables[3];
+            let right_inside = tables[4];
+            let keep_inside = tables[5];
+            assert_eq!(left_inside, left, "in-block collect keeps the left result");
+            assert_eq!(
+                right_inside, right,
+                "in-block collect keeps the right result"
+            );
+            assert_eq!(keep_inside, kept, "in-block collect keeps the outer result");
+            let drop_alive = result == "table";
+            let (kept_after, keep_after) = if drop_alive {
+                assert_eq!(tables[6], left, "omitted collect leaves the left entry");
+                assert_eq!(tables[7], right, "omitted collect leaves the right entry");
+                (tables[8], tables[9])
+            } else {
+                (tables[6], tables[7])
+            };
+            assert_eq!(kept_after, kept, "the outer local is the held result");
+            assert_eq!(keep_after, kept, "owner.keep is the outer call result");
+            for (table, alive) in [
+                (kept, true),
+                (left, drop_alive),
+                (right, drop_alive),
+                (left_inside, drop_alive),
+                (right_inside, drop_alive),
+                (keep_inside, true),
+                (kept_after, true),
+                (keep_after, true),
+            ] {
+                assert_table_lifetime(&mut host, table, alive);
+            }
+            if drop_alive {
+                assert_table_lifetime(&mut host, tables[6], true);
+                assert_table_lifetime(&mut host, tables[7], true);
+            }
+            let stats = heap::stats(&mut host).unwrap();
+            assert_eq!(stats.collections, collections, "{result} {field}");
+            assert_eq!(stats.live_nodes, live_nodes, "{result} {field}");
+            assert_eq!(stats.live_edges, live_edges, "{result} {field}");
+            assert_eq!(stats.live_roots, 0, "{result} {field}");
+            assert_eq!(host.resource_count(), resources, "{result} {field}");
+        }
+    }
+}
+
+// Nested chunk `do` retires only that block's caller slots. An explicit nil
+// inside the inner block has already cleared that slot; the sibling result
+// stays until the inner block ends. The enclosing block's call results stay
+// until that block ends. The outer call result stays through both exits.
+#[test]
+fn lua_candidate_chunk_do_releases_nested_multi_return_roots() {
+    let setup = r#"
+local function pair()
+  local left = {}
+  local right = {}
+  local a = left
+  local b = right
+  return a, b
+end
+local function hold()
+  local kept = {}
+  local alias = kept
+  return alias
+end
+local mt = {}
+mt.__mode = "v"
+local owner = {}
+setmetatable(owner, mt)
+local kept = hold()
+owner.keep = kept
+observe_table(kept, 0)
+do
+  local mid_left, mid_right = pair()
+  owner.mid_left = mid_left
+  owner.mid_right = mid_right
+  observe_table(mid_left, 0)
+  observe_table(mid_right, 0)
+  do
+    local left, right = pair()
+    owner.left = left
+    owner.right = right
+    observe_table(left, 0)
+    observe_table(right, 0)
+    left = nil
+    collectgarbage("collect")
+    observe_table(owner.right, 0)
+"#;
+    let nil_inside = r#"
+    observe_table(owner.mid_left, 0)
+    observe_table(owner.mid_right, 0)
+    observe_table(owner.keep, 0)
+    return type(owner.left)
+  end
+end
+"#;
+    let after_inner = r#"
+  end
+  collectgarbage("collect")
+  observe_table(owner.mid_left, 0)
+  observe_table(owner.mid_right, 0)
+  observe_table(owner.keep, 0)
+  return type(owner.@field@)
+end
+"#;
+    let after_mid = r#"
+  end
+  collectgarbage("collect")
+  observe_table(owner.mid_left, 0)
+  observe_table(owner.mid_right, 0)
+  observe_table(owner.keep, 0)
+end
+collectgarbage("collect")
+observe_table(kept, 0)
+observe_table(owner.keep, 0)
+return type(owner.@field@)
+"#;
+    let nil_source = format!("{setup}{nil_inside}");
+    let mut vm = candidate(&nil_source);
+    assert_eq!(vm.run().expect("run nil inside do"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("nil")]);
+    let mut host = vm.host_context();
+    let tables = host.scope_state::<Vec<ObservedTable>>().unwrap().clone();
+    let [
+        kept,
+        mid_left,
+        mid_right,
+        left,
+        right,
+        right_inside,
+        mid_left_inside,
+        mid_right_inside,
+        keep_inside,
+    ] = tables.as_slice()
+    else {
+        panic!("expected nine observed tables, got {}", tables.len());
+    };
+    assert_eq!(
+        *right_inside, *right,
+        "nil of left does not drop the sibling"
+    );
+    assert_eq!(*mid_left_inside, *mid_left);
+    assert_eq!(*mid_right_inside, *mid_right);
+    assert_eq!(*keep_inside, *kept);
+    for (table, alive) in [
+        (*kept, true),
+        (*mid_left, true),
+        (*mid_right, true),
+        (*left, false),
+        (*right, true),
+        (*right_inside, true),
+        (*mid_left_inside, true),
+        (*mid_right_inside, true),
+        (*keep_inside, true),
+    ] {
+        assert_table_lifetime(&mut host, table, alive);
+    }
+
+    for field in ["left", "right"] {
+        let mut vm = candidate(&format!("{setup}{}", after_inner.replace("@field@", field)));
+        assert_eq!(
+            vm.run().expect("run after inner do"),
+            VmStatus::Halted,
+            "{field}"
+        );
+        assert_eq!(vm.stack(), &[Value::string("nil")], "{field}");
+        let mut host = vm.host_context();
+        let tables = host.scope_state::<Vec<ObservedTable>>().unwrap().clone();
+        let [
+            kept,
+            mid_left,
+            mid_right,
+            left,
+            right,
+            right_inside,
+            mid_left_after,
+            mid_right_after,
+            keep_after,
+        ] = tables.as_slice()
+        else {
+            panic!("expected nine observed tables, got {}", tables.len());
+        };
+        assert_eq!(
+            *right_inside, *right,
+            "sibling stays through the in-block collect"
+        );
+        assert_eq!(
+            *mid_left_after, *mid_left,
+            "enclosing result stays after inner exit"
+        );
+        assert_eq!(*mid_right_after, *mid_right);
+        assert_eq!(*keep_after, *kept);
+        for (table, alive) in [
+            (*kept, true),
+            (*mid_left, true),
+            (*mid_right, true),
+            (*left, false),
+            (*right, false),
+            (*right_inside, false),
+            (*mid_left_after, true),
+            (*mid_right_after, true),
+            (*keep_after, true),
+        ] {
+            assert_table_lifetime(&mut host, table, alive);
+        }
+    }
+
+    for field in ["mid_left", "mid_right"] {
+        let mut vm = candidate(&format!("{setup}{}", after_mid.replace("@field@", field)));
+        assert_eq!(
+            vm.run().expect("run after mid do"),
+            VmStatus::Halted,
+            "{field}"
+        );
+        assert_eq!(vm.stack(), &[Value::string("nil")], "{field}");
+        let mut host = vm.host_context();
+        let tables = host.scope_state::<Vec<ObservedTable>>().unwrap().clone();
+        let kept = tables[0];
+        let mid_left = tables[1];
+        let mid_right = tables[2];
+        let left = tables[3];
+        let right = tables[4];
+        let mid_left_inside = tables[6];
+        let keep_inside = tables[8];
+        let kept_after = tables[9];
+        let keep_after = tables[10];
+        assert_eq!(
+            mid_left_inside, mid_left,
+            "mid stays until its own block ends"
+        );
+        assert_eq!(keep_inside, kept);
+        assert_eq!(kept_after, kept);
+        assert_eq!(
+            keep_after, kept,
+            "outer call result stays after both blocks"
+        );
+        for (table, alive) in [
+            (kept, true),
+            (mid_left, false),
+            (mid_right, false),
+            (left, false),
+            (right, false),
+            (mid_left_inside, false),
+            (keep_inside, true),
+            (kept_after, true),
+            (keep_after, true),
+        ] {
+            assert_table_lifetime(&mut host, table, alive);
+        }
+        let stats = heap::stats(&mut host).unwrap();
+        assert_eq!(
+            (stats.collections, stats.live_nodes, stats.live_roots),
+            (3, 3, 0),
+            "{field}"
+        );
+        assert_eq!(host.resource_count(), 3, "{field}");
+    }
+}
