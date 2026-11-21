@@ -13,15 +13,24 @@
 //!
 //! Borrowed from the ES5 heap at `3e348a010bc8d84baa5b7d1169a5f50aeb4e46ec`
 //! `src/javascript/heap.rs`: slot plus generation handles, explicit root
-//! frames, and non-moving mark/sweep. Not borrowed: numeric guest backing,
+//! frames, and non-moving mark/sweep. The guest table check uses the issued
+//! VM array identity instead of numeric guest backing. Not borrowed:
 //! JavaScript classifications, swc, or guest IR.
+//!
+//! A guest table is the VM array issued for one live slot. The slot stores a
+//! weak pointer to that array and checks the pointer, the slot, and the
+//! generation together. The weak pointer is not a GC root and does not keep
+//! the array alive. An ordinary array with the same fields is not a table.
+//! This check is the experimental guest boundary for this slice. It is not a
+//! measured production collection scheme.
 //!
 //! Later integration, not this kernel: LuaJIT `ordered.lua` plus the reverse
 //! and skip-collection controls in
 //! `/mnt/workspace/rustscript-lua/evidence/lua52-gc-arg-order/qualification.md`.
 //! When `.lua` is connected, that stage consumes the sample. A collection
 //! witness must be a helper that only returns a boolean; do not inline-read a
-//! weak referent from the caller. This milestone has no weak references.
+//! weak referent from the caller. This milestone has no Lua weak tables
+//! (`__mode`).
 
 #[path = "heap/handle.rs"]
 mod handle;
@@ -32,7 +41,9 @@ mod table;
 
 pub use handle::{HandleKind, TableRef};
 pub use resource::LuaTableResource;
-pub use table::{CollectReport, HeapError, HeapLimits, HeapStats, LuaHeap, RootFrameId, ScanMeter};
+pub use table::{
+    CollectReport, GuestClass, HeapError, HeapLimits, HeapStats, LuaHeap, RootFrameId, ScanMeter,
+};
 
 use vm::{HostContext, Value};
 
@@ -55,6 +66,26 @@ pub fn install(host: &mut HostContext, limits: HeapLimits) -> Result<(), HeapErr
 /// state and the slot can be reused at the next generation.
 pub fn publish(host: &mut HostContext) -> Result<Value, HeapError> {
     publish_table(host).map(|(_, raw)| Value::Int(raw))
+}
+
+/// Allocates a table, publishes its token, and issues the guest array.
+///
+/// The returned array is the only guest table value for that slot. The token
+/// stays on the existing host boundary and is not the guest identity.
+pub fn publish_guest(host: &mut HostContext) -> Result<Value, HeapError> {
+    let (table, raw) = publish_table(host)?;
+    match with_heap(host, |heap| heap.issue_carrier(table)) {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            let raw = u64::try_from(raw).map_err(|_| HeapError::CarrierOutOfRange)?;
+            let handle =
+                vm::ResourceHandle::from_raw(raw).map_err(|_| HeapError::CarrierOutOfRange)?;
+            host.close_resource::<LuaTableResource>(handle, vm::ResourceCloseReason::Requested)
+                .map_err(HeapError::from_scope)?;
+            with_heap(host, |heap| heap.rollback(table))?;
+            Err(error)
+        }
+    }
 }
 
 pub(super) fn publish_table(host: &mut HostContext) -> Result<(TableRef, i64), HeapError> {

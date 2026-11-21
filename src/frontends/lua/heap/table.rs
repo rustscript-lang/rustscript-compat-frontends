@@ -2,8 +2,9 @@
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 
-use vm::HostContextError;
+use vm::{HostContextError, Value};
 
 use super::handle::{HandleKind, TableRef};
 
@@ -149,6 +150,10 @@ struct Slot {
     /// Raw resource handle for this node. Ownership metadata only: the mark
     /// phase does not read it, so the token is not a GC root.
     token: Option<u64>,
+    /// Weak identity of the VM array issued for this generation. Not a GC
+    /// root and not a strong reference: dropping the guest value drops the
+    /// array even while this slot is live.
+    carrier: Weak<Vec<Value>>,
 }
 
 struct Edge {
@@ -256,6 +261,25 @@ struct OutgoingIndex {
     targets: Vec<(u32, u32)>,
 }
 
+/// Category of one guest value on this heap.
+///
+/// `Table` is only the array issued for a live slot. A structurally equal
+/// array, a raw resource token, and a value issued by another heap are
+/// `Unissued`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestClass {
+    /// Lua number.
+    Number,
+    /// Lua boolean.
+    Boolean,
+    /// Lua string.
+    String,
+    /// Issued table on this heap.
+    Table(TableRef),
+    /// Not an issued Lua value on this heap.
+    Unissued,
+}
+
 /// One scope's table nodes, edges, roots, and scan state.
 pub struct LuaHeap {
     domain: u64,
@@ -313,6 +337,7 @@ impl LuaHeap {
             }
             slot.state = SlotState::Live { marked: false };
             slot.token = None;
+            slot.carrier = Weak::new();
             return Ok(TableRef::table(self.domain, index, slot.generation));
         }
         if self.slots.len() >= self.limits.nodes as usize {
@@ -326,6 +351,7 @@ impl LuaHeap {
             generation: 1,
             state: SlotState::Live { marked: false },
             token: None,
+            carrier: Weak::new(),
         });
         self.note_node_peak();
         Ok(TableRef::table(self.domain, index, 1))
@@ -340,6 +366,71 @@ impl LuaHeap {
         self.remove_edges_touching(handle.slot());
         self.release_slot(handle.slot());
         Ok(())
+    }
+
+    /// Issues the guest array for a live table.
+    ///
+    /// The slot stores only a weak pointer to that array. The pointer is not
+    /// a root and does not keep the array alive. A second issue while the
+    /// first array is still alive is refused, so assignment and `Value` clone
+    /// keep one identity.
+    pub fn issue_carrier(&mut self, table: TableRef) -> Result<Value, HeapError> {
+        self.require_live(table)?;
+        let index = table.slot() as usize;
+        if self.slots[index].carrier.upgrade().is_some() {
+            return Err(HeapError::StaleHandle);
+        }
+        let value = Value::array(vec![
+            Value::Int(i64::from(table.slot())),
+            Value::Int(i64::from(table.generation())),
+        ]);
+        let carrier = match &value {
+            Value::Array(issued) => Arc::downgrade(issued),
+            _ => unreachable!("Value::array returns an array"),
+        };
+        self.slots[index].carrier = carrier;
+        Ok(value)
+    }
+
+    /// Classifies a guest value against this heap.
+    ///
+    /// A table result requires the live slot, the issued generation, and the
+    /// same VM array. Field equality is not enough. An integer resource token
+    /// is not consulted. This is one slot index, one generation compare, one
+    /// weak upgrade, and one pointer compare. It does not add a root and does
+    /// not increment scan counts. It is the experimental guest check for this
+    /// slice, not a measured production collection scheme.
+    pub fn guest_class(&self, value: &Value) -> GuestClass {
+        match value {
+            Value::Float(_) => GuestClass::Number,
+            Value::Bool(_) => GuestClass::Boolean,
+            Value::String(_) => GuestClass::String,
+            Value::Array(issued) => self
+                .issued_table(issued)
+                .map(GuestClass::Table)
+                .unwrap_or(GuestClass::Unissued),
+            _ => GuestClass::Unissued,
+        }
+    }
+
+    fn issued_table(&self, issued: &Arc<Vec<Value>>) -> Option<TableRef> {
+        let [Value::Int(slot), Value::Int(generation)] = issued.as_slice() else {
+            return None;
+        };
+        let slot = u32::try_from(*slot).ok()?;
+        let generation = u32::try_from(*generation).ok()?;
+        let stored = self.slots.get(slot as usize)?;
+        if stored.generation != generation {
+            return None;
+        }
+        if !matches!(stored.state, SlotState::Live { .. }) {
+            return None;
+        }
+        let current = stored.carrier.upgrade()?;
+        if !Arc::ptr_eq(&current, issued) {
+            return None;
+        }
+        Some(TableRef::table(self.domain, slot, generation))
     }
 
     /// Writes a reference edge. An existing key is overwritten and does not
@@ -717,14 +808,14 @@ impl LuaHeap {
 
     fn release_slot(&mut self, index: u32) {
         let slot = &mut self.slots[index as usize];
+        slot.token = None;
+        slot.carrier = Weak::new();
         if slot.generation >= self.limits.max_generation {
             slot.state = SlotState::Retired;
-            slot.token = None;
             return;
         }
         slot.generation = slot.generation.saturating_add(1);
         slot.state = SlotState::Free;
-        slot.token = None;
         self.free_list.push(index);
     }
 

@@ -21,6 +21,10 @@ const TABLE_ARG: &str = "lua_internal::table_arg";
 const NUMBER_ARG: &str = "lua_internal::number_arg";
 const GATHER_ROOT: &str = "lua_internal::gather_root";
 const COLLECT: &str = "lua_internal::collect";
+// Test-only witnesses. They place an ordinary VM array on the source path.
+// They are not Lua syntax and are not registered on the production entry.
+const COPY_FIELDS: &str = "lua_internal::copy_fields";
+const EXTERNAL_SHAPE: &str = "lua_internal::external_shape";
 
 pub(super) fn install_schemas(builder: &mut HostApiBuilder) {
     builder.function(HostFunctionSchema::with_return(
@@ -35,6 +39,16 @@ pub(super) fn install_schemas(builder: &mut HostApiBuilder) {
     builder.resource(vm::ResourceTypeSchema::new(key.clone(), "Lua table"));
     builder.function(HostFunctionSchema::with_return(
         NEW_TABLE,
+        vec![],
+        HostTypeSchema::Unknown,
+    ));
+    builder.function(HostFunctionSchema::with_return(
+        COPY_FIELDS,
+        vec![HostParamSchema::value("value", HostTypeSchema::Unknown)],
+        HostTypeSchema::Unknown,
+    ));
+    builder.function(HostFunctionSchema::with_return(
+        EXTERNAL_SHAPE,
         vec![],
         HostTypeSchema::Unknown,
     ));
@@ -82,6 +96,8 @@ pub(super) fn register(
         Op::NumberArg,
         Op::GatherRoot,
         Op::Collect,
+        Op::CopyFields,
+        Op::ExternalShape,
     ] {
         let name = match op {
             Op::NewTable => NEW_TABLE,
@@ -92,6 +108,8 @@ pub(super) fn register(
             Op::NumberArg => NUMBER_ARG,
             Op::GatherRoot => GATHER_ROOT,
             Op::Collect => COLLECT,
+            Op::CopyFields => COPY_FIELDS,
+            Op::ExternalShape => EXTERNAL_SHAPE,
         };
         let function = catalog.function(name).expect("private Lua operation");
         let schema = HostImportSchema::from_function(catalog, function);
@@ -112,42 +130,64 @@ enum Op {
     NumberArg,
     GatherRoot,
     Collect,
+    CopyFields,
+    ExternalShape,
 }
 
 impl HostOwnedFunction for Op {
     fn call(&mut self, call: &mut OwnedHostCall<'_>) -> Result<CallOutcome, VmError> {
         let value = match self {
-            Self::NewTable => {
-                let (table, _) = heap::publish_table(&mut call.vm().host_context())
-                    .map_err(|error| VmError::HostError(error.to_string()))?;
-                // This array is a private VM carrier, not a Lua array or a
-                // host resource token. Only Lua table construction produces it.
-                Value::array(vec![
-                    Value::Int(table.domain().cast_signed()),
-                    Value::Int(i64::from(table.slot())),
-                    Value::Int(i64::from(table.generation())),
-                ])
+            Self::NewTable => heap::publish_guest(&mut call.vm().host_context())
+                .map_err(|error| VmError::HostError(error.to_string()))?,
+            Self::Type => {
+                let value = match call.args() {
+                    [value] => value.clone(),
+                    _ => {
+                        return Err(VmError::HostError("invalid private Lua value".to_string()));
+                    }
+                };
+                let name = match classify(&mut call.vm().host_context(), &value)? {
+                    heap::GuestClass::Table(_) => "table",
+                    heap::GuestClass::Number => "number",
+                    heap::GuestClass::Boolean => "boolean",
+                    heap::GuestClass::String => "string",
+                    heap::GuestClass::Unissued => {
+                        return Err(VmError::HostError("invalid private Lua value".to_string()));
+                    }
+                };
+                Value::string(name)
             }
-            Self::Type => match call.args() {
-                [Value::Float(_)] => Value::string("number"),
-                [Value::Array(_)] => Value::string("table"),
-                [Value::Bool(_)] => Value::string("boolean"),
-                [Value::String(_)] => Value::string("string"),
-                _ => return Err(VmError::HostError("invalid private Lua value".to_string())),
-            },
-            Self::Add => match call.args() {
-                [Value::Float(left), Value::Float(right)] => Value::Float(left + right),
-                [Value::Array(_), _] | [_, Value::Array(_)] => {
-                    return Err(VmError::HostError(
-                        "attempt to perform arithmetic on a table value".to_string(),
-                    ));
+            Self::Add => {
+                let (left, right) = match call.args() {
+                    [left, right] => (left.clone(), right.clone()),
+                    _ => {
+                        return Err(VmError::HostError(
+                            "unsupported Lua arithmetic operand".to_string(),
+                        ));
+                    }
+                };
+                let left_class = classify(&mut call.vm().host_context(), &left)?;
+                let right_class = classify(&mut call.vm().host_context(), &right)?;
+                match (left_class, right_class, left, right) {
+                    (
+                        heap::GuestClass::Number,
+                        heap::GuestClass::Number,
+                        Value::Float(left),
+                        Value::Float(right),
+                    ) => Value::Float(left + right),
+                    (heap::GuestClass::Table(_), _, _, _)
+                    | (_, heap::GuestClass::Table(_), _, _) => {
+                        return Err(VmError::HostError(
+                            "attempt to perform arithmetic on a table value".to_string(),
+                        ));
+                    }
+                    _ => {
+                        return Err(VmError::HostError(
+                            "unsupported Lua arithmetic operand".to_string(),
+                        ));
+                    }
                 }
-                _ => {
-                    return Err(VmError::HostError(
-                        "unsupported Lua arithmetic operand".to_string(),
-                    ));
-                }
-            },
+            }
             Self::ReturnScalar => match call.args() {
                 [value @ (Value::Float(_) | Value::String(_) | Value::Bool(_))] => value.clone(),
                 _ => {
@@ -157,11 +197,16 @@ impl HostOwnedFunction for Op {
                 }
             },
             Self::TableArg => {
-                let table = match call.args() {
-                    [Value::Array(fields)] => decode_table(fields),
-                    _ => None,
-                }
-                .ok_or_else(|| VmError::HostError("expected Lua table".to_string()))?;
+                let value = match call.args() {
+                    [value] => value.clone(),
+                    _ => {
+                        return Err(VmError::HostError("expected Lua table".to_string()));
+                    }
+                };
+                let table = match classify(&mut call.vm().host_context(), &value)? {
+                    heap::GuestClass::Table(table) => table,
+                    _ => return Err(VmError::HostError("expected Lua table".to_string())),
+                };
                 let raw = heap::with_heap(&mut call.vm().host_context(), |heap| {
                     heap.published_token(table)
                 })
@@ -176,10 +221,20 @@ impl HostOwnedFunction for Op {
                 _ => return Err(VmError::HostError("expected Lua number".to_string())),
             },
             Self::GatherRoot => {
-                let table = match call.args() {
-                    [_, value @ Value::Array(_)] => Some(value.clone()),
-                    [_, Value::Float(_) | Value::Bool(_) | Value::String(_)] => None,
+                let value = match call.args() {
+                    [_, value] => value.clone(),
                     _ => {
+                        return Err(VmError::HostError(
+                            "invalid private Lua root candidate".to_string(),
+                        ));
+                    }
+                };
+                let included = match classify(&mut call.vm().host_context(), &value)? {
+                    heap::GuestClass::Table(_) => Some(value),
+                    heap::GuestClass::Number
+                    | heap::GuestClass::Boolean
+                    | heap::GuestClass::String => None,
+                    heap::GuestClass::Unissued => {
                         return Err(VmError::HostError(
                             "invalid private Lua root candidate".to_string(),
                         ));
@@ -189,7 +244,7 @@ impl HostOwnedFunction for Op {
                 let mut roots = match root_list {
                     Value::Null => {
                         return Ok(CallOutcome::Return(CallReturn::one(Value::array(
-                            table.into_iter().collect(),
+                            included.into_iter().collect(),
                         ))));
                     }
                     Value::Array(roots) => roots,
@@ -199,34 +254,44 @@ impl HostOwnedFunction for Op {
                         ));
                     }
                 };
-                if let Some(table) = table {
+                if let Some(table) = included {
                     std::sync::Arc::make_mut(&mut roots).push(table);
                 }
                 Value::Array(roots)
             }
             Self::Collect => {
                 let roots = match call.args() {
-                    [Value::Null] => &[][..],
-                    [Value::Array(roots)] => roots.as_slice(),
+                    [Value::Null] => Vec::new(),
+                    [Value::Array(roots)] => roots.iter().cloned().collect(),
                     _ => {
                         return Err(VmError::HostError(
                             "invalid private Lua root list".to_string(),
                         ));
                     }
                 };
-                let roots = roots
-                    .iter()
-                    .map(|root| match root {
-                        Value::Array(fields) => decode_table(fields),
-                        _ => None,
-                    })
-                    .collect::<Option<Vec<_>>>()
-                    .ok_or_else(|| {
-                        VmError::HostError("invalid private Lua table root".to_string())
-                    })?;
-                collect_at_safepoint(&mut call.vm().host_context(), &roots)?;
+                let mut tables = Vec::with_capacity(roots.len());
+                for root in &roots {
+                    match classify(&mut call.vm().host_context(), root)? {
+                        heap::GuestClass::Table(table) => tables.push(table),
+                        _ => {
+                            return Err(VmError::HostError(
+                                "invalid private Lua table root".to_string(),
+                            ));
+                        }
+                    }
+                }
+                collect_at_safepoint(&mut call.vm().host_context(), &tables)?;
                 Value::Float(0.0)
             }
+            Self::CopyFields => match call.args() {
+                [Value::Array(fields)] => Value::array(fields.iter().cloned().collect()),
+                _ => {
+                    return Err(VmError::HostError(
+                        "copy_fields witness expects an array carrier".to_string(),
+                    ));
+                }
+            },
+            Self::ExternalShape => Value::array(vec![Value::Int(0), Value::Int(1)]),
         };
         Ok(CallOutcome::Return(CallReturn::one(value)))
     }
@@ -262,15 +327,8 @@ fn heap_error(error: heap::HeapError) -> VmError {
     VmError::HostError(error.to_string())
 }
 
-fn decode_table(fields: &[Value]) -> Option<heap::TableRef> {
-    let [Value::Int(domain), Value::Int(slot), Value::Int(generation)] = fields else {
-        return None;
-    };
-    Some(heap::TableRef::table(
-        domain.cast_unsigned(),
-        (*slot).try_into().ok()?,
-        (*generation).try_into().ok()?,
-    ))
+fn classify(host: &mut vm::HostContext<'_>, value: &Value) -> Result<heap::GuestClass, VmError> {
+    heap::with_heap(host, |heap| Ok(heap.guest_class(value))).map_err(heap_error)
 }
 
 pub(super) fn lower(source: &str, catalog: &HostApiCatalog) -> Result<FrontendIr, ParseError> {
@@ -395,6 +453,24 @@ impl Lower<'_> {
                     && bytes == b"collect"
                 {
                     return self.collect_expr(expr.span());
+                }
+                if name.is("copy_fields")
+                    && let [arg] = args.exprs.as_slice()
+                {
+                    let value = self.expr(arg)?;
+                    let slot = self
+                        .builder
+                        .alloc_local_named(&format!("#copy:{}", self.stmts.len()))?;
+                    self.stmts.push(Stmt::Let {
+                        index: slot,
+                        declared_schema: None,
+                        expr: value,
+                        line: self.line(expr.span()),
+                    });
+                    return self.call(COPY_FIELDS, vec![Expr::Var(slot)]);
+                }
+                if name.is("external_shape") && args.exprs.is_empty() {
+                    return self.call(EXTERNAL_SHAPE, vec![]);
                 }
                 let name =
                     std::str::from_utf8(&name.bytes).map_err(|_| self.unsupported(expr.span()))?;

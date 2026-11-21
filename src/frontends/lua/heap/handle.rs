@@ -12,7 +12,8 @@ pub enum HandleKind {
 ///
 /// `domain` ties the handle to the heap that allocated it. `slot` and
 /// `generation` are checked against that heap on every use. A copied handle
-/// is an alias only when those fields still match a live node.
+/// is an alias only when those fields still match a live node. Guest values
+/// are not built from these fields.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TableRef {
     domain: u64,
@@ -22,7 +23,9 @@ pub struct TableRef {
 }
 
 impl TableRef {
-    pub(crate) fn table(domain: u64, slot: u32, generation: u32) -> Self {
+    /// Field construction stays inside the heap. A guest `Value` is not a
+    /// `TableRef` and cannot be assembled from these fields.
+    pub(super) fn table(domain: u64, slot: u32, generation: u32) -> Self {
         Self {
             domain,
             slot,
