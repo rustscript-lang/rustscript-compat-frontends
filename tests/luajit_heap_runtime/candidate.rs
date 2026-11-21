@@ -30,6 +30,7 @@ const SET_EDGE: &str = "lua_internal::set_edge";
 const GET_EDGE: &str = "lua_internal::get_edge";
 pub(super) const FINISH_RETURN: &str = "lua_internal::finish_return";
 pub(super) const RETIRE_CALLEE: &str = "lua_internal::retire_callee";
+const RETIRE_CHUNK: &str = "lua_internal::retire_chunk";
 const RELEASE_RESULT: &str = "lua_internal::release_result";
 // Test-only witnesses. They place an ordinary VM array on the source path.
 // They are not Lua syntax and are not registered on the production entry.
@@ -109,6 +110,7 @@ pub(super) fn install_schemas(builder: &mut HostApiBuilder) {
             HostTypeSchema::Unknown,
         ),
         (RETIRE_CALLEE, vec!["flag", "frame"], HostTypeSchema::Float),
+        (RETIRE_CHUNK, vec!["frame"], HostTypeSchema::Float),
         (RELEASE_RESULT, vec!["frame", "slot"], HostTypeSchema::Float),
     ] {
         builder.function(HostFunctionSchema::with_return(
@@ -144,6 +146,7 @@ pub(super) fn register(
         Op::GetEdge,
         Op::FinishReturn,
         Op::RetireCallee,
+        Op::RetireChunk,
         Op::ReleaseResult,
         Op::CopyFields,
         Op::ExternalShape,
@@ -166,6 +169,7 @@ pub(super) fn register(
             Op::GetEdge => GET_EDGE,
             Op::FinishReturn => FINISH_RETURN,
             Op::RetireCallee => RETIRE_CALLEE,
+            Op::RetireChunk => RETIRE_CHUNK,
             Op::ReleaseResult => RELEASE_RESULT,
             Op::CopyFields => COPY_FIELDS,
             Op::ExternalShape => EXTERNAL_SHAPE,
@@ -198,6 +202,7 @@ enum Op {
     GetEdge,
     FinishReturn,
     RetireCallee,
+    RetireChunk,
     ReleaseResult,
     CopyFields,
     ExternalShape,
@@ -372,6 +377,7 @@ impl HostOwnedFunction for Op {
             Self::GetEdge => get_edge(call)?,
             Self::FinishReturn => finish_return(call)?,
             Self::RetireCallee => retire_callee(call)?,
+            Self::RetireChunk => retire_chunk(call)?,
             Self::ReleaseResult => release_result(call)?,
             Self::CopyFields => match call.args() {
                 [Value::Array(fields)] => Value::array(fields.iter().cloned().collect()),
@@ -736,6 +742,19 @@ fn retire_callee(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
     Ok(Value::Float(0.0))
 }
 
+fn retire_chunk(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
+    let frame_token = match call.args() {
+        [frame] => frame.clone(),
+        _ => return Err(host_fault("invalid chunk retire")),
+    };
+    let frame = decode_frame(call, &frame_token)?;
+    heap::with_heap(&mut call.vm().host_context(), |heap| {
+        heap.leave_roots(frame)
+    })
+    .map_err(heap_error)?;
+    Ok(Value::Float(0.0))
+}
+
 fn get_edge(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
     let (from, key) = match call.args() {
         [from, key] => (from.clone(), float_u32(key)?),
@@ -908,6 +927,13 @@ pub(super) fn lower_returning(
     }
     for stmt in &chunk.body.stmts {
         lower.lower_stmt(stmt)?;
+    }
+    // Statements, including an explicit scalar return, have already run.
+    // A chunk with no receiver slots never opened this frame, so it does not
+    // leave one. Fallthrough has no result expression here.
+    if let Some(frame) = lower.caller_frame {
+        let retire = lower.call(RETIRE_CHUNK, vec![Expr::Var(frame)])?;
+        lower.emit_ignored(retire, 1)?;
     }
     let mut ir = lower.builder.finish(lower.stmts);
     ir.function_impls = lower.function_impls;

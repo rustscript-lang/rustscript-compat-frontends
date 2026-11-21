@@ -1497,3 +1497,211 @@ fn assert_no_calls_between(program: &Program, call_script: usize, finish: usize)
 fn call_index(program: &Program, ip: usize) -> u16 {
     u16::from_le_bytes(program.code[ip + 1..ip + 3].try_into().expect("call index"))
 }
+
+/// Chunk completion must drop only this chunk's caller frame.
+///
+/// The outer table is rooted on the native heap before the chunk starts. It
+/// is not a Lua local of this chunk. LuaJIT's 260-activation run is a separate
+/// upstream observation and is not this compat result.
+struct ChunkExit {
+    vm: vm::Vm,
+    outer_frame: heap::RootFrameId,
+    outer_table: heap::TableRef,
+    chunk_table: heap::TableRef,
+    baseline: heap::HeapStats,
+    baseline_resources: usize,
+}
+
+fn run_chunk_over_outer_root(source: &str) -> ChunkExit {
+    let mut vm = run(source, true);
+    let outer_frame = heap::with_heap(&mut vm.host_context(), |heap| heap.enter_roots(1))
+        .expect("native heap accepts an outer frame before the chunk");
+    let carrier = heap::publish_guest(&mut vm.host_context()).expect("outer table");
+    let outer_table = heap::with_heap(&mut vm.host_context(), |heap| {
+        let heap::GuestClass::Table(table) = heap.guest_class(&carrier) else {
+            return Err(heap::HeapError::WrongKind);
+        };
+        heap.write_root(outer_frame, 0, table)?;
+        Ok(table)
+    })
+    .expect("write the outer root");
+    let baseline = heap::stats(&mut vm.host_context()).expect("entry baseline");
+    let baseline_resources = vm.host_context().resource_count();
+    assert_eq!(
+        baseline.root_slots, 1,
+        "setup: outer frame occupies one root slot"
+    );
+    assert_eq!(
+        baseline.live_roots, 1,
+        "setup: outer table is the only live root"
+    );
+    assert_eq!(
+        baseline.live_nodes, 1,
+        "setup: outer table occupies one node"
+    );
+    assert_eq!(
+        baseline_resources, 1,
+        "setup: outer table holds one resource"
+    );
+    assert_eq!(vm.run().expect("run chunk"), VmStatus::Halted);
+    let chunk_table = witness(&mut vm)
+        .returned
+        .expect("the chunk received a returned table");
+    assert_ne!(
+        chunk_table, outer_table,
+        "setup: the chunk table is not the outer table"
+    );
+    ChunkExit {
+        vm,
+        outer_frame,
+        outer_table,
+        chunk_table,
+        baseline,
+        baseline_resources,
+    }
+}
+
+fn assert_only_chunk_frame_retired(exit: &mut ChunkExit) {
+    let before = heap::stats(&mut exit.vm.host_context()).expect("stats before extra collect");
+    assert_eq!(
+        before.root_slots, exit.baseline.root_slots,
+        "chunk frame must return root storage to the entry baseline"
+    );
+    assert_eq!(
+        before.live_roots, exit.baseline.live_roots,
+        "the chunk's live root must be gone before the extra collect"
+    );
+    assert!(
+        heap_alive(&mut exit.vm, exit.chunk_table),
+        "the unrooted self-cycle still occupies a node before the extra collect"
+    );
+    assert_eq!(
+        before.live_nodes,
+        exit.baseline.live_nodes + 1,
+        "the self-cycle node stays until an explicit collect"
+    );
+    assert!(
+        heap_alive(&mut exit.vm, exit.outer_table),
+        "the outer root must survive chunk completion"
+    );
+    let current = heap::with_heap(&mut exit.vm.host_context(), |heap| Ok(heap.current_frame()))
+        .expect("current frame");
+    assert_eq!(
+        current,
+        Some(exit.outer_frame),
+        "completion leaves only this chunk frame"
+    );
+    assert_eq!(
+        exit.vm.host_context().resource_count(),
+        exit.baseline_resources + 1,
+        "the self-cycle token stays until collect"
+    );
+    // Same VM, no reset and no host clear of the remaining root.
+    let report = heap::collect(&mut exit.vm.host_context()).expect("same-scope collect");
+    assert!(
+        !heap_alive(&mut exit.vm, exit.chunk_table),
+        "collect reclaims the self-cycle after the frame is gone"
+    );
+    assert!(
+        heap_alive(&mut exit.vm, exit.outer_table),
+        "collect must not reclaim the outer root"
+    );
+    assert_eq!(report.live_nodes, exit.baseline.live_nodes);
+    assert_eq!(report.live_roots, exit.baseline.live_roots);
+    assert_eq!(
+        exit.vm.host_context().resource_count(),
+        exit.baseline_resources,
+        "collect returns the self-cycle resource"
+    );
+    let after = heap::stats(&mut exit.vm.host_context()).expect("stats after collect");
+    assert_eq!(after.root_slots, exit.baseline.root_slots);
+    let current = heap::with_heap(&mut exit.vm.host_context(), |heap| Ok(heap.current_frame()))
+        .expect("frame after collect");
+    assert_eq!(current, Some(exit.outer_frame));
+}
+
+#[test]
+fn fallthrough_returns_root_slots_and_leaves_the_self_cycle_until_collect() {
+    let source = r#"
+local function make()
+  local obj = {}
+  obj.self = obj
+  return obj
+end
+local kept = make()
+"#;
+    let mut exit = run_chunk_over_outer_root(source);
+    assert_eq!(
+        exit.vm.stack(),
+        &[] as &[Value],
+        "fallthrough adds no result"
+    );
+    assert_only_chunk_frame_retired(&mut exit);
+}
+
+#[test]
+fn nil_return_keeps_the_scalar_stack_and_returns_root_slots() {
+    let source = r#"
+local function make()
+  local obj = {}
+  obj.self = obj
+  return obj
+end
+local function one()
+  return nil
+end
+local kept = make()
+local n = one()
+return n
+"#;
+    let mut exit = run_chunk_over_outer_root(source);
+    assert_eq!(exit.vm.stack(), &[Value::Null]);
+    assert_only_chunk_frame_retired(&mut exit);
+}
+
+#[test]
+fn type_return_reads_the_rooted_table_before_the_frame_leaves() {
+    let source = r#"
+local function make()
+  local obj = {}
+  obj.self = obj
+  return obj
+end
+local kept = make()
+return type(kept)
+"#;
+    let mut exit = run_chunk_over_outer_root(source);
+    assert_eq!(exit.vm.stack(), &[Value::string("table")]);
+    assert_only_chunk_frame_retired(&mut exit);
+}
+
+#[test]
+fn collect_return_sees_the_frame_root_then_the_frame_leaves() {
+    let source = r#"
+local function make()
+  local obj = {}
+  obj.self = obj
+  return obj
+end
+local kept = make()
+return collectgarbage("collect")
+"#;
+    let mut exit = run_chunk_over_outer_root(source);
+    assert_eq!(exit.vm.stack(), &[Value::Float(0.0)]);
+    let witness = witness(&mut exit.vm);
+    let during = witness
+        .collects
+        .first()
+        .expect("the return expression collected while the chunk frame was still current");
+    assert!(
+        during.returned_alive,
+        "collect inside the return must still see the chunk root: {during:?}"
+    );
+    assert_eq!(
+        during.live_roots,
+        exit.baseline.live_roots + 1,
+        "the last collection runs before the chunk frame leaves"
+    );
+    assert_eq!(during.live_nodes, exit.baseline.live_nodes + 1);
+    assert_only_chunk_frame_retired(&mut exit);
+}
