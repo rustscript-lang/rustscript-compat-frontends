@@ -2907,3 +2907,304 @@ fn return_inside_dispatch_if_arm_is_not_replaced_by_the_following_goto() {
     let miss_state = assert_one_dispatch_and_result(&miss);
     assert_eq!(source_while_count(&miss.stmts, Some(miss_state)), 1);
 }
+
+// 2100 is n=2, body=1, and neither the arm tail nor the wrong label.
+// 2110 would be the tail after the while. 2101 would land on ::wrong::.
+// 4411 is the miss: four bodies, the tail, and the wrong label on the way
+// to ::right::. Skipping that tail is 4401.
+const WHILE_OUTWARD_GOTO_HIT: &str = "\
+local n = 0
+local body = 0
+local tail = 0
+local wrong = 0
+while n < 4 do
+  n = n + 1
+  do
+    if n == 2 then
+      goto right
+    end
+  end
+  body = body + 1
+end
+tail = 1
+::wrong::
+wrong = 1
+::right::
+return n * 1000 + body * 100 + tail * 10 + wrong
+";
+
+const WHILE_OUTWARD_GOTO_MISS: &str = "\
+local n = 0
+local body = 0
+local tail = 0
+local wrong = 0
+while n < 4 do
+  n = n + 1
+  do
+    if n == 9 then
+      goto right
+    end
+  end
+  body = body + 1
+end
+tail = 1
+::wrong::
+wrong = 1
+::right::
+return n * 1000 + body * 100 + tail * 10 + wrong
+";
+
+#[test]
+fn loop_outward_goto_while_hits_and_a_miss_falls_through() {
+    expect_number("while_outward_goto_hit", WHILE_OUTWARD_GOTO_HIT, 2100.0);
+    expect_number("while_outward_goto_miss", WHILE_OUTWARD_GOTO_MISS, 4411.0);
+    let hit = lowered(WHILE_OUTWARD_GOTO_HIT);
+    let state = assert_one_dispatch_and_result(&hit);
+    assert_eq!(
+        source_while_count(&hit.stmts, Some(state)),
+        1,
+        "outward goto copied the while"
+    );
+    assert_eq!(dispatch_while_count(&hit.stmts, state), 1);
+    let miss = lowered(WHILE_OUTWARD_GOTO_MISS);
+    let miss_state = assert_one_dispatch_and_result(&miss);
+    assert_eq!(source_while_count(&miss.stmts, Some(miss_state)), 1);
+}
+
+// 10 is the first body, with until false and the arm tail both skipped.
+// until false would exhaust fuel if the post ran. 11 is the arm tail.
+// 21 is two finished trips and the tail; leaving after one trip is 11 or 10.
+const REPEAT_OUTWARD_GOTO_HIT: &str = "\
+local n = 0
+local tail = 0
+repeat
+  n = n + 1
+  if n == 1 then
+    goto out
+  end
+  n = n + 100
+until false
+tail = 1
+::out::
+return n * 10 + tail
+";
+
+const REPEAT_OUTWARD_GOTO_MISS: &str = "\
+local n = 0
+local tail = 0
+repeat
+  n = n + 1
+  if n == 9 then
+    goto out
+  end
+until n == 2
+tail = 1
+::out::
+return n * 10 + tail
+";
+
+#[test]
+fn loop_outward_goto_repeat_skips_until_and_a_miss_stops_on_until() {
+    expect_number("repeat_outward_goto_hit", REPEAT_OUTWARD_GOTO_HIT, 10.0);
+    expect_number("repeat_outward_goto_miss", REPEAT_OUTWARD_GOTO_MISS, 21.0);
+    let hit = lowered(REPEAT_OUTWARD_GOTO_HIT);
+    assert_one_dispatch_and_result(&hit);
+    assert_repeat_fors(&hit, 1);
+    let miss = lowered(REPEAT_OUTWARD_GOTO_MISS);
+    assert_one_dispatch_and_result(&miss);
+    assert_repeat_fors(&miss, 1);
+}
+
+// 10 is s=1 and the arm tail skipped. 11 is that tail. 101 is 1+2+3+4 and
+// the tail. The hidden step is not a guest write, so 10 does not show
+// whether the post ran before the for was left. The body Break is that
+// evidence: Continue would run the post and then the next body.
+const NUMERIC_OUTWARD_GOTO_HIT: &str = "\
+local s = 0
+local tail = 0
+for i = 1, 4 do
+  s = s + i
+  if i == 1 then
+    goto out
+  end
+  s = s + 100
+end
+tail = 1
+::out::
+return s * 10 + tail
+";
+
+const NUMERIC_OUTWARD_GOTO_MISS: &str = "\
+local s = 0
+local tail = 0
+for i = 1, 4 do
+  s = s + i
+  if i == 9 then
+    goto out
+  end
+end
+tail = 1
+::out::
+return s * 10 + tail
+";
+
+#[test]
+fn loop_outward_goto_numeric_for_skips_the_step_and_a_miss_sums() {
+    expect_numeric("numeric_outward_goto_hit", NUMERIC_OUTWARD_GOTO_HIT, 10.0);
+    expect_numeric(
+        "numeric_outward_goto_miss",
+        NUMERIC_OUTWARD_GOTO_MISS,
+        101.0,
+    );
+    let hit = lowered_numeric(NUMERIC_OUTWARD_GOTO_HIT);
+    assert_one_dispatch_and_result(&hit);
+    assert_eq!(
+        numeric_for_count(&hit),
+        1,
+        "outward goto copied the numeric for"
+    );
+    assert_numeric_goto_breaks_before_post(&hit);
+    let miss = lowered_numeric(NUMERIC_OUTWARD_GOTO_MISS);
+    assert_one_dispatch_and_result(&miss);
+    assert_eq!(numeric_for_count(&miss), 1);
+}
+
+fn assert_numeric_goto_breaks_before_post(ir: &FrontendIr) {
+    let mut fors = 0;
+    let mut breaks_in_body = 0;
+    let mut continues_in_body = 0;
+    let mut post_adds = 0;
+    walk_stmts(&ir.stmts, &mut |stmt| {
+        let Stmt::For {
+            init, post, body, ..
+        } = stmt
+        else {
+            return;
+        };
+        if !matches!(init.as_ref(), Stmt::Noop { .. }) {
+            return;
+        }
+        fors += 1;
+        if matches!(
+            post.as_ref(),
+            Stmt::Assign { expr, .. } if matches!(expr, Expr::Add(_, _))
+        ) {
+            post_adds += 1;
+        }
+        fn walk_body(stmts: &[Stmt], breaks: &mut usize, continues: &mut usize) {
+            for stmt in stmts {
+                match stmt {
+                    Stmt::Break { .. } => *breaks += 1,
+                    Stmt::Continue { .. } => *continues += 1,
+                    Stmt::IfElse {
+                        then_branch,
+                        else_branch,
+                        ..
+                    } => {
+                        walk_body(then_branch, breaks, continues);
+                        walk_body(else_branch, breaks, continues);
+                    }
+                    Stmt::While { body, .. } => walk_body(body, breaks, continues),
+                    Stmt::For { body, .. } => walk_body(body, breaks, continues),
+                    _ => {}
+                }
+            }
+        }
+        walk_body(body, &mut breaks_in_body, &mut continues_in_body);
+    });
+    assert_eq!(fors, 1, "numeric for was copied or missing");
+    assert_eq!(
+        post_adds, 1,
+        "the step post must stay on the for, not move onto the goto path"
+    );
+    assert_eq!(
+        breaks_in_body, 1,
+        "outward goto must Break this for so its post does not run"
+    );
+    assert_eq!(
+        continues_in_body, 0,
+        "Continue inside the numeric for would run the step post"
+    );
+}
+
+// 1 is the first numeric body. 101 adds the inner tail, 1101 the repeat
+// tail, 11101 the while tail, 111101 the arm statement after the while.
+// until false exhausts fuel if an inner exit still runs the repeat post.
+const NESTED_OUTWARD_GOTO: &str = "\
+local acc = 0
+local outer = 0
+while outer < 3 do
+  outer = outer + 1
+  repeat
+    for i = 1, 3 do
+      acc = acc + 1
+      do
+        if outer == 1 then
+          if i == 1 then
+            goto out
+          end
+        end
+      end
+      acc = acc + 100
+    end
+    acc = acc + 1000
+  until false
+  acc = acc + 10000
+end
+acc = acc + 100000
+::out::
+return acc
+";
+
+#[test]
+fn loop_outward_goto_nested_skips_every_enclosing_tail() {
+    expect_numeric("nested_outward_goto", NESTED_OUTWARD_GOTO, 1.0);
+    let ir = lowered_numeric(NESTED_OUTWARD_GOTO);
+    let state = assert_one_dispatch_and_result(&ir);
+    assert_eq!(
+        source_while_count(&ir.stmts, Some(state)),
+        1,
+        "nested outward goto copied the while"
+    );
+    assert_eq!(
+        repeat_flag_bindings(&ir).len(),
+        1,
+        "nested outward goto copied the repeat"
+    );
+    assert_eq!(
+        numeric_for_count(&ir),
+        1,
+        "nested outward goto copied the numeric for"
+    );
+    assert_eq!(dispatch_while_count(&ir.stmts, state), 1);
+}
+
+// 21 is one re-entry of the arm that owns the while, then the trailing
+// write. 11 is a same-arm comparison that breaks the while and lets that
+// write run without re-entering. 20 re-enters but then skips the write.
+const SAME_ARM_BACKWARD_GOTO: &str = "\
+local n = 0
+local seen = 0
+local after = 0
+::again::
+seen = seen + 1
+while n < 1 do
+  n = n + 1
+  goto again
+end
+after = 1
+return seen * 10 + after
+";
+
+#[test]
+fn loop_outward_goto_same_arm_backward_reenters() {
+    expect_number("same_arm_backward_goto", SAME_ARM_BACKWARD_GOTO, 21.0);
+    let ir = lowered(SAME_ARM_BACKWARD_GOTO);
+    let state = assert_one_dispatch_and_result(&ir);
+    assert_eq!(
+        source_while_count(&ir.stmts, Some(state)),
+        1,
+        "same-arm goto copied the while"
+    );
+    assert_eq!(dispatch_while_count(&ir.stmts, state), 1);
+}

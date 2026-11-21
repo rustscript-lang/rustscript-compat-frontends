@@ -12,11 +12,23 @@
 //! nested source loop. `break` and `continue` inside a source loop stay Core
 //! statements of that loop. A `return` in `while`, `repeat`, or numeric `for`
 //! writes the one result, stores the exit state, and `Break`s that source loop
-//! so its post does not run. After every loop that can return, an exit-state
-//! guard `Break`s an enclosing source loop, or `Continue`s the dispatch loop
-//! once the source loop is already in the dispatch arm. A later arm transfer
-//! therefore cannot overwrite the exit state. A loop that cannot return is
-//! unchanged. `goto` and labels inside a loop are not in this slice. A source
+//! so its post does not run. After every loop that can return or jump outward,
+//! an exit-state guard `Break`s an enclosing source loop, or `Continue`s the
+//! dispatch loop once the source loop is already in the dispatch arm. A later
+//! arm transfer therefore cannot overwrite the exit state. A loop that cannot
+//! return and has no outward goto is unchanged. A `goto` in `while`, `repeat`,
+//! or numeric `for` may target a label the resolver has already accepted outside
+//! source loop. That goto stores a negative state — the resolver label index,
+//! not an arm id — and `Break`s, so this loop's tail and post do not run.
+//! Enclosing source loops see the same non-positive state and `Break` too.
+//! After the outermost source loop, the one dispatch loop maps that negative
+//! value through the finished label table and continues to the existing arm.
+//! Positive arm ids stay positive, and `0` remains the chunk return. The
+//! negative carrier is required because the loop body is lowered before arm
+//! ids exist. Storing the positive id inside the loop would compare equal to
+//! the current arm when the label is that arm's own entry, and the statements
+//! after the loop would overwrite the jump. A label inside a loop, or a goto
+//! whose target is still inside a loop, is not in this slice. A source
 //! `repeat` is one Core `for`, not a copied body. Its private bool starts
 //! true, so the body runs before `until`. The
 //! `for` post stores whether another round is required. Fallthrough and
@@ -72,7 +84,12 @@ pub(super) fn lower_source_with(
         let line = line_of(source, error_span(error));
         return Err(ParseError::at_line(line, static_message(error)));
     }
-    let mut lower = Lower::new(source, &resolution, holds);
+    let mut lower = Lower::new(
+        source,
+        &resolution,
+        holds,
+        labels_inside_loops(&chunk, &resolution),
+    );
     let stmts = if needs_dispatch(&chunk) {
         lower.lower_dispatch(&chunk)?
     } else {
@@ -95,6 +112,8 @@ struct Lower<'a> {
     nfor_slots: Vec<LocalSlot>,
     for_indexes: Vec<LocalSlot>,
     holds: Option<&'a HostCallResolver<'a>>,
+    labels_in_loops: Vec<bool>,
+    pending_labels: Vec<usize>,
 }
 
 struct BlockBuf {
@@ -139,6 +158,7 @@ impl<'a> Lower<'a> {
         source: &'a str,
         resolution: &'a Resolution,
         holds: Option<&'a HostCallResolver<'a>>,
+        labels_in_loops: Vec<bool>,
     ) -> Self {
         let slots = vec![None; resolution.bindings.len()];
         let label_state = vec![None; resolution.labels.len()];
@@ -156,6 +176,8 @@ impl<'a> Lower<'a> {
             nfor_slots: Vec::new(),
             for_indexes: Vec::new(),
             holds,
+            labels_in_loops,
+            pending_labels: Vec::new(),
         }
     }
 
@@ -209,6 +231,14 @@ impl<'a> Lower<'a> {
             arms.push((state_id, body));
         }
         let chain = dispatch_chain(state, arms);
+        // An outward goto carries a negative label index until this point.
+        // Arm ids exist only after the walk, so the rewrite stays here, on
+        // the one dispatch loop, and only when a loop goto needs it.
+        let mut dispatch_body = Vec::new();
+        if !self.pending_labels.is_empty() {
+            dispatch_body.push(self.resolve_pending_labels(state)?);
+        }
+        dispatch_body.push(chain);
         // Core requires a `let` on every path before an assign. The arms do
         // not dominate each other, so user slots are declared here. The
         // source initializer still runs at the declaration, as an assign.
@@ -228,7 +258,7 @@ impl<'a> Lower<'a> {
                 Box::new(CoreExpr::Var(state)),
                 Box::new(CoreExpr::Int(EXIT_STATE)),
             ))),
-            body: vec![chain],
+            body: dispatch_body,
             line: 1,
         });
         if let Some(result) = self.result {
@@ -560,7 +590,7 @@ impl<'a> Lower<'a> {
     }
 
     fn reject_loop_transfer(&self, body: &Block, span: Span) -> Result<(), ParseError> {
-        if contains_goto(body) || contains_label(body) {
+        if contains_label(body) || self.block_has_goto(body, false) {
             return Err(self.fail(span, "goto or label inside a loop is not in this slice"));
         }
         Ok(())
@@ -573,7 +603,7 @@ impl<'a> Lower<'a> {
         line: u32,
         enclosing_loop: bool,
     ) -> Result<Vec<CoreStmt>, ParseError> {
-        if contains_return_block(body) {
+        if contains_return_block(body) || self.block_has_goto(body, true) {
             stmts.push(self.exit_propagation(line, enclosing_loop)?);
         }
         Ok(stmts)
@@ -592,11 +622,15 @@ impl<'a> Lower<'a> {
         } else {
             CoreStmt::Continue { line }
         };
+        // 0 is a chunk return. A negative value is an outward goto whose arm
+        // id is applied only when this state leaves the last source loop.
+        // Both must leave before a later store in this arm replaces them.
+        let pending_exit = CoreExpr::Not(Box::new(CoreExpr::Gt(
+            Box::new(CoreExpr::Var(state)),
+            Box::new(CoreExpr::Int(0)),
+        )));
         Ok(CoreStmt::IfElse {
-            condition: CoreExpr::Eq(
-                Box::new(CoreExpr::Var(state)),
-                Box::new(CoreExpr::Int(EXIT_STATE)),
-            ),
+            condition: pending_exit,
             then_branch: vec![leave],
             else_branch: Vec::new(),
             line,
@@ -624,6 +658,104 @@ impl<'a> Lower<'a> {
             set_slot(state, CoreExpr::Int(EXIT_STATE), line),
             CoreStmt::Break { line },
         ])
+    }
+
+    fn loop_goto(&mut self, span: Span) -> Result<Vec<CoreStmt>, ParseError> {
+        let label = self.goto_target(span)?;
+        if self.label_in_loop(label) {
+            return Err(self.fail(span, "goto or label inside a loop is not in this slice"));
+        }
+        let Some(state) = self.state else {
+            return Err(self.fail(span, "goto leaves a loop without a dispatch state"));
+        };
+        // The arm id does not exist yet. The negative value is the resolver
+        // label index, never 0 and never a positive arm id. Break skips this
+        // loop's tail and post; the dispatch loop applies the finished map.
+        let pending = self.pending_label_state(label, span)?;
+        let line = self.line(span);
+        self.pending_labels.push(label);
+        Ok(vec![
+            set_slot(state, CoreExpr::Int(pending), line),
+            CoreStmt::Break { line },
+        ])
+    }
+
+    fn pending_label_state(&self, label: usize, span: Span) -> Result<i64, ParseError> {
+        let index = i64::try_from(label)
+            .ok()
+            .and_then(|index| index.checked_add(1))
+            .and_then(i64::checked_neg);
+        index.ok_or_else(|| self.fail(span, "loop goto label index does not fit in a state"))
+    }
+
+    fn label_in_loop(&self, label: usize) -> bool {
+        self.labels_in_loops.get(label).copied().unwrap_or(true)
+    }
+
+    fn block_has_goto(&self, block: &Block, outward: bool) -> bool {
+        block
+            .stmts
+            .iter()
+            .any(|stmt| self.stmt_has_goto(stmt, outward))
+    }
+
+    fn stmt_has_goto(&self, stmt: &Stmt, outward: bool) -> bool {
+        match stmt {
+            Stmt::Goto { span, .. } => self.goto_is_outward(*span) == outward,
+            Stmt::Do { body, .. }
+            | Stmt::While { body, .. }
+            | Stmt::Repeat { body, .. }
+            | Stmt::NumericFor { body, .. }
+            | Stmt::GenericFor { body, .. } => self.block_has_goto(body, outward),
+            Stmt::If {
+                arms, else_body, ..
+            } => {
+                arms.iter()
+                    .any(|arm| self.block_has_goto(&arm.body, outward))
+                    || else_body
+                        .as_ref()
+                        .is_some_and(|body| self.block_has_goto(body, outward))
+            }
+            _ => false,
+        }
+    }
+
+    fn goto_is_outward(&self, span: Span) -> bool {
+        self.goto_target(span)
+            .ok()
+            .is_some_and(|label| !self.label_in_loop(label))
+    }
+
+    fn resolve_pending_labels(&self, state: LocalSlot) -> Result<CoreStmt, ParseError> {
+        let mut labels = self.pending_labels.clone();
+        labels.sort_unstable();
+        labels.dedup();
+        let mut else_branch = Vec::new();
+        for label in labels.into_iter().rev() {
+            let arm = self.label_state_id(label)?;
+            let span = self
+                .resolution
+                .labels
+                .get(label)
+                .map(|item| item.span)
+                .unwrap_or(Span::new(0, 0));
+            let pending = self.pending_label_state(label, span)?;
+            else_branch = vec![CoreStmt::IfElse {
+                condition: CoreExpr::Eq(
+                    Box::new(CoreExpr::Var(state)),
+                    Box::new(CoreExpr::Int(pending)),
+                ),
+                then_branch: vec![set_slot(state, CoreExpr::Int(arm), 1)],
+                else_branch,
+                line: 1,
+            }];
+        }
+        Ok(CoreStmt::IfElse {
+            condition: CoreExpr::Lt(Box::new(CoreExpr::Var(state)), Box::new(CoreExpr::Int(0))),
+            then_branch: else_branch,
+            else_branch: Vec::new(),
+            line: 1,
+        })
     }
 
     fn holds_call(
@@ -717,7 +849,14 @@ impl<'a> Lower<'a> {
                         line: self.line(*span),
                     });
                 }
-                Stmt::Goto { span, .. } | Stmt::Label { span, .. } => {
+                Stmt::Goto { span, .. } => {
+                    if !in_loop {
+                        return Err(self.fail(*span, "goto or label in a direct statement"));
+                    }
+                    out.extend(self.loop_goto(*span)?);
+                    return Ok((out, None));
+                }
+                Stmt::Label { span, .. } => {
                     return Err(self.fail(*span, "goto or label in a direct statement"));
                 }
                 Stmt::While { cond, body, span } => {
@@ -1257,6 +1396,51 @@ fn stmt_contains_transfer(stmt: &Stmt) -> bool {
 
 fn contains_label(block: &Block) -> bool {
     block.stmts.iter().any(stmt_contains_label)
+}
+
+fn labels_inside_loops(chunk: &Chunk, resolution: &Resolution) -> Vec<bool> {
+    let mut inside = vec![false; resolution.labels.len()];
+    mark_labels_in_loops(&chunk.body, false, resolution, &mut inside);
+    inside
+}
+
+fn mark_labels_in_loops(
+    block: &Block,
+    in_loop: bool,
+    resolution: &Resolution,
+    inside: &mut [bool],
+) {
+    for stmt in &block.stmts {
+        match stmt {
+            Stmt::Label { name, .. } if in_loop => {
+                if let Some(index) = resolution
+                    .labels
+                    .iter()
+                    .position(|label| label.span == name.span)
+                {
+                    inside[index] = true;
+                }
+            }
+            Stmt::Do { body, .. } => mark_labels_in_loops(body, in_loop, resolution, inside),
+            Stmt::While { body, .. } | Stmt::Repeat { body, .. } => {
+                mark_labels_in_loops(body, true, resolution, inside);
+            }
+            Stmt::NumericFor { body, .. } | Stmt::GenericFor { body, .. } => {
+                mark_labels_in_loops(body, true, resolution, inside);
+            }
+            Stmt::If {
+                arms, else_body, ..
+            } => {
+                for arm in arms {
+                    mark_labels_in_loops(&arm.body, in_loop, resolution, inside);
+                }
+                if let Some(body) = else_body {
+                    mark_labels_in_loops(body, in_loop, resolution, inside);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn stmt_contains_label(stmt: &Stmt) -> bool {
