@@ -679,7 +679,7 @@ fn reset_for_reuse_rejects_old_handles_and_starts_an_empty_heap() {
         };
         vm.reset_for_reuse().expect("start reset");
         let waker = std::task::Waker::noop();
-        let mut context = std::task::Context::from_waker(&waker);
+        let mut context = std::task::Context::from_waker(waker);
         match vm.poll_reset_for_reuse(&mut context) {
             std::task::Poll::Ready(Ok(())) => {}
             other => panic!("reset did not finish: {other:?}"),
@@ -809,13 +809,7 @@ fn reachable_outgoing(shape: &ScanShape, plan: &[(u32, u32, u32)]) -> u64 {
         .count() as u64
 }
 
-/// The meter is the observation. Graph size is only the budget, not a stand-in
-/// for the counts. Edge fields stay separate from node, root, and scratch
-/// requests. Scratch lengths are measured requests, not allocator capacity,
-/// RSS, Core close work, or wall time.
-fn assert_linear_meter(
-    label: &str,
-    meter: &heap::ScanMeter,
+struct LinearMeterExpect {
     slots: u64,
     roots: u64,
     occupied_roots: u64,
@@ -825,7 +819,24 @@ fn assert_linear_meter(
     marked: u64,
     doomed_tokens: u64,
     enumerates_doomed: bool,
-) {
+}
+
+/// The meter is the observation. Graph size is only the budget, not a stand-in
+/// for the counts. Edge fields stay separate from node, root, and scratch
+/// requests. Scratch lengths are measured requests, not allocator capacity,
+/// RSS, Core close work, or wall time.
+fn assert_linear_meter(label: &str, meter: &heap::ScanMeter, expect: LinearMeterExpect) {
+    let LinearMeterExpect {
+        slots,
+        roots,
+        occupied_roots,
+        edges,
+        outgoing,
+        dead,
+        marked,
+        doomed_tokens,
+        enumerates_doomed,
+    } = expect;
     assert_eq!(
         meter.mark_passes,
         1,
@@ -1023,15 +1034,17 @@ fn collect_pure_shape(shape: &ScanShape) {
     assert_linear_meter(
         shape.name,
         &meter,
-        u64::from(before.node_slots),
-        u64::from(before.root_slots),
-        u64::from(before.live_roots),
-        u64::from(before.live_edges),
-        reachable_outgoing(shape, &plan),
-        u64::from(shape.nodes - shape.reachable),
-        u64::from(shape.reachable),
-        0,
-        false,
+        LinearMeterExpect {
+            slots: u64::from(before.node_slots),
+            roots: u64::from(before.root_slots),
+            occupied_roots: u64::from(before.live_roots),
+            edges: u64::from(before.live_edges),
+            outgoing: reachable_outgoing(shape, &plan),
+            dead: u64::from(shape.nodes - shape.reachable),
+            marked: u64::from(shape.reachable),
+            doomed_tokens: 0,
+            enumerates_doomed: false,
+        },
     );
 }
 
@@ -1147,15 +1160,17 @@ fn collect_host_shape(shape: &ScanShape, share_resource: bool) {
         assert_linear_meter(
             shape.name,
             &meter,
-            u64::from(before.node_slots),
-            u64::from(before.root_slots),
-            u64::from(before.live_roots),
-            u64::from(before.live_edges),
-            reachable_outgoing(shape, &plan),
-            u64::from(shape.nodes - shape.reachable),
-            u64::from(shape.reachable),
-            u64::from(shape.nodes - shape.reachable),
-            true,
+            LinearMeterExpect {
+                slots: u64::from(before.node_slots),
+                roots: u64::from(before.root_slots),
+                occupied_roots: u64::from(before.live_roots),
+                edges: u64::from(before.live_edges),
+                outgoing: reachable_outgoing(shape, &plan),
+                dead: u64::from(shape.nodes - shape.reachable),
+                marked: u64::from(shape.reachable),
+                doomed_tokens: u64::from(shape.nodes - shape.reachable),
+                enumerates_doomed: true,
+            },
         );
     });
 }
@@ -1310,15 +1325,17 @@ fn collect_scan_retired_tokens_check_the_identified_slot() {
         assert_linear_meter(
             "retired-slot",
             &meter,
-            u64::from(before.node_slots),
-            u64::from(before.root_slots),
-            u64::from(before.live_roots),
-            0,
-            0,
-            u64::from(before.live_nodes - report.live_nodes),
-            u64::from(report.marked_nodes),
-            u64::from(meter.token_closes),
-            true,
+            LinearMeterExpect {
+                slots: u64::from(before.node_slots),
+                roots: u64::from(before.root_slots),
+                occupied_roots: u64::from(before.live_roots),
+                edges: 0,
+                outgoing: 0,
+                dead: u64::from(before.live_nodes - report.live_nodes),
+                marked: u64::from(report.marked_nodes),
+                doomed_tokens: meter.token_closes,
+                enumerates_doomed: true,
+            },
         );
     });
 }

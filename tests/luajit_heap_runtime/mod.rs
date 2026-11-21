@@ -337,10 +337,11 @@ impl HostOwnedFunction for Publish {
 
 impl HostOwnedFunction for Alive {
     fn call(&mut self, call: &mut OwnedHostCall<'_>) -> Result<CallOutcome, VmError> {
-        let mut host = call.vm().host_context();
-        note_body(&mut host);
-        note_alive(&mut host);
-        drop(host);
+        {
+            let mut host = call.vm().host_context();
+            note_body(&mut host);
+            note_alive(&mut host);
+        }
         let table = recover(call, 0)?;
         let mut host = call.vm().host_context();
         let alive = heap::with_heap(&mut host, |heap| Ok(heap.alive(table))).map_err(host_error)?;
@@ -352,12 +353,13 @@ impl HostOwnedFunction for Alive {
 
 impl HostOwnedFunction for Observe {
     fn call(&mut self, call: &mut OwnedHostCall<'_>) -> Result<CallOutcome, VmError> {
-        let mut host = call.vm().host_context();
-        note_body(&mut host);
-        note_alive(&mut host);
-        drop(host);
+        {
+            let mut host = call.vm().host_context();
+            note_body(&mut host);
+            note_alive(&mut host);
+        }
         let table = recover(call, 0)?;
-        let _marker = int_arg(&call, 1)?;
+        let _marker = int_arg(call, 1)?;
         let mut host = call.vm().host_context();
         let alive = heap::with_heap(&mut host, |heap| Ok(heap.alive(table))).map_err(host_error)?;
         Ok(CallOutcome::Return(CallReturn::one(Value::Int(i64::from(
@@ -368,11 +370,12 @@ impl HostOwnedFunction for Observe {
 
 impl HostOwnedFunction for SetEdge {
     fn call(&mut self, call: &mut OwnedHostCall<'_>) -> Result<CallOutcome, VmError> {
-        let mut host = call.vm().host_context();
-        note_body(&mut host);
-        drop(host);
+        {
+            let mut host = call.vm().host_context();
+            note_body(&mut host);
+        }
         let from = recover(call, 0)?;
-        let key = int_arg(&call, 1)?;
+        let key = int_arg(call, 1)?;
         let to = recover(call, 2)?;
         let mut host = call.vm().host_context();
         heap::with_heap(&mut host, |heap| heap.set_edge(from, key, to)).map_err(host_error)?;
@@ -382,11 +385,12 @@ impl HostOwnedFunction for SetEdge {
 
 impl HostOwnedFunction for EdgeIs {
     fn call(&mut self, call: &mut OwnedHostCall<'_>) -> Result<CallOutcome, VmError> {
-        let mut host = call.vm().host_context();
-        note_body(&mut host);
-        drop(host);
+        {
+            let mut host = call.vm().host_context();
+            note_body(&mut host);
+        }
         let from = recover(call, 0)?;
-        let key = int_arg(&call, 1)?;
+        let key = int_arg(call, 1)?;
         let to = recover(call, 2)?;
         let mut host = call.vm().host_context();
         let same = heap::with_heap(&mut host, |heap| Ok(heap.edge(from, key) == Ok(Some(to))))
@@ -399,7 +403,7 @@ impl HostOwnedFunction for EdgeIs {
 
 impl HostOwnedFunction for Enter {
     fn call(&mut self, call: &mut OwnedHostCall<'_>) -> Result<CallOutcome, VmError> {
-        let width = int_arg(&call, 0)?;
+        let width = int_arg(call, 0)?;
         let mut host = call.vm().host_context();
         note_body(&mut host);
         heap::with_heap(&mut host, |heap| heap.enter_roots(width)).map_err(host_error)?;
@@ -409,10 +413,11 @@ impl HostOwnedFunction for Enter {
 
 impl HostOwnedFunction for Root {
     fn call(&mut self, call: &mut OwnedHostCall<'_>) -> Result<CallOutcome, VmError> {
-        let mut host = call.vm().host_context();
-        note_body(&mut host);
-        drop(host);
-        let slot = int_arg(&call, 0)?;
+        {
+            let mut host = call.vm().host_context();
+            note_body(&mut host);
+        }
+        let slot = int_arg(call, 0)?;
         let table = recover(call, 1)?;
         let returned = call.args()[1].clone();
         let mut host = call.vm().host_context();
@@ -438,9 +443,10 @@ impl HostOwnedFunction for Collect {
 
 impl HostOwnedFunction for Close {
     fn call(&mut self, call: &mut OwnedHostCall<'_>) -> Result<CallOutcome, VmError> {
-        let mut host = call.vm().host_context();
-        note_body(&mut host);
-        drop(host);
+        {
+            let mut host = call.vm().host_context();
+            note_body(&mut host);
+        }
         let _taken = call.take_arg(0)?;
         Ok(CallOutcome::Return(CallReturn::one(Value::Int(1))))
     }
@@ -545,12 +551,11 @@ fn build_ir(source: &str) -> Result<FrontendIr, ParseError> {
     }
     let catalog = catalog();
     let mut builder = LocalIrBuilder::new();
-    let mut next_index = 0u16;
     let mut indices = std::collections::HashMap::new();
-    for (name, arity) in hosts_for(source) {
+    for (offset, (name, arity)) in hosts_for(source).iter().enumerate() {
+        let next_index = offset as u16;
         builder.declare_function(name, Some(*arity))?;
         indices.insert(*name, next_index);
-        next_index += 1;
     }
     let call = |name: &str, args: Vec<Expr>| {
         let index = indices[name];

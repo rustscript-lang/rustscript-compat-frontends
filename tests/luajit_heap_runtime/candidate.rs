@@ -395,13 +395,14 @@ impl Lower<'_> {
     fn expr(&mut self, expr: &ast::Expr) -> Result<Expr, ParseError> {
         match expr {
             ast::Expr::Table { fields, .. } if fields.is_empty() => self.call(NEW_TABLE, vec![]),
-            ast::Expr::Number { raw, kind, .. }
-                if matches!(kind, ast::NumberKind::Integer | ast::NumberKind::Float) =>
-            {
-                raw.parse()
-                    .map(Expr::Float)
-                    .map_err(|_| self.unsupported(expr.span()))
-            }
+            ast::Expr::Number {
+                raw,
+                kind: ast::NumberKind::Integer | ast::NumberKind::Float,
+                ..
+            } => raw
+                .parse()
+                .map(Expr::Float)
+                .map_err(|_| self.unsupported(expr.span())),
             ast::Expr::Name { name, .. } => self
                 .locals
                 .get(&name.bytes)
