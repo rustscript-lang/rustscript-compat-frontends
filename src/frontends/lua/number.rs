@@ -1,10 +1,10 @@
 //! Lower already-classified Lua numbers onto Core binary64 arithmetic.
 //!
 //! The caller has finished numeric classification. This module does not coerce
-//! strings, invoke metamethods, test truthiness, or treat a Core `Int` as a
-//! Lua object. Addition, subtraction, multiplication, division, and negation
-//! are Core f64 operations. Floor remainder is not Core `Mod`: that opcode is
-//! truncating. Power is `math::powf`.
+//! strings, invoke metamethods, test truthiness, or accept a Core expression as
+//! proof of binary64. Addition, subtraction, multiplication, division, and
+//! negation are Core f64 operations. Floor remainder is not Core `Mod`: that
+//! opcode is truncating. Power is `math::powf`.
 //!
 //! Remainder temps are names outside the Lua identifier grammar. They are
 //! probed on the same builder, because `alloc_local_named` reuses a slot for
@@ -15,36 +15,18 @@
 //! and this kernel does not own statement boundaries, so it cannot reuse a
 //! slot that a still-live nested expression might need. A future lowerer must
 //! bound that cost before production wiring. This module does not.
+//!
+//! `ClassifiedNumber` is closed. Arithmetic returns the same type, and
+//! `into_expr` is only for the statement that consumes the value. A local or
+//! temp is a typed reference returned by the operation that just emitted the
+//! binding. There is no constructor from an arbitrary `Expr` or `LocalSlot`.
 
 use vm::{BuiltinFunction, Expr, LocalIrBuilder, LocalSlot, ParseError, Stmt};
 
-/// A Lua number whose classification is already done.
-///
-/// This kernel checks only a directly visible literal. A visible `Int`, or
-/// another non-float literal, is rejected even in release builds. It is not
-/// coerced. `Var` and `Call` are not inspected: matching those variants does
-/// not prove binary64. Full-pipeline integration must pass
-/// [`FloatTypeEvidence`] only after the Lua numeric classifier has established
-/// Float.
+/// A Lua number built only from a binary64 literal or from an operation on one.
 #[derive(Clone, Debug)]
 pub(crate) struct ClassifiedNumber {
     expr: Expr,
-}
-
-/// Caller attestation that an expression is already binary64.
-///
-/// Constructing this does not inspect the expression. The future numeric
-/// classifier is the production source of this token. This kernel does not
-/// re-check `Var` or `Call`.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct FloatTypeEvidence {
-    _private: (),
-}
-
-impl FloatTypeEvidence {
-    pub(crate) const fn attested() -> Self {
-        Self { _private: () }
-    }
 }
 
 impl ClassifiedNumber {
@@ -54,54 +36,102 @@ impl ClassifiedNumber {
         }
     }
 
-    /// `evidence` is the caller's proof. A directly visible non-float literal
-    /// still fails, because that proof is contradicted by the IR the kernel
-    /// can see.
-    pub(crate) fn from_attested_float(
-        expr: Expr,
-        _evidence: FloatTypeEvidence,
-    ) -> Result<Self, ParseError> {
-        if let Some(kind) = directly_known_non_float_literal(&expr) {
-            return Err(ParseError::new(format!(
-                "classified Lua number requires binary64, found Core {kind} literal"
-            )));
+    pub(crate) fn neg(self) -> Self {
+        Self {
+            expr: Expr::Neg(Box::new(self.expr)),
         }
-        Ok(Self { expr })
     }
 
-    pub(crate) fn neg(self) -> Expr {
-        Expr::Neg(Box::new(self.expr))
+    pub(crate) fn add(self, rhs: Self) -> Self {
+        Self {
+            expr: Expr::Add(Box::new(self.expr), Box::new(rhs.expr)),
+        }
     }
 
-    pub(crate) fn add(self, rhs: Self) -> Expr {
-        Expr::Add(Box::new(self.expr), Box::new(rhs.expr))
+    pub(crate) fn sub(self, rhs: Self) -> Self {
+        Self {
+            expr: Expr::Sub(Box::new(self.expr), Box::new(rhs.expr)),
+        }
     }
 
-    pub(crate) fn sub(self, rhs: Self) -> Expr {
-        Expr::Sub(Box::new(self.expr), Box::new(rhs.expr))
+    pub(crate) fn mul(self, rhs: Self) -> Self {
+        Self {
+            expr: Expr::Mul(Box::new(self.expr), Box::new(rhs.expr)),
+        }
     }
 
-    pub(crate) fn mul(self, rhs: Self) -> Expr {
-        Expr::Mul(Box::new(self.expr), Box::new(rhs.expr))
+    pub(crate) fn div(self, rhs: Self) -> Self {
+        Self {
+            expr: Expr::Div(Box::new(self.expr), Box::new(rhs.expr)),
+        }
     }
 
-    pub(crate) fn div(self, rhs: Self) -> Expr {
-        Expr::Div(Box::new(self.expr), Box::new(rhs.expr))
+    pub(crate) fn pow(self, exponent: Self) -> Self {
+        Self {
+            expr: Expr::Call(
+                BuiltinFunction::MathPowF.call_index(),
+                Vec::new(),
+                vec![self.expr, exponent.expr],
+                None,
+                None,
+            ),
+        }
     }
 
-    pub(crate) fn pow(self, exponent: Self) -> Expr {
-        Expr::Call(
-            BuiltinFunction::MathPowF.call_index(),
-            Vec::new(),
-            vec![self.expr, exponent.expr],
-            None,
-            None,
-        )
-    }
-
+    /// Final consumption. Callers that still need a classified value must use
+    /// the reference returned by `bind_named`, `store`, or `materialize`.
     pub(crate) fn into_expr(self) -> Expr {
         self.expr
     }
+
+    /// Slot named by a binding this kernel just emitted.
+    ///
+    /// Literals and arithmetic results name no slot. This does not classify a
+    /// caller-supplied slot.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn bound_slot(&self) -> Option<LocalSlot> {
+        match &self.expr {
+            Expr::Var(slot) => Some(*slot),
+            _ => None,
+        }
+    }
+
+    /// Closed test producer. The value expression is always `Expr::Float`.
+    ///
+    /// `before` may observe evaluation. It is not a number source, and it
+    /// cannot turn an external slot into the produced value.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn from_observed_literal(before: Vec<Stmt>, value: f64) -> Self {
+        if before.is_empty() {
+            return Self::literal(value);
+        }
+        Self {
+            expr: Expr::Block {
+                stmts: before,
+                expr: Box::new(Expr::Float(value)),
+            },
+        }
+    }
+}
+
+/// An external Core slot was not emitted from a classified value.
+#[cfg(test)]
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct UnprovenSlot {
+    pub(crate) slot: LocalSlot,
+}
+
+/// Refuse an arbitrary slot. There is no success path.
+///
+/// A typed reference exists only as the return value of `bind_named`,
+/// `store`, or `materialize`.
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn external_slot_evidence(slot: LocalSlot) -> Result<ClassifiedNumber, UnprovenSlot> {
+    Err(UnprovenSlot { slot })
 }
 
 /// Temps for operations that must evaluate each operand once and then reuse it.
@@ -125,7 +155,7 @@ impl<'a> NumberLowering<'a> {
         &mut self,
         lhs: ClassifiedNumber,
         rhs: ClassifiedNumber,
-    ) -> Result<Expr, ParseError> {
+    ) -> Result<ClassifiedNumber, ParseError> {
         let lhs_slot = self.alloc_temp("mod_lhs")?;
         let rhs_slot = self.alloc_temp("mod_rhs")?;
         let lhs_var = Expr::Var(lhs_slot);
@@ -133,15 +163,38 @@ impl<'a> NumberLowering<'a> {
         let quotient = Expr::Div(Box::new(lhs_var.clone()), Box::new(rhs_var.clone()));
         let product = Expr::Mul(Box::new(call_math_floor(quotient)), Box::new(rhs_var));
         let remainder = Expr::Sub(Box::new(lhs_var), Box::new(product));
-        Ok(Expr::Block {
-            stmts: vec![bind_temp(lhs_slot, lhs.expr), bind_temp(rhs_slot, rhs.expr)],
-            expr: Box::new(remainder),
+        Ok(ClassifiedNumber {
+            expr: Expr::Block {
+                stmts: vec![
+                    bind_temp(lhs_slot, lhs.into_expr()),
+                    bind_temp(rhs_slot, rhs.into_expr()),
+                ],
+                expr: Box::new(remainder),
+            },
         })
     }
 
-    /// Bind a guest local on the same builder that owns remainder temps.
-    pub(crate) fn alloc_local_named(&mut self, name: &str) -> Result<LocalSlot, ParseError> {
-        self.builder.alloc_local_named(name)
+    /// Emit a guest binding of an already classified value.
+    ///
+    /// The returned reference names that binding. It is not rebuilt from a
+    /// slot the caller already had.
+    pub(crate) fn bind_named(
+        &mut self,
+        name: &str,
+        value: ClassifiedNumber,
+        line: u32,
+        stmts: &mut Vec<Stmt>,
+    ) -> Result<ClassifiedNumber, ParseError> {
+        let slot = self.builder.alloc_local_named(name)?;
+        stmts.push(Stmt::Let {
+            index: slot,
+            declared_schema: None,
+            expr: value.into_expr(),
+            line,
+        });
+        Ok(ClassifiedNumber {
+            expr: Expr::Var(slot),
+        })
     }
 
     /// Bind an already classified value to a fresh temp.
@@ -153,8 +206,10 @@ impl<'a> NumberLowering<'a> {
         stmts: &mut Vec<Stmt>,
     ) -> Result<ClassifiedNumber, ParseError> {
         let slot = self.alloc_temp("value")?;
-        stmts.push(bind_temp(slot, value.expr));
-        ClassifiedNumber::from_attested_float(Expr::Var(slot), FloatTypeEvidence::attested())
+        stmts.push(bind_temp(slot, value.into_expr()));
+        Ok(ClassifiedNumber {
+            expr: Expr::Var(slot),
+        })
     }
 
     /// Keep a chain step shallow when the value is not already a literal or slot.
@@ -183,17 +238,6 @@ impl<'a> NumberLowering<'a> {
                 .checked_add(1)
                 .ok_or_else(|| ParseError::new("lua number temp ordinal overflow"))?;
         }
-    }
-}
-
-fn directly_known_non_float_literal(expr: &Expr) -> Option<&'static str> {
-    match expr {
-        Expr::Int(_) => Some("Int"),
-        Expr::Null => Some("Null"),
-        Expr::Bool(_) => Some("Bool"),
-        Expr::String(_) => Some("String"),
-        Expr::Bytes(_) => Some("Bytes"),
-        _ => None,
     }
 }
 

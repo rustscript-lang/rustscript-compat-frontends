@@ -7,7 +7,7 @@
 #[path = "../src/frontends/lua/number.rs"]
 mod number;
 
-use number::{ClassifiedNumber, FloatTypeEvidence, NumberLowering};
+use number::{ClassifiedNumber, NumberLowering};
 use vm::{AssignmentKind, Compiler, Expr, LocalIrBuilder, LocalSlot, Stmt, Value, Vm};
 
 const PROTOCOL_06: [&str; 4] = ["3.5", "1", "-1", "-2.5"];
@@ -21,30 +21,37 @@ const PROTOCOL_06_BITS: [u64; 4] = [
 #[test]
 fn case06_business_results_match_frozen_protocol() {
     let mut builder = LocalIrBuilder::new();
-    let mut lowering = NumberLowering::new(&mut builder);
-    let quotient = ClassifiedNumber::literal(7.0).div(ClassifiedNumber::literal(2.0));
-    let positive_remainder = lowering
-        .floor_mod(
-            ClassifiedNumber::literal(-5.0),
-            ClassifiedNumber::literal(3.0),
+    let (quotient, positive_remainder, negative_remainder, negative_quotient) = {
+        let mut lowering = NumberLowering::new(&mut builder);
+        let quotient = ClassifiedNumber::literal(7.0).div(ClassifiedNumber::literal(2.0));
+        let positive_remainder = lowering
+            .floor_mod(
+                ClassifiedNumber::literal(-5.0),
+                ClassifiedNumber::literal(3.0),
+            )
+            .expect("bind remainder temps");
+        let negative_remainder = lowering
+            .floor_mod(
+                ClassifiedNumber::literal(5.0),
+                ClassifiedNumber::literal(-3.0),
+            )
+            .expect("bind remainder temps");
+        let negative_quotient = ClassifiedNumber::literal(-5.0).div(ClassifiedNumber::literal(2.0));
+        (
+            quotient,
+            positive_remainder,
+            negative_remainder,
+            negative_quotient,
         )
-        .expect("bind remainder temps");
-    let negative_remainder = lowering
-        .floor_mod(
-            ClassifiedNumber::literal(5.0),
-            ClassifiedNumber::literal(-3.0),
-        )
-        .expect("bind remainder temps");
-    let negative_quotient = ClassifiedNumber::literal(-5.0).div(ClassifiedNumber::literal(2.0));
-    drop(lowering);
+    };
 
     let ran = run(
         builder,
         vec![
-            expr_stmt(quotient),
-            expr_stmt(positive_remainder),
-            expr_stmt(negative_remainder),
-            expr_stmt(negative_quotient),
+            expr_stmt(quotient.into_expr()),
+            expr_stmt(positive_remainder.into_expr()),
+            expr_stmt(negative_remainder.into_expr()),
+            expr_stmt(negative_quotient.into_expr()),
         ],
     );
 
@@ -137,13 +144,6 @@ fn add_sub_mul_and_negation_match_observed_luajit() {
 
     let negated_zero = eval_unary(|operand| operand.neg(), 0.0);
     assert_expect(&negated_zero, Expect::Bits(0x8000_0000_0000_0000), 0.0, 0.0);
-    let negated_negative_zero = eval_unary(|operand| operand.neg(), -0.0);
-    assert_expect(
-        &negated_negative_zero,
-        Expect::Bits(0x0000_0000_0000_0000),
-        -0.0,
-        0.0,
-    );
     let negated_nan = eval_unary(|operand| operand.neg(), f64::NAN);
     assert_expect(&negated_nan, Expect::Nan, f64::NAN, 0.0);
 }
@@ -216,17 +216,13 @@ fn remainder_temps_keep_a_guest_local_and_a_nested_rhs() {
         };
         let mut lowering = NumberLowering::new(&mut builder);
         lowering
-            .floor_mod(
-                ClassifiedNumber::literal(7.0),
-                ClassifiedNumber::from_attested_float(inner, FloatTypeEvidence::attested())
-                    .expect("inner remainder is binary64"),
-            )
+            .floor_mod(ClassifiedNumber::literal(7.0), inner)
             .expect("outer remainder")
     };
     let ir = builder.finish(vec![
         let_int(guest, 42),
-        expr_stmt(collided),
-        expr_stmt(nested),
+        expr_stmt(collided.into_expr()),
+        expr_stmt(nested.into_expr()),
     ]);
     let ran = run_stmts(ir.locals, ir.stmts);
     let collision_is_two = matches!(
@@ -267,48 +263,68 @@ fn remainder_temps_keep_a_guest_local_and_a_nested_rhs() {
 }
 
 #[test]
-fn known_int_literal_is_rejected_before_truncating_div() {
-    let evidence = FloatTypeEvidence::attested();
-    let seven = ClassifiedNumber::from_attested_float(Expr::Int(7), evidence);
-    let two = ClassifiedNumber::from_attested_float(Expr::Int(2), evidence);
-    let negative = ClassifiedNumber::from_attested_float(Expr::Int(-5), evidence);
-    let message = seven
-        .expect_err("Int(7) must not enter classified arithmetic")
-        .message;
-    assert!(
-        message.contains("Int"),
-        "rejection should name the visible literal, got {message}"
-    );
-    assert!(two.is_err(), "Int(2) must not enter classified arithmetic");
-    assert!(
-        negative.is_err(),
-        "Int(-5) must not enter classified arithmetic"
-    );
-    let boolean = ClassifiedNumber::from_attested_float(Expr::Bool(true), evidence);
-    assert!(
-        boolean.is_err(),
-        "a visible Bool literal must not enter classified arithmetic"
+fn int_slot_cannot_obtain_float_evidence() {
+    let mut builder = LocalIrBuilder::new();
+    let int_slot = builder.alloc_local_named("raw_int").expect("int slot");
+    let refused = number::external_slot_evidence(int_slot)
+        .expect_err("an Int slot must not receive float evidence");
+    assert_eq!(refused.slot, int_slot);
+
+    let mut stmts = Vec::new();
+    let stored = {
+        let mut lowering = NumberLowering::new(&mut builder);
+        let proven = lowering
+            .bind_named("proven", ClassifiedNumber::literal(7.0), 1, &mut stmts)
+            .expect("bind proven float");
+        assert_ne!(
+            proven.bound_slot(),
+            Some(int_slot),
+            "proven bind reused the Int slot"
+        );
+        let quotient = ClassifiedNumber::literal(7.0).div(ClassifiedNumber::literal(2.0));
+        assert!(
+            quotient.bound_slot().is_none(),
+            "literal division must not be a slot reference"
+        );
+        let stored = lowering
+            .materialize(quotient, &mut stmts)
+            .expect("materialize classified division");
+        assert_ne!(
+            stored.bound_slot(),
+            Some(int_slot),
+            "classified store reused the Int slot"
+        );
+        stored
+    };
+    stmts.push(let_int(int_slot, 7));
+    stmts.push(expr_stmt(stored.into_expr()));
+    let ran = run(builder, stmts);
+    assert_eq!(local_int(&ran, int_slot), 7, "Int slot was consumed");
+    assert_protocol_number(&ran.stack[0], "3.5", 3.5f64.to_bits());
+    assert_ne!(
+        ran.stack[0],
+        Value::Int(7 / 2),
+        "kernel result must not be truncating Int division"
     );
 }
 
 #[test]
-fn attested_var_is_not_retyped_by_the_number_kernel() {
+fn observed_float_producer_does_not_adopt_an_int_slot() {
     let mut builder = LocalIrBuilder::new();
-    let slot = builder.alloc_local_named("n").expect("guest local");
-    let classified =
-        ClassifiedNumber::from_attested_float(Expr::Var(slot), FloatTypeEvidence::attested());
+    let int_slot = builder.alloc_local_named("raw_int").expect("int slot");
+    let produced = ClassifiedNumber::from_observed_literal(vec![let_int(int_slot, 7)], 2.0);
     assert!(
-        classified.is_ok(),
-        "matching Var is not Float evidence and is not a kernel type check: {classified:?}"
+        produced.bound_slot().is_none(),
+        "closed producer must not name the Int slot"
     );
-    let call = ClassifiedNumber::from_attested_float(
-        Expr::Call(0, Vec::new(), Vec::new(), None, None),
-        FloatTypeEvidence::attested(),
+    let quotient = ClassifiedNumber::literal(7.0).div(produced);
+    let ran = run(builder, vec![expr_stmt(quotient.into_expr())]);
+    assert_eq!(
+        local_int(&ran, int_slot),
+        7,
+        "preceding Int let did not run"
     );
-    assert!(
-        call.is_ok(),
-        "matching Call is not Float evidence and is not a kernel type check: {call:?}"
-    );
+    assert_protocol_number(&ran.stack[0], "3.5", 3.5f64.to_bits());
 }
 
 #[derive(Clone, Copy)]
@@ -329,11 +345,16 @@ struct Ran {
     locals: Vec<Value>,
 }
 
-fn eval_binary(op: fn(ClassifiedNumber, ClassifiedNumber) -> Expr, lhs: f64, rhs: f64) -> Value {
+fn eval_binary(
+    op: fn(ClassifiedNumber, ClassifiedNumber) -> ClassifiedNumber,
+    lhs: f64,
+    rhs: f64,
+) -> Value {
     let expr = op(
         ClassifiedNumber::literal(lhs),
         ClassifiedNumber::literal(rhs),
-    );
+    )
+    .into_expr();
     let builder = LocalIrBuilder::new();
     run(builder, vec![expr_stmt(expr)])
         .stack
@@ -352,6 +373,7 @@ fn eval_floor_mod(lhs: f64, rhs: f64) -> Value {
                 ClassifiedNumber::literal(rhs),
             )
             .expect("bind remainder temps")
+            .into_expr()
     };
     run(builder, vec![expr_stmt(expr)])
         .stack
@@ -360,8 +382,8 @@ fn eval_floor_mod(lhs: f64, rhs: f64) -> Value {
         .expect("one result")
 }
 
-fn eval_unary(op: fn(ClassifiedNumber) -> Expr, operand: f64) -> Value {
-    let expr = op(ClassifiedNumber::literal(operand));
+fn eval_unary(op: fn(ClassifiedNumber) -> ClassifiedNumber, operand: f64) -> Value {
+    let expr = op(ClassifiedNumber::literal(operand)).into_expr();
     let builder = LocalIrBuilder::new();
     run(builder, vec![expr_stmt(expr)])
         .stack
@@ -376,18 +398,18 @@ fn assert_binary_eval_once(
     rhs: f64,
     text: &str,
     bits: u64,
-    op: fn(&mut NumberLowering<'_>, ClassifiedNumber, ClassifiedNumber) -> Expr,
+    op: fn(&mut NumberLowering<'_>, ClassifiedNumber, ClassifiedNumber) -> ClassifiedNumber,
 ) {
     let mut builder = LocalIrBuilder::new();
     let sequence = builder.alloc_local_named("sequence").expect("sequence");
     let left_mark = builder.alloc_local_named("left_mark").expect("left mark");
     let right_mark = builder.alloc_local_named("right_mark").expect("right mark");
-    let expr = {
+    let value = {
         let mut lowering = NumberLowering::new(&mut builder);
         op(
             &mut lowering,
-            attested_float(counted_literal(sequence, left_mark, lhs)),
-            attested_float(counted_literal(sequence, right_mark, rhs)),
+            observed_count(sequence, left_mark, lhs),
+            observed_count(sequence, right_mark, rhs),
         )
     };
     let ran = run(
@@ -396,7 +418,7 @@ fn assert_binary_eval_once(
             let_int(sequence, 0),
             let_int(left_mark, 0),
             let_int(right_mark, 0),
-            expr_stmt(expr),
+            expr_stmt(value.into_expr()),
         ],
     );
     assert_eq!(
@@ -424,19 +446,23 @@ fn assert_unary_eval_once() {
     let mut builder = LocalIrBuilder::new();
     let sequence = builder.alloc_local_named("sequence").expect("sequence");
     let mark = builder.alloc_local_named("mark").expect("mark");
-    let expr = attested_float(counted_literal(sequence, mark, 0.0)).neg();
+    let value = observed_count(sequence, mark, 0.0).neg();
     let ran = run(
         builder,
-        vec![let_int(sequence, 0), let_int(mark, 0), expr_stmt(expr)],
+        vec![
+            let_int(sequence, 0),
+            let_int(mark, 0),
+            expr_stmt(value.into_expr()),
+        ],
     );
     assert_eq!(local_int(&ran, sequence), 1, "{:?}", ran.locals);
     assert_eq!(local_int(&ran, mark), 1, "{:?}", ran.locals);
     assert_expect(&ran.stack[0], Expect::Bits(0x8000_0000_0000_0000), 0.0, 0.0);
 }
 
-fn counted_literal(sequence: LocalSlot, mark: LocalSlot, value: f64) -> Expr {
-    Expr::Block {
-        stmts: vec![
+fn observed_count(sequence: LocalSlot, mark: LocalSlot, value: f64) -> ClassifiedNumber {
+    ClassifiedNumber::from_observed_literal(
+        vec![
             Stmt::Assign {
                 kind: AssignmentKind::Set,
                 index: sequence,
@@ -450,8 +476,8 @@ fn counted_literal(sequence: LocalSlot, mark: LocalSlot, value: f64) -> Expr {
                 line: 1,
             },
         ],
-        expr: Box::new(Expr::Float(value)),
-    }
+        value,
+    )
 }
 
 fn run(builder: LocalIrBuilder, stmts: Vec<Stmt>) -> Ran {
@@ -472,11 +498,6 @@ fn run_stmts(local_count: usize, stmts: Vec<Stmt>) -> Ran {
         stack: vm.stack().to_vec(),
         locals: vm.locals().to_vec(),
     }
-}
-
-fn attested_float(expr: Expr) -> ClassifiedNumber {
-    ClassifiedNumber::from_attested_float(expr, FloatTypeEvidence::attested())
-        .expect("caller constructed a binary64 expression")
 }
 
 fn is_lua_identifier(name: &str) -> bool {

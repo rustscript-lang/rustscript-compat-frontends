@@ -1,15 +1,15 @@
 //! Narrow source seam from a parsed Lua chunk onto the binary64 number kernel.
 //!
-//! Only a grammar kind that is already binary64, or a local whose initializer
-//! this walk proved, may receive [`FloatTypeEvidence`]. `LL`, `ULL`, imaginary
-//! suffixes, and names this walk did not prove stay outside that token.
-//! Chains are hoisted with the kernel's temps so a flat source spine does not
-//! become an unbounded Core expression. Slot reuse stays with Core.
+//! Only a grammar kind that is already binary64, or a local this walk just
+//! bound from a classified value, enters the kernel. `LL`, `ULL`, imaginary
+//! suffixes, and names this walk did not prove stay outside it. Chains are
+//! hoisted with the kernel's temps so a flat source spine does not become an
+//! unbounded Core expression. Slot reuse stays with Core.
 
 use super::ast::{BinOp, Chunk, Expr, ExprList, LocalName, NumberKind, Span, Stmt, UnOp};
-use super::number::{ClassifiedNumber, FloatTypeEvidence, NumberLowering};
+use super::number::{ClassifiedNumber, NumberLowering};
 use super::resolve::Resolution;
-use vm::{Expr as CoreExpr, FrontendIr, LocalIrBuilder, LocalSlot, ParseError, Stmt as CoreStmt};
+use vm::{FrontendIr, LocalIrBuilder, ParseError, Stmt as CoreStmt};
 
 pub(crate) struct LoweredNumberChunk {
     pub(crate) ir: FrontendIr,
@@ -20,13 +20,26 @@ pub(crate) struct LoweredNumberChunk {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum NumberSourceError {
     Syntax { message: String },
-    CompileUnsupported { reason: String },
-    NotFloat { kind: &'static str },
+    CompileUnsupported { reason: UnsupportedReason },
+    NotFloat { kind: NumberKind },
+}
+
+/// Why a parsed fragment does not enter the binary64 kernel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum UnsupportedReason {
+    Statement,
+    Operator,
+    Expression,
+    LiteralForm,
+    UnprovenName,
+    NotSingle,
+    LocalName,
+    Kernel { message: String },
 }
 
 struct ProvenLocal {
     name: Vec<u8>,
-    slot: LocalSlot,
+    value: ClassifiedNumber,
 }
 
 pub(crate) fn lower_proven_chunk(
@@ -77,7 +90,7 @@ fn lower_stmt(
             values,
         } => lower_local(source, *span, names, values, lowering, stmts, env),
         Stmt::Return { span, values } => {
-            let value = single_proven(values, "return is not a single proven number")?;
+            let value = single_proven(values)?;
             let lowered = lower_expr(source, value, lowering, stmts, env)?;
             stmts.push(CoreStmt::Expr {
                 expr: lowered.into_expr(),
@@ -85,7 +98,7 @@ fn lower_stmt(
             });
             Ok(())
         }
-        _ => Err(unsupported("statement is outside the numeric subset")),
+        _ => Err(unsupported(UnsupportedReason::Statement)),
     }
 }
 
@@ -99,22 +112,18 @@ fn lower_local(
     env: &mut Vec<ProvenLocal>,
 ) -> Result<(), NumberSourceError> {
     if names.len() != 1 || values.exprs.len() != 1 {
-        return Err(unsupported("local is not a single proven number"));
+        return Err(unsupported(UnsupportedReason::NotSingle));
     }
     let lowered = lower_expr(source, &values.exprs[0], lowering, stmts, env)?;
     let name = &names[0].name;
-    let text = std::str::from_utf8(&name.bytes)
-        .map_err(|_| unsupported("local name is not a proven number"))?;
-    let slot = lowering.alloc_local_named(text).map_err(kernel_error)?;
-    stmts.push(CoreStmt::Let {
-        index: slot,
-        declared_schema: None,
-        expr: lowered.into_expr(),
-        line: line_of(source, span),
-    });
+    let text =
+        std::str::from_utf8(&name.bytes).map_err(|_| unsupported(UnsupportedReason::LocalName))?;
+    let bound = lowering
+        .bind_named(text, lowered, line_of(source, span), stmts)
+        .map_err(kernel_error)?;
     env.push(ProvenLocal {
         name: name.bytes.clone(),
-        slot,
+        value: bound,
     });
     Ok(())
 }
@@ -149,7 +158,7 @@ fn lower_expr(
             }
             Ok(acc)
         }
-        _ => Err(unsupported("expression is outside the numeric subset")),
+        _ => Err(unsupported(UnsupportedReason::Expression)),
     }
 }
 
@@ -162,11 +171,11 @@ fn lower_unary(
     env: &[ProvenLocal],
 ) -> Result<ClassifiedNumber, NumberSourceError> {
     if op != UnOp::Neg {
-        return Err(unsupported("operator is outside the numeric subset"));
+        return Err(unsupported(UnsupportedReason::Operator));
     }
     let inner = lower_expr(source, expr, lowering, stmts, env)?;
     let inner = lowering.materialize(inner, stmts).map_err(kernel_error)?;
-    attest(inner.neg())
+    Ok(inner.neg())
 }
 
 fn apply(
@@ -178,30 +187,29 @@ fn apply(
 ) -> Result<ClassifiedNumber, NumberSourceError> {
     let lhs = lowering.materialize(lhs, stmts).map_err(kernel_error)?;
     let rhs = lowering.materialize(rhs, stmts).map_err(kernel_error)?;
-    let expr = match op {
-        BinOp::Add => lhs.add(rhs),
-        BinOp::Sub => lhs.sub(rhs),
-        BinOp::Mul => lhs.mul(rhs),
-        BinOp::Div => lhs.div(rhs),
-        BinOp::Pow => lhs.pow(rhs),
-        BinOp::Mod => lowering.floor_mod(lhs, rhs).map_err(kernel_error)?,
-        _ => return Err(unsupported("operator is outside the numeric subset")),
-    };
-    attest(expr)
+    match op {
+        BinOp::Add => Ok(lhs.add(rhs)),
+        BinOp::Sub => Ok(lhs.sub(rhs)),
+        BinOp::Mul => Ok(lhs.mul(rhs)),
+        BinOp::Div => Ok(lhs.div(rhs)),
+        BinOp::Pow => Ok(lhs.pow(rhs)),
+        BinOp::Mod => lowering.floor_mod(lhs, rhs).map_err(kernel_error),
+        _ => Err(unsupported(UnsupportedReason::Operator)),
+    }
 }
 
 fn lower_number(raw: &str, kind: NumberKind) -> Result<ClassifiedNumber, NumberSourceError> {
     let value = match kind {
-        NumberKind::Signed64 => return Err(not_float("Signed64")),
-        NumberKind::Unsigned64 => return Err(not_float("Unsigned64")),
-        NumberKind::Imaginary => return Err(not_float("Imaginary")),
-        NumberKind::HexFloat => return Err(unsupported("literal form is not lowered")),
+        NumberKind::Signed64 => return Err(not_float(NumberKind::Signed64)),
+        NumberKind::Unsigned64 => return Err(not_float(NumberKind::Unsigned64)),
+        NumberKind::Imaginary => return Err(not_float(NumberKind::Imaginary)),
+        NumberKind::HexFloat => return Err(unsupported(UnsupportedReason::LiteralForm)),
         NumberKind::Integer | NumberKind::Float => parse_decimal(raw)?,
         NumberKind::HexInteger => parse_prefixed_integer(raw, 16)?,
         NumberKind::Binary => parse_prefixed_integer(raw, 2)?,
     };
     if value.is_nan() {
-        return Err(unsupported("literal form is not lowered"));
+        return Err(unsupported(UnsupportedReason::LiteralForm));
     }
     Ok(ClassifiedNumber::literal(value))
 }
@@ -216,18 +224,18 @@ fn parse_decimal(raw: &str) -> Result<f64, NumberSourceError> {
     };
     normalized
         .parse::<f64>()
-        .map_err(|_| unsupported("literal form is not lowered"))
+        .map_err(|_| unsupported(UnsupportedReason::LiteralForm))
 }
 
 fn parse_prefixed_integer(raw: &str, radix: u32) -> Result<f64, NumberSourceError> {
     let digits = raw
         .get(2..)
         .filter(|digits| !digits.is_empty())
-        .ok_or_else(|| unsupported("literal form is not lowered"))?;
+        .ok_or_else(|| unsupported(UnsupportedReason::LiteralForm))?;
     let marker = raw.as_bytes().get(1).copied().unwrap_or(0) | 0x20;
     let expected = if radix == 16 { b'x' } else { b'b' };
     if raw.len() < 3 || raw.as_bytes()[0] != b'0' || marker != expected {
-        return Err(unsupported("literal form is not lowered"));
+        return Err(unsupported(UnsupportedReason::LiteralForm));
     }
     let mut magnitude: u64 = 0;
     for byte in digits.bytes() {
@@ -235,59 +243,50 @@ fn parse_prefixed_integer(raw: &str, radix: u32) -> Result<f64, NumberSourceErro
             b'0'..=b'9' => byte - b'0',
             b'a'..=b'f' => byte - b'a' + 10,
             b'A'..=b'F' => byte - b'A' + 10,
-            _ => return Err(unsupported("literal form is not lowered")),
+            _ => return Err(unsupported(UnsupportedReason::LiteralForm)),
         };
         if u32::from(digit) >= radix {
-            return Err(unsupported("literal form is not lowered"));
+            return Err(unsupported(UnsupportedReason::LiteralForm));
         }
         let scaled = magnitude
             .checked_mul(u64::from(radix))
-            .ok_or_else(|| unsupported("literal form is not lowered"))?;
+            .ok_or_else(|| unsupported(UnsupportedReason::LiteralForm))?;
         magnitude = scaled
             .checked_add(u64::from(digit))
-            .ok_or_else(|| unsupported("literal form is not lowered"))?;
+            .ok_or_else(|| unsupported(UnsupportedReason::LiteralForm))?;
     }
     Ok(magnitude as f64)
 }
 
 fn lookup_proven(name: &[u8], env: &[ProvenLocal]) -> Result<ClassifiedNumber, NumberSourceError> {
-    let slot = env
-        .iter()
+    env.iter()
         .rev()
         .find(|local| local.name == name)
-        .map(|local| local.slot)
-        .ok_or_else(|| unsupported("name is not a proven local"))?;
-    attest(CoreExpr::Var(slot))
+        .map(|local| local.value.clone())
+        .ok_or_else(|| unsupported(UnsupportedReason::UnprovenName))
 }
 
-fn single_proven<'a>(
-    values: &'a ExprList,
-    reason: &'static str,
-) -> Result<&'a Expr, NumberSourceError> {
+fn single_proven(values: &ExprList) -> Result<&Expr, NumberSourceError> {
     if values.exprs.len() == 1 {
         Ok(&values.exprs[0])
     } else {
-        Err(unsupported(reason))
+        Err(unsupported(UnsupportedReason::NotSingle))
     }
-}
-
-fn attest(expr: CoreExpr) -> Result<ClassifiedNumber, NumberSourceError> {
-    ClassifiedNumber::from_attested_float(expr, FloatTypeEvidence::attested()).map_err(kernel_error)
 }
 
 fn kernel_error(error: ParseError) -> NumberSourceError {
     NumberSourceError::CompileUnsupported {
-        reason: format!("number kernel: {}", error.message),
+        reason: UnsupportedReason::Kernel {
+            message: error.message,
+        },
     }
 }
 
-fn unsupported(reason: &'static str) -> NumberSourceError {
-    NumberSourceError::CompileUnsupported {
-        reason: reason.to_string(),
-    }
+fn unsupported(reason: UnsupportedReason) -> NumberSourceError {
+    NumberSourceError::CompileUnsupported { reason }
 }
 
-fn not_float(kind: &'static str) -> NumberSourceError {
+fn not_float(kind: NumberKind) -> NumberSourceError {
     NumberSourceError::NotFloat { kind }
 }
 

@@ -52,8 +52,60 @@ enum Expect {
 struct NegativeCase {
     name: &'static str,
     source: &'static str,
-    layer: &'static str,
-    detail: &'static str,
+    layer: RejectLayer,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RejectLayer {
+    Syntax,
+    NotFloat(ast::NumberKind),
+    Unsupported(number_source::UnsupportedReason),
+}
+
+#[test]
+fn hex_float_decoder_keeps_nonzero_subnormal_bits() {
+    let min_positive = parse_lua_hex_float("0x1p-1074");
+    assert_eq!(
+        min_positive.to_bits(),
+        0x0000_0000_0000_0001,
+        "min positive subnormal was misdecoded as {min_positive:?}"
+    );
+    assert!(min_positive.is_finite() && min_positive != 0.0);
+    let next = parse_lua_hex_float("0x1p-1073");
+    assert_eq!(next.to_bits(), 0x0000_0000_0000_0002);
+    let negative = parse_lua_hex_float("-0x1p-1074");
+    assert_eq!(negative.to_bits(), 0x8000_0000_0000_0001);
+    assert!(negative.is_finite() && negative.is_sign_negative() && negative != 0.0);
+    let tenth = parse_lua_hex_float("0x1.999999999999ap-4");
+    assert_eq!(tenth.to_bits(), 0x3fb9_9999_9999_999a);
+    assert_eq!(
+        parse_lua_hex_float("0x1.cp+1").to_bits(),
+        0x400c_0000_0000_0000
+    );
+    assert_eq!(
+        parse_lua_hex_float("-0x1p+1").to_bits(),
+        0xc000_0000_0000_0000
+    );
+    assert!(matches!(
+        parse_oracle_value("nan"),
+        OracleNumber::Class("nan")
+    ));
+    assert!(matches!(
+        parse_oracle_value("inf"),
+        OracleNumber::Class("inf")
+    ));
+    assert!(matches!(
+        parse_oracle_value("-inf"),
+        OracleNumber::Class("-inf")
+    ));
+    assert!(matches!(
+        parse_oracle_value("-0"),
+        OracleNumber::Bits(bits) if bits == (-0.0f64).to_bits()
+    ));
+    assert!(matches!(
+        parse_oracle_value("+0"),
+        OracleNumber::Bits(bits) if bits == 0.0f64.to_bits()
+    ));
 }
 
 #[test]
@@ -98,23 +150,21 @@ fn legal_uncovered_sources_are_not_syntax_rejections() {
     let mut unsupported = 0usize;
     for case in &cases {
         let failure = run_plugin(case.source).expect_err(case.name);
-        assert_eq!(
-            failure.layer, case.layer,
-            "{} detail={}",
-            case.name, failure.detail
-        );
-        assert!(
-            failure.detail.contains(case.detail),
-            "{} detail={} missing {}",
-            case.name,
-            failure.detail,
-            case.detail
-        );
-        match case.layer {
-            "syntax" => syntax += 1,
-            "classify-not-float" => not_float += 1,
-            "compile-unsupported" => unsupported += 1,
-            other => panic!("unexpected negative layer {other}"),
+        let layer = reject_layer(case.source);
+        assert_eq!(&layer, &case.layer, "{}", case.name);
+        match &layer {
+            RejectLayer::Syntax => {
+                assert_eq!(failure.layer, "syntax", "{}", case.name);
+                syntax += 1;
+            }
+            RejectLayer::NotFloat(_) => {
+                assert_eq!(failure.layer, "classify-not-float", "{}", case.name);
+                not_float += 1;
+            }
+            RejectLayer::Unsupported(_) => {
+                assert_eq!(failure.layer, "compile-unsupported", "{}", case.name);
+                unsupported += 1;
+            }
         }
     }
     println!(
@@ -126,23 +176,44 @@ fn legal_uncovered_sources_are_not_syntax_rejections() {
     assert_eq!(unsupported, 8);
 }
 
+fn reject_layer(source: &str) -> RejectLayer {
+    match parser::parse_chunk(source.as_bytes()) {
+        Err(_) => RejectLayer::Syntax,
+        Ok(chunk) => {
+            let resolution = resolve::resolve(&chunk);
+            match number_source::lower_proven_chunk(source, &chunk, &resolution) {
+                Err(NumberSourceError::Syntax { .. }) => RejectLayer::Syntax,
+                Err(NumberSourceError::NotFloat { kind }) => RejectLayer::NotFloat(kind),
+                Err(NumberSourceError::CompileUnsupported { reason }) => {
+                    RejectLayer::Unsupported(reason)
+                }
+                Ok(_) => panic!("lowered a negative source: {source}"),
+            }
+        }
+    }
+}
+
 #[test]
 fn sequential_mods_use_core_slots_and_keep_the_result() {
     let source = sequential_mod_source(12);
     let lowered = lower_source(&source).expect("sequential mods are proven floats");
     let run = run_plugin(&source).expect("sequential mods compile and run");
     assert_bits(&run.stack[0], 1.0f64.to_bits(), "10 % 3");
-    assert!(
-        lowered.logical_slots > 8,
-        "sequential sample should sit above the pinned compaction threshold, logical={}",
-        lowered.logical_slots
-    );
-    assert!(
-        run.frame_slots < lowered.logical_slots,
-        "Core slot allocation should shorten sequential temps: logical={} frame={}",
-        lowered.logical_slots,
-        run.frame_slots
-    );
+    let guest_bindings = lowered
+        .binding_names
+        .iter()
+        .filter(|name| !name.starts_with("$lua.number."))
+        .count();
+    let temps = lowered
+        .binding_names
+        .iter()
+        .filter(|name| name.starts_with("$lua.number."))
+        .count();
+    assert_eq!(lowered.logical_slots, 36, "logical slots");
+    assert_eq!(guest_bindings, 12, "guest bindings r0..r11");
+    assert_eq!(temps, 24, "two temps per remainder");
+    assert_eq!(guest_bindings + temps, lowered.logical_slots);
+    assert_eq!(run.frame_slots, 3, "Core frame slots after compaction");
     assert!(
         lowered
             .binding_names
@@ -153,10 +224,13 @@ fn sequential_mods_use_core_slots_and_keep_the_result() {
         lowered.binding_names
     );
     println!(
-        "slot boundary logical={} frame={} temps={}",
+        "slot boundary logical_slots={} guest_bindings={} temps={} frame_slots={}; {}→{}",
         lowered.logical_slots,
+        guest_bindings,
+        temps,
         run.frame_slots,
-        lowered.binding_names.len()
+        lowered.logical_slots,
+        run.frame_slots
     );
     if let Ok(path) = std::env::var("LUAJIT_ORACLE") {
         let oracle = oracle_execute(&path, &source);
@@ -216,9 +290,9 @@ fn configured_oracle_matches_the_same_sources() {
     for case in negative_cases() {
         let oracle_accepted = oracle_load(&path, case.source);
         let failure = run_plugin(case.source).expect_err(case.name);
-        assert_eq!(failure.layer, case.layer, "{}", case.name);
-        match case.layer {
-            "syntax" => {
+        match &case.layer {
+            RejectLayer::Syntax => {
+                assert_eq!(failure.layer, "syntax", "{}", case.name);
                 assert!(
                     !oracle_accepted,
                     "{} should be a LuaJIT source rejection",
@@ -226,23 +300,42 @@ fn configured_oracle_matches_the_same_sources() {
                 );
                 syntax_reject += 1;
             }
-            "classify-not-float" => {
-                assert!(oracle_accepted, "{} is legal LuaJIT syntax", case.name);
+            RejectLayer::NotFloat(_) => {
+                assert_eq!(failure.layer, "classify-not-float", "{}", case.name);
+                let executed = oracle_execute(&path, case.source);
+                assert!(
+                    executed.accepted,
+                    "{} is legal LuaJIT and must be executed for type()",
+                    case.name
+                );
+                assert_eq!(
+                    executed.values.len(),
+                    1,
+                    "{} {:?}",
+                    case.name,
+                    executed.values
+                );
+                match &executed.values[0] {
+                    OracleNumber::Type(ty) => {
+                        assert_eq!(ty, "cdata", "{} type category", case.name);
+                    }
+                    other => panic!("{} expected cdata type, got {other:?}", case.name),
+                }
                 not_float += 1;
             }
-            "compile-unsupported" => {
+            RejectLayer::Unsupported(_) => {
+                assert_eq!(failure.layer, "compile-unsupported", "{}", case.name);
                 assert!(oracle_accepted, "{} is legal LuaJIT syntax", case.name);
                 unsupported += 1;
             }
-            other => panic!("unexpected layer {other}"),
         }
     }
     println!(
         "oracle differential execute={execute} signed-zero={signed_zero} nonfinite={nonfinite} empty={empty} not-float={not_float} compile-unsupported={unsupported} syntax-reject={syntax_reject}"
     );
-    assert_eq!(execute, 27);
+    assert_eq!(execute, 35);
     assert_eq!(signed_zero, 4);
-    assert_eq!(nonfinite, 4);
+    assert_eq!(nonfinite, 5);
     assert_eq!(empty, 1);
     assert_eq!(not_float, 3);
     assert_eq!(unsupported, 8);
@@ -308,10 +401,10 @@ fn source_error(error: NumberSourceError) -> ParseError {
             ParseError::new(format!("lua number syntax: {message}"))
         }
         NumberSourceError::CompileUnsupported { reason } => {
-            ParseError::new(format!("lua number compile unsupported: {reason}"))
+            ParseError::new(format!("lua number compile unsupported: {reason:?}"))
         }
         NumberSourceError::NotFloat { kind } => {
-            ParseError::new(format!("lua number not float: {kind}"))
+            ParseError::new(format!("lua number not float: {kind:?}"))
         }
     }
 }
@@ -577,6 +670,60 @@ fn execute_cases() -> Vec<ExecuteCase> {
             Category::NonFinite,
             Expect::Class("nan"),
         ),
+        case(
+            "dec-tenth",
+            "return 0.1",
+            Category::Finite,
+            Expect::Bits(0x3fb9_9999_9999_999a),
+        ),
+        case(
+            "int-past-mantissa",
+            "return 9007199254740993",
+            Category::Finite,
+            Expect::Bits(0x4340_0000_0000_0000),
+        ),
+        case(
+            "subnormal",
+            "return 1e-323",
+            Category::Finite,
+            Expect::Bits(0x0000_0000_0000_0002),
+        ),
+        case(
+            "overflow",
+            "return 1e400",
+            Category::NonFinite,
+            Expect::Class("inf"),
+        ),
+        case(
+            "hex-past-mantissa",
+            "return 0x20000000000001",
+            Category::Finite,
+            Expect::Bits(0x4340_0000_0000_0000),
+        ),
+        case(
+            "hex-u64-max",
+            "return 0xFFFFFFFFFFFFFFFF",
+            Category::Finite,
+            Expect::Bits(0x43f0_0000_0000_0000),
+        ),
+        case(
+            "mod-i32-max",
+            "return 2147483647 % 7",
+            Category::Finite,
+            Expect::Bits(1.0f64.to_bits()),
+        ),
+        case(
+            "mod-i32-min",
+            "return -2147483648 % -3",
+            Category::Finite,
+            Expect::Bits((-2.0f64).to_bits()),
+        ),
+        case(
+            "dot-exponent",
+            "return 1.e5",
+            Category::Finite,
+            Expect::Bits(0x40f8_6a00_0000_0000),
+        ),
     ]
 }
 
@@ -599,86 +746,72 @@ fn negative_cases() -> Vec<NegativeCase> {
         NegativeCase {
             name: "bare-number",
             source: "42",
-            layer: "syntax",
-            detail: "lua number syntax:",
+            layer: RejectLayer::Syntax,
         },
         NegativeCase {
             name: "goto-keyword",
             source: "local goto = 1",
-            layer: "syntax",
-            detail: "lua number syntax:",
+            layer: RejectLayer::Syntax,
         },
         NegativeCase {
             name: "idiv",
             source: "return 1 // 2",
-            layer: "syntax",
-            detail: "lua number syntax:",
+            layer: RejectLayer::Syntax,
         },
         NegativeCase {
             name: "signed64",
             source: "return 1LL",
-            layer: "classify-not-float",
-            detail: "Signed64",
+            layer: RejectLayer::NotFloat(ast::NumberKind::Signed64),
         },
         NegativeCase {
             name: "unsigned64",
             source: "return 1ULL",
-            layer: "classify-not-float",
-            detail: "Unsigned64",
+            layer: RejectLayer::NotFloat(ast::NumberKind::Unsigned64),
         },
         NegativeCase {
             name: "imaginary",
             source: "return 1i",
-            layer: "classify-not-float",
-            detail: "Imaginary",
+            layer: RejectLayer::NotFloat(ast::NumberKind::Imaginary),
         },
         NegativeCase {
             name: "global",
             source: "return x",
-            layer: "compile-unsupported",
-            detail: "proven local",
+            layer: RejectLayer::Unsupported(number_source::UnsupportedReason::UnprovenName),
         },
         NegativeCase {
             name: "call",
             source: "return math.abs(-2)",
-            layer: "compile-unsupported",
-            detail: "numeric subset",
+            layer: RejectLayer::Unsupported(number_source::UnsupportedReason::Expression),
         },
         NegativeCase {
             name: "string-add",
             source: "return 1 + \"2\"",
-            layer: "compile-unsupported",
-            detail: "numeric subset",
+            layer: RejectLayer::Unsupported(number_source::UnsupportedReason::Expression),
         },
         NegativeCase {
             name: "hex-float",
             source: "return 0x1.8p1",
-            layer: "compile-unsupported",
-            detail: "literal form",
+            layer: RejectLayer::Unsupported(number_source::UnsupportedReason::LiteralForm),
         },
         NegativeCase {
             name: "assign",
             source: "local x = 1\nx = 2\nreturn x",
-            layer: "compile-unsupported",
-            detail: "numeric subset",
+            layer: RejectLayer::Unsupported(number_source::UnsupportedReason::Statement),
         },
         NegativeCase {
             name: "do-block",
             source: "do\n  local x = 7 / 2\n  return x\nend",
-            layer: "compile-unsupported",
-            detail: "numeric subset",
+            layer: RejectLayer::Unsupported(number_source::UnsupportedReason::Statement),
         },
         NegativeCase {
             name: "multi-return",
             source: "return 1, 2",
-            layer: "compile-unsupported",
-            detail: "single proven",
+            layer: RejectLayer::Unsupported(number_source::UnsupportedReason::NotSingle),
         },
         NegativeCase {
             name: "bare-return",
             source: "return",
-            layer: "compile-unsupported",
-            detail: "single proven",
+            layer: RejectLayer::Unsupported(number_source::UnsupportedReason::NotSingle),
         },
     ]
 }
@@ -742,6 +875,7 @@ struct OracleRun {
 enum OracleNumber {
     Class(&'static str),
     Bits(u64),
+    Type(String),
 }
 
 fn assert_oracle_baseline(path: &str) {
@@ -793,6 +927,9 @@ fn oracle_execute(path: &str, source: &str) -> OracleRun {
 }
 
 fn parse_oracle_value(line: &str) -> OracleNumber {
+    if let Some(ty) = line.strip_prefix("TYPE:") {
+        return OracleNumber::Type(ty.to_string());
+    }
     match line {
         "nan" => OracleNumber::Class("nan"),
         "inf" => OracleNumber::Class("inf"),
@@ -810,6 +947,7 @@ fn assert_same_number(oracle: &OracleNumber, rust: &Value, label: &str) {
     match oracle {
         OracleNumber::Class(class) => assert_eq!(float_class(*number), *class, "{label}"),
         OracleNumber::Bits(bits) => assert_eq!(number.to_bits(), *bits, "{label} rust={number}"),
+        OracleNumber::Type(ty) => panic!("{label} oracle value was type {ty}, not a number"),
     }
 }
 
@@ -839,30 +977,76 @@ fn parse_lua_hex_float(text: &str) -> f64 {
         let digit = ch
             .to_digit(16)
             .unwrap_or_else(|| panic!("oracle hex digit in {text}"));
-        magnitude = magnitude * 16 + u64::from(digit);
+        magnitude = magnitude
+            .checked_mul(16)
+            .and_then(|value| value.checked_add(u64::from(digit)))
+            .unwrap_or_else(|| panic!("oracle %a magnitude overflow: {text}"));
         if seen_dot {
             fraction_digits += 1;
         }
     }
     let scale = exponent - fraction_digits * 4;
-    let mut value = ldexp_u64(magnitude, scale);
-    if negative {
-        value = -value;
-    }
-    value
+    hex_magnitude_to_f64(negative, magnitude, scale)
 }
 
-fn ldexp_u64(magnitude: u64, scale: i32) -> f64 {
+/// Exact integer times `2^scale`, including a non-zero subnormal.
+///
+/// `1u64 << n` as `f64` is zero once `n` passes 63, so `0x1p-1074` cannot be
+/// built by scaling a float. The bit field is the value.
+fn hex_magnitude_to_f64(negative: bool, magnitude: u64, scale: i32) -> f64 {
+    let sign = if negative { 1u64 << 63 } else { 0 };
     if magnitude == 0 {
-        return 0.0;
+        return f64::from_bits(sign);
     }
-    let mut digits = magnitude;
-    let mut exponent = scale;
-    while digits > (1u64 << 53) {
-        digits >>= 1;
-        exponent += 1;
+    let msb = 63 - i32::try_from(magnitude.leading_zeros()).expect("msb");
+    let mut unbiased = msb + scale;
+    let mut significand = magnitude;
+    if msb > 52 {
+        significand = shift_right_round_even(significand, u32::try_from(msb - 52).expect("shift"));
+        if significand == 1u64 << 53 {
+            significand = 1u64 << 52;
+            unbiased += 1;
+        }
+    } else {
+        significand <<= u32::try_from(52 - msb).expect("align");
     }
-    (digits as f64) * 2f64.powi(exponent)
+    if unbiased > 1023 {
+        return f64::from_bits(sign | 0x7ff0_0000_0000_0000);
+    }
+    if unbiased < -1022 {
+        let extra = u32::try_from(-1022 - unbiased).expect("subnormal shift");
+        significand = shift_right_round_even(significand, extra);
+        if significand == 0 {
+            return f64::from_bits(sign);
+        }
+        if significand >= 1u64 << 52 {
+            return f64::from_bits(sign | (1u64 << 52));
+        }
+        return f64::from_bits(sign | significand);
+    }
+    let exp_field = u64::try_from(unbiased + 1023).expect("biased exponent");
+    let fraction = significand & ((1u64 << 52) - 1);
+    f64::from_bits(sign | (exp_field << 52) | fraction)
+}
+
+fn shift_right_round_even(value: u64, shift: u32) -> u64 {
+    if shift == 0 {
+        return value;
+    }
+    if shift >= 64 {
+        return 0;
+    }
+    let kept = value >> shift;
+    let remainder = value & ((1u64 << shift) - 1);
+    let half = 1u64 << (shift - 1);
+    let round_up = if remainder > half {
+        true
+    } else if remainder < half {
+        false
+    } else {
+        kept & 1 == 1
+    };
+    if round_up { kept + 1 } else { kept }
 }
 
 fn spawn_oracle(path: &str, args: &[&str], stdin_bytes: Option<&[u8]>) -> std::process::Output {
