@@ -9,7 +9,10 @@
 //! Remainder temps are names outside the Lua identifier grammar. They are
 //! probed on the same builder, because `alloc_local_named` reuses a slot for
 //! an existing name and unnamed allocation is private. A process-wide counter
-//! or a hard-to-guess legal identifier is not a private namespace.
+//! or a hard-to-guess legal identifier is not a private namespace. Each
+//! lowering keeps a monotonic ordinal and resumes the search there. A later
+//! lowering on the same builder starts again at zero, so it still observes
+//! names the previous one holds.
 //!
 //! Each remainder takes two fresh frame slots. Core locals are frame-scoped,
 //! and this kernel does not own statement boundaries, so it cannot reuse a
@@ -116,35 +119,33 @@ impl ClassifiedNumber {
     }
 }
 
-/// An external Core slot was not emitted from a classified value.
-#[cfg(test)]
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct UnprovenSlot {
-    pub(crate) slot: LocalSlot,
-}
-
-/// Refuse an arbitrary slot. There is no success path.
-///
-/// A typed reference exists only as the return value of `bind_named`,
-/// `store`, or `materialize`.
-#[cfg(test)]
-#[allow(dead_code)]
-pub(crate) fn external_slot_evidence(slot: LocalSlot) -> Result<ClassifiedNumber, UnprovenSlot> {
-    Err(UnprovenSlot { slot })
-}
-
 /// Temps for operations that must evaluate each operand once and then reuse it.
 ///
 /// Slots stay live for the returned expression. Calling `floor_mod` again on
 /// this lowering allocates new slots; it does not reclaim the previous pair.
 pub(crate) struct NumberLowering<'a> {
     builder: &'a mut LocalIrBuilder,
+    /// Next ordinal this lowering will probe. It only moves forward. It is
+    /// not shared with another lowering, even one that borrows this builder
+    /// after `self` is dropped.
+    next_ordinal: u32,
+    /// `resolve_local_expr` calls made while naming temps. One lowering of a
+    /// chunk can be counted from the source seam; this is not a timer.
+    name_probes: u64,
 }
 
 impl<'a> NumberLowering<'a> {
     pub(crate) fn new(builder: &'a mut LocalIrBuilder) -> Self {
-        Self { builder }
+        Self {
+            builder,
+            next_ordinal: 0,
+            name_probes: 0,
+        }
+    }
+
+    /// Name lookups performed by `alloc_temp` on this lowering.
+    pub(crate) fn name_probes(&self) -> u64 {
+        self.name_probes
     }
 
     /// Lua `%` on binary64: `lhs - floor(lhs / rhs) * rhs`.
@@ -226,13 +227,19 @@ impl<'a> NumberLowering<'a> {
 
     fn alloc_temp(&mut self, role: &str) -> Result<LocalSlot, ParseError> {
         // `$` and `.` are outside `[A-Za-z_][A-Za-z0-9_]*`, so a Lua local
-        // cannot use this name. The probe is what makes a second lowering on
-        // the same builder fresh; the ordinal is not a process-wide counter.
-        let mut ordinal = 0u32;
+        // cannot use this name. The cursor skips ordinals this lowering has
+        // already probed. It does not make a name free: `resolve_local_expr`
+        // still rejects a slot another lowering allocated on this builder.
+        let mut ordinal = self.next_ordinal;
         loop {
             let name = format!("$lua.number.{role}.{ordinal}");
+            self.name_probes += 1;
             if self.builder.resolve_local_expr(&name).is_none() {
-                return self.builder.alloc_local_named(&name);
+                let slot = self.builder.alloc_local_named(&name)?;
+                self.next_ordinal = ordinal
+                    .checked_add(1)
+                    .ok_or_else(|| ParseError::new("lua number temp ordinal overflow"))?;
+                return Ok(slot);
             }
             ordinal = ordinal
                 .checked_add(1)

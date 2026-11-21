@@ -144,6 +144,13 @@ fn add_sub_mul_and_negation_match_observed_luajit() {
 
     let negated_zero = eval_unary(|operand| operand.neg(), 0.0);
     assert_expect(&negated_zero, Expect::Bits(0x8000_0000_0000_0000), 0.0, 0.0);
+    let restored_zero = eval_unary(|operand| operand.neg(), -0.0);
+    assert_expect(
+        &restored_zero,
+        Expect::Bits(0x0000_0000_0000_0000),
+        -0.0,
+        0.0,
+    );
     let negated_nan = eval_unary(|operand| operand.neg(), f64::NAN);
     assert_expect(&negated_nan, Expect::Nan, f64::NAN, 0.0);
 }
@@ -197,22 +204,34 @@ fn remainder_temps_keep_a_guest_local_and_a_nested_rhs() {
         .expect("guest local");
     let collided = {
         let mut lowering = NumberLowering::new(&mut builder);
-        lowering
+        let value = lowering
             .floor_mod(
                 ClassifiedNumber::literal(7.0),
                 ClassifiedNumber::literal(5.0),
             )
-            .expect("colliding remainder")
+            .expect("colliding remainder");
+        let probes = lowering.name_probes();
+        assert_eq!(
+            probes, 2,
+            "first lowering on an empty builder probes once per temp, probes={probes}"
+        );
+        value
     };
     let nested = {
         let inner = {
             let mut lowering = NumberLowering::new(&mut builder);
-            lowering
+            let value = lowering
                 .floor_mod(
                     ClassifiedNumber::literal(10.0),
                     ClassifiedNumber::literal(4.0),
                 )
-                .expect("inner remainder")
+                .expect("inner remainder");
+            let probes = lowering.name_probes();
+            assert_eq!(
+                probes, 3,
+                "second lowering rescans held names from 0, then resumes, probes={probes}"
+            );
+            value
         };
         let mut lowering = NumberLowering::new(&mut builder);
         lowering
@@ -266,9 +285,6 @@ fn remainder_temps_keep_a_guest_local_and_a_nested_rhs() {
 fn int_slot_cannot_obtain_float_evidence() {
     let mut builder = LocalIrBuilder::new();
     let int_slot = builder.alloc_local_named("raw_int").expect("int slot");
-    let refused = number::external_slot_evidence(int_slot)
-        .expect_err("an Int slot must not receive float evidence");
-    assert_eq!(refused.slot, int_slot);
 
     let mut stmts = Vec::new();
     let stored = {

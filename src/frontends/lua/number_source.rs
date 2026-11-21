@@ -15,6 +15,8 @@ pub(crate) struct LoweredNumberChunk {
     pub(crate) ir: FrontendIr,
     pub(crate) logical_slots: usize,
     pub(crate) binding_names: Vec<String>,
+    /// `resolve_local_expr` calls made while naming this chunk's temps.
+    pub(crate) name_probes: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,13 +56,14 @@ pub(crate) fn lower_proven_chunk(
     }
     let mut builder = LocalIrBuilder::new();
     let mut stmts = Vec::new();
-    {
+    let name_probes = {
         let mut lowering = NumberLowering::new(&mut builder);
         let mut env = Vec::new();
         for stmt in &chunk.body.stmts {
             lower_stmt(source, stmt, &mut lowering, &mut stmts, &mut env)?;
         }
-    }
+        lowering.name_probes()
+    };
     let ir = builder.finish(stmts);
     let binding_names = ir
         .local_bindings
@@ -72,6 +75,7 @@ pub(crate) fn lower_proven_chunk(
         ir,
         logical_slots,
         binding_names,
+        name_probes,
     })
 }
 

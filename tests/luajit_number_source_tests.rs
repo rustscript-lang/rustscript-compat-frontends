@@ -4,6 +4,11 @@
 //! register hosts. Each executed sample is real Lua source, lowered by the
 //! seam, then compiled with `SourcePlugin` and run on the VM.
 
+// This test compiles the production AST through a path module. Four helpers
+// (`Name::is`, `ExprList::tail_multi`, `AssignTarget::span`/`has_nav`,
+// `Expr::is_multi`) have no caller on this path. The allow stays on this
+// module: it does not change the production AST and it is not a crate lint.
+#[allow(dead_code)]
 #[path = "../src/frontends/lua/ast.rs"]
 mod ast;
 #[path = "../src/frontends/lua/lexer.rs"]
@@ -214,6 +219,28 @@ fn sequential_mods_use_core_slots_and_keep_the_result() {
     assert_eq!(temps, 24, "two temps per remainder");
     assert_eq!(guest_bindings + temps, lowered.logical_slots);
     assert_eq!(run.frame_slots, 3, "Core frame slots after compaction");
+    let depth = expr_depth_of(&lowered.ir.stmts);
+    println!(
+        "slot boundary name_probes={} temps={} mod_lhs={} mod_rhs={} value={} logical_slots={} frame_slots={} expr_depth={}; {}→{}",
+        lowered.name_probes,
+        temps,
+        count_role(&lowered.binding_names, "mod_lhs"),
+        count_role(&lowered.binding_names, "mod_rhs"),
+        count_role(&lowered.binding_names, "value"),
+        lowered.logical_slots,
+        run.frame_slots,
+        depth,
+        lowered.logical_slots,
+        run.frame_slots
+    );
+    assert!(
+        depth < 32,
+        "short remainder sample expr depth {depth} is not bounded"
+    );
+    assert_eq!(
+        lowered.name_probes, temps as u64,
+        "name probes rescanned occupied ordinals from 0"
+    );
     assert!(
         lowered
             .binding_names
@@ -333,13 +360,232 @@ fn configured_oracle_matches_the_same_sources() {
     println!(
         "oracle differential execute={execute} signed-zero={signed_zero} nonfinite={nonfinite} empty={empty} not-float={not_float} compile-unsupported={unsupported} syntax-reject={syntax_reject}"
     );
-    assert_eq!(execute, 35);
-    assert_eq!(signed_zero, 4);
+    assert_eq!(execute, 38);
+    assert_eq!(signed_zero, 5);
     assert_eq!(nonfinite, 5);
     assert_eq!(empty, 1);
     assert_eq!(not_float, 3);
     assert_eq!(unsupported, 8);
     assert_eq!(syntax_reject, 3);
+}
+
+#[test]
+fn flat_remainder_chain_probes_once_per_temp_and_matches_oracle() {
+    let short = measure_source(&sequential_mod_source(12));
+    assert_eq!(
+        short.logical_slots, 36,
+        "12-remainder control logical slots"
+    );
+    assert_eq!(short.frame_slots, 3, "12-remainder control frame slots");
+    println!(
+        "control 36→3 name_probes={} temps={} logical_slots={} frame_slots={}",
+        short.name_probes, short.temps, short.logical_slots, short.frame_slots
+    );
+
+    let nested = measure_source("return 7%(10%4)\n");
+    assert_eq!(nested.stack_bits, Some(1.0f64.to_bits()), "nested 7%(10%4)");
+    println!(
+        "nested name_probes={} temps={} mod_lhs={} mod_rhs={} value={} logical_slots={} frame_slots={} expr_depth={}",
+        nested.name_probes,
+        nested.temps,
+        nested.mod_lhs,
+        nested.mod_rhs,
+        nested.value_temps,
+        nested.logical_slots,
+        nested.frame_slots,
+        nested.expr_depth
+    );
+
+    let chain_a = measure_source(&flat_mod_chain(100, 7, 128));
+    let chain_b = measure_source(&flat_mod_chain(101, 7, 128));
+    println!(
+        "flat chain mods=128 name_probes={} temps={} mod_lhs={} mod_rhs={} value={} logical_slots={} frame_slots={} expr_depth={} bits_a={:?} bits_b={:?}",
+        chain_a.name_probes,
+        chain_a.temps,
+        chain_a.mod_lhs,
+        chain_a.mod_rhs,
+        chain_a.value_temps,
+        chain_a.logical_slots,
+        chain_a.frame_slots,
+        chain_a.expr_depth,
+        chain_a.stack_bits,
+        chain_b.stack_bits
+    );
+    assert!(
+        chain_a.temps >= 128,
+        "flat chain did not lower 128 remainders, temps={}",
+        chain_a.temps
+    );
+    assert_ne!(
+        chain_a.stack_bits, chain_b.stack_bits,
+        "two seeds of a 128-remainder chain collapsed"
+    );
+    assert_ne!(chain_a.stack_bits, Some(0), "seed 100 collapsed to +0");
+    assert_ne!(chain_b.stack_bits, Some(0), "seed 101 collapsed to +0");
+    assert!(
+        chain_a.expr_depth < 32,
+        "flat chain expr depth {} grew with the source spine",
+        chain_a.expr_depth
+    );
+
+    let cycle_128 = measure_source(&cycling_rebind(128));
+    let cycle_127 = measure_source(&cycling_rebind(127));
+    assert_ne!(
+        cycle_128.stack_bits, cycle_127.stack_bits,
+        "dropping one rebind step left the result unchanged"
+    );
+    assert_ne!(
+        cycle_128.stack_bits,
+        Some(0),
+        "cycling chain collapsed to +0"
+    );
+    println!(
+        "cycling rebind steps=128 name_probes={} temps={} logical_slots={} frame_slots={} expr_depth={} bits_128={:?} bits_127={:?}",
+        cycle_128.name_probes,
+        cycle_128.temps,
+        cycle_128.logical_slots,
+        cycle_128.frame_slots,
+        cycle_128.expr_depth,
+        cycle_128.stack_bits,
+        cycle_127.stack_bits
+    );
+
+    if let Ok(path) = std::env::var("LUAJIT_ORACLE") {
+        assert_oracle_baseline(&path);
+        compare_oracle(&path, &flat_mod_chain(100, 7, 128), "flat-100");
+        compare_oracle(&path, &flat_mod_chain(101, 7, 128), "flat-101");
+        compare_oracle(&path, &cycling_rebind(128), "cycle-128");
+        compare_oracle(&path, &cycling_rebind(127), "cycle-127");
+        compare_oracle(&path, "return 7%(10%4)\n", "nested");
+        println!("chain oracle compared=5");
+    } else {
+        println!(
+            "chain oracle differential not run: LUAJIT_ORACLE unset; compared=0; not a differential GREEN"
+        );
+    }
+
+    assert_one_probe_per_temp(&short, "12-remainder control");
+    assert_one_probe_per_temp(&nested, "nested");
+    assert_one_probe_per_temp(&chain_a, "flat-100");
+    assert_one_probe_per_temp(&chain_b, "flat-101");
+    assert_one_probe_per_temp(&cycle_128, "cycle-128");
+    assert_one_probe_per_temp(&cycle_127, "cycle-127");
+}
+
+struct Measured {
+    name_probes: u64,
+    temps: usize,
+    mod_lhs: usize,
+    mod_rhs: usize,
+    value_temps: usize,
+    logical_slots: usize,
+    frame_slots: usize,
+    expr_depth: usize,
+    stack_bits: Option<u64>,
+}
+
+fn measure_source(source: &str) -> Measured {
+    let lowered = lower_source(source).unwrap_or_else(|error| {
+        panic!("lower failed: {error}");
+    });
+    let run = run_plugin(source).unwrap_or_else(|failure| {
+        panic!(
+            "run failed at {} logical_slots={}: {}",
+            failure.layer, lowered.logical_slots, failure.detail
+        );
+    });
+    let stack_bits = match run.stack.as_slice() {
+        [Value::Float(number)] => Some(number.to_bits()),
+        other => panic!("expected one binary64 result, stack={other:?}"),
+    };
+    Measured {
+        name_probes: lowered.name_probes,
+        temps: count_prefix(&lowered.binding_names, "$lua.number."),
+        mod_lhs: count_role(&lowered.binding_names, "mod_lhs"),
+        mod_rhs: count_role(&lowered.binding_names, "mod_rhs"),
+        value_temps: count_role(&lowered.binding_names, "value"),
+        logical_slots: lowered.logical_slots,
+        frame_slots: run.frame_slots,
+        expr_depth: expr_depth_of(&lowered.ir.stmts),
+        stack_bits,
+    }
+}
+
+fn assert_one_probe_per_temp(measured: &Measured, label: &str) {
+    assert_eq!(
+        measured.name_probes, measured.temps as u64,
+        "{label} name probes rescanned occupied ordinals from 0: probes={} temps={} logical_slots={} frame_slots={}",
+        measured.name_probes, measured.temps, measured.logical_slots, measured.frame_slots
+    );
+}
+
+fn compare_oracle(path: &str, source: &str, label: &str) {
+    let ours = run_plugin(source).unwrap_or_else(|failure| {
+        panic!("{label} rust {}: {}", failure.layer, failure.detail);
+    });
+    let oracle = oracle_execute(path, source);
+    assert!(oracle.accepted, "{label} LuaJIT rejected the source");
+    assert_eq!(oracle.values.len(), ours.stack.len(), "{label}");
+    for (index, (oracle_value, rust_value)) in
+        oracle.values.iter().zip(ours.stack.iter()).enumerate()
+    {
+        assert_same_number(oracle_value, rust_value, &format!("{label}[{index}]"));
+    }
+}
+
+fn flat_mod_chain(seed: i64, divisor: i64, mods: usize) -> String {
+    let mut source = format!("return {seed}");
+    for _ in 0..mods {
+        source.push_str(&format!(" % {divisor}"));
+    }
+    source.push('\n');
+    source
+}
+
+fn cycling_rebind(steps: usize) -> String {
+    let mut source = String::from("local x = 17\n");
+    for _ in 0..steps {
+        source.push_str("local x = (x % 5) + 3\n");
+    }
+    source.push_str("return x\n");
+    source
+}
+
+fn count_role(names: &[String], role: &str) -> usize {
+    count_prefix(names, &format!("$lua.number.{role}."))
+}
+
+fn count_prefix(names: &[String], prefix: &str) -> usize {
+    names.iter().filter(|name| name.starts_with(prefix)).count()
+}
+
+fn expr_depth_of(stmts: &[vm::Stmt]) -> usize {
+    stmts.iter().map(stmt_depth).max().unwrap_or(0)
+}
+
+fn stmt_depth(stmt: &vm::Stmt) -> usize {
+    match stmt {
+        vm::Stmt::Let { expr, .. } | vm::Stmt::Expr { expr, .. } => expr_depth(expr),
+        other => panic!("number seam emitted an unexpected statement: {other:?}"),
+    }
+}
+
+fn expr_depth(expr: &vm::Expr) -> usize {
+    match expr {
+        vm::Expr::Float(_) | vm::Expr::Int(_) | vm::Expr::Var(_) => 1,
+        vm::Expr::Neg(inner) => 1 + expr_depth(inner),
+        vm::Expr::Add(lhs, rhs)
+        | vm::Expr::Sub(lhs, rhs)
+        | vm::Expr::Mul(lhs, rhs)
+        | vm::Expr::Div(lhs, rhs) => 1 + expr_depth(lhs).max(expr_depth(rhs)),
+        vm::Expr::Call(_, _, args, _, _) => 1 + args.iter().map(expr_depth).max().unwrap_or(0),
+        vm::Expr::Block { stmts, expr } => 1 + stmt_depth_max(stmts).max(expr_depth(expr)),
+        other => panic!("number seam emitted an unexpected expression: {other:?}"),
+    }
+}
+
+fn stmt_depth_max(stmts: &[vm::Stmt]) -> usize {
+    stmts.iter().map(stmt_depth).max().unwrap_or(0)
 }
 
 #[derive(Debug)]
@@ -380,6 +626,7 @@ struct OwnedLowered {
     ir: FrontendIr,
     logical_slots: usize,
     binding_names: Vec<String>,
+    name_probes: u64,
 }
 
 fn lower_source(source: &str) -> Result<OwnedLowered, ParseError> {
@@ -391,6 +638,7 @@ fn lower_source(source: &str) -> Result<OwnedLowered, ParseError> {
     Ok(OwnedLowered {
         logical_slots: lowered.logical_slots,
         binding_names: lowered.binding_names,
+        name_probes: lowered.name_probes,
         ir: lowered.ir,
     })
 }
@@ -575,6 +823,24 @@ fn execute_cases() -> Vec<ExecuteCase> {
             Expect::Bits(3.5f64.to_bits()),
         ),
         case(
+            "rebind-reads-old",
+            "local x = 7/2\nlocal x = x + 1\nreturn x",
+            Category::Finite,
+            Expect::Bits(4.5f64.to_bits()),
+        ),
+        case(
+            "rebind-commits",
+            "local x = 7/2\nlocal x = x + 1\nlocal x = x + 1\nreturn x",
+            Category::Finite,
+            Expect::Bits(5.5f64.to_bits()),
+        ),
+        case(
+            "rebind-keeps-other-name",
+            "local x = 7/2\nlocal y = x\nlocal x = x + 1\nreturn x + y",
+            Category::Finite,
+            Expect::Bits(8.0f64.to_bits()),
+        ),
+        case(
             "two-locals",
             "local a = -5\nlocal b = 3\nreturn a % b",
             Category::Finite,
@@ -627,6 +893,12 @@ fn execute_cases() -> Vec<ExecuteCase> {
             "return -0",
             Category::SignedZero,
             Expect::Bits((-0.0f64).to_bits()),
+        ),
+        case(
+            "neg-neg-zero",
+            "return -(-0)",
+            Category::SignedZero,
+            Expect::Bits(0.0f64.to_bits()),
         ),
         case(
             "div-signed-zero",
