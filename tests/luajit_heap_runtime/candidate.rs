@@ -925,7 +925,7 @@ struct Lower<'a> {
     functions: HashMap<Vec<u8>, FuncInfo>,
     function_impls: HashMap<u16, FunctionImpl>,
     caller_frame: Option<LocalSlot>,
-    receiver_roots: HashMap<Vec<u8>, u32>,
+    receiver_roots: HashMap<LocalSlot, u32>,
     next_receiver_slot: u32,
     receiver_width: u32,
     table_locals: HashSet<Vec<u8>>,
@@ -1055,7 +1055,8 @@ impl Lower<'_> {
                     line: self.line(span),
                 });
                 self.live_locals.retain(|local| *local != slot);
-                if let Some(root_slot) = self.receiver_roots.remove(&name.bytes) {
+                // The name may now denote a shadow. Release the root of this slot only.
+                if let Some(root_slot) = self.receiver_roots.remove(&slot) {
                     let frame = self.caller_frame.ok_or_else(|| self.unsupported(span))?;
                     let release = self.call(
                         RELEASE_RESULT,
@@ -1263,8 +1264,8 @@ impl Lower<'_> {
             }
             let root_slot = self.next_receiver_slot;
             self.next_receiver_slot += 1;
-            self.receiver_roots
-                .insert(name.name.bytes.clone(), root_slot);
+            // Keep the published slot with this binding, not with the spelling.
+            self.receiver_roots.insert(index, root_slot);
             slots.push(index);
             root_slots.push(Expr::Float(root_slot as f64));
         }

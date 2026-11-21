@@ -979,6 +979,272 @@ snapshot_bindings(30)
 note_stage(30)
 "#;
 
+const SCALAR_SHADOW: &str = r#"
+local function make()
+  local returned = {}
+  returned.self = returned
+  return returned
+end
+local a = make()
+record_binding(1, a)
+note_bool(2, same_table(a, a.self))
+local a = 0
+note_text(3, type(a))
+a = nil
+note_text(4, type(a))
+note_stage(20)
+snapshot_bindings(20)
+collectgarbage("collect")
+snapshot_bindings(30)
+note_stage(30)
+"#;
+
+const CLEAR_BEFORE_SHADOW: &str = r#"
+local function make()
+  local returned = {}
+  returned.self = returned
+  return returned
+end
+local a = make()
+record_binding(1, a)
+note_bool(2, same_table(a, a.self))
+snapshot_bindings(11)
+a = nil
+note_text(3, type(a))
+local a = 0
+note_text(4, type(a))
+note_stage(20)
+collectgarbage("collect")
+snapshot_bindings(30)
+note_stage(30)
+"#;
+
+const TABLE_SHADOW: &str = r#"
+local function make()
+  local returned = {}
+  returned.self = returned
+  return returned
+end
+local a = make()
+record_binding(1, a)
+note_bool(2, same_table(a, a.self))
+local a = {}
+record_binding(3, a)
+note_text(4, type(a))
+a = nil
+note_text(5, type(a))
+note_stage(20)
+snapshot_bindings(20)
+collectgarbage("collect")
+snapshot_bindings(30)
+note_stage(30)
+"#;
+
+const TABLE_RESULT_SHADOW: &str = r#"
+local function make()
+  local returned = {}
+  returned.self = returned
+  return returned
+end
+local function other()
+  local returned = {}
+  returned.self = returned
+  return returned
+end
+local a = make()
+record_binding(1, a)
+note_bool(2, same_table(a, a.self))
+local a = other()
+record_binding(3, a)
+note_bool(6, same_table(a, a.self))
+note_text(4, type(a))
+snapshot_bindings(15)
+a = nil
+note_text(5, type(a))
+note_stage(20)
+snapshot_bindings(20)
+collectgarbage("collect")
+snapshot_bindings(30)
+note_stage(30)
+"#;
+
+#[test]
+fn scalar_shadow_nil_keeps_the_earlier_table() {
+    let (mut vm, log) = run_obs(SCALAR_SHADOW, true);
+    let witness = witness(&mut vm);
+    let old = binding_at(&log, 1.0);
+    assert_eq!(
+        witness.returned,
+        Some(old),
+        "the recorded binding is the issued table"
+    );
+    assert!(bool_at(&log, 2.0), "the earlier table was readable");
+    assert_eq!(text_at(&log, 3.0), "number", "the new binding is a scalar");
+    assert_eq!(
+        text_at(&log, 4.0),
+        "nil",
+        "nil assignment wrote nil into the new scalar"
+    );
+    let before = snap_at(&log, 20.0);
+    assert!(
+        alive_at(before, 1.0),
+        "the earlier table must still be allocated before collect: {before:?}"
+    );
+    let after = snap_at(&log, 30.0);
+    let collect = witness.collects.first();
+    assert!(
+        alive_at(after, 1.0)
+            && after.live_roots == 1
+            && collect.is_some_and(|note| {
+                note.returned_alive
+                    && note.live_roots == 1
+                    && note.swept == 0
+                    && note.live_nodes == 1
+            }),
+        "shadow nil reclaimed the earlier table; id={old:?} before_roots={} after={after:?} collect={:?} release={:?}",
+        before.live_roots,
+        witness.collects,
+        witness.release
+    );
+    assert_eq!(
+        before.live_roots, 1,
+        "the published slot stays until this frame retires"
+    );
+    assert!(
+        witness.release.is_none(),
+        "clearing the new scalar must not release the earlier root"
+    );
+    assert_eq!(after.collections, 1);
+    assert_real_return_window(vm.program());
+}
+
+#[test]
+fn explicit_clear_before_shadow_reclaims_the_earlier_table() {
+    let (mut vm, log) = run_obs(CLEAR_BEFORE_SHADOW, true);
+    let witness = witness(&mut vm);
+    let old = binding_at(&log, 1.0);
+    assert_eq!(witness.returned, Some(old));
+    assert!(bool_at(&log, 2.0));
+    let rooted = snap_at(&log, 11.0);
+    assert!(alive_at(rooted, 1.0));
+    assert_eq!(rooted.live_roots, 1);
+    assert_eq!(
+        text_at(&log, 3.0),
+        "nil",
+        "the original binding was cleared"
+    );
+    assert_eq!(text_at(&log, 4.0), "number");
+    let after = snap_at(&log, 30.0);
+    assert!(
+        !alive_at(after, 1.0),
+        "explicit clear must reclaim on collect"
+    );
+    assert_eq!(after.live_roots, 0);
+    assert_eq!(after.collections, 1);
+    let collect = &witness.collects[0];
+    assert!(!collect.returned_alive);
+    assert_eq!(collect.live_roots, 0);
+    assert_eq!(collect.swept, 1);
+    assert_eq!(collect.live_nodes, 0);
+    assert!(
+        witness.release.is_some(),
+        "the original slot still releases"
+    );
+    assert_real_return_window(vm.program());
+}
+
+#[test]
+fn table_shadow_nil_keeps_the_earlier_table() {
+    let (mut vm, log) = run_obs(TABLE_SHADOW, true);
+    let witness = witness(&mut vm);
+    let old = binding_at(&log, 1.0);
+    let fresh = binding_at(&log, 3.0);
+    assert_ne!(old, fresh, "the shadow table is a different object");
+    assert_eq!(witness.returned, Some(old));
+    assert!(bool_at(&log, 2.0));
+    assert_eq!(text_at(&log, 4.0), "table", "the new binding is a table");
+    assert_eq!(
+        text_at(&log, 5.0),
+        "nil",
+        "nil assignment wrote nil into the new table"
+    );
+    let before = snap_at(&log, 20.0);
+    assert!(
+        alive_at(before, 1.0),
+        "the earlier table must still be allocated before collect: {before:?}"
+    );
+    let after = snap_at(&log, 30.0);
+    let collect = witness.collects.first();
+    assert!(
+        alive_at(after, 1.0)
+            && after.live_roots == 1
+            && collect.is_some_and(|note| {
+                note.returned_alive && note.live_roots == 1 && note.live_nodes == 1
+            }),
+        "table shadow nil reclaimed the earlier table; old={old:?} fresh={fresh:?} before_roots={} after={after:?} collect={:?} release={:?}",
+        before.live_roots,
+        witness.collects,
+        witness.release
+    );
+    assert!(
+        !alive_at(after, 3.0),
+        "the shadowed constructor must not gain an extra root"
+    );
+    assert_eq!(
+        before.live_roots, 1,
+        "shadow does not add a root for the earlier binding"
+    );
+    assert!(witness.release.is_none());
+    assert_eq!(after.collections, 1);
+    assert_eq!(collect.expect("collect").swept, 1);
+    assert_real_return_window(vm.program());
+}
+
+#[test]
+fn table_result_shadow_keeps_the_earlier_table_and_drops_the_new_one() {
+    let (mut vm, log) = run_obs(TABLE_RESULT_SHADOW, true);
+    let witness = witness(&mut vm);
+    let old = binding_at(&log, 1.0);
+    let fresh = binding_at(&log, 3.0);
+    assert_ne!(old, fresh);
+    assert!(bool_at(&log, 2.0) && bool_at(&log, 6.0));
+    assert_eq!(text_at(&log, 4.0), "table");
+    assert_eq!(text_at(&log, 5.0), "nil");
+    assert_eq!(witness.handoffs.len(), 2);
+    assert!(witness.handoffs[0].published_root && witness.handoffs[1].published_root);
+    let both = snap_at(&log, 15.0);
+    assert!(alive_at(both, 1.0) && alive_at(both, 3.0));
+    assert_eq!(both.live_roots, 2, "each call result keeps its own slot");
+    let before = snap_at(&log, 20.0);
+    assert!(
+        alive_at(before, 1.0),
+        "nil must not drop the earlier table before collect: {before:?}"
+    );
+    let after = snap_at(&log, 30.0);
+    assert!(
+        alive_at(after, 1.0),
+        "nil on the new result must not reclaim the earlier table; after={after:?} collect={:?}",
+        witness.collects
+    );
+    assert!(
+        !alive_at(after, 3.0),
+        "the new result root is the one released"
+    );
+    assert_eq!(after.live_roots, 1);
+    assert_eq!(after.collections, 1);
+    assert_eq!(binding_at(&log, 1.0), old);
+    assert_eq!(binding_at(&log, 3.0), fresh);
+    let collect = &witness.collects[0];
+    assert!(
+        !collect.returned_alive,
+        "the witness field is the later call"
+    );
+    assert_eq!(collect.swept, 1);
+    assert_eq!(collect.live_roots, 1);
+    assert_eq!(collect.live_nodes, 1);
+    assert_real_return_window(vm.program());
+}
+
 #[test]
 fn unpublished_alias_return_is_collected_while_the_caller_binding_remains() {
     let (mut vm, log) = run_obs(UNPUBLISHED_ALIAS, false);
