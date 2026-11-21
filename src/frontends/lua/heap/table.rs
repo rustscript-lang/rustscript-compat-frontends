@@ -584,6 +584,22 @@ impl LuaHeap {
         self.write_table_edge(from, EdgeKey::object(key), to)
     }
 
+    /// Writes one string under an object key, in the same record and quota.
+    ///
+    /// Nil removal stays on [`Self::clear_object_edge`]. The string is not
+    /// issued as a table token and is not a second edge table.
+    pub fn set_object_scalar(
+        &mut self,
+        from: TableRef,
+        key: TableRef,
+        value: Value,
+    ) -> Result<(), HeapError> {
+        debug_assert!(matches!(value, Value::String(_)));
+        self.require_live(from)?;
+        self.require_live(key)?;
+        self.write_edge(from, EdgeKey::object(key), EdgeValue::Scalar(value))
+    }
+
     /// Removes one object-key record. Another key, including a later generation
     /// of the same slot, is a different identity and stays.
     pub fn clear_object_edge(&mut self, from: TableRef, key: TableRef) -> Result<(), HeapError> {
@@ -649,13 +665,7 @@ impl LuaHeap {
 
     /// Reads a direct field as the guest value without metatable dispatch.
     pub fn field_value(&self, from: TableRef, key: u32) -> Result<Value, HeapError> {
-        match self.read_edge(from, EdgeKey::Field(key))? {
-            Some(EdgeValue::Table { slot, generation }) => {
-                self.issued_value(TableRef::table(self.domain, *slot, *generation))
-            }
-            Some(EdgeValue::Scalar(value)) => Ok(value.clone()),
-            None => Ok(Value::Null),
-        }
+        self.stored_value(from, EdgeKey::Field(key))
     }
 
     /// Reads an object-key edge. The key generation must still be that live slot.
@@ -666,6 +676,24 @@ impl LuaHeap {
     ) -> Result<Option<TableRef>, HeapError> {
         self.require_live(key)?;
         self.read_table_edge(from, EdgeKey::object(key))
+    }
+
+    /// Reads an object-key edge as the guest value.
+    ///
+    /// A stored string is that string. It is not decoded as a table token.
+    pub fn object_value(&self, from: TableRef, key: TableRef) -> Result<Value, HeapError> {
+        self.require_live(key)?;
+        self.stored_value(from, EdgeKey::object(key))
+    }
+
+    fn stored_value(&self, from: TableRef, key: EdgeKey) -> Result<Value, HeapError> {
+        match self.read_edge(from, key)? {
+            Some(EdgeValue::Table { slot, generation }) => {
+                self.issued_value(TableRef::table(self.domain, *slot, *generation))
+            }
+            Some(EdgeValue::Scalar(value)) => Ok(value.clone()),
+            None => Ok(Value::Null),
+        }
     }
 
     fn read_table_edge(&self, from: TableRef, key: EdgeKey) -> Result<Option<TableRef>, HeapError> {

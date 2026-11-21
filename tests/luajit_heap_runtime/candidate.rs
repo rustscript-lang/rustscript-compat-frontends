@@ -601,14 +601,17 @@ fn set_edge(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
                 })
                 .map_err(heap_error)?;
             } else {
-                let heap::GuestClass::Table(to) =
-                    classify(&mut call.vm().host_context(), &to_value)?
-                else {
-                    return Err(host_fault("edge target is not a table"));
-                };
-                heap::with_heap(&mut call.vm().host_context(), |heap| {
-                    heap.set_object_edge(from, key, to)
-                })
+                let mut host = call.vm().host_context();
+                let class = classify(&mut host, &to_value)?;
+                match class {
+                    heap::GuestClass::Table(to) => {
+                        heap::with_heap(&mut host, |heap| heap.set_object_edge(from, key, to))
+                    }
+                    heap::GuestClass::String => heap::with_heap(&mut host, |heap| {
+                        heap.set_object_scalar(from, key, to_value)
+                    }),
+                    _ => return Err(host_fault("edge target is not a table")),
+                }
                 .map_err(heap_error)?;
             }
         }
@@ -833,11 +836,7 @@ fn get_edge(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
     let heap::GuestClass::Table(key) = classify(&mut host, &key_value)? else {
         return Err(host_fault("edge key is not a table"));
     };
-    heap::with_heap(&mut host, |heap| match heap.object_edge(table, key)? {
-        Some(target) => heap.issued_value(target),
-        None => Ok(Value::Null),
-    })
-    .map_err(heap_error)
+    heap::with_heap(&mut host, |heap| heap.object_value(table, key)).map_err(heap_error)
 }
 
 fn set_metatable(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {

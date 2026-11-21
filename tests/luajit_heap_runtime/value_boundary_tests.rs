@@ -1382,6 +1382,201 @@ return type(owner[alias_key])
     assert_eq!(heap::stats(&mut vm.host_context()).unwrap().live_edges, 1);
 }
 
+/// Object-key strings share the table edge record. They are not table tokens.
+///
+/// Upstream LuaJIT `96f7b297` with `-joff` and Lua 5.2 compat, after the helper
+/// returns and an explicit collect: `rawget(owner, kept_key)` is `stored-42` in
+/// `k`/`v`/`kv`; `rawget(watch, "drop")` is nil and `owner` has 1 entry in `k`
+/// and `kv`, and is a table with 2 entries in `v`. Omitting collect leaves the
+/// drop key as a table and 2 owner entries in all three modes.
+///
+/// Candidate adaptations, same literals: index reads stand in for `rawget`
+/// because this lowerer has no metamethods; `live_edges` stands in for the
+/// owner entry count (two `__mode` fields, `kept_key.owner`, `kept_key.watch`,
+/// and the kept string are the five records that remain when the drop entry
+/// and `watch.drop` are cleared); `collectgarbage("stop")` is omitted because
+/// collection runs only at the explicit call. The candidate cannot capture
+/// upvalues or return three tables, so `seed` returns `kept_key` and that key
+/// holds `owner` and the weak-value watch by strong fields. Concatenation is
+/// not lowered here; the string local is cleared so it is not a root.
+#[test]
+fn lua_candidate_weak_object_keys_retain_string_values() {
+    let source = r#"
+local function seed()
+  local mt = {}
+  mt.__mode = "@mode@"
+  local owner = {}
+  setmetatable(owner, mt)
+  local kept_key = {}
+  local drop = {}
+  local watch_mt = {}
+  watch_mt.__mode = "v"
+  local watch = {}
+  setmetatable(watch, watch_mt)
+  local kept = "stored-42"
+  owner[kept_key] = kept
+  kept = nil
+  local stored = "drop-7"
+  owner[drop] = stored
+  stored = nil
+  watch.drop = drop
+  kept_key.owner = owner
+  kept_key.watch = watch
+  observe_table(drop, 0)
+  return kept_key
+end
+local kept_key = seed()
+@collect@
+local owner = kept_key.owner
+local watch = kept_key.watch
+@return@
+"#;
+    let collect = "collectgarbage(\"collect\")\n";
+    for mode in ["k", "v", "kv"] {
+        for (do_collect, drop_result, drop_alive, edges, collections) in [
+            (
+                true,
+                if mode == "v" { "table" } else { "nil" },
+                mode == "v",
+                if mode == "v" { 7 } else { 5 },
+                1,
+            ),
+            (false, "table", true, 7, 0),
+        ] {
+            let body = source
+                .replace("@mode@", mode)
+                .replace("@collect@", if do_collect { collect } else { "" });
+            assert_object_string(
+                &body.replace("@return@", "return owner[kept_key]\n"),
+                "stored-42",
+                drop_alive,
+                edges,
+                collections,
+            );
+            assert_object_string(
+                &body.replace("@return@", "return type(watch.drop)\n"),
+                drop_result,
+                drop_alive,
+                edges,
+                collections,
+            );
+        }
+    }
+}
+
+/// One object key reuses one edge for a table, a string, and nil.
+///
+/// A later generation of the same slot must not read the cleared string.
+/// `live_edges` is the shared quota: overwrite does not add a record, nil
+/// releases it, and a second key consumes a second record.
+#[test]
+fn lua_candidate_object_key_string_reuses_one_edge_record() {
+    let overwrite = r#"
+local owner = {}
+local key = {}
+local other = {}
+local value = {}
+observe_table(value, 0)
+owner[key] = "stored-42"
+owner[other] = value
+owner[key] = value
+observe_table(owner[key], 0)
+owner[key] = "stored-42"
+owner[other] = nil
+return owner[key]
+"#;
+    let mut vm = candidate(overwrite);
+    assert_eq!(
+        vm.run()
+            .expect("overwrite an object key between table and string"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::string("stored-42")]);
+    let tables = vm
+        .host_context()
+        .scope_state::<Vec<ObservedTable>>()
+        .unwrap()
+        .clone();
+    let [value, via_key] = tables.as_slice() else {
+        panic!("expected the table value and its readback");
+    };
+    assert_eq!(via_key, value, "string to table keeps the issued identity");
+    assert_eq!(heap::stats(&mut vm.host_context()).unwrap().live_edges, 1);
+
+    let reused = r#"
+local owner = {}
+local key = {}
+observe_table(key, 0)
+owner[key] = "stored-42"
+owner[key] = nil
+key = nil
+collectgarbage("collect")
+local reused = {}
+observe_table(reused, 0)
+return type(owner[reused])
+"#;
+    let mut vm = candidate(reused);
+    assert_eq!(
+        vm.run()
+            .expect("a reused object-key slot does not revive the string"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::string("nil")]);
+    let mut host = vm.host_context();
+    let tables = host.scope_state::<Vec<ObservedTable>>().unwrap().clone();
+    let [key, reused] = tables.as_slice() else {
+        panic!("expected the old key and the reused slot");
+    };
+    assert_eq!(reused.table.domain(), key.table.domain());
+    assert_eq!(reused.table.kind(), key.table.kind());
+    assert_eq!(reused.table.slot(), key.table.slot());
+    assert_ne!(reused.table.generation(), key.table.generation());
+    let resource_key = heap::LuaTableResource::key();
+    assert!(
+        host.borrow_resource_with_key::<heap::LuaTableResource>(key.token, &resource_key)
+            .is_err()
+    );
+    assert!(
+        host.borrow_resource_with_key::<heap::LuaTableResource>(reused.token, &resource_key)
+            .is_ok()
+    );
+    let stats = heap::stats(&mut host).unwrap();
+    assert_eq!(stats.live_edges, 0);
+    assert_eq!(stats.collections, 1);
+}
+
+fn assert_object_string(
+    source: &str,
+    result: &str,
+    drop_alive: bool,
+    edges: u32,
+    collections: u32,
+) {
+    let mut vm = candidate(source);
+    assert_eq!(vm.run().expect("object-key string"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string(result)]);
+    let mut host = vm.host_context();
+    let observed = host.scope_state::<Vec<ObservedTable>>().unwrap().clone();
+    let [drop] = observed.as_slice() else {
+        panic!("expected the dropped object key");
+    };
+    let resource_key = heap::LuaTableResource::key();
+    assert_eq!(
+        heap::with_heap(&mut host, |heap| Ok(heap.alive(drop.table))).unwrap(),
+        drop_alive,
+        "dropped key heap node"
+    );
+    assert_eq!(
+        host.borrow_resource_with_key::<heap::LuaTableResource>(drop.token, &resource_key)
+            .is_ok(),
+        drop_alive,
+        "dropped key Core token"
+    );
+    let stats = heap::stats(&mut host).unwrap();
+    assert_eq!(stats.live_edges, edges, "stored entries after collection");
+    assert_eq!(stats.collections, collections);
+}
+
 #[test]
 fn lua_candidate_bracket_numbers_do_not_alias_private_field_ids() {
     let source = r#"
