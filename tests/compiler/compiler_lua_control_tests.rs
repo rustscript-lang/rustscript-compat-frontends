@@ -14,7 +14,6 @@ use common::*;
 #[allow(dead_code)]
 #[path = "../../src/frontends/lua/ast.rs"]
 mod ast;
-#[allow(dead_code)]
 #[path = "../../src/frontends/lua/control.rs"]
 mod control;
 #[allow(dead_code)]
