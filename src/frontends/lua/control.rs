@@ -21,28 +21,51 @@
 //! `core_truthy` before a Core branch or `Not`. `until` does the same, once,
 //! in the `for` post. The operand expression is placed once. The state id is
 //! a private Core int and is not a Lua number.
-
+//!
+//! A numeric `for` is also one Core `for`, in the same dispatch arm as the
+//! surrounding chunk. Its three header expressions are assigned once, left to
+//! right, into private float slots. The default step is `+1`. Those slots are
+//! declared at the chunk root so a nested loop can assign them again without
+//! a second `let`. The visible index is a different slot, copied from the
+//! hidden counter at the start of each iteration, so a write to the Lua local
+//! does not move the counter and a same-name header reference still sees the
+//! outer binding. Core has no sign-bit opcode, so the condition is one call of
+//! `lua_control::numeric_for_holds`. The test catalog owns that predicate:
+//! direction is the step's sign bit, and the closed interval uses ordered
+//! comparisons. `continue` reaches the post, which adds the saved step to the
+//! hidden counter. `break` skips that post and leaves this `for`.
+//!
 use super::ast::{self, BinOp, Block, Chunk, Expr, Name, NumberKind, Span, Stmt, UnOp};
 use super::lexer;
 use super::parser;
 use super::resolve::{self, Resolution, ResolveError};
+use vm::compiler::HostCallResolver;
 use vm::{
     AssignmentKind, Expr as CoreExpr, FrontendIr, LocalIrBuilder, LocalSlot, ParseError,
-    Stmt as CoreStmt,
+    Stmt as CoreStmt, TypeSchema,
 };
 
 const STATE_SLOT: &str = "$lua_dispatch_state";
 const RESULT_SLOT: &str = "$lua_return_value";
 const EXIT_STATE: i64 = 0;
 
+pub(super) const NUMERIC_FOR_HOLDS: &str = "lua_control::numeric_for_holds";
+
 pub(super) fn lower_source(source: &str) -> Result<FrontendIr, ParseError> {
+    lower_source_with(source, None)
+}
+
+pub(super) fn lower_source_with(
+    source: &str,
+    holds: Option<&HostCallResolver<'_>>,
+) -> Result<FrontendIr, ParseError> {
     let chunk = parser::parse_chunk(source.as_bytes()).map_err(syntax_error)?;
     let resolution = resolve::resolve(&chunk);
     if let Some(error) = resolution.errors.first() {
         let line = line_of(source, error_span(error));
         return Err(ParseError::at_line(line, static_message(error)));
     }
-    let mut lower = Lower::new(source, &resolution);
+    let mut lower = Lower::new(source, &resolution, holds);
     let stmts = if needs_dispatch(&chunk) {
         lower.lower_dispatch(&chunk)?
     } else {
@@ -61,6 +84,10 @@ struct Lower<'a> {
     result: Option<LocalSlot>,
     label_state: Vec<Option<i64>>,
     repeat_flags: u32,
+    nfor_ordinal: u32,
+    nfor_slots: Vec<LocalSlot>,
+    for_indexes: Vec<LocalSlot>,
+    holds: Option<&'a HostCallResolver<'a>>,
 }
 
 struct BlockBuf {
@@ -101,7 +128,11 @@ enum Exit {
 }
 
 impl<'a> Lower<'a> {
-    fn new(source: &'a str, resolution: &'a Resolution) -> Self {
+    fn new(
+        source: &'a str,
+        resolution: &'a Resolution,
+        holds: Option<&'a HostCallResolver<'a>>,
+    ) -> Self {
         let slots = vec![None; resolution.bindings.len()];
         let label_state = vec![None; resolution.labels.len()];
         Self {
@@ -114,6 +145,10 @@ impl<'a> Lower<'a> {
             result: None,
             label_state,
             repeat_flags: 0,
+            nfor_ordinal: 0,
+            nfor_slots: Vec::new(),
+            for_indexes: Vec::new(),
+            holds,
         }
     }
 
@@ -122,7 +157,19 @@ impl<'a> Lower<'a> {
         if let Some(expr) = value {
             stmts.push(CoreStmt::Expr { expr, line: 1 });
         }
-        Ok(stmts)
+        Ok(self.hoist_numeric_for(stmts))
+    }
+
+    fn hoist_numeric_for(&self, stmts: Vec<CoreStmt>) -> Vec<CoreStmt> {
+        let mut root = Vec::new();
+        for slot in &self.nfor_slots {
+            root.push(let_float(*slot, CoreExpr::Float(0.0), 1));
+        }
+        for slot in &self.for_indexes {
+            root.push(let_float(*slot, CoreExpr::Float(0.0), 1));
+        }
+        root.extend(stmts);
+        root
     }
 
     fn lower_dispatch(&mut self, chunk: &Chunk) -> Result<Vec<CoreStmt>, ParseError> {
@@ -158,6 +205,9 @@ impl<'a> Lower<'a> {
         let mut root = Vec::new();
         for slot in self.slots.iter().flatten().copied() {
             root.push(let_expr(slot, CoreExpr::Null, 1));
+        }
+        for slot in &self.nfor_slots {
+            root.push(let_float(*slot, CoreExpr::Float(0.0), 1));
         }
         root.push(let_expr(state, CoreExpr::Int(1), 1));
         if let Some(result) = self.result {
@@ -205,6 +255,20 @@ impl<'a> Lower<'a> {
                         expr: self.one_value(values, *span)?,
                         line: self.line(*span),
                     });
+                }
+                Stmt::NumericFor {
+                    name,
+                    start,
+                    limit,
+                    step,
+                    body,
+                    span,
+                } => {
+                    for stmt in
+                        self.numeric_for_stmts(name, start, limit, step.as_ref(), body, *span)?
+                    {
+                        blocks.current.push(Item::Core(stmt));
+                    }
                 }
                 other => blocks.current.push(self.arm_item(other)?),
             }
@@ -264,6 +328,22 @@ impl<'a> Lower<'a> {
             }
             if let Stmt::Do { body, .. } = stmt {
                 items.extend(self.branch_items(&body.stmts)?);
+                continue;
+            }
+            if let Stmt::NumericFor {
+                name,
+                start,
+                limit,
+                step,
+                body,
+                span,
+            } = stmt
+            {
+                for core in
+                    self.numeric_for_stmts(name, start, limit, step.as_ref(), body, *span)?
+                {
+                    items.push(Item::Core(core));
+                }
                 continue;
             }
             items.push(self.arm_item(stmt)?);
@@ -402,6 +482,109 @@ impl<'a> Lower<'a> {
         })
     }
 
+    fn numeric_for_stmts(
+        &mut self,
+        name: &Name,
+        start: &Expr,
+        limit: &Expr,
+        step: Option<&Expr>,
+        body: &Block,
+        span: Span,
+    ) -> Result<Vec<CoreStmt>, ParseError> {
+        if contains_transfer(body) || contains_label(body) {
+            return Err(self.fail(
+                span,
+                "goto, label, or return inside a loop is not in this slice",
+            ));
+        }
+        let (body_stmts, value) = self.straight(&body.stmts, true)?;
+        if value.is_some() {
+            return Err(self.fail(span, "return inside a loop is not in this slice"));
+        }
+        let line = self.line(span);
+        let visible = self.slot(self.binding_for_index(name, body)?)?;
+        if !self.dispatching {
+            self.for_indexes.push(visible);
+        }
+        let hidden = self.alloc_nfor("index")?;
+        let limit_slot = self.alloc_nfor("limit")?;
+        let step_slot = self.alloc_nfor("step")?;
+        // `expr` builds IR. The assigns below are the only runtime evaluation,
+        // left to right, once per time this loop statement is reached.
+        let start_expr = self.expr(start)?;
+        let limit_expr = self.expr(limit)?;
+        let step_expr = match step {
+            Some(expr) => self.expr(expr)?,
+            None => CoreExpr::Float(1.0),
+        };
+        let mut loop_body = vec![set_slot(visible, CoreExpr::Var(hidden), line)];
+        loop_body.extend(body_stmts);
+        Ok(vec![
+            set_slot(hidden, start_expr, line),
+            set_slot(limit_slot, limit_expr, line),
+            set_slot(step_slot, step_expr, line),
+            CoreStmt::For {
+                init: Box::new(CoreStmt::Noop { line }),
+                condition: self.holds_call(hidden, limit_slot, step_slot, span)?,
+                post: Box::new(set_slot(
+                    hidden,
+                    CoreExpr::Add(
+                        Box::new(CoreExpr::Var(hidden)),
+                        Box::new(CoreExpr::Var(step_slot)),
+                    ),
+                    line,
+                )),
+                body: loop_body,
+                line,
+            },
+        ])
+    }
+
+    fn holds_call(
+        &mut self,
+        index: LocalSlot,
+        limit: LocalSlot,
+        step: LocalSlot,
+        span: Span,
+    ) -> Result<CoreExpr, ParseError> {
+        let Some(resolver) = self.holds else {
+            return Err(self.fail(span, "numeric for predicate is not bound"));
+        };
+        let signature = [TypeSchema::Float, TypeSchema::Float, TypeSchema::Float];
+        let resolved = resolver
+            .resolve(NUMERIC_FOR_HOLDS, &signature)
+            .map_err(|error| self.fail(span, format!("numeric for predicate: {error}")))?;
+        if resolved.return_type != TypeSchema::Bool
+            || resolved.params.len() != signature.len()
+            || resolved
+                .params
+                .iter()
+                .any(|param| param.schema != TypeSchema::Float)
+        {
+            return Err(self.fail(
+                span,
+                "numeric for predicate signature is not three floats to bool",
+            ));
+        }
+        self.builder
+            .declare_function(NUMERIC_FOR_HOLDS, Some(signature.len() as u8))?;
+        let index_fn = self
+            .builder
+            .function_index(NUMERIC_FOR_HOLDS)
+            .ok_or_else(|| self.fail(span, "numeric for predicate was not declared"))?;
+        Ok(CoreExpr::Call(
+            index_fn,
+            Vec::new(),
+            vec![
+                CoreExpr::Var(index),
+                CoreExpr::Var(limit),
+                CoreExpr::Var(step),
+            ],
+            Some(Box::new(resolved)),
+            None,
+        ))
+    }
+
     fn straight(
         &mut self,
         stmts: &[Stmt],
@@ -446,6 +629,23 @@ impl<'a> Lower<'a> {
                 }
                 Stmt::Goto { span, .. } | Stmt::Label { span, .. } => {
                     return Err(self.fail(*span, "goto or label in a direct statement"));
+                }
+                Stmt::NumericFor {
+                    name,
+                    start,
+                    limit,
+                    step,
+                    body,
+                    span,
+                } => {
+                    out.extend(self.numeric_for_stmts(
+                        name,
+                        start,
+                        limit,
+                        step.as_ref(),
+                        body,
+                        *span,
+                    )?);
                 }
                 other => out.push(self.straight_stmt(other, in_loop)?),
             }
@@ -698,6 +898,18 @@ impl<'a> Lower<'a> {
             .ok_or_else(|| self.fail(name.span, "local has no resolver binding"))
     }
 
+    fn binding_for_index(&self, name: &Name, body: &Block) -> Result<usize, ParseError> {
+        self.resolution
+            .bindings
+            .iter()
+            .position(|binding| {
+                binding.function_id == 0
+                    && binding.name == name.bytes
+                    && binding.visible_from == body.span.start
+            })
+            .ok_or_else(|| self.fail(name.span, "numeric for index has no resolver binding"))
+    }
+
     fn binding_at(&self, name: &[u8], span: Span) -> Result<usize, ParseError> {
         let mut best: Option<(usize, u32)> = None;
         for (index, binding) in self.resolution.bindings.iter().enumerate() {
@@ -737,6 +949,14 @@ impl<'a> Lower<'a> {
         let name = format!("$lua_repeat_again_{}", self.repeat_flags);
         self.repeat_flags += 1;
         self.alloc_private(&name)
+    }
+
+    fn alloc_nfor(&mut self, role: &str) -> Result<LocalSlot, ParseError> {
+        let name = format!("$lua_nfor_{role}_{}", self.nfor_ordinal);
+        self.nfor_ordinal += 1;
+        let slot = self.alloc_private(&name)?;
+        self.nfor_slots.push(slot);
+        Ok(slot)
     }
 
     fn goto_target(&self, span: Span) -> Result<usize, ParseError> {
@@ -839,6 +1059,15 @@ fn let_expr(slot: LocalSlot, expr: CoreExpr, line: u32) -> CoreStmt {
     CoreStmt::Let {
         index: slot,
         declared_schema: None,
+        expr,
+        line,
+    }
+}
+
+fn let_float(slot: LocalSlot, expr: CoreExpr, line: u32) -> CoreStmt {
+    CoreStmt::Let {
+        index: slot,
+        declared_schema: Some(TypeSchema::Float),
         expr,
         line,
     }

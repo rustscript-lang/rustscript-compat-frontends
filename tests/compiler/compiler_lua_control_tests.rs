@@ -31,10 +31,14 @@ mod resolve;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, OnceLock};
 
+use vm::compiler::HostCallResolver;
 use vm::{
-    Expr, FrontendImportSyntax, FrontendIr, JitConfig, LocalSlot, ParseError, SourceFlavor,
-    SourcePlugin, Stmt, Value, VmStatus,
+    CallOutcome, CallReturn, CompileSourceFileOptions, Expr, FrontendImportSyntax, FrontendIr,
+    HostApiBuilder, HostApiCatalog, HostFunctionRegistry, HostFunctionSchema, HostImportSchema,
+    HostOwnedFunction, HostParamSchema, HostTypeSchema, JitConfig, LocalSlot, OwnedHostCall,
+    ParseError, SourceFlavor, SourcePlugin, Stmt, Value, Vm, VmError, VmStatus,
 };
 
 const FUEL_BUDGET: u64 = 8_192;
@@ -71,7 +75,8 @@ impl SourcePlugin for ControlLuaPlugin {
     }
 
     fn parse_source(&self, source: &str) -> Result<FrontendIr, ParseError> {
-        control::lower_source(source)
+        let resolver = HostCallResolver::new(holds_catalog());
+        control::lower_source_with(source, Some(&resolver))
     }
 
     fn parse_module_imports(
@@ -87,6 +92,68 @@ fn candidate_options() -> CompileSourceFileOptions {
     CompileSourceFileOptions::new().with_source_plugin(&CONTROL_LUA_PLUGIN)
 }
 
+fn numeric_options() -> CompileSourceFileOptions {
+    candidate_options().with_host_api_catalog(Arc::clone(holds_catalog()))
+}
+
+struct NumericForHolds;
+
+impl HostOwnedFunction for NumericForHolds {
+    fn call(&mut self, call: &mut OwnedHostCall<'_>) -> Result<CallOutcome, VmError> {
+        let [Value::Float(index), Value::Float(limit), Value::Float(step)] = call.args() else {
+            return Err(VmError::HostError(
+                "lua_control::numeric_for_holds requires three floats".into(),
+            ));
+        };
+        // `>=` / `<=` are ordered: NaN makes both false. That is not
+        // `!(index < limit)`, which would be true for NaN. Sign comes from
+        // the step bit, so +0 and -0 stay distinct.
+        let holds = if step.is_sign_negative() {
+            *index >= *limit
+        } else {
+            *index <= *limit
+        };
+        Ok(CallOutcome::Return(CallReturn::one(Value::Bool(holds))))
+    }
+}
+
+fn holds_schema() -> HostFunctionSchema {
+    HostFunctionSchema::with_return(
+        control::NUMERIC_FOR_HOLDS,
+        vec![
+            HostParamSchema::value("index", HostTypeSchema::Float),
+            HostParamSchema::value("limit", HostTypeSchema::Float),
+            HostParamSchema::value("step", HostTypeSchema::Float),
+        ],
+        HostTypeSchema::Bool,
+    )
+}
+
+fn holds_catalog() -> &'static Arc<HostApiCatalog> {
+    static CATALOG: OnceLock<Arc<HostApiCatalog>> = OnceLock::new();
+    CATALOG.get_or_init(|| {
+        let mut builder = HostApiBuilder::new();
+        builder.function(holds_schema());
+        Arc::new(builder.build().expect("numeric for predicate catalog"))
+    })
+}
+
+fn bind_numeric_for_holds(vm: &mut Vm) -> Result<(), VmError> {
+    let catalog = holds_catalog();
+    let mut registry = HostFunctionRegistry::empty();
+    let function = catalog
+        .function(control::NUMERIC_FOR_HOLDS)
+        .expect("numeric for predicate schema");
+    registry.register_exact_owned(
+        control::NUMERIC_FOR_HOLDS,
+        function.params.len() as u8,
+        HostImportSchema::from_function(catalog, function),
+        move |_| Box::new(NumericForHolds),
+    )?;
+    registry.authorize_registered_builtin_import(control::NUMERIC_FOR_HOLDS);
+    registry.bind_vm_cached(vm)
+}
+
 fn write_fixture(label: &str, source: &str) -> PathBuf {
     let root = namespace_case_root(&format!("lua_control_{label}"));
     let path = root.join("chunk.lua");
@@ -95,8 +162,21 @@ fn write_fixture(label: &str, source: &str) -> PathBuf {
 }
 
 fn run_fixture(label: &str, source: &str) -> (Vec<Value>, u64) {
+    run_compiled(label, source, false)
+}
+
+fn run_numeric(label: &str, source: &str) -> (Vec<Value>, u64) {
+    run_compiled(label, source, true)
+}
+
+fn run_compiled(label: &str, source: &str, numeric_for: bool) -> (Vec<Value>, u64) {
     let path = write_fixture(label, source);
-    let compiled = compile_source_file_with_options(&path, candidate_options())
+    let options = if numeric_for {
+        numeric_options()
+    } else {
+        candidate_options()
+    };
+    let compiled = compile_source_file_with_options(&path, options)
         .unwrap_or_else(|error| panic!("{label}: compile failed: {error}"));
     let mut vm = Vm::new_with_jit_config(
         compiled.program,
@@ -106,6 +186,10 @@ fn run_fixture(label: &str, source: &str) -> (Vec<Value>, u64) {
             max_trace_len: 256,
         },
     );
+    if numeric_for {
+        bind_numeric_for_holds(&mut vm)
+            .unwrap_or_else(|error| panic!("{label}: bind numeric for predicate: {error}"));
+    }
     vm.set_fuel_check_interval(FUEL_CHECK_INTERVAL)
         .unwrap_or_else(|error| panic!("{label}: fuel interval: {error}"));
     vm.set_fuel(FUEL_BUDGET);
@@ -124,6 +208,27 @@ fn run_fixture(label: &str, source: &str) -> (Vec<Value>, u64) {
         "LUA_CONTROL label={label} fuel_budget={FUEL_BUDGET} check_interval={FUEL_CHECK_INTERVAL} consumed={consumed} remaining={remaining} jit=disabled stack={stack:?}"
     );
     (stack, consumed)
+}
+
+fn expect_numeric(label: &str, source: &str, expected: f64) {
+    let (stack, consumed) = run_numeric(label, source);
+    assert_eq!(
+        stack,
+        vec![Value::Float(expected)],
+        "{label}: numeric for mismatch; fuel records a budget exhaustion separately from this value"
+    );
+    assert!(consumed > 0, "{label}: recorded no fuel");
+    assert!(
+        consumed < FUEL_BUDGET,
+        "{label}: exhausted the fuel budget, so this is not a numeric-for result"
+    );
+    if let Ok(oracle) = std::env::var("LUAJIT_ORACLE") {
+        let observed = oracle_return(&oracle, &write_fixture(label, source));
+        assert_eq!(
+            observed, expected,
+            "{label}: LuaJIT returned {observed}, candidate returned {expected}"
+        );
+    }
 }
 
 fn expect_number(label: &str, source: &str, expected: f64) {
@@ -498,6 +603,12 @@ fn lowered(source: &str) -> FrontendIr {
     control::lower_source(source).unwrap_or_else(|error| panic!("lower failed: {error}"))
 }
 
+fn lowered_numeric(source: &str) -> FrontendIr {
+    let resolver = HostCallResolver::new(holds_catalog());
+    control::lower_source_with(source, Some(&resolver))
+        .unwrap_or_else(|error| panic!("lower failed: {error}"))
+}
+
 fn slot_named(ir: &FrontendIr, name: &str) -> Option<LocalSlot> {
     ir.local_bindings
         .iter()
@@ -644,15 +755,18 @@ fn assert_repeat_fors(ir: &FrontendIr, expected: usize) {
             ..
         } = stmt
         {
-            seen += 1;
             let Stmt::Let {
                 index,
                 expr: init_expr,
                 ..
             } = init.as_ref()
             else {
-                panic!("repeat init is not one flag let: {init:?}");
+                return;
             };
+            if !flags.iter().any(|(_, slot)| slot == index) {
+                return;
+            }
+            seen += 1;
             assert!(
                 matches!(init_expr, Expr::Bool(true)),
                 "repeat flag must start true so the body runs before until: {init_expr:?}"
@@ -1567,6 +1681,788 @@ fn nested_while_and_repeat_keep_transfers_on_the_nearest_loop() {
     assert_repeat_fors(&inner, 1);
     assert_eq!(source_while_count(&outer.stmts, None), 1);
     assert_eq!(source_while_count(&inner.stmts, None), 1);
+}
+
+const NUMERIC_FOR_UP_AND_EMPTY: &str = "\
+local sum = 0
+for i = 1, 3 do
+  sum = sum * 10 + i
+end
+for i = 3, 1 do
+  sum = -1
+end
+return sum
+";
+
+#[test]
+fn numeric_for_counts_up_and_skips_an_empty_range() {
+    // 123 is 1 then 2 then 3. The descending header with the default step
+    // must not enter, so a wrong direction or a copied body cannot yield 123.
+    expect_numeric("numeric_for_up_empty", NUMERIC_FOR_UP_AND_EMPTY, 123.0);
+    let ir = lowered_numeric(NUMERIC_FOR_UP_AND_EMPTY);
+    assert_eq!(numeric_for_count(&ir), 2);
+    assert_eq!(default_step_assigns(&ir), 2);
+}
+
+const NUMERIC_FOR_DOWN: &str = "\
+local sum = 0
+for i = 3, 1, -1 do
+  sum = sum * 10 + i
+end
+return sum
+";
+
+const NUMERIC_FOR_FRACTION: &str = "\
+local code = 0
+for i = 0.5, 1.5, 0.5 do
+  code = code * 10 + i * 2
+end
+return code
+";
+
+const NUMERIC_FOR_HEADER: &str = "\
+local i = 7
+local limit = 1
+local step = -2
+local packed = 0
+local effects = 0
+local n = 0
+for i = i, limit, step do
+  n = n + 1
+  packed = packed * 10 + i
+  if n == 2 then
+    continue
+  end
+  i = 99
+  limit = 100
+  step = 100
+  effects = effects + 1
+end
+return i * 1000000 + packed * 10 + effects
+";
+
+const NUMERIC_FOR_HEADER_DISPATCH: &str = "\
+local skipped = 0
+goto enter
+skipped = 1
+::enter::
+local i = 7
+local limit = 1
+local step = -2
+local packed = 0
+local effects = 0
+local n = 0
+for i = i, limit, step do
+  n = n + 1
+  packed = packed * 10 + i
+  if n == 2 then
+    continue
+  end
+  i = 99
+  limit = 100
+  step = 100
+  effects = effects + 1
+end
+return skipped * 10000000 + i * 1000000 + packed * 10 + effects
+";
+
+const NUMERIC_FOR_NESTED: &str = "\
+local outer = 0
+local inner = 0
+local after = 0
+for i = 1, 3 do
+  outer = outer + 1
+  for j = 1, 3 do
+    inner = inner + 1
+    if j == 2 then
+      break
+    end
+  end
+  if i == 2 then
+    continue
+  end
+  after = after + 1
+end
+return outer * 100 + inner * 10 + after
+";
+
+const NUMERIC_FOR_NESTED_DISPATCH: &str = "\
+local skipped = 0
+goto enter
+skipped = 1
+::enter::
+local outer = 0
+local inner = 0
+local after = 0
+for i = 1, 3 do
+  outer = outer + 1
+  for j = 1, 3 do
+    inner = inner + 1
+    if j == 2 then
+      break
+    end
+  end
+  if i == 2 then
+    continue
+  end
+  after = after + 1
+end
+return skipped * 1000 + outer * 100 + inner * 10 + after
+";
+
+const NUMERIC_FOR_FLOATS: &str = "\
+local huge = 1e308 * 10
+local nnan = huge - huge
+local pnan = -nnan
+local neg0 = -0
+local pos0 = 0
+local code = 0
+local n = 0
+local ok = 1
+n = 0
+ok = 1
+for i = 1.5, 2.5, pos0 do
+  n = n + 1
+  if i ~= 1.5 then
+    ok = 0
+  end
+  if n == 3 then
+    break
+  end
+end
+if ok == 0 then
+  n = 9
+end
+code = code * 10 + n
+n = 0
+ok = 1
+for i = 1.5, 2.5, neg0 do
+  n = n + 1
+  if n == 3 then
+    break
+  end
+end
+if ok == 0 then
+  n = 9
+end
+code = code * 10 + n
+n = 0
+ok = 1
+for i = 2.5, 1.5, pos0 do
+  n = n + 1
+  if n == 3 then
+    break
+  end
+end
+if ok == 0 then
+  n = 9
+end
+code = code * 10 + n
+n = 0
+ok = 1
+for i = 2.5, 1.5, neg0 do
+  n = n + 1
+  if i ~= 2.5 then
+    ok = 0
+  end
+  if n == 3 then
+    break
+  end
+end
+if ok == 0 then
+  n = 9
+end
+code = code * 10 + n
+n = 0
+ok = 1
+for i = 1.5, 2.5, pnan do
+  n = n + 1
+  if n == 1 then
+    if i ~= 1.5 then
+      ok = 0
+    end
+  end
+  if n == 3 then
+    break
+  end
+end
+if ok == 0 then
+  n = 9
+end
+code = code * 10 + n
+n = 0
+ok = 1
+for i = 1.5, 2.5, nnan do
+  n = n + 1
+  if n == 3 then
+    break
+  end
+end
+if ok == 0 then
+  n = 9
+end
+code = code * 10 + n
+n = 0
+ok = 1
+for i = 2.5, 1.5, pnan do
+  n = n + 1
+  if n == 3 then
+    break
+  end
+end
+if ok == 0 then
+  n = 9
+end
+code = code * 10 + n
+n = 0
+ok = 1
+for i = 2.5, 1.5, nnan do
+  n = n + 1
+  if n == 1 then
+    if i ~= 2.5 then
+      ok = 0
+    end
+  end
+  if n == 3 then
+    break
+  end
+end
+if ok == 0 then
+  n = 9
+end
+code = code * 10 + n
+n = 0
+ok = 1
+for i = nnan, 2.5, 1 do
+  n = n + 1
+  if n == 3 then
+    break
+  end
+end
+if ok == 0 then
+  n = 9
+end
+code = code * 10 + n
+n = 0
+ok = 1
+for i = 1.5, nnan, 1 do
+  n = n + 1
+  if n == 3 then
+    break
+  end
+end
+if ok == 0 then
+  n = 9
+end
+code = code * 10 + n
+n = 0
+ok = 1
+for i = 9007199254740992, 9007199254740996, 1 do
+  n = n + 1
+  if i ~= 9007199254740992 then
+    ok = 0
+  end
+  if n == 3 then
+    break
+  end
+end
+if ok == 0 then
+  n = 9
+end
+code = code * 10 + n
+n = 0
+ok = 1
+for i = 1, huge, huge do
+  n = n + 1
+  if n == 1 then
+    if i ~= 1 then
+      ok = 0
+    end
+  end
+  if n > 1 then
+    if i ~= i then
+      ok = 0
+    end
+    if not (i > 1e308) then
+      ok = 0
+    end
+  end
+  if n == 3 then
+    break
+  end
+end
+if ok == 0 then
+  n = 9
+end
+code = code * 10 + n
+return code
+";
+
+const NUMERIC_FOR_ONCE: &str = "\
+local a = 1
+local b = 4
+local c = 1
+local sum = 0
+for i = a + 1, b, c do
+  sum = sum + i
+end
+return sum
+";
+
+const NUMERIC_FOR_ONCE_DISPATCH: &str = "\
+local skipped = 0
+goto enter
+skipped = 1
+::enter::
+local a = 1
+local b = 4
+local c = 1
+local sum = 0
+for i = a + 1, b, c do
+  sum = sum + i
+end
+return skipped * 10 + sum
+";
+
+const NUMERIC_FOR_BAD_STEP: &str = "\
+local bad = false
+local seen = 0
+for i = 1, 2, bad do
+  seen = 1
+end
+return seen
+";
+
+const NUMERIC_FOR_BAD_START: &str = "\
+local bad = false
+local seen = 0
+for i = bad, 2, 1 do
+  seen = 1
+end
+return seen
+";
+
+const NUMERIC_FOR_GENERIC: &str = "\
+for i in 1 do
+end
+return 0
+";
+
+#[test]
+fn numeric_for_counts_down_and_uses_a_fractional_step() {
+    expect_numeric("numeric_for_down", NUMERIC_FOR_DOWN, 321.0);
+    expect_numeric("numeric_for_fraction", NUMERIC_FOR_FRACTION, 123.0);
+}
+
+#[test]
+fn numeric_for_header_is_a_snapshot_and_continue_still_updates() {
+    // 7075313: outer i stays 7, visits are 7,5,3,1, and the second visit
+    // continues past the writes. A live limit or step would not pack 7531.
+    expect_numeric("numeric_for_header", NUMERIC_FOR_HEADER, 7_075_313.0);
+    expect_numeric(
+        "numeric_for_header_dispatch",
+        NUMERIC_FOR_HEADER_DISPATCH,
+        7_075_313.0,
+    );
+}
+
+#[test]
+fn numeric_for_break_and_continue_stay_on_the_source_loop() {
+    // 362: three outer trips, two inner trips each, and the middle continue
+    // skips one tail. An inner break that left the outer loop cannot pack 362.
+    expect_numeric("numeric_for_nested", NUMERIC_FOR_NESTED, 362.0);
+    expect_numeric(
+        "numeric_for_nested_dispatch",
+        NUMERIC_FOR_NESTED_DISPATCH,
+        362.0,
+    );
+    let direct = lowered_numeric(NUMERIC_FOR_NESTED);
+    let dispatch = lowered_numeric(NUMERIC_FOR_NESTED_DISPATCH);
+    assert!(slot_named(&direct, "$lua_dispatch_state").is_none());
+    assert_eq!(
+        numeric_for_count(&direct),
+        2,
+        "nested source is two fors, not a copied body"
+    );
+    assert_eq!(
+        numeric_for_count(&dispatch),
+        2,
+        "dispatch must not copy the numeric-for body"
+    );
+    let state = slot_named(&dispatch, "$lua_dispatch_state").expect("dispatch state");
+    assert_eq!(dispatch_while_count(&dispatch.stmts, state), 1);
+    assert_eq!(break_count(&direct), 1);
+    // Dispatch keeps one unknown-state sentinel break outside the numeric fors.
+    assert_eq!(break_count(&dispatch), 2);
+    assert_eq!(breaks_inside_numeric_for(&direct), 1);
+    assert_eq!(breaks_inside_numeric_for(&dispatch), 1);
+}
+
+#[test]
+fn numeric_for_float_boundaries_match_the_locked_sign_bit() {
+    // Digits, each capped by a source break so a stuck back edge is a wrong
+    // digit rather than an exhausted fuel budget:
+    // +0 up 3, -0 up 0, +0 down 0, -0 down 3,
+    // +NaN up 1, -NaN up 0, +NaN down 0, -NaN down 1,
+    // NaN start 0, NaN limit 0, 2^53 step 3, inf step 3.
+    expect_numeric("numeric_for_floats", NUMERIC_FOR_FLOATS, 300_310_010_033.0);
+}
+
+#[test]
+fn numeric_for_header_expression_is_materialized_once() {
+    expect_numeric("numeric_for_once", NUMERIC_FOR_ONCE, 9.0);
+    expect_numeric("numeric_for_once_dispatch", NUMERIC_FOR_ONCE_DISPATCH, 9.0);
+    assert_header_once("direct", &lowered_numeric(NUMERIC_FOR_ONCE));
+    assert_header_once("dispatch", &lowered_numeric(NUMERIC_FOR_ONCE_DISPATCH));
+    let dispatch = lowered_numeric(NUMERIC_FOR_ONCE_DISPATCH);
+    let state = slot_named(&dispatch, "$lua_dispatch_state").expect("dispatch state");
+    assert_eq!(dispatch_while_count(&dispatch.stmts, state), 1);
+    assert_eq!(numeric_for_count(&dispatch), 1);
+}
+
+#[test]
+fn numeric_for_rejects_a_non_float_header_instead_of_an_empty_loop() {
+    assert_numeric_header_rejected("numeric_for_bad_step", NUMERIC_FOR_BAD_STEP);
+    assert_numeric_header_rejected("numeric_for_bad_start", NUMERIC_FOR_BAD_START);
+}
+
+#[test]
+fn generic_for_stays_outside_this_slice() {
+    let error = lowered_numeric_err(NUMERIC_FOR_GENERIC);
+    assert!(
+        error.contains("statement is not in this chunk control slice"),
+        "{error}"
+    );
+}
+
+fn lowered_numeric_err(source: &str) -> String {
+    let resolver = HostCallResolver::new(holds_catalog());
+    control::lower_source_with(source, Some(&resolver))
+        .expect_err("generic for must not lower")
+        .to_string()
+}
+
+fn slots_with_prefix(ir: &FrontendIr, prefix: &str) -> Vec<LocalSlot> {
+    ir.local_bindings
+        .iter()
+        .filter(|(name, _)| name.starts_with(prefix))
+        .map(|(name, slot)| {
+            assert!(!is_lua_ident(name), "{name} is a guest identifier");
+            *slot
+        })
+        .collect()
+}
+
+fn default_step_assigns(ir: &FrontendIr) -> usize {
+    let steps = slots_with_prefix(ir, "$lua_nfor_step_");
+    let mut seen = 0;
+    walk_stmts(&ir.stmts, &mut |stmt| {
+        if let Stmt::Assign { index, expr, .. } = stmt
+            && steps.contains(index)
+            && matches!(expr, Expr::Float(value) if *value == 1.0)
+        {
+            seen += 1;
+        }
+    });
+    seen
+}
+
+fn numeric_for_count(ir: &FrontendIr) -> usize {
+    let mut seen = 0;
+    walk_stmts(&ir.stmts, &mut |stmt| {
+        if let Stmt::For { init, .. } = stmt
+            && matches!(init.as_ref(), Stmt::Noop { .. })
+        {
+            seen += 1;
+        }
+    });
+    seen
+}
+
+fn break_count(ir: &FrontendIr) -> usize {
+    break_count_stmts(&ir.stmts)
+}
+
+fn breaks_inside_numeric_for(ir: &FrontendIr) -> usize {
+    fn walk(stmts: &[Stmt], inside: bool) -> usize {
+        let mut seen = 0;
+        for stmt in stmts {
+            match stmt {
+                Stmt::Break { .. } if inside => seen += 1,
+                Stmt::For {
+                    init, post, body, ..
+                } => {
+                    let numeric = matches!(init.as_ref(), Stmt::Noop { .. });
+                    seen += walk(std::slice::from_ref(init.as_ref()), inside);
+                    seen += walk(std::slice::from_ref(post.as_ref()), inside);
+                    seen += walk(body, inside || numeric);
+                }
+                Stmt::While { body, .. } => seen += walk(body, inside),
+                Stmt::IfElse {
+                    then_branch,
+                    else_branch,
+                    ..
+                } => {
+                    seen += walk(then_branch, inside);
+                    seen += walk(else_branch, inside);
+                }
+                _ => {}
+            }
+        }
+        seen
+    }
+    walk(&ir.stmts, false)
+}
+
+fn break_count_stmts(stmts: &[Stmt]) -> usize {
+    let mut seen = 0;
+    walk_stmts(stmts, &mut |stmt| {
+        if matches!(stmt, Stmt::Break { .. }) {
+            seen += 1;
+        }
+    });
+    seen
+}
+
+fn assert_header_once(label: &str, ir: &FrontendIr) {
+    let indexes = slots_with_prefix(ir, "$lua_nfor_index_");
+    let limits = slots_with_prefix(ir, "$lua_nfor_limit_");
+    let steps = slots_with_prefix(ir, "$lua_nfor_step_");
+    assert_eq!(indexes.len(), 1, "{label}: one hidden counter");
+    assert_eq!(limits.len(), 1, "{label}: one cached limit");
+    assert_eq!(steps.len(), 1, "{label}: one cached step");
+    let index = indexes[0];
+    let limit = limits[0];
+    let step = steps[0];
+    let start = header_start_slot(ir, index).unwrap_or_else(|| {
+        panic!(
+            "{label}: hidden counter is not assigned from a + 1; bindings={:?}",
+            ir.local_bindings
+        )
+    });
+    let mut start_adds = 0;
+    let mut condition_calls = 0;
+    let mut post_adds = 0;
+    walk_stmts(&ir.stmts, &mut |stmt| {
+        if let Stmt::Assign {
+            index: slot, expr, ..
+        } = stmt
+            && *slot == index
+            && is_start_add(expr, start)
+        {
+            start_adds += 1;
+        }
+        if let Stmt::For {
+            condition, post, ..
+        } = stmt
+        {
+            if is_holds_call(condition, index, limit, step) {
+                condition_calls += 1;
+            }
+            if let Stmt::Assign {
+                index: slot, expr, ..
+            } = post.as_ref()
+                && *slot == index
+                && is_slot_add(expr, index, step)
+            {
+                post_adds += 1;
+            }
+        }
+    });
+    assert_eq!(start_adds, 1, "{label}: header start must be assigned once");
+    assert_eq!(
+        condition_calls, 1,
+        "{label}: one predicate call, not a copied loop"
+    );
+    assert_eq!(
+        post_adds, 1,
+        "{label}: post adds the saved step, not the source step"
+    );
+    assert!(
+        !for_interior_has_start_add(&ir.stmts, start),
+        "{label}: start expression leaked into the condition, post, or body"
+    );
+    assert_eq!(
+        ir.functions.len(),
+        1,
+        "{label}: one predicate declaration, functions={:?}",
+        ir.functions
+    );
+    assert_eq!(ir.functions[0].name, control::NUMERIC_FOR_HOLDS);
+}
+
+fn header_start_slot(ir: &FrontendIr, index: LocalSlot) -> Option<LocalSlot> {
+    let mut found = None;
+    walk_stmts(&ir.stmts, &mut |stmt| {
+        if let Stmt::Assign {
+            index: slot,
+            expr: Expr::Add(lhs, rhs),
+            ..
+        } = stmt
+            && *slot == index
+            && matches!(rhs.as_ref(), Expr::Float(value) if *value == 1.0)
+            && let Expr::Var(start) = lhs.as_ref()
+        {
+            found = Some(*start);
+        }
+    });
+    found
+}
+
+fn is_start_add(expr: &Expr, start: LocalSlot) -> bool {
+    matches!(
+        expr,
+        Expr::Add(lhs, rhs)
+            if matches!(lhs.as_ref(), Expr::Var(slot) if *slot == start)
+                && matches!(rhs.as_ref(), Expr::Float(value) if *value == 1.0)
+    )
+}
+
+fn is_slot_add(expr: &Expr, left: LocalSlot, right: LocalSlot) -> bool {
+    matches!(
+        expr,
+        Expr::Add(lhs, rhs)
+            if matches!(lhs.as_ref(), Expr::Var(slot) if *slot == left)
+                && matches!(rhs.as_ref(), Expr::Var(slot) if *slot == right)
+    )
+}
+
+fn is_holds_call(expr: &Expr, index: LocalSlot, limit: LocalSlot, step: LocalSlot) -> bool {
+    matches!(
+        expr,
+        Expr::Call(_, _, args, Some(_), None)
+            if matches!(
+                args.as_slice(),
+                [
+                    Expr::Var(got_index),
+                    Expr::Var(got_limit),
+                    Expr::Var(got_step),
+                ] if *got_index == index && *got_limit == limit && *got_step == step
+            )
+    )
+}
+
+fn for_interior_has_start_add(stmts: &[Stmt], start: LocalSlot) -> bool {
+    let mut found = false;
+    walk_stmts(stmts, &mut |stmt| {
+        if let Stmt::For {
+            condition,
+            post,
+            body,
+            ..
+        } = stmt
+        {
+            found |= expr_contains_start_add(condition, start);
+            found |= stmt_contains_start_add(post, start);
+            found |= stmts_contain_start_add(body, start);
+        }
+    });
+    found
+}
+
+fn stmts_contain_start_add(stmts: &[Stmt], start: LocalSlot) -> bool {
+    stmts.iter().any(|stmt| match stmt {
+        Stmt::Assign { expr, .. } | Stmt::Let { expr, .. } => expr_contains_start_add(expr, start),
+        Stmt::For {
+            condition,
+            post,
+            body,
+            ..
+        } => {
+            expr_contains_start_add(condition, start)
+                || stmt_contains_start_add(post, start)
+                || stmts_contain_start_add(body, start)
+        }
+        Stmt::IfElse {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            expr_contains_start_add(condition, start)
+                || stmts_contain_start_add(then_branch, start)
+                || stmts_contain_start_add(else_branch, start)
+        }
+        Stmt::While {
+            condition, body, ..
+        } => expr_contains_start_add(condition, start) || stmts_contain_start_add(body, start),
+        _ => false,
+    })
+}
+
+fn stmt_contains_start_add(stmt: &Stmt, start: LocalSlot) -> bool {
+    match stmt {
+        Stmt::Assign { expr, .. } | Stmt::Let { expr, .. } => expr_contains_start_add(expr, start),
+        _ => false,
+    }
+}
+
+fn expr_contains_start_add(expr: &Expr, start: LocalSlot) -> bool {
+    if is_start_add(expr, start) {
+        return true;
+    }
+    match expr {
+        Expr::Add(lhs, rhs)
+        | Expr::Sub(lhs, rhs)
+        | Expr::Mul(lhs, rhs)
+        | Expr::Div(lhs, rhs)
+        | Expr::Eq(lhs, rhs)
+        | Expr::Gt(lhs, rhs) => {
+            expr_contains_start_add(lhs, start) || expr_contains_start_add(rhs, start)
+        }
+        Expr::Not(inner) => expr_contains_start_add(inner, start),
+        Expr::Call(_, _, args, _, _) => args.iter().any(|arg| expr_contains_start_add(arg, start)),
+        _ => false,
+    }
+}
+
+fn assert_numeric_header_rejected(label: &str, source: &str) {
+    let path = write_fixture(label, source);
+    let compiled = compile_source_file_with_options(&path, numeric_options());
+    let compiled = match compiled {
+        Err(error) => {
+            let text = error.to_string();
+            assert!(
+                !text.contains("not in this chunk control slice"),
+                "{label}: non-float header was rejected as unsupported syntax: {text}"
+            );
+            assert!(
+                text.to_ascii_lowercase().contains("float")
+                    || text.to_ascii_lowercase().contains("type"),
+                "{label}: non-float header must fail closed, not as an empty loop: {text}"
+            );
+            return;
+        }
+        Ok(compiled) => compiled,
+    };
+    let mut vm = Vm::new_with_jit_config(
+        compiled.program,
+        JitConfig {
+            enabled: false,
+            hot_loop_threshold: 8,
+            max_trace_len: 256,
+        },
+    );
+    bind_numeric_for_holds(&mut vm)
+        .unwrap_or_else(|error| panic!("{label}: bind numeric for predicate: {error}"));
+    vm.set_fuel_check_interval(FUEL_CHECK_INTERVAL)
+        .unwrap_or_else(|error| panic!("{label}: fuel interval: {error}"));
+    vm.set_fuel(FUEL_BUDGET);
+    match vm.run() {
+        Ok(status) => panic!(
+            "{label}: non-float header halted ({status:?}) with stack {:?}; an empty loop would be 0",
+            vm.stack()
+        ),
+        Err(error) => {
+            let text = error.to_string();
+            assert!(
+                text.to_ascii_lowercase().contains("float")
+                    || text.to_ascii_lowercase().contains("type")
+                    || text.contains("HostError"),
+                "{label}: expected a float header failure, got {text}"
+            );
+        }
+    }
 }
 
 #[test]
