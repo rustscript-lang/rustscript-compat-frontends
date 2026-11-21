@@ -797,12 +797,12 @@ impl LuaHeap {
     }
 
     fn mark_slot(&mut self, index: u32, work: &mut Vec<u32>) {
-        if let SlotState::Live { marked } = &mut self.slots[index as usize].state {
-            if !*marked {
-                *marked = true;
-                work.push(index);
-                self.scan.scratch.work_pushed += 1;
-            }
+        if let SlotState::Live { marked } = &mut self.slots[index as usize].state
+            && !*marked
+        {
+            *marked = true;
+            work.push(index);
+            self.scan.scratch.work_pushed += 1;
         }
     }
 
