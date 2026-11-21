@@ -1366,9 +1366,9 @@ fn numeric_table_keys_are_refused() {
     assert!(error.to_string().contains("numeric table keys"), "{error}");
 }
 
-fn assert_stale_edge(vm: &mut vm::Vm, table: heap::TableRef, key: Option<u32>) {
+fn assert_stale_edge(vm: &mut vm::Vm, table: heap::TableRef, key: Option<String>) {
     let key = key.expect("field key");
-    let edge = heap::with_heap(&mut vm.host_context(), |heap| heap.edge(table, key));
+    let edge = heap::with_heap(&mut vm.host_context(), |heap| heap.named_edge(table, &key));
     assert!(
         matches!(edge, Err(heap::HeapError::StaleHandle)),
         "stale edge must stay structured, got {edge:?}"
@@ -1937,7 +1937,7 @@ fn exported_chunk_reuses_one_root_slot_across_260_calls() {
             "round {round}: table handle is not reused before collect"
         );
         let key = seen.field_key.expect("self field");
-        let edge = heap::with_heap(&mut vm.host_context(), |heap| heap.edge(table, key))
+        let edge = heap::with_heap(&mut vm.host_context(), |heap| heap.named_edge(table, &key))
             .expect("self edge");
         assert_eq!(edge, Some(table), "round {round}: self-loop is live");
         let stats = heap::stats(&mut vm.host_context()).expect("stats after return");

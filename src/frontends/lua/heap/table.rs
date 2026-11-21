@@ -172,8 +172,9 @@ struct Slot {
 
 struct Edge {
     from: u32,
-    /// Field ids and object identities share this record. An object key is the
-    /// live slot and generation, not a guest number and not a second edge table.
+    /// Field ids, object identities, and full string text share this record.
+    /// An object key is the live slot and generation. A string key is the
+    /// complete UTF-8 text, not a guest number and not a second edge table.
     key: EdgeKey,
     value: EdgeValue,
 }
@@ -197,10 +198,15 @@ impl EdgeValue {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum EdgeKey {
     Field(u32),
-    Object { slot: u32, generation: u32 },
+    Object {
+        slot: u32,
+        generation: u32,
+    },
+    /// Complete UTF-8 text, including interior NUL. Not a collectable table.
+    Utf8(String),
 }
 
 impl EdgeKey {
@@ -208,6 +214,16 @@ impl EdgeKey {
         Self::Object {
             slot: key.slot(),
             generation: key.generation(),
+        }
+    }
+
+    /// One constructor for a Lua name. `__mode` is the reserved field id.
+    /// Every other name keeps its full text.
+    fn named(name: &str) -> Self {
+        if name == "__mode" {
+            Self::Field(LuaHeap::MODE_FIELD)
+        } else {
+            Self::Utf8(name.to_owned())
         }
     }
 }
@@ -553,11 +569,54 @@ impl LuaHeap {
         self.require_live(from)?;
         let key = EdgeKey::Field(key);
         if matches!(value, Value::Null) {
-            self.clear_edge(from, key);
+            self.clear_edge(from, &key);
             Ok(())
         } else {
             self.write_edge(from, key, EdgeValue::Scalar(value))
         }
+    }
+
+    /// Writes a table under a Lua string key.
+    ///
+    /// `__mode` is the reserved field. Any other text is compared in full,
+    /// including interior NUL. The same text overwrites one record.
+    pub fn set_named_edge(
+        &mut self,
+        from: TableRef,
+        name: &str,
+        to: TableRef,
+    ) -> Result<(), HeapError> {
+        self.write_table_edge(from, EdgeKey::named(name), to)
+    }
+
+    /// Writes a scalar under a Lua string key, or deletes that record on nil.
+    ///
+    /// A number or boolean is accepted only for the reserved mode field. The
+    /// direct numeric field API stays available for heap tests.
+    pub fn set_named_scalar(
+        &mut self,
+        from: TableRef,
+        name: &str,
+        value: Value,
+    ) -> Result<(), HeapError> {
+        let key = EdgeKey::named(name);
+        let mode = matches!(key, EdgeKey::Field(Self::MODE_FIELD));
+        debug_assert!(
+            matches!(value, Value::Null | Value::String(_))
+                || (mode && matches!(value, Value::Float(_) | Value::Bool(_)))
+        );
+        self.require_live(from)?;
+        if matches!(value, Value::Null) {
+            self.clear_edge(from, &key);
+            Ok(())
+        } else {
+            self.write_edge(from, key, EdgeValue::Scalar(value))
+        }
+    }
+
+    /// True when the name constructor selects the reserved mode field.
+    pub fn names_mode_field(name: &str) -> bool {
+        matches!(EdgeKey::named(name), EdgeKey::Field(Self::MODE_FIELD))
     }
 
     /// Writes the non-reference forms of the direct `__mode` field.
@@ -605,13 +664,14 @@ impl LuaHeap {
     pub fn clear_object_edge(&mut self, from: TableRef, key: TableRef) -> Result<(), HeapError> {
         self.require_live(from)?;
         self.require_live(key)?;
-        self.clear_edge(from, EdgeKey::object(key));
+        let key = EdgeKey::object(key);
+        self.clear_edge(from, &key);
         Ok(())
     }
 
-    fn clear_edge(&mut self, from: TableRef, key: EdgeKey) {
+    fn clear_edge(&mut self, from: TableRef, key: &EdgeKey) {
         self.edges
-            .retain(|edge| edge.from != from.slot() || edge.key != key);
+            .retain(|edge| edge.from != from.slot() || &edge.key != key);
     }
 
     fn write_table_edge(
@@ -660,12 +720,20 @@ impl LuaHeap {
 
     /// Reads the table target of a direct field through either alias of `from`.
     pub fn edge(&self, from: TableRef, key: u32) -> Result<Option<TableRef>, HeapError> {
-        self.read_table_edge(from, EdgeKey::Field(key))
+        let key = EdgeKey::Field(key);
+        self.read_table_edge(from, &key)
     }
 
-    /// Reads a direct field as the guest value without metatable dispatch.
-    pub fn field_value(&self, from: TableRef, key: u32) -> Result<Value, HeapError> {
-        self.stored_value(from, EdgeKey::Field(key))
+    /// Reads a Lua string key as a table target. `__mode` is the reserved field.
+    pub fn named_edge(&self, from: TableRef, name: &str) -> Result<Option<TableRef>, HeapError> {
+        let key = EdgeKey::named(name);
+        self.read_table_edge(from, &key)
+    }
+
+    /// Reads a Lua string key as the stored guest value, or nil when absent.
+    pub fn named_value(&self, from: TableRef, name: &str) -> Result<Value, HeapError> {
+        let key = EdgeKey::named(name);
+        self.stored_value(from, &key)
     }
 
     /// Reads an object-key edge. The key generation must still be that live slot.
@@ -675,7 +743,8 @@ impl LuaHeap {
         key: TableRef,
     ) -> Result<Option<TableRef>, HeapError> {
         self.require_live(key)?;
-        self.read_table_edge(from, EdgeKey::object(key))
+        let key = EdgeKey::object(key);
+        self.read_table_edge(from, &key)
     }
 
     /// Reads an object-key edge as the guest value.
@@ -683,10 +752,11 @@ impl LuaHeap {
     /// A stored string is that string. It is not decoded as a table token.
     pub fn object_value(&self, from: TableRef, key: TableRef) -> Result<Value, HeapError> {
         self.require_live(key)?;
-        self.stored_value(from, EdgeKey::object(key))
+        let key = EdgeKey::object(key);
+        self.stored_value(from, &key)
     }
 
-    fn stored_value(&self, from: TableRef, key: EdgeKey) -> Result<Value, HeapError> {
+    fn stored_value(&self, from: TableRef, key: &EdgeKey) -> Result<Value, HeapError> {
         match self.read_edge(from, key)? {
             Some(EdgeValue::Table { slot, generation }) => {
                 self.issued_value(TableRef::table(self.domain, *slot, *generation))
@@ -696,19 +766,23 @@ impl LuaHeap {
         }
     }
 
-    fn read_table_edge(&self, from: TableRef, key: EdgeKey) -> Result<Option<TableRef>, HeapError> {
+    fn read_table_edge(
+        &self,
+        from: TableRef,
+        key: &EdgeKey,
+    ) -> Result<Option<TableRef>, HeapError> {
         Ok(self
             .read_edge(from, key)?
             .and_then(EdgeValue::table)
             .map(|(slot, generation)| TableRef::table(self.domain, slot, generation)))
     }
 
-    fn read_edge(&self, from: TableRef, key: EdgeKey) -> Result<Option<&EdgeValue>, HeapError> {
+    fn read_edge(&self, from: TableRef, key: &EdgeKey) -> Result<Option<&EdgeValue>, HeapError> {
         self.require_live(from)?;
         Ok(self
             .edges
             .iter()
-            .find(|edge| edge.from == from.slot() && edge.key == key)
+            .find(|edge| edge.from == from.slot() && &edge.key == key)
             .map(|edge| &edge.value))
     }
 
@@ -1024,9 +1098,13 @@ impl LuaHeap {
             self.scan.outgoing_edge_checks += (end - start) as u64;
             for &entry in &index.entries[start..end] {
                 let edge = &self.edges[entry as usize];
-                let (key, value) = (edge.key, edge.value.table());
+                let object_key = match &edge.key {
+                    EdgeKey::Object { slot, generation } => Some((*slot, *generation)),
+                    EdgeKey::Field(_) | EdgeKey::Utf8(_) => None,
+                };
+                let value = edge.value.table();
                 if !mode.keys
-                    && let EdgeKey::Object { slot, generation } = key
+                    && let Some((slot, generation)) = object_key
                 {
                     self.follow_target(slot, generation, &mut work);
                 }
@@ -1152,9 +1230,9 @@ impl LuaHeap {
         self.edges.retain(|edge| {
             is_marked(edge.from)
                 && edge.value.table().is_none_or(|(slot, _)| is_marked(slot))
-                && match edge.key {
-                    EdgeKey::Field(_) => true,
-                    EdgeKey::Object { slot, .. } => is_marked(slot),
+                && match &edge.key {
+                    EdgeKey::Field(_) | EdgeKey::Utf8(_) => true,
+                    EdgeKey::Object { slot, .. } => is_marked(*slot),
                 }
         });
     }
@@ -1189,7 +1267,7 @@ impl LuaHeap {
         self.edges.retain(|edge| {
             edge.from != slot
                 && edge.value.table().is_none_or(|(target, _)| target != slot)
-                && !edge_key_is_slot(edge.key, slot)
+                && !edge_key_is_slot(&edge.key, slot)
         });
     }
 
@@ -1250,6 +1328,6 @@ impl LuaHeap {
     }
 }
 
-fn edge_key_is_slot(key: EdgeKey, slot: u32) -> bool {
-    matches!(key, EdgeKey::Object { slot: key_slot, .. } if key_slot == slot)
+fn edge_key_is_slot(key: &EdgeKey, slot: u32) -> bool {
+    matches!(key, EdgeKey::Object { slot: key_slot, .. } if *key_slot == slot)
 }

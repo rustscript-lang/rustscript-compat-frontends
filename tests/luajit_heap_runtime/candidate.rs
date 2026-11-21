@@ -449,12 +449,12 @@ fn carrier_ptr(value: &Value) -> Option<usize> {
 fn read_edge(
     heap: &heap::LuaHeap,
     table: Option<heap::TableRef>,
-    key: Option<u32>,
+    key: Option<&str>,
 ) -> Result<EdgeView, heap::HeapError> {
     let (Some(table), Some(key)) = (table, key) else {
         return Ok(EdgeView::Absent);
     };
-    match heap.edge(table, key) {
+    match heap.named_edge(table, key) {
         Ok(Some(target)) => Ok(EdgeView::Live(target)),
         Ok(None) => Ok(EdgeView::Absent),
         Err(heap::HeapError::StaleHandle) => Ok(EdgeView::Stale),
@@ -562,31 +562,31 @@ fn set_edge(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
         _ => return Err(host_fault("edge source is not a table")),
     };
     match key_value {
-        Value::Int(key) => {
-            // Only the private dot lowering emits an Int field id.
-            let key = u32::try_from(key).map_err(|_| host_fault("invalid field id"))?;
+        Value::String(name) => {
             let mut host = call.vm().host_context();
             match classify(&mut host, &to_value)? {
                 heap::GuestClass::Table(to) => {
-                    heap::with_heap(&mut host, |heap| heap.set_edge(from, key, to))
+                    heap::with_heap(&mut host, |heap| heap.set_named_edge(from, &name, to))
                 }
                 class
                     if matches!(class, heap::GuestClass::String)
                         || matches!(to_value, Value::Null)
-                        || (key == heap::LuaHeap::MODE_FIELD
+                        || (heap::LuaHeap::names_mode_field(&name)
                             && matches!(
                                 class,
                                 heap::GuestClass::Number | heap::GuestClass::Boolean
                             )) =>
                 {
-                    heap::with_heap(&mut host, |heap| heap.set_field_scalar(from, key, to_value))
+                    heap::with_heap(&mut host, |heap| {
+                        heap.set_named_scalar(from, &name, to_value)
+                    })
                 }
                 _ => return Err(host_fault("edge target is not a table")),
             }
             .map_err(heap_error)?;
             with_witness(call.vm(), |witness| {
                 if witness.field_key.is_none() {
-                    witness.field_key = Some(key);
+                    witness.field_key = Some(name.to_string());
                 }
             })?;
         }
@@ -671,14 +671,14 @@ fn finish_return(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
         (
             witness.returned,
             witness.discarded,
-            witness.field_key,
+            witness.field_key.clone(),
             witness.callee_depth,
         )
     })?;
     let (returned_edge, discarded_edge) = heap::with_heap(&mut call.vm().host_context(), |heap| {
         Ok((
-            read_edge(heap, returned, key)?,
-            read_edge(heap, discarded, key)?,
+            read_edge(heap, returned, key.as_deref())?,
+            read_edge(heap, discarded, key.as_deref())?,
         ))
     })
     .map_err(heap_error)?;
@@ -829,9 +829,9 @@ fn get_edge(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
         _ => return Err(host_fault("field source is not a table")),
     };
     let mut host = call.vm().host_context();
-    if let Value::Int(key) = key_value {
-        let key = u32::try_from(key).map_err(|_| host_fault("invalid field id"))?;
-        return heap::with_heap(&mut host, |heap| heap.field_value(table, key)).map_err(heap_error);
+    if let Value::String(name) = key_value {
+        return heap::with_heap(&mut host, |heap| heap.named_value(table, &name))
+            .map_err(heap_error);
     }
     let heap::GuestClass::Table(key) = classify(&mut host, &key_value)? else {
         return Err(host_fault("edge key is not a table"));
@@ -888,11 +888,13 @@ fn release_result(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
         _ => return Err(host_fault("invalid result release")),
     };
     let frame = decode_frame(call, &frame_token)?;
-    let (returned, key) = with_witness(call.vm(), |witness| (witness.returned, witness.field_key))?;
+    let (returned, key) = with_witness(call.vm(), |witness| {
+        (witness.returned, witness.field_key.clone())
+    })?;
     let (alive, edge) = heap::with_heap(&mut call.vm().host_context(), |heap| {
         Ok((
             returned.is_some_and(|table| heap.alive(table)),
-            read_edge(heap, returned, key)?,
+            read_edge(heap, returned, key.as_deref())?,
         ))
     })
     .map_err(heap_error)?;
@@ -922,7 +924,7 @@ fn note_collect(
             (
                 witness.returned,
                 witness.discarded,
-                witness.field_key,
+                witness.field_key.clone(),
                 witness.issued.last().copied(),
             )
         })
@@ -934,7 +936,7 @@ fn note_collect(
             Ok((
                 returned.is_some_and(|table| heap.alive(table)),
                 discarded.is_some_and(|table| heap.alive(table)),
-                read_edge(heap, returned, key)?,
+                read_edge(heap, returned, key.as_deref())?,
                 latest.is_some_and(|table| heap.alive(table)),
             ))
         })
@@ -1025,7 +1027,6 @@ pub(super) fn lower_returning(
         next_receiver_slot: 0,
         receiver_width: chunk_receiver_width(&chunk.body.stmts),
         table_locals: HashSet::new(),
-        field_keys: HashMap::new(),
         publish_results,
         in_function: false,
         return_names: HashSet::new(),
@@ -1183,7 +1184,6 @@ struct Lower<'a> {
     next_receiver_slot: u32,
     receiver_width: u32,
     table_locals: HashSet<Vec<u8>>,
-    field_keys: HashMap<Vec<u8>, u32>,
     publish_results: bool,
     in_function: bool,
     return_names: HashSet<Vec<u8>>,
@@ -1444,7 +1444,7 @@ impl Lower<'_> {
                 },
                 _,
             ) => {
-                let key = self.field_key(&name.bytes);
+                let key = utf8_field(&name.bytes).map_err(|_| self.unsupported(span))?;
                 let temp_base = self.active_temps.len();
                 let from = self.expr(table)?;
                 let from = self.index_operand_slot(from, span)?;
@@ -1453,10 +1453,7 @@ impl Lower<'_> {
                     other => self.expr(other)?,
                 };
                 self.active_temps.truncate(temp_base);
-                let expr = self.call(
-                    SET_EDGE,
-                    vec![Expr::Var(from), Expr::Int(i64::from(key)), to],
-                )?;
+                let expr = self.call(SET_EDGE, vec![Expr::Var(from), Expr::String(key), to])?;
                 self.emit_ignored(expr, self.line(span))
             }
             (
@@ -1516,7 +1513,10 @@ impl Lower<'_> {
                 "numeric table keys are not in this field-key subset",
             ));
         }
-        if !matches!(key, ast::Expr::Name { .. } | ast::Expr::Paren { .. }) {
+        if !matches!(
+            key,
+            ast::Expr::Name { .. } | ast::Expr::Paren { .. } | ast::Expr::String { .. }
+        ) {
             return Err(self.unsupported(key.span()));
         }
         let table = self.expr(base)?;
@@ -1810,20 +1810,8 @@ impl Lower<'_> {
             expr: table,
             line: self.line(span),
         });
-        let key = self.field_key(key_name);
-        self.call(GET_EDGE, vec![Expr::Var(slot), Expr::Int(i64::from(key))])
-    }
-
-    fn field_key(&mut self, name: &[u8]) -> u32 {
-        if name == b"__mode" {
-            return heap::LuaHeap::MODE_FIELD;
-        }
-        if let Some(key) = self.field_keys.get(name).copied() {
-            return key;
-        }
-        let key = u32::try_from(self.field_keys.len() + 1).expect("field key");
-        self.field_keys.insert(name.to_vec(), key);
-        key
+        let key = utf8_field(key_name).map_err(|_| self.unsupported(span))?;
+        self.call(GET_EDGE, vec![Expr::Var(slot), Expr::String(key)])
     }
 
     fn emit_ignored(&mut self, expr: Expr, line: u32) -> Result<(), ParseError> {
@@ -2185,6 +2173,10 @@ fn statement_receiver_width(stmt: &ast::Stmt) -> u32 {
     }
 }
 
+fn utf8_field(name: &[u8]) -> Result<String, ()> {
+    String::from_utf8(name.to_vec()).map_err(|_| ())
+}
+
 fn index_key_is_number(key: &ast::Expr) -> bool {
     match key {
         ast::Expr::Number { .. } => true,
@@ -2226,7 +2218,7 @@ pub(super) struct ReturnWitness {
     pub returned: Option<heap::TableRef>,
     pub discarded: Option<heap::TableRef>,
     pub returned_carrier: Option<usize>,
-    pub field_key: Option<u32>,
+    pub field_key: Option<String>,
     pub returned_edge_at_handoff: EdgeView,
     pub discarded_edge_at_handoff: EdgeView,
     pub elements: Vec<ReturnedElement>,

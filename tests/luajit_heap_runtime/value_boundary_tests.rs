@@ -2409,3 +2409,330 @@ return type(owner.seen)
         assert_eq!(host.resource_count(), resources, "{result}");
     }
 }
+
+fn assert_halted_string(source: &str, result: &str, edges: u32) {
+    let mut vm = candidate(source);
+    assert_eq!(vm.run().expect("string-key program"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string(result)]);
+    let stats = heap::stats(&mut vm.host_context()).unwrap();
+    assert_eq!(stats.live_edges, edges, "stored entries");
+    assert_eq!(stats.collections, 0);
+}
+
+/// `t.name`, `t["name"]`, and `t[k]` are one record and one edge quota.
+#[test]
+fn lua_candidate_string_key_spellings_share_one_record() {
+    let shared = r#"
+local owner = {}
+local value = {}
+owner.name = value
+local bracket = owner["name"]
+local k = "name"
+local dynamic = owner[k]
+observe_table(value, 0)
+observe_table(bracket, 0)
+observe_table(dynamic, 0)
+return type(owner.name)
+"#;
+    let mut vm = candidate(shared);
+    assert_eq!(vm.run().expect("shared string key"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("table")]);
+    let observed = vm
+        .host_context()
+        .scope_state::<Vec<ObservedTable>>()
+        .unwrap()
+        .clone();
+    assert_eq!(observed.len(), 3);
+    assert_eq!(
+        observed[0], observed[1],
+        "bracket literal reads the dot record"
+    );
+    assert_eq!(
+        observed[0], observed[2],
+        "dynamic string reads the dot record"
+    );
+    let stats = heap::stats(&mut vm.host_context()).unwrap();
+    assert_eq!(stats.live_edges, 1, "three spellings share one edge");
+    assert_eq!(stats.collections, 0);
+
+    assert_halted_string(
+        r#"
+local owner = {}
+local value = {}
+owner["name"] = value
+local k = "name"
+owner[k] = value
+owner.name = value
+return type(owner["name"])
+"#,
+        "table",
+        1,
+    );
+    assert_halted_string(
+        r#"
+local owner = {}
+local k = "name"
+owner.name = {}
+owner[k] = nil
+return type(owner["name"])
+"#,
+        "nil",
+        0,
+    );
+    assert_halted_string(
+        r#"
+local owner = {}
+owner["name"] = {}
+owner.name = nil
+local k = "name"
+return type(owner[k])
+"#,
+        "nil",
+        0,
+    );
+    assert_halted_string(
+        r#"
+local owner = {}
+local key = {}
+local value = {}
+owner[key] = value
+owner.name = value
+owner["other"] = value
+return type(owner.name)
+"#,
+        "table",
+        3,
+    );
+}
+
+/// A string local used as a key is the same record as the dot field.
+#[test]
+fn lua_candidate_string_key_dynamic_read_uses_the_same_record() {
+    assert_halted_string(
+        r#"
+local owner = {}
+local value = {}
+owner.name = value
+local k = "name"
+return type(owner[k])
+"#,
+        "table",
+        1,
+    );
+    assert_halted_string(
+        r#"
+local owner = {}
+local k = "name"
+owner[k] = {}
+return type(owner.name)
+"#,
+        "table",
+        1,
+    );
+    assert_halted_string(
+        r#"
+local owner = {}
+local k = "name"
+owner.name = {}
+owner[k] = nil
+return type(owner.name)
+"#,
+        "nil",
+        0,
+    );
+}
+
+/// Full UTF-8 text is the key. A NUL does not end the key or collapse a prefix.
+#[test]
+fn lua_candidate_string_key_full_bytes_stay_distinct() {
+    let accent = "caf\u{e9}";
+    assert_halted_string(
+        &format!(
+            r#"
+local owner = {{}}
+local accent = "{accent}"
+owner[accent] = "accented"
+owner["{accent}"] = "accented"
+owner.cafe = "plain"
+return owner["{accent}"]
+"#
+        ),
+        "accented",
+        2,
+    );
+    assert_halted_string(
+        r#"
+local owner = {}
+owner.cafe = "plain"
+return owner.cafe
+"#,
+        "plain",
+        1,
+    );
+    assert_halted_string(
+        r#"
+local owner = {}
+local prefix = "ab\0"
+owner[prefix] = "cut"
+owner["ab"] = "short"
+owner["ab\0c"] = "full"
+return owner[prefix]
+"#,
+        "cut",
+        3,
+    );
+    assert_halted_string(
+        r#"
+local owner = {}
+local prefix = "ab\0"
+owner[prefix] = "cut"
+owner["ab"] = "short"
+owner["ab\0c"] = "full"
+return owner["ab"]
+"#,
+        "short",
+        3,
+    );
+    assert_halted_string(
+        r#"
+local owner = {}
+local prefix = "ab\0"
+owner[prefix] = "cut"
+owner["ab"] = "short"
+owner["ab\0c"] = "full"
+return owner["ab\0c"]
+"#,
+        "full",
+        3,
+    );
+    assert_halted_string(
+        r#"
+local owner = {}
+local prefix = "ab\0"
+owner[prefix] = "cut"
+owner["ab"] = "short"
+owner["ab\0c"] = "full"
+return type(owner["ab\0d"])
+"#,
+        "nil",
+        3,
+    );
+}
+
+/// `mt.__mode` and `mt[k]` with `k == "__mode"` are one scanned record.
+/// A longer key that only starts with `__mode` is not a mode.
+#[test]
+fn lua_candidate_string_key_mode_enters_the_weak_scan() {
+    let collect = r#"
+local mt = {}
+local k = "__mode"
+mt[k] = "v"
+local owner = {}
+setmetatable(owner, mt)
+local drop = {}
+local rooted = {}
+local name = "name"
+owner[name] = drop
+observe_table(drop, 0)
+observe_table(rooted, 0)
+drop = nil
+name = nil
+collectgarbage("collect")
+return type(owner.name)
+"#;
+    assert_weak_probe(collect, "nil", &[false, true], 1, 1);
+    let omitted = collect.replace(r#"collectgarbage("collect")"#, "");
+    assert_weak_probe(&omitted, "table", &[true, true], 2, 0);
+
+    let keep_value = collect.replace("mt[k] = \"v\"", "mt[k] = \"k\"");
+    assert_weak_probe(&keep_value, "table", &[true, true], 2, 1);
+    let clear_value = collect.replace("mt[k] = \"v\"", "mt[k] = \"kv\"");
+    assert_weak_probe(&clear_value, "nil", &[false, true], 1, 1);
+
+    let note = r#"
+local mt = {}
+local k = "note"
+mt[k] = "v"
+local owner = {}
+setmetatable(owner, mt)
+local drop = {}
+owner.name = drop
+observe_table(drop, 0)
+drop = nil
+collectgarbage("collect")
+return type(owner.name)
+"#;
+    assert_weak_probe(note, "table", &[true], 2, 1);
+
+    let prefix = r#"
+local mt = {}
+local k = "__mode\0x"
+mt[k] = "v"
+local owner = {}
+setmetatable(owner, mt)
+local drop = {}
+owner.name = drop
+observe_table(drop, 0)
+drop = nil
+collectgarbage("collect")
+return type(owner.name)
+"#;
+    assert_weak_probe(prefix, "table", &[true], 2, 1);
+
+    let overwritten = r#"
+local mt = {}
+mt.__mode = "x"
+local k = "__mode"
+mt[k] = "v"
+local owner = {}
+setmetatable(owner, mt)
+local drop = {}
+local rooted = {}
+owner.name = drop
+observe_table(drop, 0)
+observe_table(rooted, 0)
+drop = nil
+collectgarbage("collect")
+return type(owner.name)
+"#;
+    assert_weak_probe(overwritten, "nil", &[false, true], 1, 1);
+    let overwritten_omitted = overwritten.replace(r#"collectgarbage("collect")"#, "");
+    assert_weak_probe(&overwritten_omitted, "table", &[true, true], 2, 0);
+
+    let restored = r#"
+local mt = {}
+local k = "__mode"
+mt[k] = "v"
+mt.__mode = "x"
+local owner = {}
+setmetatable(owner, mt)
+local drop = {}
+owner.name = drop
+observe_table(drop, 0)
+drop = nil
+collectgarbage("collect")
+return type(owner["name"])
+"#;
+    assert_weak_probe(restored, "table", &[true], 2, 1);
+    assert_halted_string(
+        r#"
+local mt = {}
+mt.__mode = "v"
+local k = "__mode"
+mt[k] = "kv"
+return mt.__mode
+"#,
+        "kv",
+        1,
+    );
+    assert_halted_string(
+        r#"
+local mt = {}
+local k = "__mode"
+mt[k] = "v"
+return mt["__mode"]
+"#,
+        "v",
+        1,
+    );
+}
