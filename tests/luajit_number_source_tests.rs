@@ -116,9 +116,12 @@ fn hex_float_decoder_keeps_nonzero_subnormal_bits() {
 #[test]
 fn proven_binary64_sources_run_through_the_plugin() {
     let cases = execute_cases();
+    assert_hex_expectations_differ(&cases);
     let mut ran = 0usize;
+    let mut failed = Vec::new();
     for case in &cases {
         let outcome = run_plugin(case.source);
+        let mut failed_this = false;
         match (&case.expect, outcome) {
             (Expect::Empty, Ok(run)) => {
                 assert!(
@@ -131,18 +134,44 @@ fn proven_binary64_sources_run_through_the_plugin() {
             (Expect::Bits(bits), Ok(run)) => {
                 assert_eq!(run.stack.len(), 1, "{}", case.name);
                 assert_bits(&run.stack[0], *bits, case.name);
+                if case.name.starts_with("hex-") {
+                    println!("hex {} bits={bits:#018x}", case.name);
+                }
             }
             (Expect::Class(class), Ok(run)) => {
                 assert_eq!(run.stack.len(), 1, "{}", case.name);
                 assert_class(&run.stack[0], class, case.name);
+                if case.name.starts_with("hex-") {
+                    println!("hex {} class={class}", case.name);
+                }
             }
-            (_, Err(failure)) => panic!(
-                "{} failed at {}: {}",
-                case.name, failure.layer, failure.detail
-            ),
+            (_, Err(failure)) => {
+                let note = if failure.layer == "syntax" {
+                    "; syntax rejection is not a lowering RED"
+                } else {
+                    ""
+                };
+                failed.push(format!(
+                    "{} at {}: {} expect={}{note}",
+                    case.name,
+                    failure.layer,
+                    failure.detail,
+                    expect_label(&case.expect)
+                ));
+                failed_this = true;
+            }
         }
-        ran += 1;
+        if !failed_this {
+            ran += 1;
+        }
     }
+    assert!(
+        failed.is_empty(),
+        "execute failures ({} of {}):\n{}",
+        failed.len(),
+        cases.len(),
+        failed.join("\n")
+    );
     assert_eq!(ran, cases.len());
     println!("execute cases={ran}");
 }
@@ -172,13 +201,25 @@ fn legal_uncovered_sources_are_not_syntax_rejections() {
             }
         }
     }
+    let syntax_names: Vec<_> = cases
+        .iter()
+        .filter(|case| matches!(case.layer, RejectLayer::Syntax))
+        .map(|case| case.name)
+        .collect();
+    let not_float_names: Vec<_> = cases
+        .iter()
+        .filter(|case| matches!(case.layer, RejectLayer::NotFloat(_)))
+        .map(|case| case.name)
+        .collect();
     println!(
         "negative cases={} syntax={syntax} classify-not-float={not_float} compile-unsupported={unsupported}",
         cases.len()
     );
-    assert_eq!(syntax, 3);
+    println!("syntax-reject names={syntax_names:?}");
+    println!("not-float names={not_float_names:?}");
+    assert_eq!(syntax, 9);
     assert_eq!(not_float, 3);
-    assert_eq!(unsupported, 8);
+    assert_eq!(unsupported, 7);
 }
 
 fn reject_layer(source: &str) -> RejectLayer {
@@ -360,13 +401,13 @@ fn configured_oracle_matches_the_same_sources() {
     println!(
         "oracle differential execute={execute} signed-zero={signed_zero} nonfinite={nonfinite} empty={empty} not-float={not_float} compile-unsupported={unsupported} syntax-reject={syntax_reject}"
     );
-    assert_eq!(execute, 38);
-    assert_eq!(signed_zero, 5);
-    assert_eq!(nonfinite, 5);
+    assert_eq!(execute, 51);
+    assert_eq!(signed_zero, 8);
+    assert_eq!(nonfinite, 7);
     assert_eq!(empty, 1);
     assert_eq!(not_float, 3);
-    assert_eq!(unsupported, 8);
-    assert_eq!(syntax_reject, 3);
+    assert_eq!(unsupported, 7);
+    assert_eq!(syntax_reject, 9);
 }
 
 #[test]
@@ -996,6 +1037,116 @@ fn execute_cases() -> Vec<ExecuteCase> {
             Category::Finite,
             Expect::Bits(0x40f8_6a00_0000_0000),
         ),
+        // Ordinary hex float and the wide hex integer are different literal forms.
+        // Expected bits come from the pinned LuaJIT `%a` oracle, not this parser.
+        case(
+            "hex-float",
+            "return 0x1.8p1",
+            Category::Finite,
+            Expect::Bits(0x4008_0000_0000_0000),
+        ),
+        case(
+            "hex-upper-omit-int",
+            "return 0X.8P+2",
+            Category::Finite,
+            Expect::Bits(0x4000_0000_0000_0000),
+        ),
+        case(
+            "hex-omit-exp",
+            "return 0x1.8",
+            Category::Finite,
+            Expect::Bits(0x3ff8_0000_0000_0000),
+        ),
+        case(
+            "hex-min-subnormal",
+            "return 0x1p-1074",
+            Category::Finite,
+            Expect::Bits(0x0000_0000_0000_0001),
+        ),
+        case(
+            "hex-above-half-ulp",
+            "return 0x1.0000000000000001p-1075",
+            Category::Finite,
+            Expect::Bits(0x0000_0000_0000_0001),
+        ),
+        case(
+            "hex-max-subnormal",
+            "return 0x0.fffffffffffffp-1022",
+            Category::Finite,
+            Expect::Bits(0x000f_ffff_ffff_ffff),
+        ),
+        case(
+            "hex-subnormal-to-normal",
+            "return 0x0.fffffffffffff8p-1022",
+            Category::Finite,
+            Expect::Bits(0x0010_0000_0000_0000),
+        ),
+        case(
+            "hex-tie-down",
+            "return 0x1.00000000000008p0",
+            Category::Finite,
+            Expect::Bits(0x3ff0_0000_0000_0000),
+        ),
+        case(
+            "hex-tie-sticky",
+            "return 0x1.000000000000080001p0",
+            Category::Finite,
+            Expect::Bits(0x3ff0_0000_0000_0001),
+        ),
+        case(
+            "hex-tie-up",
+            "return 0x1.00000000000018p0",
+            Category::Finite,
+            Expect::Bits(0x3ff0_0000_0000_0002),
+        ),
+        case(
+            "hex-tie-zero-tail",
+            "return 0x1.000000000000080000p0",
+            Category::Finite,
+            Expect::Bits(0x3ff0_0000_0000_0000),
+        ),
+        case(
+            "hex-max-finite",
+            "return 0x1.fffffffffffffp1023",
+            Category::Finite,
+            Expect::Bits(0x7fef_ffff_ffff_ffff),
+        ),
+        case(
+            "hex-wide",
+            "return 0x10000000000000000",
+            Category::Finite,
+            Expect::Bits(0x43f0_0000_0000_0000),
+        ),
+        case(
+            "hex-half-ulp-pos-zero",
+            "return 0x1p-1075",
+            Category::SignedZero,
+            Expect::Bits(0.0f64.to_bits()),
+        ),
+        case(
+            "hex-half-ulp-neg-zero",
+            "return -0x1p-1075",
+            Category::SignedZero,
+            Expect::Bits((-0.0f64).to_bits()),
+        ),
+        case(
+            "hex-zero-large-exp",
+            "return 0x0.000p1048575",
+            Category::SignedZero,
+            Expect::Bits(0.0f64.to_bits()),
+        ),
+        case(
+            "hex-overflow",
+            "return 0x1.fffffffffffff8p1023",
+            Category::NonFinite,
+            Expect::Class("inf"),
+        ),
+        case(
+            "hex-large-exp",
+            "return 0x1.000p1048575",
+            Category::NonFinite,
+            Expect::Class("inf"),
+        ),
     ]
 }
 
@@ -1010,6 +1161,47 @@ fn case(
         source,
         category,
         expect,
+    }
+}
+
+fn assert_hex_expectations_differ(cases: &[ExecuteCase]) {
+    let float = cases
+        .iter()
+        .find(|case| case.name == "hex-float")
+        .expect("ordinary hex float case");
+    let wide = cases
+        .iter()
+        .find(|case| case.name == "hex-wide")
+        .expect("wide hex integer case");
+    match (&float.expect, &wide.expect) {
+        (Expect::Bits(float_bits), Expect::Bits(wide_bits)) => {
+            assert_ne!(
+                float_bits, wide_bits,
+                "ordinary hex float and wide hex integer share an expected value"
+            );
+        }
+        _ => panic!("hex-float and hex-wide must be finite bit patterns"),
+    }
+    let mut seen = Vec::new();
+    for case in cases.iter().filter(|case| case.name.starts_with("hex-")) {
+        if let Expect::Bits(bits) = case.expect
+            && !seen.contains(&bits)
+        {
+            seen.push(bits);
+        }
+    }
+    assert!(
+        seen.len() >= 10,
+        "hex finite expectations collapsed to {} values",
+        seen.len()
+    );
+}
+
+fn expect_label(expect: &Expect) -> String {
+    match expect {
+        Expect::Bits(bits) => format!("bits={bits:#018x}"),
+        Expect::Class(class) => format!("class={class}"),
+        Expect::Empty => "empty".to_string(),
     }
 }
 
@@ -1028,6 +1220,37 @@ fn negative_cases() -> Vec<NegativeCase> {
         NegativeCase {
             name: "idiv",
             source: "return 1 // 2",
+            layer: RejectLayer::Syntax,
+        },
+        // Huge text exponents and a 65-bit binary significand never reach lowering.
+        NegativeCase {
+            name: "hex-exp-huge",
+            source: "return 0x1p9999999",
+            layer: RejectLayer::Syntax,
+        },
+        NegativeCase {
+            name: "hex-exp-huge-zero",
+            source: "return 0x0p9999999",
+            layer: RejectLayer::Syntax,
+        },
+        NegativeCase {
+            name: "hex-exp-huge-neg",
+            source: "return 0x1p-9999999",
+            layer: RejectLayer::Syntax,
+        },
+        NegativeCase {
+            name: "binary-past-64",
+            source: "return 0b10000000000000000000000000000000000000000000000000000000000000000",
+            layer: RejectLayer::Syntax,
+        },
+        NegativeCase {
+            name: "hex-exp-truncated",
+            source: "return 0x1p+",
+            layer: RejectLayer::Syntax,
+        },
+        NegativeCase {
+            name: "hex-dot-only",
+            source: "return 0x.p1",
             layer: RejectLayer::Syntax,
         },
         NegativeCase {
@@ -1059,11 +1282,6 @@ fn negative_cases() -> Vec<NegativeCase> {
             name: "string-add",
             source: "return 1 + \"2\"",
             layer: RejectLayer::Unsupported(number_source::UnsupportedReason::Expression),
-        },
-        NegativeCase {
-            name: "hex-float",
-            source: "return 0x1.8p1",
-            layer: RejectLayer::Unsupported(number_source::UnsupportedReason::LiteralForm),
         },
         NegativeCase {
             name: "assign",

@@ -1,10 +1,11 @@
 //! Narrow source seam from a parsed Lua chunk onto the binary64 number kernel.
 //!
 //! Only a grammar kind that is already binary64, or a local this walk just
-//! bound from a classified value, enters the kernel. `LL`, `ULL`, imaginary
-//! suffixes, and names this walk did not prove stay outside it. Chains are
-//! hoisted with the kernel's temps so a flat source spine does not become an
-//! unbounded Core expression. Slot reuse stays with Core.
+//! bound from a classified value, enters the kernel. Hex integers and hex
+//! floats share one conversion. `LL`, `ULL`, imaginary suffixes, and names
+//! this walk did not prove stay outside it. Chains are hoisted with the
+//! kernel's temps so a flat source spine does not become an unbounded Core
+//! expression. Slot reuse stays with Core.
 
 use super::ast::{BinOp, Chunk, Expr, ExprList, LocalName, NumberKind, Span, Stmt, UnOp};
 use super::number::{ClassifiedNumber, NumberLowering};
@@ -207,10 +208,9 @@ fn lower_number(raw: &str, kind: NumberKind) -> Result<ClassifiedNumber, NumberS
         NumberKind::Signed64 => return Err(not_float(NumberKind::Signed64)),
         NumberKind::Unsigned64 => return Err(not_float(NumberKind::Unsigned64)),
         NumberKind::Imaginary => return Err(not_float(NumberKind::Imaginary)),
-        NumberKind::HexFloat => return Err(unsupported(UnsupportedReason::LiteralForm)),
+        NumberKind::HexFloat | NumberKind::HexInteger => parse_hex_literal(raw)?,
         NumberKind::Integer | NumberKind::Float => parse_decimal(raw)?,
-        NumberKind::HexInteger => parse_prefixed_integer(raw, 16)?,
-        NumberKind::Binary => parse_prefixed_integer(raw, 2)?,
+        NumberKind::Binary => parse_binary_literal(raw)?,
     };
     if value.is_nan() {
         return Err(unsupported(UnsupportedReason::LiteralForm));
@@ -231,35 +231,266 @@ fn parse_decimal(raw: &str) -> Result<f64, NumberSourceError> {
         .map_err(|_| unsupported(UnsupportedReason::LiteralForm))
 }
 
-fn parse_prefixed_integer(raw: &str, radix: u32) -> Result<f64, NumberSourceError> {
+fn parse_binary_literal(raw: &str) -> Result<f64, NumberSourceError> {
     let digits = raw
         .get(2..)
         .filter(|digits| !digits.is_empty())
         .ok_or_else(|| unsupported(UnsupportedReason::LiteralForm))?;
     let marker = raw.as_bytes().get(1).copied().unwrap_or(0) | 0x20;
-    let expected = if radix == 16 { b'x' } else { b'b' };
-    if raw.len() < 3 || raw.as_bytes()[0] != b'0' || marker != expected {
+    if raw.len() < 3 || raw.as_bytes()[0] != b'0' || marker != b'b' {
         return Err(unsupported(UnsupportedReason::LiteralForm));
     }
     let mut magnitude: u64 = 0;
     for byte in digits.bytes() {
         let digit = match byte {
-            b'0'..=b'9' => byte - b'0',
-            b'a'..=b'f' => byte - b'a' + 10,
-            b'A'..=b'F' => byte - b'A' + 10,
+            b'0' | b'1' => byte - b'0',
             _ => return Err(unsupported(UnsupportedReason::LiteralForm)),
         };
-        if u32::from(digit) >= radix {
-            return Err(unsupported(UnsupportedReason::LiteralForm));
-        }
         let scaled = magnitude
-            .checked_mul(u64::from(radix))
+            .checked_mul(2)
             .ok_or_else(|| unsupported(UnsupportedReason::LiteralForm))?;
         magnitude = scaled
             .checked_add(u64::from(digit))
             .ok_or_else(|| unsupported(UnsupportedReason::LiteralForm))?;
     }
     Ok(magnitude as f64)
+}
+
+/// One round-to-nearest-even from the full hex significand onto binary64.
+///
+/// The scan keeps 64 bits of magnitude and one sticky flag. That is enough for
+/// a 53-bit significand plus a guard bit; every later digit folds into sticky.
+/// Extra space stays constant. The exponent is applied as a bit place, not as
+/// a second floating multiply.
+fn parse_hex_literal(raw: &str) -> Result<f64, NumberSourceError> {
+    let bytes = raw.as_bytes();
+    if bytes.len() < 3 || bytes[0] != b'0' || (bytes[1] | 0x20) != b'x' {
+        return Err(unsupported(UnsupportedReason::LiteralForm));
+    }
+    let body = &bytes[2..];
+    let exp_at = body.iter().position(|byte| (byte | 0x20) == b'p');
+    let digits = match exp_at {
+        Some(at) => &body[..at],
+        None => body,
+    };
+    let bin_exp = match exp_at {
+        Some(at) => parse_bin_exp(&body[at + 1..])?,
+        None => 0,
+    };
+    hex_digits_to_f64(digits, bin_exp)
+}
+
+fn parse_bin_exp(text: &[u8]) -> Result<i64, NumberSourceError> {
+    if text.is_empty() {
+        return Err(unsupported(UnsupportedReason::LiteralForm));
+    }
+    let (negative, digits) = match text[0] {
+        b'+' => (false, &text[1..]),
+        b'-' => (true, &text[1..]),
+        _ => (false, text),
+    };
+    if digits.is_empty() {
+        return Err(unsupported(UnsupportedReason::LiteralForm));
+    }
+    let mut magnitude: i64 = 0;
+    for byte in digits {
+        if !byte.is_ascii_digit() {
+            return Err(unsupported(UnsupportedReason::LiteralForm));
+        }
+        let digit = i64::from(byte - b'0');
+        magnitude = match magnitude
+            .checked_mul(10)
+            .and_then(|value| value.checked_add(digit))
+        {
+            Some(value) => value,
+            None => return Ok(if negative { i64::MIN } else { i64::MAX }),
+        };
+    }
+    Ok(if negative { -magnitude } else { magnitude })
+}
+
+fn hex_digits_to_f64(digits: &[u8], bin_exp: i64) -> Result<f64, NumberSourceError> {
+    let mut saw_digit = false;
+    let mut seen_dot = false;
+    let mut integer_len = 0usize;
+    let mut first_nz: Option<(usize, u8)> = None;
+    for (index, byte) in digits.iter().copied().enumerate() {
+        if byte == b'.' {
+            if seen_dot {
+                return Err(unsupported(UnsupportedReason::LiteralForm));
+            }
+            seen_dot = true;
+            continue;
+        }
+        let digit = hex_value(byte).ok_or_else(|| unsupported(UnsupportedReason::LiteralForm))?;
+        saw_digit = true;
+        if !seen_dot {
+            integer_len += 1;
+        }
+        if digit != 0 && first_nz.is_none() {
+            first_nz = Some((index, digit));
+        }
+    }
+    if !saw_digit {
+        return Err(unsupported(UnsupportedReason::LiteralForm));
+    }
+    let Some((index, digit)) = first_nz else {
+        return Ok(0.0);
+    };
+    let place = match hex_place(index, integer_len) {
+        Place::Over => return Ok(f64::INFINITY),
+        Place::Under => return Ok(0.0),
+        Place::Exact(place) => place,
+    };
+    let bitlen = 32 - u32::from(digit).leading_zeros();
+    let msb_exp = match msb_exponent(bin_exp, place, bitlen) {
+        Place::Over => return Ok(f64::INFINITY),
+        Place::Under => return Ok(0.0),
+        Place::Exact(exp) => exp,
+    };
+    if msb_exp > 1023 {
+        return Ok(f64::INFINITY);
+    }
+    if msb_exp < -1075 {
+        return Ok(0.0);
+    }
+    let (mag, sticky) = hex_window(digits, index, digit, bitlen);
+    Ok(round_hex_window(mag, msb_exp, sticky))
+}
+
+enum Place {
+    Exact(i64),
+    Over,
+    Under,
+}
+
+fn hex_place(index: usize, integer_len: usize) -> Place {
+    if index < integer_len {
+        match i64::try_from(integer_len - 1 - index) {
+            Ok(place) => Place::Exact(place),
+            Err(_) => Place::Over,
+        }
+    } else {
+        let fraction_index = index - integer_len - 1;
+        match i64::try_from(fraction_index) {
+            Ok(place) => Place::Exact(-1 - place),
+            Err(_) => Place::Under,
+        }
+    }
+}
+
+fn msb_exponent(bin_exp: i64, place: i64, bitlen: u32) -> Place {
+    let shift = match place.checked_mul(4) {
+        Some(shift) => shift,
+        None => return if place < 0 { Place::Under } else { Place::Over },
+    };
+    let placed = match bin_exp.checked_add(shift) {
+        Some(placed) => placed,
+        None => {
+            return if place < 0 && bin_exp < 0 {
+                Place::Under
+            } else {
+                Place::Over
+            };
+        }
+    };
+    match placed.checked_add(i64::from(bitlen - 1)) {
+        Some(exp) => Place::Exact(exp),
+        None => {
+            if placed < 0 {
+                Place::Under
+            } else {
+                Place::Over
+            }
+        }
+    }
+}
+
+fn hex_window(digits: &[u8], start: usize, first: u8, bitlen: u32) -> (u64, bool) {
+    let mut mag = u64::from(first) << (64 - bitlen);
+    let mut filled = bitlen;
+    let mut sticky = false;
+    for byte in &digits[start + 1..] {
+        if *byte == b'.' {
+            continue;
+        }
+        let Some(digit) = hex_value(*byte) else {
+            break;
+        };
+        if filled >= 64 {
+            if digit != 0 {
+                sticky = true;
+            }
+            continue;
+        }
+        if filled + 4 <= 64 {
+            mag |= u64::from(digit) << (64 - filled - 4);
+            filled += 4;
+            continue;
+        }
+        let room = 64 - filled;
+        mag |= u64::from(digit) >> (4 - room);
+        let dropped = digit & ((1u8 << (4 - room)) - 1);
+        if dropped != 0 {
+            sticky = true;
+        }
+        filled = 64;
+    }
+    (mag, sticky)
+}
+
+fn round_hex_window(mag: u64, msb_exp: i64, sticky: bool) -> f64 {
+    if msb_exp >= -1022 {
+        let mut significand = round_right(mag, 11, sticky);
+        let mut exp = msb_exp;
+        if significand == 1u64 << 53 {
+            significand = 1u64 << 52;
+            exp += 1;
+        }
+        if exp > 1023 {
+            return f64::INFINITY;
+        }
+        let exp_field = u64::try_from(exp + 1023).expect("binary64 exponent");
+        let fraction = significand & ((1u64 << 52) - 1);
+        return f64::from_bits((exp_field << 52) | fraction);
+    }
+    let shift = u32::try_from(-msb_exp - 1011).expect("subnormal shift");
+    let significand = round_right(mag, shift, sticky);
+    if significand >= 1u64 << 52 {
+        f64::from_bits(1u64 << 52)
+    } else {
+        f64::from_bits(significand)
+    }
+}
+
+fn round_right(mag: u64, shift: u32, sticky: bool) -> u64 {
+    if shift == 0 {
+        return mag;
+    }
+    if shift > 64 {
+        return 0;
+    }
+    if shift == 64 {
+        let guard = mag >> 63;
+        let rest = mag & ((1u64 << 63) - 1);
+        let round_up = guard == 1 && (rest != 0 || sticky);
+        return u64::from(round_up);
+    }
+    let kept = mag >> shift;
+    let guard = (mag >> (shift - 1)) & 1;
+    let rest_mask = (1u64 << (shift - 1)) - 1;
+    let rest = mag & rest_mask;
+    let round_up = guard == 1 && (rest != 0 || sticky || (kept & 1) == 1);
+    if round_up { kept + 1 } else { kept }
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn lookup_proven(name: &[u8], env: &[ProvenLocal]) -> Result<ClassifiedNumber, NumberSourceError> {
