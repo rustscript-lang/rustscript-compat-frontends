@@ -19,8 +19,18 @@ const RETURN_SCALAR: &str = "lua_internal::return_scalar";
 
 const TABLE_ARG: &str = "lua_internal::table_arg";
 const NUMBER_ARG: &str = "lua_internal::number_arg";
+const GATHER_ROOT: &str = "lua_internal::gather_root";
+const COLLECT: &str = "lua_internal::collect";
 
 pub(super) fn install_schemas(builder: &mut HostApiBuilder) {
+    builder.function(HostFunctionSchema::with_return(
+        GATHER_ROOT,
+        vec![
+            HostParamSchema::value("roots", HostTypeSchema::Unknown),
+            HostParamSchema::value("value", HostTypeSchema::Unknown),
+        ],
+        HostTypeSchema::Unknown,
+    ));
     let key = heap::LuaTableResource::key();
     builder.resource(vm::ResourceTypeSchema::new(key.clone(), "Lua table"));
     builder.function(HostFunctionSchema::with_return(
@@ -49,6 +59,7 @@ pub(super) fn install_schemas(builder: &mut HostApiBuilder) {
     for (name, result) in [
         (TABLE_ARG, HostTypeSchema::Resource(key)),
         (NUMBER_ARG, HostTypeSchema::Float),
+        (COLLECT, HostTypeSchema::Float),
     ] {
         builder.function(HostFunctionSchema::with_return(
             name,
@@ -69,6 +80,8 @@ pub(super) fn register(
         Op::ReturnScalar,
         Op::TableArg,
         Op::NumberArg,
+        Op::GatherRoot,
+        Op::Collect,
     ] {
         let name = match op {
             Op::NewTable => NEW_TABLE,
@@ -77,6 +90,8 @@ pub(super) fn register(
             Op::ReturnScalar => RETURN_SCALAR,
             Op::TableArg => TABLE_ARG,
             Op::NumberArg => NUMBER_ARG,
+            Op::GatherRoot => GATHER_ROOT,
+            Op::Collect => COLLECT,
         };
         let function = catalog.function(name).expect("private Lua operation");
         let schema = HostImportSchema::from_function(catalog, function);
@@ -95,6 +110,8 @@ enum Op {
     ReturnScalar,
     TableArg,
     NumberArg,
+    GatherRoot,
+    Collect,
 }
 
 impl HostOwnedFunction for Op {
@@ -158,9 +175,91 @@ impl HostOwnedFunction for Op {
                 [Value::Float(number)] => Value::Float(*number),
                 _ => return Err(VmError::HostError("expected Lua number".to_string())),
             },
+            Self::GatherRoot => {
+                let table = match call.args() {
+                    [_, value @ Value::Array(_)] => Some(value.clone()),
+                    [_, Value::Float(_) | Value::Bool(_) | Value::String(_)] => None,
+                    _ => {
+                        return Err(VmError::HostError(
+                            "invalid private Lua root candidate".to_string(),
+                        ));
+                    }
+                };
+                let root_list = call.take_arg(0)?;
+                let mut roots = match root_list {
+                    Value::Null => {
+                        return Ok(CallOutcome::Return(CallReturn::one(Value::array(
+                            table.into_iter().collect(),
+                        ))));
+                    }
+                    Value::Array(roots) => roots,
+                    _ => {
+                        return Err(VmError::HostError(
+                            "invalid private Lua root list".to_string(),
+                        ));
+                    }
+                };
+                if let Some(table) = table {
+                    std::sync::Arc::make_mut(&mut roots).push(table);
+                }
+                Value::Array(roots)
+            }
+            Self::Collect => {
+                let roots = match call.args() {
+                    [Value::Null] => &[][..],
+                    [Value::Array(roots)] => roots.as_slice(),
+                    _ => {
+                        return Err(VmError::HostError(
+                            "invalid private Lua root list".to_string(),
+                        ));
+                    }
+                };
+                let roots = roots
+                    .iter()
+                    .map(|root| match root {
+                        Value::Array(fields) => decode_table(fields),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or_else(|| {
+                        VmError::HostError("invalid private Lua table root".to_string())
+                    })?;
+                collect_at_safepoint(&mut call.vm().host_context(), &roots)?;
+                Value::Float(0.0)
+            }
         };
         Ok(CallOutcome::Return(CallReturn::one(value)))
     }
+}
+
+fn collect_at_safepoint(
+    host: &mut vm::HostContext<'_>,
+    roots: &[heap::TableRef],
+) -> Result<(), VmError> {
+    let frame = heap::with_heap(host, |heap| {
+        if roots.is_empty() {
+            return Ok(None);
+        }
+        let frame = heap
+            .enter_roots(u32::try_from(roots.len()).map_err(|_| heap::HeapError::RootCapacity)?)?;
+        for (index, root) in roots.iter().enumerate() {
+            if let Err(error) = heap.write_root(frame, index as u32, *root) {
+                heap.leave_roots(frame)?;
+                return Err(error);
+            }
+        }
+        Ok(Some(frame))
+    })
+    .map_err(heap_error)?;
+    let collect = heap::collect(host);
+    if let Some(frame) = frame {
+        heap::with_heap(host, |heap| heap.leave_roots(frame)).map_err(heap_error)?;
+    }
+    collect.map(|_| ()).map_err(heap_error)
+}
+
+fn heap_error(error: heap::HeapError) -> VmError {
+    VmError::HostError(error.to_string())
 }
 
 fn decode_table(fields: &[Value]) -> Option<heap::TableRef> {
@@ -182,6 +281,8 @@ pub(super) fn lower(source: &str, catalog: &HostApiCatalog) -> Result<FrontendIr
         catalog,
         builder: LocalIrBuilder::new(),
         locals: HashMap::new(),
+        live_locals: Vec::new(),
+        active_temps: Vec::new(),
         stmts: Vec::new(),
     };
     if let Some(error) = resolve::resolve(&chunk).errors.first() {
@@ -199,6 +300,7 @@ pub(super) fn lower(source: &str, catalog: &HostApiCatalog) -> Result<FrontendIr
                     .builder
                     .alloc_local_named(&format!("#{}", span.start))?;
                 lower.locals.insert(name.name.bytes.clone(), index);
+                lower.live_locals.push(index);
                 lower.stmts.push(Stmt::Let {
                     index,
                     declared_schema: None,
@@ -226,6 +328,8 @@ struct Lower<'a> {
     catalog: &'a HostApiCatalog,
     builder: LocalIrBuilder,
     locals: HashMap<Vec<u8>, LocalSlot>,
+    live_locals: Vec<LocalSlot>,
+    active_temps: Vec<LocalSlot>,
     stmts: Vec<Stmt>,
 }
 
@@ -262,7 +366,9 @@ impl Lower<'_> {
                         expr: left,
                         line: self.line(*span),
                     });
+                    self.active_temps.push(temp);
                     let right = self.expr(&step.expr)?;
+                    self.active_temps.pop();
                     left = self.call(ADD, vec![Expr::Var(temp), right])?;
                 }
                 Ok(left)
@@ -283,6 +389,12 @@ impl Lower<'_> {
                 {
                     let arg = self.expr(arg)?;
                     return self.call(TYPE, vec![arg]);
+                }
+                if name.is("collectgarbage")
+                    && let [ast::Expr::String { bytes, .. }] = args.exprs.as_slice()
+                    && bytes == b"collect"
+                {
+                    return self.collect_expr(expr.span());
                 }
                 let name =
                     std::str::from_utf8(&name.bytes).map_err(|_| self.unsupported(expr.span()))?;
@@ -310,6 +422,7 @@ impl Lower<'_> {
             return Err(self.unsupported(span));
         }
         let mut checked = Vec::new();
+        let temp_base = self.active_temps.len();
         for (arg, param) in args.iter().zip(&function.params) {
             let adapter = match (&param.ty, param.passing) {
                 (HostTypeSchema::Float, vm::HostParamPassing::Value) => NUMBER_ARG,
@@ -330,9 +443,37 @@ impl Lower<'_> {
                 expr: value,
                 line: self.line(span),
             });
+            self.active_temps.push(slot);
             checked.push(self.call(adapter, vec![Expr::Var(slot)])?);
         }
+        self.active_temps.truncate(temp_base);
         self.call(name, checked)
+    }
+
+    fn collect_expr(&mut self, span: ast::Span) -> Result<Expr, ParseError> {
+        // All supported collects are explicit safepoints. Completed arguments
+        // live in compat-emitted temporaries, not in an implicit Core stack scan.
+        let live: Vec<_> = self
+            .live_locals
+            .iter()
+            .chain(&self.active_temps)
+            .copied()
+            .collect();
+        let mut roots = Expr::Null;
+        for slot in live {
+            let packed = self.call(GATHER_ROOT, vec![roots, Expr::Var(slot)])?;
+            let next = self
+                .builder
+                .alloc_local_named(&format!("#roots:{}", self.stmts.len()))?;
+            self.stmts.push(Stmt::Let {
+                index: next,
+                declared_schema: None,
+                expr: packed,
+                line: self.line(span),
+            });
+            roots = Expr::MoveVar(next);
+        }
+        self.call(COLLECT, vec![roots])
     }
 
     fn call(&mut self, name: &str, args: Vec<Expr>) -> Result<Expr, ParseError> {

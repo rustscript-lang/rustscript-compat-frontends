@@ -150,6 +150,27 @@ fn catalog() -> &'static Arc<vm::HostApiCatalog> {
             vec![HostParamSchema::value("number", HostTypeSchema::Float)],
             HostTypeSchema::Float,
         ));
+        for (name, reverse) in [
+            ("lua_host::observe_table", false),
+            ("lua_host::observe_table_after", true),
+        ] {
+            let table = HostParamSchema::with_passing(
+                "table",
+                HostTypeSchema::Resource(heap::LuaTableResource::key()),
+                HostParamPassing::Borrow,
+            );
+            let number = HostParamSchema::value("number", HostTypeSchema::Float);
+            let params = if reverse {
+                vec![number, table]
+            } else {
+                vec![table, number]
+            };
+            builder.function(HostFunctionSchema::with_return(
+                name,
+                params,
+                HostTypeSchema::Bool,
+            ));
+        }
         Arc::new(builder.build().unwrap())
     })
 }
@@ -158,6 +179,8 @@ fn register_witnesses(registry: &mut HostFunctionRegistry, catalog: &vm::HostApi
     for (name, op) in [
         ("lua_host::same_table", Witness::Tables),
         ("lua_host::observe_number", Witness::Number),
+        ("lua_host::observe_table", Witness::TableAndNumber(0)),
+        ("lua_host::observe_table_after", Witness::TableAndNumber(1)),
     ] {
         let function = catalog.function(name).unwrap();
         registry
@@ -175,6 +198,7 @@ fn register_witnesses(registry: &mut HostFunctionRegistry, catalog: &vm::HostApi
 enum Witness {
     Tables,
     Number,
+    TableAndNumber(usize),
 }
 
 impl vm::HostOwnedFunction for Witness {
@@ -201,6 +225,21 @@ impl vm::HostOwnedFunction for Witness {
                 };
                 Value::Bool(get(left) == get(right))
             }
+            Self::TableAndNumber(index) => {
+                counters.tables += 1;
+                let Value::Int(raw) = args[*index] else {
+                    panic!("expected Core resource carrier")
+                };
+                let handle = vm::ResourceHandle::from_raw(u64::try_from(raw).unwrap()).unwrap();
+                let key = heap::LuaTableResource::key();
+                let table = host
+                    .borrow_resource_with_key::<heap::LuaTableResource>(handle, &key)
+                    .unwrap()
+                    .table();
+                let live = heap::with_heap(&mut host, |heap| Ok(heap.alive(table))).unwrap();
+                assert_eq!(args[1 - *index], Value::Float(0.0));
+                Value::Bool(live)
+            }
             Self::Number => {
                 counters.numbers += 1;
                 let [Value::Float(number)] = args.as_slice() else {
@@ -210,5 +249,50 @@ impl vm::HostOwnedFunction for Witness {
             }
         };
         Ok(vm::CallOutcome::Return(vm::CallReturn::one(value)))
+    }
+}
+
+#[test]
+fn lua_candidate_collect_preserves_an_already_evaluated_host_argument() {
+    for (source, collections, marked, live, dead) in [
+        (
+            r#"local discarded = type({}); return observe_table({}, collectgarbage("collect"))"#,
+            1,
+            1,
+            1,
+            1,
+        ),
+        (
+            r#"local discarded = type({}); return observe_table_after(collectgarbage("collect"), {})"#,
+            1,
+            0,
+            1,
+            1,
+        ),
+        (
+            r#"local discarded = type({}); return observe_table({}, 0)"#,
+            0,
+            0,
+            2,
+            0,
+        ),
+    ] {
+        let mut vm = candidate(source);
+        assert_eq!(vm.run().unwrap(), VmStatus::Halted, "{source}");
+        assert_eq!(vm.stack(), &[Value::Bool(true)], "{source}");
+        assert_eq!(entries(&mut vm).tables, 1);
+        let (stats, meter) = heap::with_heap(&mut vm.host_context(), |heap| {
+            Ok((heap.stats(), heap.take_scan_meter()))
+        })
+        .unwrap();
+        assert_eq!(stats.collections, collections, "{source}");
+        assert_eq!(stats.last_marked, marked, "{source}");
+        assert_eq!(stats.live_nodes, live, "{source}");
+        assert_eq!(stats.live_roots, 0, "{source}");
+        assert_eq!(meter.scratch.dead_slots_pushed, dead, "{source}");
+        println!(
+            "{source}: collections={} marked={} live={} swept={}",
+            stats.collections, stats.last_marked, stats.live_nodes, meter.scratch.dead_slots_pushed,
+        );
     }
 }
