@@ -47,21 +47,25 @@ impl SourcePlugin for CandidatePlugin {
 }
 
 fn candidate(source: &str) -> vm::Vm {
+    try_candidate(source).expect("compile Lua text")
+}
+
+fn try_candidate(source: &str) -> Result<vm::Vm, String> {
     let catalog = Arc::clone(catalog());
     let options = CompileSourceFileOptions::new()
         .with_source_plugin(&CandidatePlugin)
         .with_host_api_catalog(Arc::clone(&catalog));
     let mut vm = vm::compile_source_with_flavor_and_options(source, SourceFlavor::Lua, options)
-        .expect("compile Lua text")
+        .map_err(|error| error.to_string())?
         .into_vm()
-        .expect("create VM");
+        .map_err(|error| error.to_string())?;
     let mut registry = HostFunctionRegistry::empty();
-    candidate::register(&mut registry, &catalog).expect("register candidate runtime");
+    candidate::register(&mut registry, &catalog).map_err(|error| error.to_string())?;
     register_witnesses(&mut registry, &catalog);
     registry
         .bind_vm_cached(&mut vm)
-        .expect("bind candidate runtime");
-    vm
+        .map_err(|error| error.to_string())?;
+    Ok(vm)
 }
 
 #[test]
@@ -4721,9 +4725,7 @@ return type(k)
     let run = run_next(source);
     assert_eq!(run.stack, &[Value::string("number")]);
     assert_eq!(run.counts, vec![2]);
-    let omitted = run_next("return type(next({}))\n");
-    assert_eq!(omitted.stack, &[Value::string("nil")]);
-    assert_eq!(omitted.counts, vec![1]);
+    assert_not_lowered("return type(next({}))\n");
 }
 
 #[test]
@@ -4769,4 +4771,257 @@ fn run_next(source: &str) -> NextRun {
             .unwrap_or_default(),
         counts: candidate::next_counts(&mut vm),
     }
+}
+
+fn not_lowered(source: &str) -> String {
+    match try_candidate(source) {
+        Ok(_) => String::new(),
+        Err(error) => error,
+    }
+}
+
+fn assert_not_lowered(source: &str) {
+    let diagnostic = not_lowered(source);
+    assert!(
+        diagnostic.contains("not lowered yet"),
+        "expected the existing unsupported path, got {diagnostic:?}\n{source}"
+    );
+}
+
+/// Chunk export is one `RETURN_SCALAR`. The pinned Core rejects
+/// `CallReturn::Many` from that non-yielding host, so the array transport
+/// cannot become two public returns without a second protocol. An
+/// unparenthesized tail `next` stays on the existing unsupported path.
+/// `return (next(t))` still exports the first value. A cursor that is not a
+/// live entry, including one whose entry was cleared, is `invalid key to
+/// next`, not a restart. `next` walks the owner's edge vector; that walk is
+/// the scan cost of this candidate.
+#[test]
+fn lua_candidate_review_tail_next_is_not_lowered() {
+    let sources = [
+        "\
+local owner = {}
+owner.keep = \"yes\"
+return next(owner)
+",
+        "\
+local owner = {}
+owner.keep = \"yes\"
+return type(next(owner))
+",
+        "\
+local owner = {}
+owner.keep = \"yes\"
+return type(rawget(owner, next(owner)))
+",
+        "\
+local owner = {}
+owner.keep = \"yes\"
+local other = {}
+other.keep = \"yes\"
+local k, v = next(owner, next(other))
+return type(k)
+",
+        "\
+local owner = {}
+owner.keep = \"yes\"
+return observe_number(next(owner))
+",
+        "\
+local owner = {}
+owner.keep = \"yes\"
+local mt = {}
+return type(setmetatable(owner, next(owner)))
+",
+        "\
+local owner = {}
+owner.keep = \"yes\"
+return type(getmetatable(next(owner)))
+",
+        "\
+local owner = {}
+owner.keep = \"yes\"
+return type(copy_fields(next(owner)))
+",
+    ];
+    for source in sources {
+        assert_not_lowered(source);
+    }
+}
+
+#[test]
+fn lua_candidate_review_parenthesized_next_exports_one() {
+    let run = run_next(
+        "\
+local owner = {}
+owner.keep = \"yes\"
+return (next(owner))
+",
+    );
+    assert_eq!(run.stack, vec![Value::string("keep")]);
+    assert_eq!(run.counts, vec![2], "transport still carries the pair");
+}
+
+#[test]
+fn lua_candidate_review_adjusted_next_stays_one_value() {
+    let non_last = run_next(
+        "\
+local owner = {}
+local key = {}
+key.self = key
+owner[key] = key
+return type(rawget(next(owner), \"self\"))
+",
+    );
+    assert_eq!(non_last.stack, vec![Value::string("table")]);
+
+    let parenthesized_arg = run_next(
+        "\
+local owner = {}
+owner.keep = \"yes\"
+return type(rawget(owner, (next(owner))))
+",
+    );
+    assert_eq!(parenthesized_arg.stack, vec![Value::string("string")]);
+    assert_eq!(parenthesized_arg.counts, vec![2]);
+}
+
+#[test]
+fn lua_candidate_review_shadowed_next_is_not_builtin() {
+    let sources = [
+        "\
+local next = 1
+local owner = {}
+owner.keep = \"yes\"
+local k, v = next(owner)
+return k
+",
+        "\
+local next = 1
+local owner = {}
+owner.keep = \"yes\"
+local k = next(owner)
+return type(k)
+",
+        "\
+local next = 1
+local owner = {}
+owner.keep = \"yes\"
+return type(next(owner))
+",
+    ];
+    for source in sources {
+        assert_not_lowered(source);
+    }
+}
+
+#[test]
+fn lua_candidate_review_next_rhs_sees_builtin() {
+    let run = run_next(
+        "\
+local owner = {}
+owner.keep = \"yes\"
+local next, v = next(owner)
+return next
+",
+    );
+    assert_eq!(run.stack, vec![Value::string("keep")]);
+    assert_eq!(run.counts, vec![2]);
+}
+
+#[test]
+fn lua_candidate_review_next_after_do_is_builtin() {
+    let run = run_next(
+        "\
+local owner = {}
+owner.keep = \"yes\"
+do
+  local next = 1
+end
+local k, v = next(owner)
+return k
+",
+    );
+    assert_eq!(run.stack, vec![Value::string("keep")]);
+    assert_eq!(run.counts, vec![2]);
+}
+
+#[test]
+fn lua_candidate_review_receiver_temp_survives_cursor_collect() {
+    let source = "\
+local orphan = {}
+orphan.self = orphan
+observe_table(orphan, 0)
+orphan = nil
+local k, v = next({}, collectgarbage(\"collect\"))
+return type(k)
+";
+    let (mut vm, status) = {
+        let mut vm = candidate(source);
+        let status = vm.run();
+        (vm, status)
+    };
+    let error = status.expect_err("0 is not a key of the empty receiver");
+    match &error {
+        vm::VmError::HostError(message) => {
+            assert!(
+                message.contains("invalid key to next"),
+                "a live receiver with a missing cursor is not a stale handle: {message}"
+            );
+            assert!(
+                !message.contains("stale"),
+                "stale receiver is a different failure from an invalid cursor: {message}"
+            );
+        }
+        other => panic!("expected a host error, got {other}"),
+    }
+    let tables = observed_tables(&mut vm);
+    assert_eq!(tables.len(), 1, "the independent orphan was observed");
+    assert_table_lifetime(&mut vm.host_context(), tables[0], false);
+}
+
+#[test]
+fn lua_candidate_review_zero_cursor_is_invalid_key() {
+    let mut vm = candidate(
+        "\
+local k, v = next({}, 0)
+return type(k)
+",
+    );
+    let error = vm.run().expect_err("0 is not a key of {}");
+    match error {
+        vm::VmError::HostError(message) => {
+            assert!(
+                message.contains("invalid key to next"),
+                "missing cursor without a collect is still invalid, got {message}"
+            );
+        }
+        other => panic!("expected a host error, got {other}"),
+    }
+}
+
+#[test]
+fn lua_candidate_review_receiver_temp_released_after_next() {
+    let mut vm = candidate(
+        "\
+local marker = {}
+observe_table(marker, 0)
+local k, v = next({})
+marker = nil
+k = nil
+v = nil
+collectgarbage(\"collect\")
+return type(k)
+",
+    );
+    assert_eq!(vm.run().expect("collect after next"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("nil")]);
+    let tables = observed_tables(&mut vm);
+    assert_eq!(tables.len(), 1);
+    assert_table_lifetime(&mut vm.host_context(), tables[0], false);
+    let stats = heap::stats(&mut vm.host_context()).expect("heap stats");
+    assert_eq!(
+        stats.live_nodes, 0,
+        "the consumed receiver temp must not remain a root"
+    );
 }

@@ -1568,6 +1568,13 @@ impl Lower<'_> {
                 self.emit_ignored(expr, self.line(*span))
             }
             ast::Stmt::Return { span, values } if !self.in_function && values.exprs.len() == 1 => {
+                // One public chunk return. `CallReturn::Many` is not a
+                // non-yielding host result, so an unparenthesized tail `next`
+                // is the existing unsupported path rather than a second
+                // protocol. `return (next(t))` still exports the first value.
+                if self.is_next_call(&values.exprs[0]) {
+                    return Err(self.unsupported(*span));
+                }
                 let value = self.expr(&values.exprs[0])?;
                 let expr = self.call(RETURN_SCALAR, vec![value])?;
                 self.stmts.push(Stmt::Expr {
@@ -1948,6 +1955,12 @@ impl Lower<'_> {
             .ok_or_else(|| self.unsupported(span))
     }
 
+    fn builtin_next(&self, name: &ast::Name) -> bool {
+        name.is("next")
+            && !self.functions.contains_key(&name.bytes)
+            && !self.locals.contains_key(&name.bytes)
+    }
+
     fn is_next_call(&self, expr: &ast::Expr) -> bool {
         let ast::Expr::SuffixChain { base, steps, .. } = expr else {
             return false;
@@ -1955,7 +1968,7 @@ impl Lower<'_> {
         let ast::Expr::Name { name, .. } = base.as_ref() else {
             return false;
         };
-        if !name.is("next") || self.functions.contains_key(&name.bytes) {
+        if !self.builtin_next(name) {
             return false;
         }
         matches!(
@@ -1968,10 +1981,24 @@ impl Lower<'_> {
         )
     }
 
+    /// Last-argument adjustment is not implemented. Parentheses and a
+    /// non-last argument still take one value through `expr`.
+    fn reject_tail_next(&self, arg: &ast::Expr, span: ast::Span) -> Result<(), ParseError> {
+        if self.is_next_call(arg) {
+            Err(self.unsupported(span))
+        } else {
+            Ok(())
+        }
+    }
+
     /// `local k, v = next(...)` binds through the existing array transport.
+    /// The RHS is lowered before the new names are bound, so
+    /// `local next, v = next(t)` still sees the builtin.
     ///
-    /// Chunk `return next(...)` stays one value: the chunk return path only
-    /// carries a scalar. A single-value expression uses the first result.
+    /// Chunk `return next(...)` is not this path. A missing or cleared cursor
+    /// is `invalid key to next`, not a restart. `next` walks the owner's
+    /// edges; that walk is the scan cost. Continuation from a cleared cursor
+    /// is not implemented.
     fn lower_next_local(
         &mut self,
         span: ast::Span,
@@ -2029,13 +2056,20 @@ impl Lower<'_> {
         args: &[ast::Expr],
         span: ast::Span,
     ) -> Result<LocalSlot, ParseError> {
+        // A fresh receiver is a temp root only while the cursor expression
+        // runs. It is released with the call, so a later collect can reclaim
+        // it. A missing or cleared cursor still errors; this walk is the scan.
+        if args.last().is_some_and(|arg| self.is_next_call(arg)) {
+            return Err(self.unsupported(span));
+        }
         let (table, cursor) = match args {
             [table] => (table, None),
             [table, cursor] => (table, Some(cursor)),
             _ => return Err(self.unsupported(span)),
         };
+        let temp_base = self.active_temps.len();
         let table = self.expr(table)?;
-        let table = self.operand_slot(table, span)?;
+        let table = self.rooted_operand(table, span)?;
         let cursor = match cursor {
             Some(ast::Expr::Nil { .. }) => Expr::Null,
             Some(cursor) => self.expr(cursor)?,
@@ -2054,6 +2088,7 @@ impl Lower<'_> {
             line,
         });
         self.note_next_len(transport, line)?;
+        self.active_temps.truncate(temp_base);
         Ok(transport)
     }
 
@@ -2123,6 +2158,15 @@ impl Lower<'_> {
             });
         }
         Ok(())
+    }
+
+    fn rooted_operand(&mut self, expr: Expr, span: ast::Span) -> Result<LocalSlot, ParseError> {
+        if let Expr::Var(slot) = expr {
+            return Ok(slot);
+        }
+        let slot = self.operand_slot(expr, span)?;
+        self.active_temps.push(slot);
+        Ok(slot)
     }
 
     fn operand_slot(&mut self, expr: Expr, span: ast::Span) -> Result<LocalSlot, ParseError> {
@@ -2979,6 +3023,7 @@ impl Lower<'_> {
                 if name.is("type")
                     && let [arg] = args.exprs.as_slice()
                 {
+                    self.reject_tail_next(arg, expr.span())?;
                     let arg = self.expr(arg)?;
                     return self.call(TYPE, vec![arg]);
                 }
@@ -2991,6 +3036,7 @@ impl Lower<'_> {
                 if name.is("copy_fields")
                     && let [arg] = args.exprs.as_slice()
                 {
+                    self.reject_tail_next(arg, expr.span())?;
                     let value = self.expr(arg)?;
                     let slot = self
                         .builder
@@ -3006,6 +3052,7 @@ impl Lower<'_> {
                 if name.is("setmetatable")
                     && let [owner, mt] = args.exprs.as_slice()
                 {
+                    self.reject_tail_next(mt, expr.span())?;
                     let owner = self.expr(owner)?;
                     let mt = match mt {
                         ast::Expr::Nil { .. } => Expr::Null,
@@ -3016,10 +3063,11 @@ impl Lower<'_> {
                 if name.is("getmetatable")
                     && let [owner] = args.exprs.as_slice()
                 {
+                    self.reject_tail_next(owner, expr.span())?;
                     let owner = self.expr(owner)?;
                     return self.call(GET_METATABLE, vec![owner]);
                 }
-                if name.is("next") && !self.functions.contains_key(&name.bytes) {
+                if self.builtin_next(name) {
                     return self.next_expr(args, expr.span());
                 }
                 if name.is("rawget") {
@@ -3027,6 +3075,7 @@ impl Lower<'_> {
                     let [table, key] = args.exprs.as_slice() else {
                         return Err(self.unsupported(expr.span()));
                     };
+                    self.reject_tail_next(key, expr.span())?;
                     return self.index_read(table, key, expr.span());
                 }
                 if name.is("external_shape") && args.exprs.is_empty() {
@@ -3055,6 +3104,9 @@ impl Lower<'_> {
                 HostTypeSchema::Bool | HostTypeSchema::Float | HostTypeSchema::String
             )
         {
+            return Err(self.unsupported(span));
+        }
+        if args.last().is_some_and(|arg| self.is_next_call(arg)) {
             return Err(self.unsupported(span));
         }
         let mut checked = Vec::new();
