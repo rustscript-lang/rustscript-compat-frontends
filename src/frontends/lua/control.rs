@@ -54,7 +54,13 @@
 //! comparisons. `continue` reaches the post, which adds the saved step to the
 //! hidden counter. `break` skips that post and leaves this `for`.
 //!
+//! A top-level named static link is not a local value. The declaration span
+//! selects the resolver binding; a direct zero-argument call of that binding
+//! is an implicit extern. Another binding with the same spelling stays a
+//! local. A non-call use or a rebinding is refused.
+//!
 use super::ast::{self, BinOp, Block, Chunk, Expr, Name, NumberKind, Span, Stmt, UnOp};
+use super::imports::{self, ClassifiedLink};
 use super::lexer;
 use super::parser;
 use super::resolve::{self, LexicalLimitKind, Resolution, ResolveError};
@@ -98,18 +104,22 @@ pub(super) fn lower_source_with(
             ),
         ));
     }
+    let links = imports::top_level_links(&chunk);
     let mut lower = Lower::new(
         source,
         &resolution,
         holds,
         label_loop_owners(&chunk, &resolution),
+        links,
     );
     let stmts = if needs_dispatch(&chunk) {
         lower.lower_dispatch(&chunk)?
     } else {
         lower.lower_direct(&chunk)?
     };
-    Ok(lower.builder.finish(stmts))
+    let mut ir = lower.builder.finish(stmts);
+    ir.implicit_extern_names = lower.externs;
+    Ok(ir)
 }
 
 struct Lower<'a> {
@@ -128,6 +138,8 @@ struct Lower<'a> {
     holds: Option<&'a HostCallResolver<'a>>,
     label_loops: Vec<Option<Span>>,
     pending_labels: Vec<usize>,
+    link_by_binding: Vec<Option<String>>,
+    externs: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -179,9 +191,24 @@ impl<'a> Lower<'a> {
         resolution: &'a Resolution,
         holds: Option<&'a HostCallResolver<'a>>,
         label_loops: Vec<Option<Span>>,
+        links: Vec<ClassifiedLink>,
     ) -> Self {
         let slots = vec![None; resolution.bindings.len()];
         let label_state = vec![None; resolution.labels.len()];
+        let mut link_by_binding = vec![None; resolution.bindings.len()];
+        for link in links {
+            if link.member.is_none() {
+                continue;
+            }
+            let Some(index) = resolution
+                .bindings
+                .iter()
+                .position(|binding| binding.function_id == 0 && binding.span == link.decl_span)
+            else {
+                continue;
+            };
+            link_by_binding[index] = Some(link.alias);
+        }
         Self {
             source,
             resolution,
@@ -198,6 +225,8 @@ impl<'a> Lower<'a> {
             holds,
             label_loops,
             pending_labels: Vec::new(),
+            link_by_binding,
+            externs: Vec::new(),
         }
     }
 
@@ -958,6 +987,12 @@ impl<'a> Lower<'a> {
         if names[0].const_binding {
             return Err(self.fail(span, "const locals are not in this slice"));
         }
+        if let Some(alias) = self.link_alias_for_decl(&names[0].name).map(str::to_string) {
+            self.declare_link(&alias, names[0].name.span)?;
+            return Ok(CoreStmt::Noop {
+                line: self.line(span),
+            });
+        }
         let init = self.expr(&values.exprs[0])?;
         let index = self.binding_for_local(&names[0].name, span)?;
         let slot = self.slot(index)?;
@@ -983,6 +1018,9 @@ impl<'a> Lower<'a> {
         };
         let expr = self.expr(&values.exprs[0])?;
         let index = self.binding_at(&name.bytes, name.span)?;
+        if self.link_alias(index).is_some() {
+            return Err(self.fail(span, "static link cannot be rebound in this slice"));
+        }
         let slot = self.slot(index)?;
         Ok(set_slot(slot, expr, self.line(span)))
     }
@@ -1000,6 +1038,11 @@ impl<'a> Lower<'a> {
             Expr::Number { raw, kind, span } => self.number(raw, *kind, *span),
             Expr::Name { name, .. } => {
                 let index = self.binding_at(&name.bytes, name.span)?;
+                if self.link_alias(index).is_some() {
+                    return Err(
+                        self.fail(name.span, "static link is only a direct call in this slice")
+                    );
+                }
                 let slot = self.slot(index)?;
                 Ok(CoreExpr::Var(slot))
             }
@@ -1030,8 +1073,65 @@ impl<'a> Lower<'a> {
                 }
                 Ok(acc)
             }
+            Expr::SuffixChain { base, steps, span } => self.direct_link_call(base, steps, *span),
             other => Err(self.fail(expr_span(other), "expression is not in this slice")),
         }
+    }
+
+    fn direct_link_call(
+        &mut self,
+        base: &Expr,
+        steps: &[ast::Suffix],
+        span: Span,
+    ) -> Result<CoreExpr, ParseError> {
+        let Expr::Name { name, .. } = base else {
+            return Err(self.fail(span, "expression is not in this slice"));
+        };
+        let [
+            ast::Suffix::Call {
+                args: ast::Args::List(list),
+                nav: false,
+                ..
+            },
+        ] = steps
+        else {
+            return Err(self.fail(span, "expression is not in this slice"));
+        };
+        if !list.exprs.is_empty() {
+            return Err(self.fail(span, "expression is not in this slice"));
+        }
+        let index = self.binding_at(&name.bytes, name.span)?;
+        let Some(alias) = self.link_alias(index).map(str::to_string) else {
+            return Err(self.fail(span, "expression is not in this slice"));
+        };
+        let func = self.declare_link(&alias, name.span)?;
+        Ok(CoreExpr::Call(func, Vec::new(), Vec::new(), None, None))
+    }
+
+    fn link_alias(&self, index: usize) -> Option<&str> {
+        self.link_by_binding.get(index)?.as_deref()
+    }
+
+    fn link_alias_for_decl(&self, name: &Name) -> Option<&str> {
+        let index = self
+            .resolution
+            .bindings
+            .iter()
+            .position(|binding| binding.function_id == 0 && binding.span == name.span)?;
+        self.link_alias(index)
+    }
+
+    fn declare_link(&mut self, alias: &str, span: Span) -> Result<u16, ParseError> {
+        if let Some(index) = self.builder.function_index(alias) {
+            return Ok(index);
+        }
+        self.builder
+            .declare_function(alias, Some(0))
+            .map_err(|error| self.fail(span, error.message))?;
+        self.externs.push(alias.to_string());
+        self.builder
+            .function_index(alias)
+            .ok_or_else(|| self.fail(span, "static link was not declared"))
     }
 
     fn bin(

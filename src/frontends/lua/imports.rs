@@ -3,31 +3,51 @@
 //! Production `LuaPlugin` still uses the line scanner. This walk uses the
 //! parsed chunk so a string, comment, uncalled function, shadow, or ordinary
 //! call cannot enter the module graph. A named link binds the declared local
-//! alias. Path mapping stays in Core, including an extensionless relative spec.
+//! alias. One initializer is the whole shape: an extra RHS is not a link and
+//! is not dropped. Path mapping stays in Core, including an extensionless
+//! relative spec.
 
-use super::ast::{Args, AssignTarget, Expr, Stmt, Suffix};
+use super::ast::{Args, AssignTarget, Expr, Span, Stmt, Suffix};
 use super::lexer;
 use super::parser;
 use vm::{ImportClause, ModuleImport, NamedImport, ParseError, SourceError, SourcePathError};
 
-pub(super) fn static_module_imports(source: &str) -> Result<Vec<ModuleImport>, SourcePathError> {
-    let chunk = parser::parse_chunk(source.as_bytes()).map_err(syntax_to_path_error)?;
-    let mut imports = Vec::new();
-    let mut lines = PhysicalLines {
-        source: source.as_bytes(),
-        offset: 0,
-        line: 1,
-    };
+pub(super) struct ClassifiedLink {
+    // The control lowerer matches this declaration span to a resolver binding.
+    // A second include of this file only scans imports and does not read it.
+    #[allow(dead_code)]
+    pub decl_span: Span,
+    pub alias: String,
+    pub spec: String,
+    pub member: Option<String>,
+    name_start: u32,
+}
+
+pub(super) fn top_level_links(chunk: &super::ast::Chunk) -> Vec<ClassifiedLink> {
+    let mut links = Vec::new();
     let mut require_shadowed = false;
     for stmt in &chunk.body.stmts {
-        if !require_shadowed && let Some(import) = local_static_link(stmt, &mut lines) {
-            imports.push(import);
+        if !require_shadowed && let Some(link) = classify_local(stmt) {
+            links.push(link);
         }
         if binds_require(stmt) {
             require_shadowed = true;
         }
     }
-    Ok(imports)
+    links
+}
+
+pub(super) fn static_module_imports(source: &str) -> Result<Vec<ModuleImport>, SourcePathError> {
+    let chunk = parser::parse_chunk(source.as_bytes()).map_err(syntax_to_path_error)?;
+    let mut lines = PhysicalLines {
+        source: source.as_bytes(),
+        offset: 0,
+        line: 1,
+    };
+    Ok(top_level_links(&chunk)
+        .into_iter()
+        .map(|link| module_import(&mut lines, link))
+        .collect())
 }
 
 fn syntax_to_path_error(err: lexer::SyntaxError) -> SourcePathError {
@@ -37,32 +57,43 @@ fn syntax_to_path_error(err: lexer::SyntaxError) -> SourcePathError {
     )))
 }
 
-fn local_static_link(stmt: &Stmt, lines: &mut PhysicalLines<'_>) -> Option<ModuleImport> {
+fn classify_local(stmt: &Stmt) -> Option<ClassifiedLink> {
     let Stmt::Local { names, values, .. } = stmt else {
         return None;
     };
     let [local_name] = names.as_slice() else {
         return None;
     };
-    let [value, ..] = values.exprs.as_slice() else {
+    // One value only. `local alias = require(...).tag, side_effect()` is not
+    // a link, so the extra call is not removed from the statement.
+    let [value] = values.exprs.as_slice() else {
         return None;
     };
     let link = require_link(value)?;
-    let alias = utf8_bytes(&local_name.name.bytes)?;
+    Some(ClassifiedLink {
+        decl_span: local_name.name.span,
+        alias: utf8_bytes(&local_name.name.bytes)?,
+        spec: link.spec,
+        member: link.member,
+        name_start: link.name_start,
+    })
+}
+
+fn module_import(lines: &mut PhysicalLines<'_>, link: ClassifiedLink) -> ModuleImport {
     let clause = match link.member {
-        None => ImportClause::Namespace(alias),
+        None => ImportClause::Namespace(link.alias),
         Some(member) => ImportClause::Named(vec![NamedImport {
             // Core binds this local name. The export stays in `imported`,
             // matching the line scanner's declared-name split.
             imported: member,
-            local: alias,
+            local: link.alias,
         }]),
     };
-    Some(ModuleImport {
+    ModuleImport {
         spec: link.spec,
         line: lines.line_at(link.name_start),
         clause,
-    })
+    }
 }
 
 struct RequireLink {

@@ -18,6 +18,8 @@ use common::*;
 mod ast;
 #[path = "../../src/frontends/lua/control.rs"]
 mod control;
+#[path = "../../src/frontends/lua/imports.rs"]
+mod imports;
 #[allow(dead_code)]
 #[path = "../../src/frontends/lua/lexer.rs"]
 mod lexer;
@@ -81,10 +83,10 @@ impl SourcePlugin for ControlLuaPlugin {
 
     fn parse_module_imports(
         &self,
-        _source: &str,
+        source: &str,
         _path: &Path,
     ) -> Result<Vec<vm::ModuleImport>, vm::SourcePathError> {
-        Ok(Vec::new())
+        imports::static_module_imports(source)
     }
 }
 
@@ -3578,4 +3580,141 @@ end
         assert_eq!(output.status.code(), Some(2));
         assert!(String::from_utf8_lossy(&output.stderr).contains("LOAD_REJECT"));
     }
+}
+
+const NAMED_LINK_CALL: &str =
+    "local different = require(\"./present.rss\").tag\nreturn different()\n";
+
+fn write_named_link(label: &str, source: &str) -> PathBuf {
+    let root = namespace_case_root(&format!("lua_control_{label}"));
+    fs::write(root.join("present.rss"), "pub fn tag() { 41 }\n").expect("present module");
+    let path = root.join("main.lua");
+    fs::write(&path, source).unwrap_or_else(|error| panic!("{label}: write main.lua: {error}"));
+    path
+}
+
+fn run_named_link(label: &str, source: &str) -> Vec<Value> {
+    let path = write_named_link(label, source);
+    let compiled =
+        compile_source_file_with_options(&path, candidate_options()).unwrap_or_else(|error| {
+            panic!("{label}: named static link call was not connected: {error}")
+        });
+    let mut vm = Vm::new_with_jit_config(
+        compiled.program,
+        JitConfig {
+            enabled: false,
+            hot_loop_threshold: 8,
+            max_trace_len: 256,
+        },
+    );
+    vm.set_fuel_check_interval(FUEL_CHECK_INTERVAL)
+        .unwrap_or_else(|error| panic!("{label}: fuel interval: {error}"));
+    vm.set_fuel(FUEL_BUDGET);
+    let status = vm
+        .run()
+        .unwrap_or_else(|error| panic!("{label}: vm run failed: {error}"));
+    assert_eq!(status, VmStatus::Halted, "{label}: status");
+    let stack = vm.stack().to_vec();
+    eprintln!("LUA_CONTROL label={label} named_link_stack={stack:?}");
+    stack
+}
+
+#[test]
+fn named_static_link_call_returns_rss_export() {
+    // LuaJIT does not run RSS. This path is the control plugin, the AST import
+    // scan, Core's file graph, and Vm::run.
+    let stack = run_named_link("named_link_call", NAMED_LINK_CALL);
+    assert_eq!(
+        stack,
+        vec![Value::Int(41)],
+        "named static link call must return the RSS export"
+    );
+}
+
+#[test]
+fn named_static_link_ignores_shadowed_spelling() {
+    let source = "\
+local different = require(\"./present.rss\").tag
+do
+  local different = 7
+  different = different + 1
+end
+return different()
+";
+    let stack = run_named_link("named_link_shadow", source);
+    assert_eq!(stack, vec![Value::Int(41)]);
+}
+
+#[test]
+fn inner_same_spelling_call_is_not_the_static_link() {
+    let source = "\
+local different = require(\"./present.rss\").tag
+do
+  local different = 7
+  return different()
+end
+";
+    expect_link_refusal(
+        "named_link_inner_call",
+        source,
+        "expression is not in this slice",
+    );
+}
+
+#[test]
+fn static_link_value_and_rebinding_are_refused() {
+    expect_link_refusal(
+        "named_link_value",
+        "local different = require(\"./present.rss\").tag\nreturn different\n",
+        "static link is only a direct call in this slice",
+    );
+    expect_link_refusal(
+        "named_link_rebind",
+        "local different = require(\"./present.rss\").tag\ndifferent = 7\nreturn different()\n",
+        "static link cannot be rebound in this slice",
+    );
+}
+
+#[test]
+fn extra_rhs_and_shadowed_require_are_not_static_links() {
+    let extra =
+        "local different = require(\"./present.rss\").tag, side_effect()\nreturn different()\n";
+    assert!(
+        imports::static_module_imports(extra)
+            .expect("scan extra rhs")
+            .is_empty()
+    );
+    expect_link_refusal(
+        "named_link_extra_rhs",
+        extra,
+        "this slice lowers one local and one initializer",
+    );
+    let shadowed = "\
+local require = 1
+local different = require(\"./present.rss\").tag
+return different()
+";
+    assert!(
+        imports::static_module_imports(shadowed)
+            .expect("scan shadowed require")
+            .is_empty()
+    );
+    expect_link_refusal(
+        "named_link_shadowed_require",
+        shadowed,
+        "expression is not in this slice",
+    );
+}
+
+fn expect_link_refusal(label: &str, source: &str, message: &str) {
+    let path = write_named_link(label, source);
+    let error = match compile_source_file_with_options(&path, candidate_options()) {
+        Err(error) => error,
+        Ok(_) => panic!("{label}: boundary must not run the RSS export"),
+    };
+    let text = error.to_string();
+    assert!(
+        text.contains(message),
+        "{label}: expected {message}, got {text}"
+    );
 }
