@@ -17,6 +17,8 @@ mod resolve;
 mod return_frame;
 #[path = "source_closure.rs"]
 mod source_closure;
+#[path = "string_byte_length.rs"]
+mod string_byte_length;
 
 use super::heap;
 use super::support;
