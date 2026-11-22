@@ -8,6 +8,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use vm::{
@@ -1032,15 +1033,25 @@ note_graph(2)\n"
 }
 
 fn namespace_fixture(label: &str, source: &str) -> PathBuf {
-    // Same directory as `namespace_case_root` in tests/common. This test crate
-    // does not include that module. A missing target dir must not fall back to /tmp.
-    let target = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| {
-        panic!("CARGO_TARGET_DIR must name the slot target; refusing to write a fixture elsewhere")
-    });
-    let root = PathBuf::from(target)
-        .join("compat-frontends-namespace-cases")
-        .join(label);
-    fs::create_dir_all(&root).unwrap_or_else(|error| panic!("create {}: {error}", root.display()));
+    // Ordinary Cargo leaves CARGO_TARGET_DIR unset. A fixed label under the
+    // slot target is also one path, so concurrent libtest processes truncate
+    // it with fs::write. Claim a fresh directory under the process temp root.
+    let parent = std::env::temp_dir().join("compat-frontends-lua-source-fixtures");
+    fs::create_dir_all(&parent)
+        .unwrap_or_else(|error| panic!("create {}: {error}", parent.display()));
+    // pid separates processes and the counter separates claims in one process.
+    // create_dir is the claim: an existing name is skipped, not reused.
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id();
+    let root = loop {
+        let ticket = NEXT.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!("{label}-{pid}-{ticket}"));
+        match fs::create_dir(&candidate) {
+            Ok(()) => break candidate,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!("claim {}: {error}", candidate.display()),
+        }
+    };
     let path = root.join("chunk.lua");
     fs::write(&path, source).unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
     path
