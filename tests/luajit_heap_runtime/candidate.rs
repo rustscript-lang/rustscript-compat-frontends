@@ -143,7 +143,8 @@ pub(super) fn install_schemas(builder: &mut HostApiBuilder) {
             vec!["value", "slot", "role"],
             HostTypeSchema::Float,
         ),
-        (SET_EDGE, vec!["from", "key", "to"], HostTypeSchema::Float),
+        // Success returns the issued receiver. Assignment discards it.
+        (SET_EDGE, vec!["from", "key", "to"], HostTypeSchema::Unknown),
         (GET_EDGE, vec!["table", "key"], HostTypeSchema::Unknown),
         (NEXT, vec!["table", "cursor"], HostTypeSchema::Unknown),
         (NOTE_NEXT_COUNT, vec!["count"], HostTypeSchema::Float),
@@ -690,11 +691,11 @@ fn write_number_edge(
 }
 
 fn set_edge(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
-    let (from, key_value, to_value) = match call.args() {
+    let (issued, key_value, to_value) = match call.args() {
         [from, key, to] => (from.clone(), key.clone(), to.clone()),
         _ => return Err(host_fault("invalid table edge")),
     };
-    let from = match classify(&mut call.vm().host_context(), &from)? {
+    let from = match classify(&mut call.vm().host_context(), &issued)? {
         heap::GuestClass::Table(table) => table,
         _ => return Err(host_fault("edge source is not a table")),
     };
@@ -752,7 +753,7 @@ fn set_edge(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
             }
         }
     }
-    Ok(Value::Float(0.0))
+    Ok(issued)
 }
 
 fn finish_return(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
@@ -2786,6 +2787,25 @@ impl Lower<'_> {
         self.emit_ignored(expr, self.line(span))
     }
 
+    /// Same rooted operands and write as index assignment. The call result is
+    /// the issued receiver; a statement call discards it through `emit_ignored`.
+    fn rawset_expr(
+        &mut self,
+        table: &ast::Expr,
+        key: &ast::Expr,
+        value: &ast::Expr,
+        span: ast::Span,
+    ) -> Result<Expr, ParseError> {
+        let temp_base = self.active_temps.len();
+        let (from, key_slot) = self.index_operands(table, key, span)?;
+        let to = match value {
+            ast::Expr::Nil { .. } => Expr::Null,
+            other => self.expr(other)?,
+        };
+        self.active_temps.truncate(temp_base);
+        self.call(SET_EDGE, vec![Expr::Var(from), Expr::Var(key_slot), to])
+    }
+
     fn index_read(
         &mut self,
         base: &ast::Expr,
@@ -3299,6 +3319,18 @@ impl Lower<'_> {
                     };
                     self.reject_tail_next(key, expr.span())?;
                     return self.index_read(table, key, expr.span());
+                }
+                if name.is("rawset") {
+                    // A resolver binding is not yet in `locals` for an upvalue
+                    // use. Do not treat that name as the builtin.
+                    if self.name_is_bound(name) {
+                        return Err(self.unsupported(expr.span()));
+                    }
+                    let [table, key, value] = args.exprs.as_slice() else {
+                        return Err(self.unsupported(expr.span()));
+                    };
+                    self.reject_tail_next(value, expr.span())?;
+                    return self.rawset_expr(table, key, value, expr.span());
                 }
                 if name.is("external_shape") && args.exprs.is_empty() {
                     return self.call(EXTERNAL_SHAPE, vec![]);
