@@ -217,13 +217,31 @@ impl EdgeKey {
         }
     }
 
-    /// One constructor for a Lua name. `__mode` is the reserved field id.
-    /// Every other name keeps its full text.
+    /// One constructor for a stored Lua name. `__mode` is the reserved field
+    /// id. Every other name keeps its full text. A lookup does not call this.
     fn named(name: &str) -> Self {
-        if name == "__mode" {
+        if Self::is_mode_name(name) {
             Self::Field(LuaHeap::MODE_FIELD)
         } else {
             Self::Utf8(name.to_owned())
+        }
+    }
+
+    /// The reserved mode name. Field id 0 is that key; a longer text is not.
+    fn is_mode_name(name: &str) -> bool {
+        name == "__mode"
+    }
+
+    /// Compares a borrowed lookup name with this stored key.
+    ///
+    /// `__mode` matches the reserved field. Every other name matches stored
+    /// UTF-8 of the same length, including an interior NUL. An object key
+    /// does not match a name. This does not construct a key.
+    fn matches_name(&self, name: &str) -> bool {
+        if Self::is_mode_name(name) {
+            matches!(self, Self::Field(field) if *field == LuaHeap::MODE_FIELD)
+        } else {
+            matches!(self, Self::Utf8(stored) if stored == name)
         }
     }
 }
@@ -721,19 +739,22 @@ impl LuaHeap {
     /// Reads the table target of a direct field through either alias of `from`.
     pub fn edge(&self, from: TableRef, key: u32) -> Result<Option<TableRef>, HeapError> {
         let key = EdgeKey::Field(key);
-        self.read_table_edge(from, &key)
+        self.read_table_edge(from, |stored| stored == &key)
     }
 
     /// Reads a Lua string key as a table target. `__mode` is the reserved field.
+    ///
+    /// The name is borrowed for the comparison. This does not construct a key.
     pub fn named_edge(&self, from: TableRef, name: &str) -> Result<Option<TableRef>, HeapError> {
-        let key = EdgeKey::named(name);
-        self.read_table_edge(from, &key)
+        self.read_table_edge(from, |stored| stored.matches_name(name))
     }
 
     /// Reads a Lua string key as the stored guest value, or nil when absent.
+    ///
+    /// The name is borrowed for the comparison. This does not construct a key.
+    /// A cloned string in the returned value is the stored scalar, not the lookup.
     pub fn named_value(&self, from: TableRef, name: &str) -> Result<Value, HeapError> {
-        let key = EdgeKey::named(name);
-        self.stored_value(from, &key)
+        self.stored_value(from, |stored| stored.matches_name(name))
     }
 
     /// Reads an object-key edge. The key generation must still be that live slot.
@@ -744,7 +765,7 @@ impl LuaHeap {
     ) -> Result<Option<TableRef>, HeapError> {
         self.require_live(key)?;
         let key = EdgeKey::object(key);
-        self.read_table_edge(from, &key)
+        self.read_table_edge(from, |stored| stored == &key)
     }
 
     /// Reads an object-key edge as the guest value.
@@ -753,11 +774,15 @@ impl LuaHeap {
     pub fn object_value(&self, from: TableRef, key: TableRef) -> Result<Value, HeapError> {
         self.require_live(key)?;
         let key = EdgeKey::object(key);
-        self.stored_value(from, &key)
+        self.stored_value(from, |stored| stored == &key)
     }
 
-    fn stored_value(&self, from: TableRef, key: &EdgeKey) -> Result<Value, HeapError> {
-        match self.read_edge(from, key)? {
+    fn stored_value(
+        &self,
+        from: TableRef,
+        matches_key: impl Fn(&EdgeKey) -> bool,
+    ) -> Result<Value, HeapError> {
+        match self.read_edge(from, matches_key)? {
             Some(EdgeValue::Table { slot, generation }) => {
                 self.issued_value(TableRef::table(self.domain, *slot, *generation))
             }
@@ -769,20 +794,26 @@ impl LuaHeap {
     fn read_table_edge(
         &self,
         from: TableRef,
-        key: &EdgeKey,
+        matches_key: impl Fn(&EdgeKey) -> bool,
     ) -> Result<Option<TableRef>, HeapError> {
         Ok(self
-            .read_edge(from, key)?
+            .read_edge(from, matches_key)?
             .and_then(EdgeValue::table)
             .map(|(slot, generation)| TableRef::table(self.domain, slot, generation)))
     }
 
-    fn read_edge(&self, from: TableRef, key: &EdgeKey) -> Result<Option<&EdgeValue>, HeapError> {
+    /// One scan of the heap edge vector. `from` is checked before any key test.
+    /// The predicate selects the stored key. This does not build another table.
+    fn read_edge(
+        &self,
+        from: TableRef,
+        matches_key: impl Fn(&EdgeKey) -> bool,
+    ) -> Result<Option<&EdgeValue>, HeapError> {
         self.require_live(from)?;
         Ok(self
             .edges
             .iter()
-            .find(|edge| edge.from == from.slot() && &edge.key == key)
+            .find(|edge| edge.from == from.slot() && matches_key(&edge.key))
             .map(|edge| &edge.value))
     }
 
