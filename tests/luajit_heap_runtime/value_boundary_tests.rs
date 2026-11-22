@@ -41,21 +41,24 @@ impl SourcePlugin for CandidatePlugin {
 }
 
 fn candidate(source: &str) -> vm::Vm {
+    try_candidate(source).expect("compile Lua text")
+}
+
+fn try_candidate(source: &str) -> Result<vm::Vm, String> {
     let catalog = Arc::clone(catalog());
     let options = CompileSourceFileOptions::new()
         .with_source_plugin(&CandidatePlugin)
         .with_host_api_catalog(Arc::clone(&catalog));
-    let mut vm = vm::compile_source_with_flavor_and_options(source, SourceFlavor::Lua, options)
-        .expect("compile Lua text")
-        .into_vm()
-        .expect("create VM");
+    let program = vm::compile_source_with_flavor_and_options(source, SourceFlavor::Lua, options)
+        .map_err(|error| format!("{error:?}"))?;
+    let mut vm = program.into_vm().map_err(|error| format!("{error:?}"))?;
     let mut registry = HostFunctionRegistry::empty();
-    candidate::register(&mut registry, &catalog).expect("register candidate runtime");
+    candidate::register(&mut registry, &catalog).map_err(|error| format!("{error:?}"))?;
     register_witnesses(&mut registry, &catalog);
     registry
         .bind_vm_cached(&mut vm)
-        .expect("bind candidate runtime");
-    vm
+        .map_err(|error| format!("{error:?}"))?;
+    Ok(vm)
 }
 
 #[test]
@@ -2997,4 +3000,296 @@ end
             );
         }
     }
+}
+
+/// `::tail::` followed by another label and `;`, and `::tail::` followed only
+/// by `;`, are both in the block's trailing set. The goto is real: the local
+/// after it would publish a receiver and run `fresh`, whose RHS observes two
+/// tables and writes `box.kept`. An adjacent label does not skip that local;
+/// the locked `-joff` fall arm does run it. This candidate only has the goto
+/// arm. `omit` leaves the prefix receivers allocated, so a skipped root cannot
+/// hide in the sweep.
+#[test]
+fn lua_candidate_chunk_do_trailing_label_set_skips_receiver_local() {
+    for (shape, suffix) in [
+        ("label-and-empty", "  ::tail::\n  ::other::\n  ;\n"),
+        ("empty-only", "  ::tail::\n  ;\n"),
+    ] {
+        assert_trailing_label_set_skips_receiver(shape, suffix);
+    }
+}
+
+fn assert_trailing_label_set_skips_receiver(shape: &str, suffix: &str) {
+    let source = r#"
+local function fresh()
+  local made = {}
+  local box = {}
+  box.kept = made
+  observe_table(made, 0)
+  observe_table(box, 0)
+  local out = made
+  return out
+end
+local function pair()
+  local left = {}
+  local right = {}
+  observe_table(left, 0)
+  observe_table(right, 0)
+  local a = left
+  local b = right
+  return a, b
+end
+local mt = {}
+mt.__mode = "v"
+local owner = {}
+setmetatable(owner, mt)
+local marker = {}
+local x = {}
+owner.keep = x
+observe_table(x, 0)
+observe_table(marker, 0)
+do
+  local x, x = pair()
+  owner.seen = x
+  observe_table(x, 0)
+  collectgarbage("collect")
+  observe_table(owner.seen, 0)
+  observe_table(owner.keep, 0)
+  goto tail
+  local x = fresh()
+  marker.ran = x
+@suffix@end
+@after@
+"#
+    .replace("@suffix@", suffix);
+    let collect_after = "\
+collectgarbage(\"collect\")
+observe_table(x, 0)
+observe_table(owner.keep, 0)
+observe_table(marker, 0)
+return type(owner.seen)
+";
+    let omit_after = "\
+observe_table(owner.seen, 0)
+observe_table(x, 0)
+observe_table(owner.keep, 0)
+observe_table(marker, 0)
+return type(owner.seen)
+";
+    for (after, result, collections, live_nodes, live_edges, resources, observations) in [
+        (omit_after, "table", 1u32, 6u32, 3u32, 6usize, 11usize),
+        (collect_after, "nil", 2, 4, 2, 4, 10),
+    ] {
+        let mut vm = candidate(&source.replace("@after@", after));
+        assert_eq!(
+            vm.run().expect("run trailing label set"),
+            VmStatus::Halted,
+            "{shape}/{result}"
+        );
+        assert_eq!(vm.stack(), &[Value::string(result)], "{shape}/{result}");
+        let mut host = vm.host_context();
+        let tables = host.scope_state::<Vec<ObservedTable>>().unwrap().clone();
+        assert_eq!(
+            tables.len(),
+            observations,
+            "{shape}/{result}: fresh() must not publish made or box"
+        );
+        let outer = tables[0];
+        let marker = tables[1];
+        let left = tables[2];
+        let right = tables[3];
+        let visible = tables[4];
+        let seen_inside = tables[5];
+        let keep_inside = tables[6];
+        assert_ne!(left, right, "{shape}/{result}");
+        assert_ne!(marker, outer, "{shape}/{result}");
+        assert_eq!(visible, right, "{shape}/{result}");
+        assert_eq!(seen_inside, right, "{shape}/{result}");
+        assert_eq!(keep_inside, outer, "{shape}/{result}");
+        let drop_alive = result == "table";
+        let (seen_after, restored, keep_after, marker_after) = if drop_alive {
+            (tables[7], tables[8], tables[9], tables[10])
+        } else {
+            (right, tables[7], tables[8], tables[9])
+        };
+        assert_eq!(restored, outer, "{shape}/{result}: restored name is outer");
+        assert_ne!(restored, right, "{shape}/{result}");
+        assert_eq!(keep_after, outer, "{shape}/{result}");
+        assert_eq!(
+            marker_after, marker,
+            "{shape}/{result}: marker.ran was not written"
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| Ok(heap.alive(left.table))).unwrap(),
+            drop_alive,
+            "{shape}/{result}"
+        );
+        for (table, alive) in [
+            (left, drop_alive),
+            (right, drop_alive),
+            (outer, true),
+            (marker, true),
+            (visible, drop_alive),
+            (seen_inside, drop_alive),
+            (keep_inside, true),
+            (seen_after, drop_alive),
+            (restored, true),
+            (keep_after, true),
+            (marker_after, true),
+        ] {
+            assert_table_lifetime(&mut host, table, alive);
+        }
+        let stats = heap::stats(&mut host).unwrap();
+        let label = format!("{shape}/{result}");
+        assert_eq!(stats.collections, collections, "{label}");
+        assert_eq!(stats.live_nodes, live_nodes, "{label}");
+        assert_eq!(stats.live_edges, live_edges, "{label}");
+        assert_eq!(stats.live_roots, 0, "{label}");
+        assert_eq!(host.resource_count(), resources, "{label}");
+    }
+}
+
+/// Same label text in two blocks. Each goto uses its own resolved target, so
+/// the statement between the blocks still runs and neither `fresh` runs.
+#[test]
+fn lua_candidate_chunk_do_trailing_label_set_keeps_outer_statement() {
+    let source = r#"
+local function fresh()
+  local made = {}
+  observe_table(made, 0)
+  local out = made
+  return out
+end
+local live = {}
+observe_table(live, 0)
+do
+  goto tail
+  local x = fresh()
+  ::tail::
+  ::other::
+  ;
+end
+observe_table(live, 0)
+do
+  goto tail
+  local x = fresh()
+  ::tail::
+  ;
+end
+observe_table(live, 0)
+return type(live)
+"#;
+    let mut vm = candidate(source);
+    assert_eq!(
+        vm.run().expect("run same-name trailing labels"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::string("table")]);
+    let host = vm.host_context();
+    let tables = host.scope_state::<Vec<ObservedTable>>().unwrap().clone();
+    assert_eq!(
+        tables.len(),
+        3,
+        "fresh must not publish, and the outer local must"
+    );
+    assert_eq!(tables[0], tables[1]);
+    assert_eq!(tables[1], tables[2]);
+}
+
+/// A non-trailing target is outside this cut. Accepting it and dropping the
+/// local after that label would be a mis-cut. Rejection is not pinned.
+#[test]
+fn lua_candidate_trailing_label_set_does_not_cut_reachable_non_tail() {
+    let source = r#"
+local live = {}
+observe_table(live, 0)
+do
+  goto mid
+  ::mid::
+  local after = {}
+  observe_table(after, 0)
+  ::tail::
+  ;
+end
+observe_table(live, 0)
+return type(live)
+"#;
+    let Ok(mut vm) = try_candidate(source) else {
+        return;
+    };
+    assert_eq!(vm.run().expect("run non-tail"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("table")]);
+    let host = vm.host_context();
+    let tables = host.scope_state::<Vec<ObservedTable>>().unwrap().clone();
+    assert!(
+        tables.len() >= 3,
+        "the local after the non-trailing label must still be lowered"
+    );
+    assert_eq!(tables[0], tables[2]);
+    assert_ne!(tables[1], tables[0]);
+}
+
+/// Resolver identity the cut uses. This does not pin a lowerer error.
+#[test]
+fn trailing_label_set_keeps_resolved_identity() {
+    let set = parser::parse_chunk(
+        b"do\n  goto tail\n  local x = 1\n  ::tail::\n  ::other::\n  ;\nend\ndo\n  goto tail\n  local x = 1\n  ::tail::\n  ;\nend\n",
+    )
+    .expect("parse trailing set");
+    let resolution = resolve::resolve(&set);
+    assert!(resolution.errors.is_empty(), "{:?}", resolution.errors);
+    let first = resolution.gotos[0].target.expect("first tail");
+    let second = resolution.gotos[1].target.expect("second tail");
+    assert_ne!(
+        first, second,
+        "same name in another block is a different label"
+    );
+    assert_eq!(resolution.labels[first].name, b"tail");
+    assert_eq!(resolution.labels[second].name, b"tail");
+    assert!(resolution.labels[first].trailing);
+    assert!(resolution.labels[second].trailing);
+    let other = resolution
+        .labels
+        .iter()
+        .find(|label| label.name == b"other")
+        .expect("other");
+    assert!(other.trailing);
+    assert_ne!(other.span, resolution.labels[first].span);
+
+    let nontail = parser::parse_chunk(
+        b"do\n  goto mid\n  ::mid::\n  local after = 1\n  ::tail::\n  ;\nend\n",
+    )
+    .expect("parse non-tail");
+    let resolution = resolve::resolve(&nontail);
+    assert!(resolution.errors.is_empty(), "{:?}", resolution.errors);
+    let mid = resolution.gotos[0].target.expect("mid");
+    assert_eq!(resolution.labels[mid].name, b"mid");
+    assert!(!resolution.labels[mid].trailing);
+
+    let cross = parser::parse_chunk(
+        b"do\n  do\n    goto tail\n    local skipped = 1\n  end\n  local between = 1\n  ::tail::\n  ;\nend\n",
+    )
+    .expect("parse cross-block");
+    let resolution = resolve::resolve(&cross);
+    assert!(resolution.errors.is_empty(), "{:?}", resolution.errors);
+    let target = resolution.gotos[0].target.expect("outer tail");
+    let label = &resolution.labels[target];
+    assert!(label.trailing);
+    assert_eq!(label.name, b"tail");
+    let ast::Stmt::Do { body: outer, .. } = &cross.body.stmts[0] else {
+        panic!("outer do");
+    };
+    let ast::Stmt::Do { body: inner, .. } = &outer.stmts[0] else {
+        panic!("inner do");
+    };
+    assert!(
+        inner.stmts.iter().all(|stmt| {
+            !matches!(stmt, ast::Stmt::Label { name, .. } if name.span == label.span)
+        })
+    );
+    assert!(
+        outer.stmts.iter().any(|stmt| {
+            matches!(stmt, ast::Stmt::Label { name, .. } if name.span == label.span)
+        })
+    );
 }

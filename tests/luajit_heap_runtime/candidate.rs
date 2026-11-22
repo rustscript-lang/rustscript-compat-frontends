@@ -1255,12 +1255,14 @@ impl Lower<'_> {
     /// `live_locals`. Same-name outer slots stay where they are, including a
     /// slot already removed by `= nil`. A function body is not this path.
     ///
-    /// A resolver-proven `goto` to this block's trailing end label does not
-    /// emit the suffix. `retire_block` is still the exit, so executed bindings
-    /// drop their roots. This is not the `control.rs` state dispatcher, and
-    /// the target comes from the resolved label index rather than a bare name.
+    /// A resolver-proven `goto` whose target is in this block's trailing label
+    /// set does not emit the suffix. The set is every direct label the
+    /// resolver marked `trailing`: only labels and empty statements follow it.
+    /// The target index is matched to a direct child by that label's span, not
+    /// by name. `retire_block` is still the exit, so executed bindings drop
+    /// their roots. This is not the `control.rs` state dispatcher.
     fn lower_do(&mut self, span: ast::Span, body: &ast::Block) -> Result<(), ParseError> {
-        let statements = match self.tail_goto_cut(span, body)? {
+        let statements = match self.tail_goto_cut(body)? {
             Some(cut) => &body.stmts[..cut],
             None => body.stmts.as_slice(),
         };
@@ -1270,14 +1272,14 @@ impl Lower<'_> {
         self.retire_block(span, body)
     }
 
-    /// Index of the one direct `goto` whose resolved target is this block's
-    /// trailing end label. `None` keeps the straight path. A different goto
+    /// Index of the one direct `goto` whose resolved target is in this block's
+    /// trailing label set. `None` keeps the straight path. The resolver index
+    /// is matched to a direct child by label span, not by name, so a
+    /// same-named label in another block is not this target. A non-trailing
+    /// label in this block stays unsupported. `scope_id` is not a second
+    /// check: that direct-child span is already this block. A different goto
     /// stays unsupported instead of falling through the suffix.
-    fn tail_goto_cut(
-        &self,
-        span: ast::Span,
-        body: &ast::Block,
-    ) -> Result<Option<usize>, ParseError> {
+    fn tail_goto_cut(&self, body: &ast::Block) -> Result<Option<usize>, ParseError> {
         let mut found = None;
         for (index, stmt) in body.stmts.iter().enumerate() {
             let ast::Stmt::Goto {
@@ -1294,12 +1296,6 @@ impl Lower<'_> {
         let Some((index, goto_span)) = found else {
             return Ok(None);
         };
-        let Some(ast::Stmt::Label { name, .. }) = body.stmts.last() else {
-            return Err(self.statement_unsupported(goto_span));
-        };
-        if index + 1 >= body.stmts.len() {
-            return Err(self.statement_unsupported(goto_span));
-        }
         let jump = self
             .resolution
             .gotos
@@ -1314,14 +1310,12 @@ impl Lower<'_> {
         let Some(label) = self.resolution.labels.get(target) else {
             return Err(self.statement_unsupported(goto_span));
         };
-        let same_end = label.trailing && label.function_id == 0 && label.span == name.span;
-        if !same_end {
-            return Err(self.statement_unsupported(goto_span));
-        }
-        if self
-            .block_scope(span, body)
-            .is_some_and(|scope_id| scope_id != label.scope_id)
-        {
+        let in_trailing_set = label.trailing
+            && label.function_id == 0
+            && body.stmts.iter().any(
+                |stmt| matches!(stmt, ast::Stmt::Label { name, .. } if name.span == label.span),
+            );
+        if !in_trailing_set {
             return Err(self.statement_unsupported(goto_span));
         }
         Ok(Some(index))
