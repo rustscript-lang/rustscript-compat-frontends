@@ -1995,10 +1995,10 @@ impl Lower<'_> {
     /// The RHS is lowered before the new names are bound, so
     /// `local next, v = next(t)` still sees the builtin.
     ///
-    /// Chunk `return next(...)` is not this path. A missing or cleared cursor
-    /// is `invalid key to next`, not a restart. `next` walks the owner's
-    /// edges; that walk is the scan cost. Continuation from a cleared cursor
-    /// is not implemented.
+    /// Chunk `return next(...)` is not this path. A missing cursor is
+    /// `invalid key to next`, not a restart. A weak-cleared cursor is still
+    /// stored, so `next` continues from it. `next` walks the owner's edges;
+    /// that walk is the scan cost.
     fn lower_next_local(
         &mut self,
         span: ast::Span,

@@ -124,13 +124,15 @@ pub struct HeapStats {
     pub live_nodes: u32,
     /// Root slots currently holding a handle.
     pub live_roots: u32,
-    /// Table-entry records currently stored.
+    /// Table-entry records that still hold a value. A weak-cleared cursor is
+    /// stored, but it is not a live entry.
     pub live_edges: u32,
     /// Slot vector length. Free and retired slots still occupy it.
     pub node_slots: u32,
     /// Root vector length.
     pub root_slots: u32,
-    /// Edge vector length.
+    /// Edge vector length, including weak-cleared cursors that no longer hold a
+    /// value. Quota uses this storage, not `live_edges`.
     pub edge_slots: u32,
     /// Completed collections.
     pub collections: u32,
@@ -236,6 +238,12 @@ impl EdgeValue {
             }
             Self::Scalar(_) => None,
         }
+    }
+
+    /// A weak-cleared entry left in place so `next` can continue from that key.
+    /// Nil is not otherwise stored: an explicit removal deletes the record.
+    fn is_cursor_gap(&self) -> bool {
+        matches!(self, Self::Scalar(Value::Null))
     }
 }
 
@@ -1235,7 +1243,7 @@ impl LuaHeap {
             edge.value = value;
             return Ok(());
         }
-        if self.edges.len() >= self.limits.edges as usize {
+        if self.edges.len() >= self.limits.edges as usize && !self.reclaim_cursor_gap() {
             return Err(HeapError::EdgeCapacity);
         }
         self.edges.push(Edge {
@@ -1245,6 +1253,20 @@ impl LuaHeap {
         });
         self.note_edge_peak();
         Ok(())
+    }
+
+    /// Drops one valueless cursor so a real edge can use that storage.
+    /// Lua does not keep an old cursor valid across this structural change.
+    fn reclaim_cursor_gap(&mut self) -> bool {
+        let Some(index) = self
+            .edges
+            .iter()
+            .position(|edge| edge.value.is_cursor_gap())
+        else {
+            return false;
+        };
+        self.edges.remove(index);
+        true
     }
 
     /// Reads the table target of a direct field through either alias of `from`.
@@ -1270,11 +1292,16 @@ impl LuaHeap {
 
     /// Next raw entry of `table` after `cursor`, in stored edge order.
     ///
-    /// `Value::Null` starts at the first edge. `None` is the end: one nil, not
-    /// an empty pair. A missing cursor and a non-guest key are errors, not the
-    /// end and not a restart. This walks `edges`, the same vector weak sweep
-    /// retains. It does not allocate another table and does not read a
-    /// metamethod.
+    /// `Value::Null` starts at the first valued edge. `None` is the end: one
+    /// nil, not an empty pair. A weak-cleared entry keeps its key in that order
+    /// with no value, so `rawget` is nil, a fresh `next` skips it, and `next`
+    /// with that key continues at the next valued entry or one nil at the end.
+    /// A missing key and a non-guest key are errors, not the end and not a
+    /// restart. An explicit removal drops the key. A later write of the same
+    /// key reuses the record. Inserting a different key may drop an old cursor
+    /// when edge storage is full; Lua does not keep cursors across that change.
+    /// This walks `edges`. It does not allocate another table and does not read
+    /// a metamethod.
     pub fn next_guest(
         &self,
         table: TableRef,
@@ -1327,6 +1354,9 @@ impl LuaHeap {
                 {
                     passed = true;
                 }
+                continue;
+            }
+            if edge.value.is_cursor_gap() {
                 continue;
             }
             return Ok(Some((
@@ -1739,7 +1769,11 @@ impl LuaHeap {
         HeapStats {
             live_nodes: self.live_nodes(),
             live_roots: self.live_roots(),
-            live_edges: self.edges.len() as u32,
+            live_edges: self
+                .edges
+                .iter()
+                .filter(|edge| !edge.value.is_cursor_gap())
+                .count() as u32,
             node_slots: self.slots.len() as u32,
             root_slots: self.roots.len() as u32,
             edge_slots: self.edges.len() as u32,
@@ -1842,6 +1876,10 @@ impl LuaHeap {
             let end = index.offsets[slot as usize + 1] as usize;
             self.scan.outgoing_edge_checks += (end - start) as u64;
             for &entry in &index.entries[start..end] {
+                let gap = self.edges[entry as usize].value.is_cursor_gap();
+                if gap {
+                    continue;
+                }
                 let (object_key, value_target) = {
                     let edge = &self.edges[entry as usize];
                     let object_key = match &edge.key {
@@ -1930,6 +1968,9 @@ impl LuaHeap {
         let mut counts = vec![0u32; slot_count];
         self.scan.scratch.index_counts_inited += counts.len() as u64;
         for edge in &self.edges {
+            if edge.value.is_cursor_gap() {
+                continue;
+            }
             if let Some(count) = counts.get_mut(edge.from as usize) {
                 *count = count.saturating_add(1);
             }
@@ -1952,6 +1993,9 @@ impl LuaHeap {
         self.scan.scratch.index_targets_inited += entries.len() as u64;
         let mut weak_modes = None;
         for (entry, edge) in self.edges.iter().enumerate() {
+            if edge.value.is_cursor_gap() {
+                continue;
+            }
             let from = edge.from as usize;
             if from >= slot_count {
                 continue;
@@ -2010,10 +2054,70 @@ impl LuaHeap {
                 found.marked && found.kind == kind && found.generation == generation
             })
         };
-        // Strong endpoints of a marked owner were already marked. For weak
-        // edges, either dead object endpoint invalidates the whole entry.
-        // Closure and cell targets, and object keys of either stored kind,
-        // are checked in this same retain.
+        let weak_values: Vec<bool> = sweep
+            .iter()
+            .enumerate()
+            .map(|(index, found)| {
+                if !found.marked || found.kind != HandleKind::Table {
+                    return false;
+                }
+                let Some((mt_slot, mt_generation)) = self.slots[index].metatable else {
+                    return false;
+                };
+                let Some(mt) = sweep.get(mt_slot as usize) else {
+                    return false;
+                };
+                if !mt.marked || mt.kind != HandleKind::Table || mt.generation != mt_generation {
+                    return false;
+                }
+                self.edges.iter().any(|edge| {
+                    if edge.from != mt_slot || edge.key != EdgeKey::Field(Self::MODE_FIELD) {
+                        return false;
+                    }
+                    let EdgeValue::Scalar(Value::String(mode)) = &edge.value else {
+                        return false;
+                    };
+                    let mut ignored = 0u64;
+                    WeakMode::parse(mode, &mut ignored).values
+                })
+            })
+            .collect();
+        let guest_cursor = |key: &EdgeKey| match key {
+            EdgeKey::Utf8(_) | EdgeKey::Number(_) => true,
+            EdgeKey::Field(_) => false,
+            EdgeKey::Object {
+                slot,
+                generation,
+                kind: HandleKind::Table,
+            } => typed(*slot, *generation, HandleKind::Table),
+            EdgeKey::Object { .. } => false,
+        };
+        // A weak-value clear leaves the key in place with no value. The record
+        // is the cursor. It is not a second index. A dead key, a private field,
+        // or a strong edge is still removed.
+        for edge in &mut self.edges {
+            let owner = edge.from as usize;
+            if !is_marked(edge.from) || !weak_values.get(owner).copied().unwrap_or(false) {
+                continue;
+            }
+            let value_dead = match &edge.value {
+                EdgeValue::Scalar(_) => false,
+                EdgeValue::Table { slot, .. } => !is_marked(*slot),
+                EdgeValue::Closure { slot, generation } => {
+                    !typed(*slot, *generation, HandleKind::Closure)
+                }
+                EdgeValue::Upvalue { slot, generation } => {
+                    !typed(*slot, *generation, HandleKind::Upvalue)
+                }
+            };
+            if !value_dead || !guest_cursor(&edge.key) {
+                continue;
+            }
+            edge.value = EdgeValue::Scalar(Value::Null);
+        }
+        // Strong endpoints of a marked owner were already marked. A valueless
+        // cursor stays when its key is still usable. Closure and cell targets,
+        // and object keys of either stored kind, are checked in this same retain.
         self.edges.retain(|edge| {
             is_marked(edge.from)
                 && match &edge.value {
@@ -2028,6 +2132,11 @@ impl LuaHeap {
                 }
                 && match &edge.key {
                     EdgeKey::Field(_) | EdgeKey::Utf8(_) | EdgeKey::Number(_) => true,
+                    EdgeKey::Object {
+                        slot,
+                        generation,
+                        kind,
+                    } if edge.value.is_cursor_gap() => typed(*slot, *generation, *kind),
                     EdgeKey::Object { slot, .. } => is_marked(*slot),
                 }
         });

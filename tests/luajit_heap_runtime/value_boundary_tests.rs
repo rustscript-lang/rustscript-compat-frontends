@@ -4613,6 +4613,467 @@ fn assert_weak_next_identities(seen: &[ObservedTable]) {
     assert_ne!(seen[8].table, key);
 }
 
+/// Weak-cleared cursor continuation. The candidate walk order is insertion
+/// order, so each source plants one key kind first. LuaJIT hash order is not
+/// assumed here; the locked oracle discovers it. This lowerer has no `if`, so
+/// the two shapes stay separate sources rather than one runtime branch.
+#[test]
+fn lua_candidate_next_continues_from_a_cleared_weak_cursor() {
+    let text_cursor = r#"
+local mt = {}
+mt.__mode = "v"
+local owner = {}
+setmetatable(owner, mt)
+local dead = {}
+dead.self = dead
+local kept = {}
+local key = {}
+owner.gone = dead
+owner[key] = kept
+observe_table(dead, 0)
+observe_table(kept, 0)
+observe_table(key, 0)
+local cursor, first = next(owner, nil)
+observe_table(first, 0)
+first = nil
+dead = nil
+collectgarbage("collect")
+local raw = rawget(owner, cursor)
+local fresh_key, fresh_value = next(owner, nil)
+local cont_key, cont_value = next(owner, cursor)
+observe_table(fresh_key, 0)
+observe_table(fresh_value, 0)
+observe_table(cont_key, 0)
+observe_table(cont_value, 0)
+observe_table(rawget(owner, cont_key), 0)
+"#;
+    let cleared = run_next(&format!("{text_cursor}return type(raw)\n"));
+    assert_eq!(cleared.stack, &[Value::string("nil")]);
+    assert_eq!(cleared.counts, vec![2, 2, 2]);
+    assert_cleared_text_cursor(&cleared.tables);
+    let cursor_kind = run_next(&format!("{text_cursor}return type(cursor)\n"));
+    assert_eq!(cursor_kind.stack, &[Value::string("string")]);
+    assert_eq!(cursor_kind.counts, vec![2, 2, 2]);
+
+    let table_cursor = r#"
+local mt = {}
+mt.__mode = "v"
+local owner = {}
+setmetatable(owner, mt)
+local dead = {}
+dead.self = dead
+local kept = {}
+local key = {}
+owner[key] = dead
+owner.keep = kept
+observe_table(dead, 0)
+observe_table(kept, 0)
+observe_table(key, 0)
+local cursor, first = next(owner, nil)
+observe_table(cursor, 0)
+observe_table(first, 0)
+first = nil
+dead = nil
+collectgarbage("collect")
+local raw = rawget(owner, cursor)
+local fresh_key, fresh_value = next(owner, nil)
+local cont_key, cont_value = next(owner, cursor)
+observe_table(fresh_value, 0)
+observe_table(cont_value, 0)
+"#;
+    let table_cleared = run_next(&format!("{table_cursor}return type(raw)\n"));
+    assert_eq!(table_cleared.stack, &[Value::string("nil")]);
+    assert_eq!(table_cleared.counts, vec![2, 2, 2]);
+    assert_cleared_table_cursor(&table_cleared.tables);
+    let successor = run_next(&format!("{table_cursor}return fresh_key\n"));
+    assert_eq!(successor.stack, &[Value::string("keep")]);
+    assert_eq!(successor.counts, vec![2, 2, 2]);
+    let successor_again = run_next(&format!("{table_cursor}return cont_key\n"));
+    assert_eq!(successor_again.stack, &[Value::string("keep")]);
+    assert_eq!(successor_again.counts, vec![2, 2, 2]);
+}
+
+fn assert_cleared_text_cursor(seen: &[ObservedTable]) {
+    let dead = seen[0].table;
+    let kept = seen[1].table;
+    let key = seen[2].table;
+    assert_eq!(seen[3].table, dead, "first next value is the dying entry");
+    assert_eq!(seen[4].table, key, "fresh next skips the cleared text key");
+    assert_eq!(seen[5].table, kept);
+    assert_eq!(
+        seen[6].table, key,
+        "continuation returns the same successor"
+    );
+    assert_eq!(seen[7].table, kept);
+    assert_eq!(seen[8].table, kept, "rawget agrees with the successor");
+    assert_ne!(seen[4].table, dead);
+}
+
+fn assert_cleared_table_cursor(seen: &[ObservedTable]) {
+    let dead = seen[0].table;
+    let kept = seen[1].table;
+    let key = seen[2].table;
+    assert_eq!(seen[3].table, key, "first next key is the rooted table key");
+    assert_eq!(seen[4].table, dead);
+    assert_eq!(
+        seen[5].table, kept,
+        "fresh next skips the cleared table key"
+    );
+    assert_eq!(
+        seen[6].table, kept,
+        "continuation returns the same successor"
+    );
+    assert_ne!(seen[5].table, dead);
+}
+
+/// No collection: the same cursor still returns the following live pair.
+/// This is the control for the cleared-cursor fixture, not a second protocol.
+#[test]
+fn lua_candidate_next_without_collect_keeps_the_following_pair() {
+    let source = r#"
+local mt = {}
+mt.__mode = "v"
+local owner = {}
+setmetatable(owner, mt)
+local dead = {}
+local kept = {}
+local key = {}
+owner.gone = dead
+owner[key] = kept
+observe_table(dead, 0)
+observe_table(kept, 0)
+observe_table(key, 0)
+local cursor, first = next(owner, nil)
+local cont_key, cont_value = next(owner, cursor)
+observe_table(first, 0)
+observe_table(cont_key, 0)
+observe_table(cont_value, 0)
+observe_table(rawget(owner, cursor), 0)
+"#;
+    let run = run_next(&format!("{source}return type(cursor)\n"));
+    assert_eq!(run.stack, &[Value::string("string")]);
+    assert_eq!(run.counts, vec![2, 2]);
+    let dead = run.tables[0].table;
+    let kept = run.tables[1].table;
+    let key = run.tables[2].table;
+    assert_eq!(run.tables[3].table, dead);
+    assert_eq!(run.tables[4].table, key);
+    assert_eq!(run.tables[5].table, kept);
+    assert_eq!(run.tables[6].table, dead, "rawget still sees the value");
+}
+
+/// A key that was never stored is an error. It must not restart at the first entry.
+#[test]
+fn lua_candidate_next_missing_key_is_not_a_restart() {
+    let table_key = "\
+local owner = {}
+owner.keep = \"yes\"
+local missing = {}
+local k, v = next(owner, missing)
+return k
+";
+    assert_invalid_next_key(table_key);
+    let text_key = "\
+local owner = {}
+owner.keep = \"yes\"
+local k, v = next(owner, \"missing\")
+return k
+";
+    assert_invalid_next_key(text_key);
+}
+
+fn assert_invalid_next_key(source: &str) {
+    let mut vm = candidate(source);
+    let error = vm.run().expect_err("a missing key is not a fresh next");
+    match error {
+        vm::VmError::HostError(message) => {
+            assert!(
+                message.contains("invalid key to next"),
+                "missing key must not restart, got {message}"
+            );
+        }
+        other => panic!("expected a host error, got {other}"),
+    }
+}
+
+/// The cleared key is the last stored entry. Continuation is one nil, not a restart.
+#[test]
+fn lua_candidate_next_cleared_tail_is_one_nil() {
+    let source = r#"
+local mt = {}
+mt.__mode = "v"
+local owner = {}
+setmetatable(owner, mt)
+local dead = {}
+dead.self = dead
+local kept = {}
+local key = {}
+owner[key] = kept
+owner.gone = dead
+observe_table(kept, 0)
+observe_table(dead, 0)
+local head, head_value = next(owner, nil)
+local tail, tail_value = next(owner, head)
+observe_table(head_value, 0)
+observe_table(tail_value, 0)
+tail_value = nil
+dead = nil
+collectgarbage("collect")
+local cont, cont_value = next(owner, tail)
+local fresh, fresh_value = next(owner, nil)
+observe_table(fresh_value, 0)
+observe_table(rawget(owner, head), 0)
+"#;
+    let run = run_next(&format!("{source}return type(cont)\n"));
+    assert_eq!(run.stack, &[Value::string("nil")]);
+    assert_eq!(run.counts, vec![2, 2, 1, 2]);
+    let kept = run.tables[0].table;
+    let dead = run.tables[1].table;
+    assert_eq!(run.tables[2].table, kept);
+    assert_eq!(run.tables[3].table, dead);
+    assert_eq!(
+        run.tables[4].table, kept,
+        "fresh next still returns the head value"
+    );
+    assert_eq!(run.tables[5].table, kept, "rawget of the live head agrees");
+}
+
+/// No new write. A rooted cursor still continues after a second collect.
+#[test]
+fn lua_candidate_next_cleared_cursor_survives_a_second_collect() {
+    let source = r#"
+local mt = {}
+mt.__mode = "v"
+local owner = {}
+setmetatable(owner, mt)
+local dead = {}
+dead.self = dead
+local kept = {}
+local key = {}
+owner.gone = dead
+owner[key] = kept
+observe_table(kept, 0)
+observe_table(key, 0)
+local cursor, first = next(owner, nil)
+first = nil
+dead = nil
+collectgarbage("collect")
+collectgarbage("collect")
+local raw = rawget(owner, cursor)
+local cont_key, cont_value = next(owner, cursor)
+observe_table(cont_key, 0)
+observe_table(cont_value, 0)
+"#;
+    let run = run_next(&format!("{source}return type(raw)\n"));
+    assert_eq!(run.stack, &[Value::string("nil")]);
+    assert_eq!(run.counts, vec![2, 2]);
+    let kept = run.tables[0].table;
+    let key = run.tables[1].table;
+    assert_eq!(run.tables[2].table, key);
+    assert_eq!(run.tables[3].table, kept);
+}
+
+/// Writing the same key again fills the cleared record. Continuation still
+/// reaches the original successor, so the write did not append a new edge.
+#[test]
+fn lua_candidate_next_reinsert_reuses_the_cleared_position() {
+    let source = r#"
+local mt = {}
+mt.__mode = "v"
+local owner = {}
+setmetatable(owner, mt)
+local dead = {}
+dead.self = dead
+local kept = {}
+local key = {}
+owner.gone = dead
+owner[key] = kept
+observe_table(kept, 0)
+observe_table(key, 0)
+local cursor, first = next(owner, nil)
+first = nil
+dead = nil
+collectgarbage("collect")
+local restored = {}
+owner.gone = restored
+observe_table(restored, 0)
+local cont_key, cont_value = next(owner, cursor)
+observe_table(cont_key, 0)
+observe_table(cont_value, 0)
+observe_table(rawget(owner, cursor), 0)
+"#;
+    let run = run_next(&format!("{source}return type(rawget(owner, cursor))\n"));
+    assert_eq!(run.stack, &[Value::string("table")]);
+    assert_eq!(run.counts, vec![2, 2]);
+    let kept = run.tables[0].table;
+    let key = run.tables[1].table;
+    let restored = run.tables[2].table;
+    assert_eq!(
+        run.tables[3].table, key,
+        "same-key write stays before the successor"
+    );
+    assert_eq!(run.tables[4].table, kept);
+    assert_eq!(run.tables[5].table, restored);
+}
+
+/// Quota, mark, and an explicit removal are not expressible as candidate
+/// control flow. This heap fixture uses the same edge record and `next_guest`.
+#[test]
+fn weak_cleared_cursor_stays_in_the_edge_record() {
+    let limits = heap::HeapLimits {
+        nodes: 24,
+        roots: 8,
+        edges: 4,
+        max_generation: 16,
+    };
+    let mut heap = heap::LuaHeap::new(limits);
+    let mt = heap.alloc().unwrap();
+    let owner = heap.alloc().unwrap();
+    let kept = heap.alloc().unwrap();
+    let key = heap.alloc().unwrap();
+    heap.set_mode_scalar(mt, Value::string("v")).unwrap();
+    heap.set_metatable(owner, Some(mt)).unwrap();
+    let frame = heap.enter_roots(3).unwrap();
+    heap.write_root(frame, 0, owner).unwrap();
+    heap.write_root(frame, 1, mt).unwrap();
+    heap.write_root(frame, 2, kept).unwrap();
+
+    let dead = heap.alloc().unwrap();
+    heap.set_object_edge(owner, key, dead).unwrap();
+    heap.set_named_edge(owner, "keep", kept).unwrap();
+    heap.issue_carrier(kept).unwrap();
+    heap.collect();
+    assert_eq!(heap.object_value(owner, key).unwrap(), Value::Null);
+    assert_eq!(heap.stats().live_edges, 2, "mode and the live entry");
+    assert_eq!(
+        heap.stats().edge_slots,
+        3,
+        "the cleared key still occupies storage"
+    );
+    let key_value = heap.issue_carrier(key).unwrap();
+    let continued = heap.next_guest(owner, &key_value).unwrap().unwrap();
+    assert_eq!(continued.0, Value::string("keep"));
+    assert_eq!(continued.1, heap.issued_value(kept).unwrap());
+    let fresh = heap.next_guest(owner, &Value::Null).unwrap().unwrap();
+    assert_eq!(fresh.0, Value::string("keep"));
+
+    heap.collect();
+    assert!(
+        !heap.alive(key),
+        "a cleared object key is not marked on the next collect"
+    );
+    let stale = heap.next_guest(owner, &key_value);
+    assert!(
+        stale.is_err(),
+        "a dead object is not a cursor and not a restart"
+    );
+    let still = heap.next_guest(owner, &Value::Null).unwrap().unwrap();
+    assert_eq!(still.0, Value::string("keep"));
+
+    heap.set_named_scalar(owner, "keep", Value::Null).unwrap();
+    assert_eq!(
+        heap.next_guest(owner, &Value::string("keep")).unwrap_err(),
+        heap::HeapError::NextCursorMissing,
+        "an explicit removal drops the cursor"
+    );
+    assert!(heap.next_guest(owner, &Value::Null).unwrap().is_none());
+}
+
+#[test]
+fn weak_cleared_cursors_yield_storage_under_insert_pressure() {
+    let limits = heap::HeapLimits {
+        nodes: 24,
+        roots: 8,
+        edges: 3,
+        max_generation: 16,
+    };
+    let mut heap = heap::LuaHeap::new(limits);
+    let mt = heap.alloc().unwrap();
+    let owner = heap.alloc().unwrap();
+    let kept = heap.alloc().unwrap();
+    let key = heap.alloc().unwrap();
+    heap.set_mode_scalar(mt, Value::string("v")).unwrap();
+    heap.set_metatable(owner, Some(mt)).unwrap();
+    let first = heap.alloc().unwrap();
+    let second = heap.alloc().unwrap();
+    heap.set_named_edge(owner, "a", first).unwrap();
+    heap.set_named_edge(owner, "b", second).unwrap();
+    heap.issue_carrier(kept).unwrap();
+    heap.issue_carrier(key).unwrap();
+    let frame = heap.enter_roots(4).unwrap();
+    heap.write_root(frame, 0, owner).unwrap();
+    heap.write_root(frame, 1, mt).unwrap();
+    heap.write_root(frame, 2, kept).unwrap();
+    heap.write_root(frame, 3, key).unwrap();
+    heap.collect();
+    assert_eq!(heap.stats().edge_slots, 3);
+    assert_eq!(heap.stats().live_edges, 1);
+    heap.set_object_edge(owner, key, kept).unwrap();
+    assert_eq!(
+        heap.stats().edge_slots,
+        3,
+        "the new edge reused a cleared cursor"
+    );
+    assert_eq!(heap.stats().live_edges, 2);
+    let lost_a = heap.next_guest(owner, &Value::string("a"));
+    let lost_b = heap.next_guest(owner, &Value::string("b"));
+    assert!(
+        lost_a.is_err() || lost_b.is_err(),
+        "pressure drops an old cursor instead of refusing the real edge"
+    );
+    let survivor = heap.next_guest(owner, &Value::Null).unwrap().unwrap();
+    assert_eq!(survivor.1, heap.issued_value(kept).unwrap());
+
+    let mut occupied = heap.stats().edge_slots;
+    for step in 0..6 {
+        let extra = heap.alloc().unwrap();
+        let name = format!("n{step}");
+        heap.set_named_edge(owner, &name, extra).unwrap();
+        heap.collect();
+        occupied = heap.stats().edge_slots;
+        assert!(occupied <= 3, "repeated clears stay inside the edge cap");
+    }
+    assert_eq!(occupied, 3);
+}
+
+#[test]
+fn private_field_clear_does_not_leave_a_next_cursor() {
+    let mut heap = heap::LuaHeap::new(heap::HeapLimits {
+        nodes: 8,
+        roots: 4,
+        edges: 4,
+        max_generation: 4,
+    });
+    let mt = heap.alloc().unwrap();
+    let owner = heap.alloc().unwrap();
+    let kept = heap.alloc().unwrap();
+    let dead = heap.alloc().unwrap();
+    heap.set_mode_scalar(mt, Value::string("v")).unwrap();
+    heap.set_metatable(owner, Some(mt)).unwrap();
+    heap.set_edge(owner, 1, dead).unwrap();
+    heap.set_named_edge(owner, "keep", kept).unwrap();
+    heap.issue_carrier(kept).unwrap();
+    let frame = heap.enter_roots(3).unwrap();
+    heap.write_root(frame, 0, owner).unwrap();
+    heap.write_root(frame, 1, mt).unwrap();
+    heap.write_root(frame, 2, kept).unwrap();
+    heap.collect();
+    assert_eq!(heap.edge(owner, 1).unwrap(), None);
+    assert_eq!(heap.stats().live_edges, 2);
+    assert_eq!(
+        heap.stats().edge_slots,
+        2,
+        "a private field is removed, not a cursor"
+    );
+    let fresh = heap.next_guest(owner, &Value::Null).unwrap().unwrap();
+    assert_eq!(fresh.0, Value::string("keep"));
+    assert_eq!(
+        heap.next_guest(owner, &Value::string("missing"))
+            .unwrap_err(),
+        heap::HeapError::NextCursorMissing
+    );
+}
+
 #[test]
 fn lua_candidate_next_on_empty_or_cleared_returns_one_nil() {
     let empty_key = run_next("local k, v = next({})\nreturn type(k)\n");
@@ -4792,10 +5253,11 @@ fn assert_not_lowered(source: &str) {
 /// `CallReturn::Many` from that non-yielding host, so the array transport
 /// cannot become two public returns without a second protocol. An
 /// unparenthesized tail `next` stays on the existing unsupported path.
-/// `return (next(t))` still exports the first value. A cursor that is not a
-/// live entry, including one whose entry was cleared, is `invalid key to
-/// next`, not a restart. `next` walks the owner's edge vector; that walk is
-/// the scan cost of this candidate.
+/// `return (next(t))` still exports the first value. A key that was never
+/// stored, or that an explicit removal dropped, is `invalid key to next`,
+/// not a restart. A weak-cleared key stays in the edge vector and continues.
+/// `next` walks the owner's edge vector; that walk is the scan cost of this
+/// candidate.
 #[test]
 fn lua_candidate_review_tail_next_is_not_lowered() {
     let sources = [
