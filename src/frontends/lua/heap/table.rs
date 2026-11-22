@@ -22,6 +22,9 @@ const UPVALUE_EDGE: u32 = 0;
 /// Cell current-value field. It is keyed only on an upvalue node. A missing
 /// edge is nil. This id is not a Lua number.
 const CURRENT_EDGE: u32 = 0;
+/// Table-to-cell field. Not `__mode`, and not the per-closure field that
+/// points at that closure's own node. This id is not a Lua number.
+const CELL_EDGE: u32 = 2;
 
 /// Hard caps. Edges and root slots are counted separately so fields cannot
 /// grow past the edge cap by avoiding the node cap.
@@ -822,6 +825,57 @@ impl LuaHeap {
         let closure = ClosureRef::closure(self.domain, *slot, *generation);
         self.require_closure(closure)?;
         Ok(closure)
+    }
+
+    /// Points a table at the one cell that binding uses.
+    ///
+    /// The field is private. It is not a Lua key, so next/raw enumeration does
+    /// not see it. A non-weak table follows the edge strongly through the
+    /// existing mark; this does not add a scan rule.
+    pub fn set_cell_edge(&mut self, from: TableRef, cell: UpvalueRef) -> Result<(), HeapError> {
+        self.require_live(from)?;
+        self.require_upvalue(cell)?;
+        self.write_from(
+            from.slot(),
+            EdgeKey::Field(CELL_EDGE),
+            EdgeValue::Upvalue {
+                slot: cell.slot(),
+                generation: cell.generation(),
+            },
+        )
+    }
+
+    /// The cell a table publishes. A missing edge is `StaleHandle`.
+    pub fn cell_edge(&self, from: TableRef) -> Result<UpvalueRef, HeapError> {
+        self.require_live(from)?;
+        let Some(value) = self.stored_from(from.slot(), &EdgeKey::Field(CELL_EDGE)) else {
+            return Err(HeapError::StaleHandle);
+        };
+        let EdgeValue::Upvalue { slot, generation } = value else {
+            return Err(HeapError::WrongKind);
+        };
+        let cell = UpvalueRef::upvalue(self.domain, *slot, *generation);
+        self.require_upvalue(cell)?;
+        Ok(cell)
+    }
+
+    /// The table currently stored in a cell.
+    ///
+    /// `Ok(None)` is a missing current edge, which is nil. This does not go
+    /// through a closure.
+    pub fn current_table(&self, cell: UpvalueRef) -> Result<Option<TableRef>, HeapError> {
+        self.require_upvalue(cell)?;
+        let Some(value) = self.stored_from(cell.slot(), &EdgeKey::Field(CURRENT_EDGE)) else {
+            return Ok(None);
+        };
+        match value {
+            EdgeValue::Table { slot, generation } => {
+                let table = TableRef::table(self.domain, *slot, *generation);
+                self.require_live(table)?;
+                Ok(Some(table))
+            }
+            _ => Err(HeapError::WrongKind),
+        }
     }
 
     /// Writes a scalar into the same record and quota as a table edge.
