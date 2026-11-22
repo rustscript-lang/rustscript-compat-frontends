@@ -855,6 +855,11 @@ fn get_edge(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
         heap::GuestClass::Table(table) => table,
         _ => return Err(host_fault("field source is not a table")),
     };
+    // Nil and boolean keys are misses. Boolean keys are not written. Unissued
+    // integers, foreign handles, and stale carriers stay on the error path.
+    if matches!(key_value, Value::Null | Value::Bool(_)) {
+        return Ok(Value::Null);
+    }
     let mut host = call.vm().host_context();
     if let Value::String(name) = key_value {
         return heap::with_heap(&mut host, |heap| heap.named_value(table, &name))
@@ -2050,6 +2055,13 @@ impl Lower<'_> {
                 {
                     let owner = self.expr(owner)?;
                     return self.call(GET_METATABLE, vec![owner]);
+                }
+                if name.is("rawget") {
+                    // Exact two arguments. Same GET_EDGE path as t[k]. No metamethod.
+                    let [table, key] = args.exprs.as_slice() else {
+                        return Err(self.unsupported(expr.span()));
+                    };
+                    return self.index_read(table, key, expr.span());
                 }
                 if name.is("external_shape") && args.exprs.is_empty() {
                     return self.call(EXTERNAL_SHAPE, vec![]);

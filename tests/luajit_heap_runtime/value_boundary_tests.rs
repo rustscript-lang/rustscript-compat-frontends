@@ -360,8 +360,9 @@ impl vm::HostOwnedFunction for Witness {
 }
 
 fn special_float(tag: f64) -> f64 {
-    // Candidate source cannot spell these. The tags are ordinary numbers.
-    // The returned binary64 values are the typed inputs.
+    // `1e400` is +Inf in this lowerer. `-0`, NaN, and `-Inf` still enter
+    // through these tags. The tags themselves are ordinary numbers. The
+    // returned binary64 values are the typed inputs.
     match tag {
         1.0 => f64::from_bits(0x8000_0000_0000_0000),
         2.0 => f64::NAN,
@@ -3677,4 +3678,320 @@ fn trailing_label_set_keeps_resolved_identity() {
             matches!(stmt, ast::Stmt::Label { name, .. } if name.span == label.span)
         })
     );
+}
+
+/// `rawget(weak, 1)` reads the numeric weak value without a caller binding.
+///
+/// The helper records the value, stores it only under `weak[1]`, and returns
+/// the weak table. Omit keeps that same object. Collect returns one nil and
+/// retires the original token and heap node. The string key `"1"` is a
+/// different entry.
+#[test]
+fn lua_candidate_rawget_reads_a_weak_numeric_value_until_collect() {
+    let source = r#"
+local function seed()
+  local mt = {}
+  mt.__mode = "v"
+  local weak = {}
+  setmetatable(weak, mt)
+  local value = {}
+  value.self = value
+  weak[1] = value
+  observe_table(value, 0)
+  return weak
+end
+local weak = seed()
+observe_table(rawget(weak, 1), 0)
+@collect@
+return type(rawget(weak, 1))
+"#;
+    let omitted = source.replace("@collect@\n", "");
+    let observed = assert_weak_probe(&omitted, "table", &[true, true], 3, 0);
+    assert_eq!(
+        observed[0], observed[1],
+        "rawget returns the helper's original object"
+    );
+
+    let collected = source.replace("@collect@", "collectgarbage(\"collect\")");
+    let observed = assert_weak_probe(&collected, "nil", &[false, false], 1, 1);
+    assert_eq!(
+        observed[0], observed[1],
+        "the retired token is the object rawget returned"
+    );
+
+    let text_key = omitted.replace(
+        "return type(rawget(weak, 1))",
+        "return type(rawget(weak, \"1\"))",
+    );
+    let observed = assert_weak_probe(&text_key, "nil", &[true, true], 3, 0);
+    assert_eq!(observed[0], observed[1], "the numeric entry stays readable");
+}
+
+/// A nil key is one miss after the table is accepted. The numeric entry stays.
+#[test]
+fn lua_candidate_rawget_nil_key_reads_one_nil() {
+    let source = r#"
+local owner = {}
+owner[1] = "kept"
+local k = 1
+k = nil
+return rawget(owner, k)
+"#;
+    let mut vm = candidate(source);
+    assert_eq!(vm.run().expect("nil key readback"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Null]);
+    assert_eq!(heap::stats(&mut vm.host_context()).unwrap().live_edges, 1);
+
+    let kept = source.replace("return rawget(owner, k)", "return owner[1]");
+    let mut vm = candidate(&kept);
+    assert_eq!(
+        vm.run().expect("entry survives a nil key"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::string("kept")]);
+}
+
+/// A boolean cannot be written as a key. When one reaches `rawget`, it misses.
+#[test]
+fn lua_candidate_rawget_bool_key_is_a_miss() {
+    let source = r#"
+local a = {}
+local owner = {}
+owner[1] = "kept"
+local k = same_table(a, a)
+return rawget(owner, k)
+"#;
+    let mut vm = candidate(source);
+    assert_eq!(vm.run().expect("bool key readback"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Null]);
+
+    let kept = source.replace("return rawget(owner, k)", "return owner[1]");
+    let mut vm = candidate(&kept);
+    assert_eq!(
+        vm.run().expect("bool key does not delete"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::string("kept")]);
+}
+
+/// A nil table is rejected before a nil key can become a miss.
+#[test]
+fn lua_candidate_rawget_rejects_a_nil_table_before_the_key() {
+    let source = r#"
+local owner = 1
+owner = nil
+local k = 1
+k = nil
+return rawget(owner, k)
+"#;
+    let mut vm = candidate(source);
+    let error = vm.run().expect_err("nil table");
+    assert!(
+        matches!(error, vm::VmError::HostError(ref message) if message == "field source is not a table"),
+        "{error}"
+    );
+}
+
+/// An unissued array is not a nil miss, as a table or as a key.
+#[test]
+fn lua_candidate_rawget_keeps_unissued_values_as_errors() {
+    let table = "return rawget(external_shape(), 1)";
+    let mut vm = candidate(table);
+    let error = vm.run().expect_err("unissued table");
+    assert!(
+        matches!(error, vm::VmError::HostError(ref message) if message == "field source is not a table"),
+        "{error}"
+    );
+
+    let key = r#"
+local owner = {}
+owner[1] = "kept"
+local bad = external_shape()
+return rawget(owner, bad)
+"#;
+    let mut vm = candidate(key);
+    let error = vm.run().expect_err("unissued key");
+    assert!(
+        matches!(error, vm::VmError::HostError(ref message) if message == "edge key is not a table"),
+        "{error}"
+    );
+    assert_eq!(heap::stats(&mut vm.host_context()).unwrap().live_edges, 1);
+
+    let copy = r#"
+local owner = {}
+owner[1] = "kept"
+local bad = copy_fields(owner)
+return rawget(owner, bad)
+"#;
+    let mut vm = candidate(copy);
+    let error = vm.run().expect_err("structural copy key");
+    assert!(
+        matches!(error, vm::VmError::HostError(ref message) if message == "edge key is not a table"),
+        "{error}"
+    );
+    assert_eq!(heap::stats(&mut vm.host_context()).unwrap().live_edges, 1);
+}
+
+/// Boolean keys stay unwritable. `rawget` does not add a write path.
+#[test]
+fn lua_candidate_bool_key_write_stays_refused() {
+    let source = r#"
+local a = {}
+local owner = {}
+owner[1] = "kept"
+local k = same_table(a, a)
+observe_table(owner, 0)
+owner[k] = "no"
+"#;
+    let mut vm = candidate(source);
+    let error = vm.run().expect_err("bool key write");
+    assert!(
+        matches!(error, vm::VmError::HostError(ref message) if message == "edge key is not a table"),
+        "{error}"
+    );
+    assert_eq!(heap::stats(&mut vm.host_context()).unwrap().live_edges, 1);
+}
+
+/// The fresh table is rooted while the key expression collects.
+///
+/// The key is parenthesized because index keys already accept that form.
+/// A table constructor is not an index key, so the reversed case uses a name.
+/// Collect in the first argument does not root a table that has not been
+/// evaluated, and that number is still not a table.
+#[test]
+fn lua_candidate_rawget_roots_a_fresh_table_while_the_key_collects() {
+    let source = r#"
+local orphan = {}
+orphan.self = orphan
+observe_table(orphan, 0)
+orphan = nil
+return type(rawget({}, (collectgarbage("collect"))))
+"#;
+    let mut vm = candidate(source);
+    assert_eq!(vm.run().expect("collect inside the key"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("nil")]);
+    let observed = observed_tables(&mut vm);
+    assert_eq!(observed.len(), 1);
+    assert!(
+        !heap::with_heap(&mut vm.host_context(), |heap| {
+            Ok(heap.alive(observed[0].table))
+        })
+        .unwrap()
+    );
+    let stats = heap::stats(&mut vm.host_context()).unwrap();
+    assert_eq!(stats.collections, 1);
+    assert_eq!(
+        stats.live_nodes, 1,
+        "the fresh table survived the key collect"
+    );
+    assert_eq!(stats.live_edges, 0);
+
+    let omitted = source.replace("(collectgarbage(\"collect\"))", "0");
+    let mut vm = candidate(&omitted);
+    assert_eq!(vm.run().expect("omit key collect"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("nil")]);
+    let observed = observed_tables(&mut vm);
+    assert!(
+        heap::with_heap(&mut vm.host_context(), |heap| {
+            Ok(heap.alive(observed[0].table))
+        })
+        .unwrap()
+    );
+    let stats = heap::stats(&mut vm.host_context()).unwrap();
+    assert_eq!(stats.collections, 0);
+    assert_eq!(stats.live_nodes, 2);
+
+    let reversed = r#"
+local orphan = {}
+orphan.self = orphan
+observe_table(orphan, 0)
+orphan = nil
+local key = {}
+return type(rawget((collectgarbage("collect")), key))
+"#;
+    let mut vm = candidate(reversed);
+    let error = vm.run().expect_err("collect before the table exists");
+    assert!(
+        matches!(error, vm::VmError::HostError(ref message) if message == "field source is not a table"),
+        "{error}"
+    );
+    let observed = observed_tables(&mut vm);
+    assert!(
+        !heap::with_heap(&mut vm.host_context(), |heap| {
+            Ok(heap.alive(observed[0].table))
+        })
+        .unwrap()
+    );
+    assert_eq!(heap::stats(&mut vm.host_context()).unwrap().collections, 1);
+}
+
+/// A block-local `rawget` does not replace the unbound call after the block.
+#[test]
+fn lua_candidate_rawget_after_a_block_shadow_is_the_builtin() {
+    let source = r#"
+do
+  local rawget = 1
+end
+local owner = {}
+owner[1] = "kept"
+return rawget(owner, 1)
+"#;
+    let mut vm = candidate(source);
+    assert_eq!(vm.run().expect("builtin after the block"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("kept")]);
+}
+
+#[test]
+fn lua_candidate_local_rawget_is_not_the_builtin() {
+    let function = r#"
+local function rawget()
+  return 7
+end
+local n = rawget()
+return n
+"#;
+    let mut vm = candidate(function);
+    assert_eq!(vm.run().expect("local function"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Float(7.0)]);
+
+    for source in [
+        "local rawget = 1\nreturn rawget({}, 1)\n",
+        "local function rawget()\n  return 7\nend\nreturn rawget({}, 1)\n",
+        "return rawget({})\n",
+        "return rawget({}, 1, 2)\n",
+    ] {
+        let error = candidate::lower(source, catalog()).expect_err(source);
+        let text = error.to_string();
+        assert!(
+            text.contains("not lowered"),
+            "{source} lowered or failed differently: {text}"
+        );
+    }
+}
+
+/// `1e400` is +Inf in this lowerer. It shares the injected +Inf key.
+/// `-0` and NaN still need `float_bits`.
+#[test]
+fn lua_candidate_literal_overflow_shares_positive_infinity_key() {
+    let from_literal = r#"
+local inf = float_bits(3)
+local owner = {}
+owner[1e400] = "literal"
+return owner[inf]
+"#;
+    let mut vm = candidate(from_literal);
+    assert_eq!(vm.run().expect("read injected +Inf"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("literal")]);
+    assert_eq!(heap::stats(&mut vm.host_context()).unwrap().live_edges, 1);
+
+    let from_bits = r#"
+local inf = float_bits(3)
+local owner = {}
+owner[inf] = "bits"
+return rawget(owner, 1e400)
+"#;
+    let mut vm = candidate(from_bits);
+    assert_eq!(vm.run().expect("read literal +Inf"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("bits")]);
+    assert_eq!(heap::stats(&mut vm.host_context()).unwrap().live_edges, 1);
 }
