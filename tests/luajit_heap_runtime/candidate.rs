@@ -1254,11 +1254,81 @@ impl Lower<'_> {
     /// Normal exit of one chunk `do`. Slots declared in this block leave
     /// `live_locals`. Same-name outer slots stay where they are, including a
     /// slot already removed by `= nil`. A function body is not this path.
+    ///
+    /// A resolver-proven `goto` to this block's trailing end label does not
+    /// emit the suffix. `retire_block` is still the exit, so executed bindings
+    /// drop their roots. This is not the `control.rs` state dispatcher, and
+    /// the target comes from the resolved label index rather than a bare name.
     fn lower_do(&mut self, span: ast::Span, body: &ast::Block) -> Result<(), ParseError> {
-        for stmt in &body.stmts {
+        let statements = match self.tail_goto_cut(span, body)? {
+            Some(cut) => &body.stmts[..cut],
+            None => body.stmts.as_slice(),
+        };
+        for stmt in statements {
             self.lower_stmt(stmt)?;
         }
         self.retire_block(span, body)
+    }
+
+    /// Index of the one direct `goto` whose resolved target is this block's
+    /// trailing end label. `None` keeps the straight path. A different goto
+    /// stays unsupported instead of falling through the suffix.
+    fn tail_goto_cut(
+        &self,
+        span: ast::Span,
+        body: &ast::Block,
+    ) -> Result<Option<usize>, ParseError> {
+        let mut found = None;
+        for (index, stmt) in body.stmts.iter().enumerate() {
+            let ast::Stmt::Goto {
+                span: goto_span, ..
+            } = stmt
+            else {
+                continue;
+            };
+            if found.is_some() {
+                return Err(self.statement_unsupported(*goto_span));
+            }
+            found = Some((index, *goto_span));
+        }
+        let Some((index, goto_span)) = found else {
+            return Ok(None);
+        };
+        let Some(ast::Stmt::Label { name, .. }) = body.stmts.last() else {
+            return Err(self.statement_unsupported(goto_span));
+        };
+        if index + 1 >= body.stmts.len() {
+            return Err(self.statement_unsupported(goto_span));
+        }
+        let jump = self
+            .resolution
+            .gotos
+            .iter()
+            .find(|jump| jump.span == goto_span && jump.function_id == 0);
+        let Some(jump) = jump else {
+            return Err(self.statement_unsupported(goto_span));
+        };
+        let Some(target) = jump.target else {
+            return Err(self.statement_unsupported(goto_span));
+        };
+        let Some(label) = self.resolution.labels.get(target) else {
+            return Err(self.statement_unsupported(goto_span));
+        };
+        let same_end = label.trailing && label.function_id == 0 && label.span == name.span;
+        if !same_end {
+            return Err(self.statement_unsupported(goto_span));
+        }
+        if self
+            .block_scope(span, body)
+            .is_some_and(|scope_id| scope_id != label.scope_id)
+        {
+            return Err(self.statement_unsupported(goto_span));
+        }
+        Ok(Some(index))
+    }
+
+    fn statement_unsupported(&self, span: ast::Span) -> ParseError {
+        ParseError::at_line(self.line(span) as usize, "Lua statement not lowered yet")
     }
 
     fn retire_block(&mut self, span: ast::Span, body: &ast::Block) -> Result<(), ParseError> {

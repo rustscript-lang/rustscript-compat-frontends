@@ -2736,3 +2736,265 @@ return mt["__mode"]
         1,
     );
 }
+
+// Chunk `do` jumps to its own trailing end label. The resolver target is that
+// label, not a same-named label in another block. Statements after the goto
+// are not lowered, so `marker.ran = x` does not publish a strong edge. Both
+// receivers from `pair` stay live through the in-block collect, including the
+// shadowed first slot. Leaving the block retires those executed bindings.
+// The next collect closes both nodes and Core tokens. Omitting it leaves
+// them. The outer `x` is a different binding and stays. An adjacent label
+// would not show this: the skipped field write is what the jump must avoid.
+#[test]
+fn lua_candidate_chunk_do_tail_goto_releases_executed_roots() {
+    let source = r#"
+local function pair()
+  local left = {}
+  local right = {}
+  observe_table(left, 0)
+  observe_table(right, 0)
+  local a = left
+  local b = right
+  return a, b
+end
+local mt = {}
+mt.__mode = "v"
+local owner = {}
+setmetatable(owner, mt)
+local marker = {}
+local x = {}
+owner.keep = x
+observe_table(x, 0)
+observe_table(marker, 0)
+do
+  local x, x = pair()
+  owner.seen = x
+  observe_table(x, 0)
+  collectgarbage("collect")
+  observe_table(owner.seen, 0)
+  observe_table(owner.keep, 0)
+  goto tail
+  marker.ran = x
+  ::tail::
+end
+@after@
+"#;
+    let collect_after = "\
+collectgarbage(\"collect\")
+observe_table(x, 0)
+observe_table(owner.keep, 0)
+observe_table(marker, 0)
+return type(owner.seen)
+";
+    let omit_after = "\
+observe_table(owner.seen, 0)
+observe_table(x, 0)
+observe_table(owner.keep, 0)
+observe_table(marker, 0)
+return type(owner.seen)
+";
+    // marker is an extra rooted table and adds no edge when the jump skips
+    // `marker.ran = x`. The duplicate-receiver counts are otherwise unchanged.
+    for (after, result, collections, live_nodes, live_edges, resources) in [
+        (omit_after, "table", 1u32, 6u32, 3u32, 6usize),
+        (collect_after, "nil", 2, 4, 2, 4),
+    ] {
+        let mut vm = candidate(&source.replace("@after@", after));
+        assert_eq!(
+            vm.run().expect("run tail goto"),
+            VmStatus::Halted,
+            "{result}"
+        );
+        assert_eq!(vm.stack(), &[Value::string(result)], "{result}");
+        let mut host = vm.host_context();
+        let tables = host.scope_state::<Vec<ObservedTable>>().unwrap().clone();
+        let outer = tables[0];
+        let marker = tables[1];
+        let left = tables[2];
+        let right = tables[3];
+        let visible = tables[4];
+        let seen_inside = tables[5];
+        let keep_inside = tables[6];
+        assert_ne!(left, right, "pair returns two tables");
+        assert_ne!(marker, outer, "marker is not the outer local");
+        assert_eq!(visible, right, "the visible name is the second receiver");
+        assert_ne!(
+            visible, left,
+            "the shadowed receiver is not the visible name"
+        );
+        assert_eq!(
+            seen_inside, right,
+            "in-block collect keeps the visible receiver"
+        );
+        assert_eq!(
+            keep_inside, outer,
+            "in-block collect keeps the outer object"
+        );
+        let drop_alive = result == "table";
+        let (seen_after, restored, keep_after, marker_after) = if drop_alive {
+            assert_eq!(
+                tables[7], right,
+                "omitted collect leaves the visible receiver"
+            );
+            (tables[7], tables[8], tables[9], tables[10])
+        } else {
+            (right, tables[7], tables[8], tables[9])
+        };
+        assert_eq!(restored, outer, "the restored name is the outer object");
+        assert_ne!(restored, right, "block exit does not keep the inner name");
+        assert_eq!(keep_after, outer, "owner.keep is the outer object");
+        assert_eq!(marker_after, marker, "the jump does not replace marker");
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| Ok(heap.alive(left.table))).unwrap(),
+            drop_alive,
+            "shadowed receiver after the block; result={result}"
+        );
+        for (table, alive) in [
+            (left, drop_alive),
+            (right, drop_alive),
+            (outer, true),
+            (marker, true),
+            (visible, drop_alive),
+            (seen_inside, drop_alive),
+            (keep_inside, true),
+            (seen_after, drop_alive),
+            (restored, true),
+            (keep_after, true),
+            (marker_after, true),
+        ] {
+            assert_table_lifetime(&mut host, table, alive);
+        }
+        let stats = heap::stats(&mut host).unwrap();
+        assert_eq!(stats.collections, collections, "{result}");
+        assert_eq!(stats.live_nodes, live_nodes, "{result}");
+        assert_eq!(stats.live_edges, live_edges, "{result}");
+        assert_eq!(stats.live_roots, 0, "{result}");
+        assert_eq!(host.resource_count(), resources, "{result}");
+    }
+}
+
+// Same trailing-label cut as the replayed goto. The weak write is
+// `owner[k]` with a text local. Leaving the block still drops both
+// same-name receiver roots. `owner.seen` and `owner["seen"]` read that
+// one record. Collecting after the block retires the receiver token;
+// omitting that collect leaves the same table. `marker.ran = x` remains
+// after the goto, so a missed cut would keep the receiver.
+#[test]
+fn lua_candidate_chunk_do_tail_goto_string_key_releases_receiver() {
+    let source = r#"
+local function pair()
+  local left = {}
+  local right = {}
+  observe_table(left, 0)
+  observe_table(right, 0)
+  local a = left
+  local b = right
+  return a, b
+end
+local mt = {}
+mt.__mode = "v"
+local owner = {}
+setmetatable(owner, mt)
+observe_table(owner, 0)
+local marker = {}
+local x = {}
+owner.keep = x
+observe_table(x, 0)
+do
+  local x, x = pair()
+  local k = "seen"
+  owner[k] = x
+  collectgarbage("collect")
+  goto tail
+  marker.ran = x
+  ::tail::
+end
+@after@
+"#;
+    let reads = ["owner.seen", r#"owner["seen"]"#];
+    for collect in [false, true] {
+        for read in reads {
+            let after = if collect {
+                format!(
+                    "collectgarbage(\"collect\")\n\
+                     return type({read})\n"
+                )
+            } else {
+                format!(
+                    "observe_table(owner.seen, 0)\n\
+                     observe_table(owner[\"seen\"], 0)\n\
+                     return type({read})\n"
+                )
+            };
+            let label = format!("collect={collect} read={read}");
+            let mut vm = candidate(&source.replace("@after@", &after));
+            assert_eq!(
+                vm.run().expect("run tail goto string key"),
+                VmStatus::Halted,
+                "{label}"
+            );
+            let result = if collect { "nil" } else { "table" };
+            assert_eq!(vm.stack(), &[Value::string(result)], "{label}");
+            let mut host = vm.host_context();
+            let tables = host.scope_state::<Vec<ObservedTable>>().unwrap().clone();
+            let owner = tables[0];
+            let outer = tables[1];
+            let left = tables[2];
+            let right = tables[3];
+            assert_ne!(left, right, "pair returns two tables; {label}");
+            assert_ne!(owner, outer, "owner is not the kept object; {label}");
+            if !collect {
+                let dot = tables[4];
+                let bracket = tables[5];
+                assert_eq!(
+                    dot, bracket,
+                    "dot and literal bracket read the dynamic key; {label}"
+                );
+                assert_eq!(dot, right, "that key is the visible receiver; {label}");
+                assert_ne!(
+                    dot, left,
+                    "the shadowed receiver is not the stored value; {label}"
+                );
+            }
+            let (seen, keep) = heap::with_heap(&mut host, |heap| {
+                Ok((
+                    heap.named_edge(owner.table, "seen")?,
+                    heap.named_edge(owner.table, "keep")?,
+                ))
+            })
+            .unwrap();
+            assert_eq!(
+                keep,
+                Some(outer.table),
+                "owner.keep stays the outer object; {label}"
+            );
+            if collect {
+                assert_eq!(seen, None, "the weak text key is cleared; {label}");
+            } else {
+                assert_eq!(
+                    seen,
+                    Some(right.table),
+                    "the dynamic write and both reads are one key; {label}"
+                );
+            }
+            for (table, alive) in [
+                (left, !collect),
+                (right, !collect),
+                (owner, true),
+                (outer, true),
+            ] {
+                assert_table_lifetime(&mut host, table, alive);
+            }
+            let stats = heap::stats(&mut host).unwrap();
+            assert_eq!(stats.collections, if collect { 2 } else { 1 }, "{label}");
+            assert_eq!(stats.live_nodes, if collect { 4 } else { 6 }, "{label}");
+            assert_eq!(stats.live_edges, if collect { 2 } else { 3 }, "{label}");
+            assert_eq!(stats.live_roots, 0, "{label}");
+            assert_eq!(
+                host.resource_count(),
+                if collect { 4 } else { 6 },
+                "{label}"
+            );
+        }
+    }
+}
