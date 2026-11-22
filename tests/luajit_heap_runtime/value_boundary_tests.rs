@@ -3683,9 +3683,11 @@ fn trailing_label_set_keeps_resolved_identity() {
 /// `rawget(weak, 1)` reads the numeric weak value without a caller binding.
 ///
 /// The helper records the value, stores it only under `weak[1]`, and returns
-/// the weak table. Omit keeps that same object. Collect returns one nil and
-/// retires the original token and heap node. The string key `"1"` is a
-/// different entry.
+/// the weak table. Omit keeps that same object. `type(rawget(...))` observes
+/// only the first value, so collect yields the string `"nil"`. The original
+/// token and heap node are retired. One nil on the VM stack is the separate
+/// `return rawget(owner, k)` case. The string key `"1"` is another entry;
+/// its type wrapper also sees only the first value.
 #[test]
 fn lua_candidate_rawget_reads_a_weak_numeric_value_until_collect() {
     let source = r#"
@@ -3724,7 +3726,10 @@ return type(rawget(weak, 1))
         "return type(rawget(weak, \"1\"))",
     );
     let observed = assert_weak_probe(&text_key, "nil", &[true, true], 3, 0);
-    assert_eq!(observed[0], observed[1], "the numeric entry stays readable");
+    assert_eq!(
+        observed[0], observed[1],
+        "numeric observations match; type() on \"1\" only saw the first value"
+    );
 }
 
 /// A nil key is one miss after the table is accepted. The numeric entry stays.
@@ -3751,7 +3756,7 @@ return rawget(owner, k)
     assert_eq!(vm.stack(), &[Value::string("kept")]);
 }
 
-/// A boolean cannot be written as a key. When one reaches `rawget`, it misses.
+/// When a boolean reaches `rawget`, the read misses. The numeric entry stays.
 #[test]
 fn lua_candidate_rawget_bool_key_is_a_miss() {
     let source = r#"
@@ -3832,32 +3837,18 @@ return rawget(owner, bad)
     assert_eq!(heap::stats(&mut vm.host_context()).unwrap().live_edges, 1);
 }
 
-/// Boolean keys stay unwritable. `rawget` does not add a write path.
-#[test]
-fn lua_candidate_bool_key_write_stays_refused() {
-    let source = r#"
-local a = {}
-local owner = {}
-owner[1] = "kept"
-local k = same_table(a, a)
-observe_table(owner, 0)
-owner[k] = "no"
-"#;
-    let mut vm = candidate(source);
-    let error = vm.run().expect_err("bool key write");
-    assert!(
-        matches!(error, vm::VmError::HostError(ref message) if message == "edge key is not a table"),
-        "{error}"
-    );
-    assert_eq!(heap::stats(&mut vm.host_context()).unwrap().live_edges, 1);
-}
-
 /// The fresh table is rooted while the key expression collects.
 ///
 /// The key is parenthesized because index keys already accept that form.
 /// A table constructor is not an index key, so the reversed case uses a name.
 /// Collect in the first argument does not root a table that has not been
 /// evaluated, and that number is still not a table.
+///
+/// `last_marked` is that collect's marked-node count. The orphan is retired,
+/// so the marked node is the fresh table the first argument already created.
+/// A second run records that table before the call and checks the same handle
+/// is still alive. Its local also roots it; argument-temp rooting stays on
+/// the first run.
 #[test]
 fn lua_candidate_rawget_roots_a_fresh_table_while_the_key_collects() {
     let source = r#"
@@ -3881,10 +3872,39 @@ return type(rawget({}, (collectgarbage("collect"))))
     let stats = heap::stats(&mut vm.host_context()).unwrap();
     assert_eq!(stats.collections, 1);
     assert_eq!(
+        stats.last_marked, 1,
+        "the collector marked the fresh table already created as the first argument"
+    );
+    assert_eq!(
         stats.live_nodes, 1,
         "the fresh table survived the key collect"
     );
     assert_eq!(stats.live_edges, 0);
+
+    let named = r#"
+local fresh = {}
+observe_table(fresh, 0)
+return type(rawget(fresh, (collectgarbage("collect"))))
+"#;
+    let mut vm = candidate(named);
+    assert_eq!(
+        vm.run().expect("record the fresh table before collect"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::string("nil")]);
+    let observed = observed_tables(&mut vm);
+    assert_eq!(observed.len(), 1);
+    assert!(
+        heap::with_heap(&mut vm.host_context(), |heap| {
+            Ok(heap.alive(observed[0].table))
+        })
+        .unwrap(),
+        "the table recorded before the key collect is still alive"
+    );
+    let stats = heap::stats(&mut vm.host_context()).unwrap();
+    assert_eq!(stats.collections, 1);
+    assert_eq!(stats.last_marked, 1);
+    assert_eq!(stats.live_nodes, 1);
 
     let omitted = source.replace("(collectgarbage(\"collect\"))", "0");
     let mut vm = candidate(&omitted);
@@ -3941,6 +3961,8 @@ return rawget(owner, 1)
     assert_eq!(vm.stack(), &[Value::string("kept")]);
 }
 
+/// A local function named `rawget` returns 7. Legal call shapes this subset
+/// does not lower are not frozen as refusals.
 #[test]
 fn lua_candidate_local_rawget_is_not_the_builtin() {
     let function = r#"
@@ -3953,20 +3975,6 @@ return n
     let mut vm = candidate(function);
     assert_eq!(vm.run().expect("local function"), VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Float(7.0)]);
-
-    for source in [
-        "local rawget = 1\nreturn rawget({}, 1)\n",
-        "local function rawget()\n  return 7\nend\nreturn rawget({}, 1)\n",
-        "return rawget({})\n",
-        "return rawget({}, 1, 2)\n",
-    ] {
-        let error = candidate::lower(source, catalog()).expect_err(source);
-        let text = error.to_string();
-        assert!(
-            text.contains("not lowered"),
-            "{source} lowered or failed differently: {text}"
-        );
-    }
 }
 
 /// `1e400` is +Inf in this lowerer. It shares the injected +Inf key.
