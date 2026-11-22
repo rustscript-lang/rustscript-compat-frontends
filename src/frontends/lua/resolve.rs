@@ -5,9 +5,10 @@
 //! forward jump into a local's scope is an error. Const bindings cannot be
 //! redeclared or assigned, including from a nested function.
 //!
-//! Active local slots and distinct upvalues follow pinned LuaJIT `load`. The
-//! counts are recorded on `Resolution::limits` and do not change binding
-//! identity, goto slots, or `ResolveError`.
+//! Active local slots and distinct upvalues follow pinned LuaJIT `load` for
+//! accept and reject. Overflows are appended to `Resolution::limits` in
+//! frontend walk order. That order is not LuaJIT's first error. The counts
+//! do not change binding identity, goto slots, or `ResolveError`.
 
 use super::ast::*;
 
@@ -27,7 +28,14 @@ pub struct Resolution {
     /// A use whose function differs from the binding's function is a capture.
     pub uses: Vec<NameUse>,
     pub errors: Vec<ResolveError>,
-    /// First overflows of the pinned local-slot and upvalue caps.
+    /// Appended overflows of the pinned local-slot and upvalue caps.
+    ///
+    /// Non-empty means the chunk is over a cap. `first()` is the entry for
+    /// one diagnostic, in frontend walk order. Later entries may repeat the
+    /// same miss: a `for` can overflow on a hidden slot and again on a
+    /// visible index. This is not LuaJIT's first error. LuaJIT can report a
+    /// local before it initializes that local's RHS. Diagnostics that are
+    /// not wired yet do not deduplicate this vector or add state.
     ///
     /// Production lowering still reads `errors` only. This field is the
     /// source-level check; it is not a LuaPlugin switch.
@@ -466,9 +474,11 @@ impl Cx {
             .map(|local| local.binding_index)
     }
 
-    /// Shared name-access point. The closure candidate records `NameUse` from
-    /// this same nearest-binding lookup. Keep capture charging here so
-    /// integration does not grow a second walk.
+    /// Look up the nearest binding and charge a distinct outer upvalue.
+    ///
+    /// `function a.b` and `function a:m` bill the receiver through this
+    /// lookup before `walk_func`. A later integration line reuses the same
+    /// lookup instead of walking the name again.
     fn note_name(&mut self, name: &Name) {
         let function_id = self.funcs.last().expect("function").id;
         let binding = self.lookup_binding(&name.bytes);
@@ -737,6 +747,7 @@ impl Cx {
                 if name.method.is_none() && name.segments.len() == 1 {
                     self.assign_name(&name.segments[0]);
                 } else if let Some(base) = name.segments.first() {
+                    // First segment of `function a.b` / `function a:m`, before the body.
                     self.note_name(base);
                 }
                 self.walk_func(body, name.method.is_some());

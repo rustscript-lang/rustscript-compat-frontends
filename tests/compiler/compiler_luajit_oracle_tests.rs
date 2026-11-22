@@ -1753,6 +1753,8 @@ fn resolved(source: &[u8]) -> resolve::Resolution {
     resolve::resolve(&chunk)
 }
 
+/// `limits.first()` is the frontend walk entry for one diagnostic.
+/// Later entries may repeat. This is not LuaJIT's first error.
 fn assert_first_limit(
     name: &str,
     source: &[u8],
