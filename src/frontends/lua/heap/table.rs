@@ -221,8 +221,9 @@ enum EdgeValue {
         slot: u32,
         generation: u32,
     },
-    /// One guest scalar in the same record as a table target. Field 0 is the
-    /// only key whose string is read as `__mode`.
+    /// One guest scalar in the same record as a table target. Field 0 on a
+    /// table is the only key whose string is read as `__mode`. A cell current
+    /// edge may hold a boolean or binary64; that value is not a key.
     Scalar(Value),
 }
 
@@ -241,13 +242,16 @@ impl EdgeValue {
 ///
 /// A missing edge is nil and is not a variant. `None` from [`LuaHeap::read_cell`]
 /// is that nil. An error is an invalid handle, not nil. A cell is not issued
-/// as a table value.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// as a table value. A scalar carries the stored [`Value`]. [`Value`] is not
+/// `Copy` or `Eq`, so this enum is not either.
+#[derive(Clone, Debug, PartialEq)]
 pub enum CellValue {
     /// The cell currently holds a table.
     Table(TableRef),
     /// The cell currently holds a closure.
     Closure(ClosureRef),
+    /// The cell currently holds a boolean or binary64. Not a table key.
+    Scalar(Value),
 }
 
 /// One explicit root. Table, closure, and upvalue roots share the root vector.
@@ -757,7 +761,8 @@ impl LuaHeap {
     /// Replaces the table currently stored in a shared cell.
     ///
     /// An existing current edge is overwritten. This does not insert a second
-    /// record. A closure target uses [`Self::write_closure_upvalue`].
+    /// record. A closure target uses [`Self::write_closure_upvalue`]. A
+    /// boolean or binary64 uses [`Self::write_scalar_upvalue`].
     pub fn write_upvalue(&mut self, cell: UpvalueRef, table: TableRef) -> Result<(), HeapError> {
         self.require_upvalue(cell)?;
         self.require_live(table)?;
@@ -786,6 +791,29 @@ impl LuaHeap {
                 slot: closure.slot(),
                 generation: closure.generation(),
             },
+        )
+    }
+
+    /// Replaces the current edge with a boolean or binary64 scalar.
+    ///
+    /// Same record as [`Self::write_upvalue`]. An existing edge is overwritten.
+    /// Nil is not stored here; [`Self::clear_upvalue`] deletes that record.
+    /// Any other guest value is refused at entry and leaves the stored edge
+    /// unchanged. The number is stored as given: signed zero is not
+    /// canonicalized, and NaN is not treated as a table key.
+    pub fn write_scalar_upvalue(
+        &mut self,
+        cell: UpvalueRef,
+        value: Value,
+    ) -> Result<(), HeapError> {
+        if !matches!(value, Value::Bool(_) | Value::Float(_)) {
+            return Err(HeapError::WrongKind);
+        }
+        self.require_upvalue(cell)?;
+        self.write_from(
+            cell.slot(),
+            EdgeKey::Field(CURRENT_EDGE),
+            EdgeValue::Scalar(value),
         )
     }
 
@@ -819,19 +847,22 @@ impl LuaHeap {
                 self.require_closure(found)?;
                 Ok(Some(CellValue::Closure(found)))
             }
+            EdgeValue::Scalar(value @ (Value::Bool(_) | Value::Float(_))) => {
+                Ok(Some(CellValue::Scalar(value.clone())))
+            }
             EdgeValue::Upvalue { .. } | EdgeValue::Scalar(_) => Err(HeapError::WrongKind),
         }
     }
 
     /// Reads the table currently stored through a closure's cell.
     ///
-    /// A closure target is `WrongKind`. A missing edge has no table, so this
-    /// table adapter returns `StaleHandle`. [`Self::read_cell`] returns `None`
-    /// for that nil.
+    /// A closure or scalar target is `WrongKind`. A missing edge has no table,
+    /// so this table adapter returns `StaleHandle`. [`Self::read_cell`] returns
+    /// `None` for that nil.
     pub fn read_upvalue(&self, closure: ClosureRef) -> Result<TableRef, HeapError> {
         match self.read_cell(closure)? {
             Some(CellValue::Table(table)) => Ok(table),
-            Some(CellValue::Closure(_)) => Err(HeapError::WrongKind),
+            Some(CellValue::Closure(_) | CellValue::Scalar(_)) => Err(HeapError::WrongKind),
             None => Err(HeapError::StaleHandle),
         }
     }

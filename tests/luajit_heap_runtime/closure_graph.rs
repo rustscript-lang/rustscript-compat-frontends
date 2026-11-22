@@ -74,6 +74,7 @@ fn read_capture(host: &mut HostContext<'_>, closure: ClosureRef) -> Value {
     let table = heap::with_heap(host, |heap| match heap.read_cell(closure)? {
         Some(CellValue::Table(table)) => Ok(table),
         Some(CellValue::Closure(_)) => panic!("capture is not a closure"),
+        Some(CellValue::Scalar(_)) => panic!("capture is not a table"),
         None => panic!("capture is nil"),
     })
     .expect("read the cell through the closure");
@@ -2231,4 +2232,283 @@ fn closure_keys_sharing_a_cell_stay_distinct_and_refused_writes_keep_entries() {
         Some(table_value)
     );
     assert_eq!(heap.collect().live_nodes, 5);
+}
+
+fn shared_current(
+    host: &mut HostContext<'_>,
+    left: ClosureRef,
+    right: ClosureRef,
+) -> Option<CellValue> {
+    let through_left = heap::with_heap(host, |heap| heap.read_cell(left)).expect("left cell");
+    let through_right = heap::with_heap(host, |heap| heap.read_cell(right)).expect("right cell");
+    assert!(
+        same_recorded_cell(&through_left, &through_right),
+        "both closures read the same current edge: {through_left:?} vs {through_right:?}"
+    );
+    through_left
+}
+
+fn same_recorded_cell(left: &Option<CellValue>, right: &Option<CellValue>) -> bool {
+    match (left, right) {
+        (
+            Some(CellValue::Scalar(Value::Float(left))),
+            Some(CellValue::Scalar(Value::Float(right))),
+        ) => left.to_bits() == right.to_bits(),
+        _ => left == right,
+    }
+}
+
+/// Two closures share one cell. `false` replaces that cell's only object edge
+/// in the same record. The old self-cycle stays live until the next collect.
+#[test]
+fn shared_upvalue_scalar_replaces_object_edge_and_collect_reclaims_only_that_cycle() {
+    super::super::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(
+            &mut host,
+            HeapLimits {
+                nodes: 6,
+                roots: 2,
+                edges: 6,
+                max_generation: 8,
+            },
+        )
+        .expect("install");
+        let root_raw = publish_raw(&mut host);
+        let root = table_ref(&host, root_raw);
+        let independent_raw = publish_raw(&mut host);
+        let independent = table_ref(&host, independent_raw);
+        let frame = heap::with_heap(&mut host, |heap| heap.enter_roots(2)).expect("two roots");
+        heap::with_heap(&mut host, |heap| heap.write_root(frame, 0, root)).expect("root the owner");
+        heap::with_heap(&mut host, |heap| heap.write_root(frame, 1, independent))
+            .expect("root the survivor");
+
+        let (left, right, cell) = heap::with_heap(&mut host, |heap| {
+            let left = heap.alloc_closure()?;
+            let right = heap.alloc_closure()?;
+            let cell = heap.alloc_upvalue()?;
+            heap.set_closure_edge(root, LEFT_KEY, left)?;
+            heap.set_closure_edge(root, RIGHT_KEY, right)?;
+            heap.set_upvalue_edge(left, cell)?;
+            heap.set_upvalue_edge(right, cell)?;
+            Ok((left, right, cell))
+        })
+        .expect("two closures, one cell");
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| heap.upvalue_of(left)).expect("left cell"),
+            cell
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| heap.upvalue_of(right)).expect("right cell"),
+            cell,
+            "both closures name one upvalue"
+        );
+
+        let original_raw = publish_raw(&mut host);
+        let original = table_ref(&host, original_raw);
+        heap::with_heap(&mut host, |heap| heap.write_upvalue(cell, original))
+            .expect("capture the table");
+        heap::with_heap(&mut host, |heap| {
+            heap.set_edge(original, BACK_KEY, original)
+        })
+        .expect("self-cycle");
+        let original_carrier = issue(&mut host, original);
+        let independent_carrier = issue(&mut host, independent);
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| heap.read_upvalue(left)).expect("left object"),
+            original
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| heap.read_upvalue(right)).expect("right object"),
+            original,
+            "the live root keeps the shared object readable"
+        );
+        let linked = heap::stats(&mut host).expect("linked");
+        assert_eq!(linked.live_nodes, 6, "three tables, two closures, one cell");
+        assert_eq!(
+            linked.live_edges, 6,
+            "two fields, two closure links, one current edge, one self-edge"
+        );
+        assert_eq!(
+            linked.edge_slots, 6,
+            "the edge cap is the current record count"
+        );
+
+        heap::with_heap(&mut host, |heap| {
+            heap.write_scalar_upvalue(cell, Value::Bool(false))
+        })
+        .expect("replace the object edge with false");
+        assert_eq!(
+            heap::stats(&mut host).expect("overwrite").live_edges,
+            linked.live_edges,
+            "a scalar overwrite does not add an edge"
+        );
+        assert_eq!(
+            heap::stats(&mut host).expect("slots").edge_slots,
+            linked.edge_slots
+        );
+        assert_eq!(
+            shared_current(&mut host, left, right),
+            Some(CellValue::Scalar(Value::Bool(false)))
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| heap.read_upvalue(left)).expect_err("not a table"),
+            HeapError::WrongKind
+        );
+
+        // Uncollected control. The old cycle is still live before a real collect.
+        assert!(heap::with_heap(&mut host, |heap| Ok(heap.alive(original))).expect("still live"));
+        assert!(
+            token_open(&host, original_raw),
+            "token stays open without collect"
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| Ok(heap.guest_class(&original_carrier)))
+                .expect("class"),
+            heap::GuestClass::Table(original)
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| heap.edge(original, BACK_KEY)).expect("self-edge"),
+            Some(original)
+        );
+
+        let before_tokens = host.resource_count();
+        assert_eq!(before_tokens, 3, "root, survivor, and the captured table");
+        let report = heap::collect(&mut host).expect("collect the replaced cycle");
+        let meter = heap::take_scan_meter(&mut host).expect("meter");
+        assert_eq!(meter.mark_passes, 1, "the existing collector marks once");
+        assert_eq!(
+            meter.outgoing_edge_checks, 5,
+            "mark walks the rooted edges and does not follow the scalar"
+        );
+        assert_eq!(
+            meter.index_edge_checks,
+            u64::from(linked.live_edges) * 2,
+            "index walks the same edge vector twice"
+        );
+        assert_eq!(report.live_nodes, 5, "only the self-cycle table is swept");
+        assert!(!heap::with_heap(&mut host, |heap| Ok(heap.alive(original))).expect("swept"));
+        assert!(
+            !token_open(&host, original_raw),
+            "the captured table token is closed"
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| Ok(heap.guest_class(&original_carrier)))
+                .expect("class"),
+            heap::GuestClass::Unissued
+        );
+        assert!(heap::with_heap(&mut host, |heap| Ok(heap.alive(root))).expect("root"));
+        assert!(heap::with_heap(&mut host, |heap| Ok(heap.closure_alive(left))).expect("left"));
+        assert!(heap::with_heap(&mut host, |heap| Ok(heap.closure_alive(right))).expect("right"));
+        assert!(heap::with_heap(&mut host, |heap| Ok(heap.upvalue_alive(cell))).expect("cell"));
+        assert!(heap::with_heap(&mut host, |heap| Ok(heap.alive(independent))).expect("survivor"));
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| heap.upvalue_of(left)).expect("left still shared"),
+            cell
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| heap.upvalue_of(right)).expect("right still shared"),
+            cell
+        );
+        assert!(token_open(&host, root_raw));
+        assert!(token_open(&host, independent_raw));
+        assert_eq!(host.resource_count(), before_tokens - 1);
+        assert_eq!(
+            heap::stats(&mut host).expect("after sweep").live_edges,
+            linked.live_edges - 1,
+            "sweep drops the self-edge and keeps the current scalar record"
+        );
+        assert_eq!(
+            shared_current(&mut host, left, right),
+            Some(CellValue::Scalar(Value::Bool(false)))
+        );
+
+        let neg_zero = -0.0_f64;
+        heap::with_heap(&mut host, |heap| {
+            heap.write_scalar_upvalue(cell, Value::Float(neg_zero))
+        })
+        .expect("store -0");
+        match shared_current(&mut host, left, right) {
+            Some(CellValue::Scalar(Value::Float(stored))) => {
+                assert_eq!(
+                    stored.to_bits(),
+                    neg_zero.to_bits(),
+                    "signed zero is stored as given"
+                );
+                assert_ne!(stored.to_bits(), 0.0_f64.to_bits());
+                assert_eq!(1.0 / stored, f64::NEG_INFINITY);
+            }
+            other => panic!("expected -0, got {other:?}"),
+        }
+        assert_eq!(
+            heap::stats(&mut host).expect("-0 edges").live_edges,
+            linked.live_edges - 1
+        );
+
+        let nan_bits = 0x7ff8_0000_0000_0001_u64;
+        let nan = f64::from_bits(nan_bits);
+        heap::with_heap(&mut host, |heap| {
+            heap.write_scalar_upvalue(cell, Value::Float(nan))
+        })
+        .expect("store NaN");
+        match shared_current(&mut host, left, right) {
+            Some(CellValue::Scalar(Value::Float(stored))) => {
+                assert_eq!(stored.to_bits(), nan_bits, "NaN bits are not rewritten");
+                assert!(stored.is_nan());
+            }
+            other => panic!("expected NaN, got {other:?}"),
+        }
+        assert_eq!(
+            heap::stats(&mut host).expect("NaN edges").live_edges,
+            linked.live_edges - 1
+        );
+
+        heap::with_heap(&mut host, |heap| heap.clear_upvalue(cell)).expect("nil");
+        assert_eq!(shared_current(&mut host, left, right), None);
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| heap.read_upvalue(left)).expect_err("nil"),
+            HeapError::StaleHandle
+        );
+        assert_eq!(
+            heap::stats(&mut host).expect("cleared").live_edges,
+            linked.live_edges - 2,
+            "nil deletes the current record"
+        );
+
+        heap::with_heap(&mut host, |heap| heap.write_upvalue(cell, independent))
+            .expect("write the object back onto the same edge");
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| heap.read_upvalue(left)).expect("left object"),
+            independent
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| heap.read_upvalue(right)).expect("right object"),
+            independent
+        );
+        let kept = shared_current(&mut host, left, right);
+        let edges_kept = heap::stats(&mut host).expect("restored").live_edges;
+        assert_eq!(edges_kept, linked.live_edges - 1);
+        for value in [
+            Value::Null,
+            Value::Int(1),
+            Value::string("no"),
+            independent_carrier,
+        ] {
+            assert_eq!(
+                heap::with_heap(&mut host, |heap| heap.write_scalar_upvalue(cell, value))
+                    .expect_err("unsupported value"),
+                HeapError::WrongKind
+            );
+        }
+        assert_eq!(shared_current(&mut host, left, right), kept);
+        assert_eq!(
+            heap::stats(&mut host).expect("refusal").live_edges,
+            edges_kept,
+            "a refused write does not add or delete an edge"
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| heap.read_upvalue(right)).expect("not clobbered"),
+            independent
+        );
+    });
 }

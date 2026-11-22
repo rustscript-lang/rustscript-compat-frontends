@@ -27,7 +27,7 @@
 //! Closure and upvalue nodes use the same slots, edges, roots, meter, and
 //! sweep. A root slot holds a table, a closure, or an upvalue. A table field can point at
 //! a closure, a closure at one shared upvalue, and that upvalue at its current
-//! table or closure. A missing current edge is nil. Two closures can point at
+//! table, closure, boolean, or binary64. A missing current edge is nil. Two closures can point at
 //! the same upvalue. A table entry key can be a table or a closure. Both use
 //! the same object-key record: slot, generation, and kind. Mark and sweep walk
 //! that record in the existing pass. A closure key is not a field id and is
