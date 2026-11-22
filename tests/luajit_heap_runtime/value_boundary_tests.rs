@@ -4005,3 +4005,204 @@ return rawget(owner, 1e400)
     assert_eq!(vm.stack(), &[Value::string("bits")]);
     assert_eq!(heap::stats(&mut vm.host_context()).unwrap().live_edges, 1);
 }
+
+// Chunk `do` jumps forward to its own non-trailing label. The label is not in
+// the trailing set: `collectgarbage` follows it. The goto is the block's only
+// direct jump, so the statements between it and that label are not lowered.
+// `marker.skipped = {}` therefore publishes no node. The statements after the
+// label do run, and the in-block collect happens while `t` is still that
+// block's root. Leaving the block is the one `retire_block`. The next collect
+// clears the weak value and retires the original token. Omitting it leaves
+// the same token. Omitting the goto runs the skipped write. A nested block
+// with the same label name is a different span. A jump over a same-block
+// local is a resolver error, not a lowered path. This does not pin an
+// unimplemented goto's diagnostic text.
+#[test]
+fn lua_candidate_chunk_do_forward_goto_keeps_root_until_block_exit() {
+    let nested = parser::parse_chunk(
+        b"do\n  goto resume\n  do\n    ::resume::\n  end\n  marker.skipped = {}\n  ::resume::\n  collectgarbage(\"collect\")\nend\n",
+    )
+    .expect("parse nested same name");
+    let resolution = resolve::resolve(&nested);
+    assert!(
+        resolution.errors.is_empty(),
+        "a nested same name is not this block's label: {:?}",
+        resolution.errors
+    );
+    let target = resolution.gotos[0].target.expect("outer resume");
+    let label = &resolution.labels[target];
+    assert_eq!(label.name, b"resume");
+    assert!(!label.trailing, "collectgarbage follows the label");
+    let ast::Stmt::Do { body, .. } = &nested.body.stmts[0] else {
+        panic!("outer do");
+    };
+    let ast::Stmt::Do { body: inner, .. } = &body.stmts[1] else {
+        panic!("nested do");
+    };
+    assert!(
+        inner.stmts.iter().all(|stmt| {
+            !matches!(stmt, ast::Stmt::Label { name, .. } if name.span == label.span)
+        }),
+        "the nested name is a different label"
+    );
+    assert!(
+        body.stmts.iter().any(|stmt| {
+            matches!(stmt, ast::Stmt::Label { name, .. } if name.span == label.span)
+        }),
+        "the resolved target is a direct child"
+    );
+
+    let into_local = parser::parse_chunk(
+        b"do\n  goto resume\n  local hidden = {}\n  ::resume::\n  local after = 1\nend\n",
+    )
+    .expect("parse jump into local");
+    let resolution = resolve::resolve(&into_local);
+    assert!(
+        matches!(
+            resolution.errors.first(),
+            Some(resolve::ResolveError::JumpIntoLocal { local_name, .. })
+                if local_name == b"hidden"
+        ),
+        "a non-trailing label cannot enter a same-block local: {:?}",
+        resolution.errors
+    );
+
+    let source = r#"
+local mt = {}
+mt.__mode = "v"
+local weak = {}
+setmetatable(weak, mt)
+local marker = {}
+observe_table(weak, 0)
+observe_table(marker, 0)
+do
+  local t = {}
+  t.self = t
+  weak.seen = t
+  observe_table(t, 0)
+@jump@
+  marker.skipped = {}
+  ::resume::
+  observe_table(t, 0)
+  observe_table(weak.seen, 0)
+  collectgarbage("collect")
+  observe_table(t, 0)
+  observe_table(weak.seen, 0)
+end
+@after@
+"#;
+    let collect_after = "\
+collectgarbage(\"collect\")
+observe_table(weak, 0)
+observe_table(marker, 0)
+return type(weak.seen)
+";
+    let omit_after = "\
+observe_table(weak.seen, 0)
+observe_table(weak, 0)
+observe_table(marker, 0)
+return type(weak.seen)
+";
+    let fall_after = "\
+collectgarbage(\"collect\")
+observe_table(marker.skipped, 0)
+observe_table(weak, 0)
+observe_table(marker, 0)
+return type(weak.seen)
+";
+    for (jump, after, result, collections, live_nodes, live_edges, resources, observations) in [
+        (
+            "  goto resume\n",
+            omit_after,
+            "table",
+            1u32,
+            4u32,
+            3u32,
+            4usize,
+            10usize,
+        ),
+        ("  goto resume\n", collect_after, "nil", 2, 3, 1, 3, 9),
+        ("", fall_after, "nil", 2, 4, 2, 4, 10),
+    ] {
+        let mut vm = candidate(&source.replace("@jump@", jump).replace("@after@", after));
+        assert_eq!(
+            vm.run().expect("run forward goto"),
+            VmStatus::Halted,
+            "{result}/{collections}"
+        );
+        assert_eq!(
+            vm.stack(),
+            &[Value::string(result)],
+            "{result}/{collections}"
+        );
+        let mut host = vm.host_context();
+        let tables = host.scope_state::<Vec<ObservedTable>>().unwrap().clone();
+        assert_eq!(
+            tables.len(),
+            observations,
+            "{result}/{collections}: skipped write must not add an observation on the goto arms"
+        );
+        let weak = tables[0];
+        let marker = tables[1];
+        let created = tables[2];
+        let after_label = tables[3];
+        let seen_before = tables[4];
+        let after_collect = tables[5];
+        let seen_after = tables[6];
+        assert_ne!(weak, marker, "{result}/{collections}");
+        assert_ne!(created, weak, "{result}/{collections}");
+        assert_ne!(created, marker, "{result}/{collections}");
+        assert_eq!(
+            after_label, created,
+            "{result}/{collections}: the label's following read is t"
+        );
+        assert_eq!(
+            seen_before, created,
+            "{result}/{collections}: weak.seen before the in-block collect is t"
+        );
+        assert_eq!(
+            after_collect, created,
+            "{result}/{collections}: in-block collect keeps the same token"
+        );
+        assert_eq!(
+            seen_after, created,
+            "{result}/{collections}: the weak read after that collect is still t"
+        );
+        let dropped = result == "nil";
+        if jump.is_empty() {
+            let skipped = tables[7];
+            let weak_after = tables[8];
+            let marker_after = tables[9];
+            assert_ne!(skipped, created, "the skipped write publishes a new table");
+            assert_ne!(skipped, marker, "marker.skipped is not marker");
+            assert_ne!(skipped, weak, "marker.skipped is not weak");
+            assert_eq!(weak_after, weak);
+            assert_eq!(marker_after, marker);
+            assert_table_lifetime(&mut host, skipped, true);
+        } else {
+            let (weak_after, marker_after) = if dropped {
+                (tables[7], tables[8])
+            } else {
+                let seen_outside = tables[7];
+                assert_eq!(
+                    seen_outside, created,
+                    "omitted collect leaves the same token in weak.seen"
+                );
+                assert_table_lifetime(&mut host, seen_outside, true);
+                (tables[8], tables[9])
+            };
+            assert_eq!(weak_after, weak, "{result}");
+            assert_eq!(marker_after, marker, "{result}");
+        }
+        assert_table_lifetime(&mut host, created, !dropped);
+        assert_table_lifetime(&mut host, weak, true);
+        assert_table_lifetime(&mut host, marker, true);
+        let stats = heap::stats(&mut host).unwrap();
+        let label = format!("{result}/{collections}");
+        assert_eq!(stats.collections, collections, "{label}");
+        assert_eq!(stats.live_nodes, live_nodes, "{label}");
+        assert_eq!(stats.live_edges, live_edges, "{label}");
+        assert_eq!(stats.live_roots, 0, "{label}");
+        assert_eq!(host.resource_count(), resources, "{label}");
+    }
+}

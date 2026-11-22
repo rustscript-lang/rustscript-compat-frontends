@@ -1291,31 +1291,60 @@ impl Lower<'_> {
     /// `live_locals`. Same-name outer slots stay where they are, including a
     /// slot already removed by `= nil`. A function body is not this path.
     ///
-    /// A resolver-proven `goto` whose target is in this block's trailing label
-    /// set does not emit the suffix. The set is every direct label the
-    /// resolver marked `trailing`: only labels and empty statements follow it.
-    /// The target index is matched to a direct child by that label's span, not
-    /// by name. `retire_block` is still the exit, so executed bindings drop
-    /// their roots. This is not the `control.rs` state dispatcher.
+    /// The lowered list is one retained segment. `retire_block` still runs
+    /// once, at this statement's end, not at the label. This is not the
+    /// `control.rs` state dispatcher.
     fn lower_do(&mut self, span: ast::Span, body: &ast::Block) -> Result<(), ParseError> {
-        let statements = match self.tail_goto_cut(body)? {
-            Some(cut) => &body.stmts[..cut],
-            None => body.stmts.as_slice(),
-        };
-        for stmt in statements {
+        for stmt in self.retained_statements(span, body)? {
             self.lower_stmt(stmt)?;
         }
         self.retire_block(span, body)
     }
 
-    /// Index of the one direct `goto` whose resolved target is in this block's
-    /// trailing label set. `None` keeps the straight path. The resolver index
-    /// is matched to a direct child by label span, not by name, so a
-    /// same-named label in another block is not this target. A non-trailing
-    /// label in this block stays unsupported. `scope_id` is not a second
-    /// check: that direct-child span is already this block. A different goto
-    /// stays unsupported instead of falling through the suffix.
-    fn tail_goto_cut(&self, body: &ast::Block) -> Result<Option<usize>, ParseError> {
+    /// Statements this chunk `do` lowers, in source order. Labels are not
+    /// runtime statements. Empty statements stay, including a trailing `;`.
+    ///
+    /// With no direct `goto`, that is the whole block. One direct unconditional
+    /// `goto` whose resolver target is a later direct child keeps the prefix
+    /// and the statements after that label, and drops the jump plus the
+    /// statements between them. A trailing label is the same shape: only
+    /// labels and empty statements follow it, so the kept tail is those
+    /// semicolons. The target id is matched by label span, not by name.
+    fn retained_statements<'b>(
+        &self,
+        span: ast::Span,
+        body: &'b ast::Block,
+    ) -> Result<Vec<&'b ast::Stmt>, ParseError> {
+        let skip = self.forward_goto_skip(span, body)?;
+        let mut kept = Vec::new();
+        for (index, stmt) in body.stmts.iter().enumerate() {
+            if matches!(stmt, ast::Stmt::Label { .. }) {
+                continue;
+            }
+            if let Some((goto_index, label_index)) = skip
+                && index >= goto_index
+                && index < label_index
+            {
+                continue;
+            }
+            kept.push(stmt);
+        }
+        Ok(kept)
+    }
+
+    /// Bounds of the one direct forward `goto` this block can structure.
+    /// `None` is the straight path. The resolver target must be a direct child
+    /// later in this block. Its scope must be this block's scope when the
+    /// block has locals, and must not be a nested block's scope. Another goto
+    /// whose target lies in the skipped span is excluded: that shape needs a
+    /// graph, and this path does not invent one. A second direct goto, a
+    /// backward jump, or a target in another block stays unsupported instead
+    /// of falling through the skipped statements.
+    fn forward_goto_skip(
+        &self,
+        span: ast::Span,
+        body: &ast::Block,
+    ) -> Result<Option<(usize, usize)>, ParseError> {
         let mut found = None;
         for (index, stmt) in body.stmts.iter().enumerate() {
             let ast::Stmt::Goto {
@@ -1329,7 +1358,7 @@ impl Lower<'_> {
             }
             found = Some((index, *goto_span));
         }
-        let Some((index, goto_span)) = found else {
+        let Some((goto_index, goto_span)) = found else {
             return Ok(None);
         };
         let jump = self
@@ -1346,15 +1375,79 @@ impl Lower<'_> {
         let Some(label) = self.resolution.labels.get(target) else {
             return Err(self.statement_unsupported(goto_span));
         };
-        let in_trailing_set = label.trailing
-            && label.function_id == 0
-            && body.stmts.iter().any(
-                |stmt| matches!(stmt, ast::Stmt::Label { name, .. } if name.span == label.span),
-            );
-        if !in_trailing_set {
+        if label.function_id != 0 || !self.label_names_this_block(span, body, label) {
             return Err(self.statement_unsupported(goto_span));
         }
-        Ok(Some(index))
+        let Some(label_index) = body.stmts.iter().position(
+            |stmt| matches!(stmt, ast::Stmt::Label { name, .. } if name.span == label.span),
+        ) else {
+            return Err(self.statement_unsupported(goto_span));
+        };
+        if label_index <= goto_index
+            || self.outside_goto_enters_skip(body, goto_index, label_index, goto_span)
+        {
+            return Err(self.statement_unsupported(goto_span));
+        }
+        Ok(Some((goto_index, label_index)))
+    }
+
+    /// Direct-child span already places the label in this block. When the
+    /// block has locals, their `scope_id` must be the label's scope. A nested
+    /// block's binding uses another scope and must not share this name.
+    fn label_names_this_block(
+        &self,
+        span: ast::Span,
+        body: &ast::Block,
+        label: &resolve::LabelBinding,
+    ) -> bool {
+        for binding in &self.resolution.bindings {
+            if binding.function_id != 0 {
+                continue;
+            }
+            let inside = binding.span.start >= body.span.start && binding.span.end <= body.span.end;
+            if !inside {
+                continue;
+            }
+            if binding.visible_to == span.end {
+                if binding.scope_id != label.scope_id {
+                    return false;
+                }
+            } else if binding.scope_id == label.scope_id {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// True when some other goto targets a label inside the skipped statements.
+    /// The structuring goto itself lands on the label after that span.
+    fn outside_goto_enters_skip(
+        &self,
+        body: &ast::Block,
+        goto_index: usize,
+        label_index: usize,
+        goto_span: ast::Span,
+    ) -> bool {
+        let skipped = &body.stmts[goto_index + 1..label_index];
+        let Some(first) = skipped.first() else {
+            return false;
+        };
+        let start = stmt_span(first).start;
+        let end = stmt_span(skipped.last().expect("skipped statement")).end;
+        self.resolution.gotos.iter().any(|jump| {
+            if jump.span == goto_span {
+                return false;
+            }
+            let Some(target) = jump.target else {
+                return true;
+            };
+            let Some(label) = self.resolution.labels.get(target) else {
+                return true;
+            };
+            let outside = jump.span.end <= start || jump.span.start >= end;
+            let inside = label.span.start >= start && label.span.end <= end;
+            outside && inside
+        })
     }
 
     fn statement_unsupported(&self, span: ast::Span) -> ParseError {
