@@ -2382,9 +2382,8 @@ fn shared_upvalue_scalar_replaces_object_edge_and_collect_reclaims_only_that_cyc
             "mark walks the rooted edges and does not follow the scalar"
         );
         assert_eq!(
-            meter.index_edge_checks,
-            u64::from(linked.live_edges) * 2,
-            "index walks the same edge vector twice"
+            meter.outgoing_gap_checks, 0,
+            "no rebuilt index walks stored gaps",
         );
         assert_eq!(report.live_nodes, 5, "only the self-cycle table is swept");
         assert!(!heap::with_heap(&mut host, |heap| Ok(heap.alive(original))).expect("swept"));

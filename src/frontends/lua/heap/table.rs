@@ -194,8 +194,16 @@ struct Slot {
     /// array so a field can read it back while the node is live. It contains
     /// identity only, not object edges, and does not participate in marking.
     carrier: Option<Arc<Vec<Value>>>,
-    /// Optional metatable. Not a field key and not an `edges` record.
+    /// Optional metatable. Not a field key and not an edge record.
     metatable: Option<(u32, u32)>,
+    /// Head of this owner's edge chain. `None` means no edges. A reused owner
+    /// starts with no chain.
+    edge_head: Option<u32>,
+    /// Tail of this owner's edge chain. New keys append here.
+    edge_tail: Option<u32>,
+    /// Direct `__mode` edge of a table, if that field is stored. Not a parsed
+    /// mode, and not set for field 0 on a closure or cell.
+    mode_edge: Option<u32>,
 }
 
 /// Bytes of a string or byte payload stored in a heap record. Capacity is not
@@ -228,13 +236,27 @@ fn edge_payload(edge: &Edge) -> u64 {
 }
 
 struct Edge {
-    from: u32,
     /// Field ids, object identities, string text, and binary64 numbers share
     /// this record. An object key is the live slot, generation, and kind. A
     /// string key is the complete UTF-8 text. A number key is canonical binary64
-    /// bits, not a field id and not a collectable node.
+    /// bits, not a field id and not a collectable node. The owner is the chain
+    /// that holds this record, not a field of the record.
     key: EdgeKey,
     value: EdgeValue,
+}
+
+/// One address-stable edge record. `next` is the owner-chain link while
+/// occupied and the free-list link while free. Deleting a record does not
+/// move any other record.
+struct EdgeSlot {
+    next: Option<u32>,
+    edge: Option<Edge>,
+}
+
+enum SweepAction {
+    Keep,
+    Gap,
+    Drop,
 }
 
 enum EdgeValue {
@@ -430,24 +452,26 @@ struct Frame {
 /// counts. A test query after the take is not part of the collection that was
 /// taken.
 ///
-/// Edge work stays in its own fields. `index_edge_checks` is the two passes
-/// that build the outgoing index (2E). `outgoing_edge_checks` counts records
-/// inspected from marked nodes. Each followed object target contributes
-/// separately to `node_slot_visits`; skipped weak targets do not.
-/// `sweep_edge_checks` is that one retain of stored records. It is zero when
-/// every live node is marked. Sweep reads modes parsed during mark and does
-/// not scan edges again to find `__mode`. Adding those fields is not a total
-/// GC cost.
+/// Edge work stays in its own fields. Mark walks each marked owner's chain:
+/// `outgoing_edge_checks` counts non-gap records on that chain, and
+/// `outgoing_gap_checks` counts gaps actually visited there. Neither walk
+/// builds an index. `owner_head_checks` counts owner-chain head reads during
+/// mark and, when sweep runs, during the owner walk. `sweep_edge_checks` is
+/// one visit of each occupied record when any live node is unmarked. It is
+/// zero when every live node is marked. Sweep reads modes parsed during the
+/// clear-mark slot walk and does not scan edges again to find `__mode`.
+/// Adding those fields is not a total GC cost.
 ///
-/// A metatable is not in that edge vector. `metatable_edge_checks` counts
+/// A metatable is not in an owner chain. `metatable_edge_checks` counts
 /// stored metatable refs followed from marked nodes. A collect with none
-/// stored does not read those slots, so the three field-edge counters stay
-/// the same as a heap that never had a metatable.
+/// stored does not read those slots, so the field-edge counters stay the
+/// same as a heap that never had a metatable.
 ///
-/// `index_slot_checks` is the one counts-to-offsets walk over index scratch.
-/// Its length is the node-slot vector. It is not a heap-node walk. Heap node
-/// walks are `node_slot_visits`. Root-vector walks are `root_slot_visits`.
-/// Token identity checks stay in `token_slot_checks`.
+/// `weak_mode_slot_checks` counts `mode_edge` pointer reads during the
+/// clear-mark slot walk. `weak_mode_edge_checks` counts the edge records
+/// those pointers actually open. A non-table field 0 has no mode pointer.
+/// Heap node walks are `node_slot_visits`. Root-vector walks are
+/// `root_slot_visits`. Token identity checks stay in `token_slot_checks`.
 ///
 /// `scratch` records element counts the collector asked Rust to initialize,
 /// copy, reserve, or push. Those are measured requests. They are not allocator
@@ -461,20 +485,29 @@ struct Frame {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScanMeter {
     pub mark_passes: u64,
-    pub index_edge_checks: u64,
-    pub index_slot_checks: u64,
     pub outgoing_edge_checks: u64,
+    /// Gaps visited while walking a marked owner's chain. Not included in
+    /// `outgoing_edge_checks`.
+    pub outgoing_gap_checks: u64,
+    /// Owner-chain head reads. Mark reads one per marked node. Sweep, when it
+    /// runs, reads one per node slot.
+    pub owner_head_checks: u64,
     pub sweep_edge_checks: u64,
     /// Stored metatable references followed from a marked node.
     ///
     /// A metatable is an optional per-slot reference, not a field-edge record
-    /// and not an integer key. It is not included in `index_edge_checks`,
-    /// `outgoing_edge_checks`, or `sweep_edge_checks`. A heap with no stored
-    /// metatable reference does not read this path, so those collects add zero
-    /// and leave the field-edge counts unchanged.
+    /// and not an integer key. It is not included in `outgoing_edge_checks`
+    /// or `sweep_edge_checks`. A heap with no stored metatable reference does
+    /// not read this path, so those collects add zero and leave the field-edge
+    /// counts unchanged.
     pub metatable_edge_checks: u64,
     /// Bytes examined while parsing direct string modes (including a NUL terminator if present).
     pub weak_mode_bytes: u64,
+    /// `mode_edge` pointer reads during the clear-mark slot walk.
+    pub weak_mode_slot_checks: u64,
+    /// Mode-edge records opened through those pointers. A missing pointer is
+    /// not an edge read. A non-table field 0 is not a mode pointer.
+    pub weak_mode_edge_checks: u64,
     /// Mode lookups by live metatable slot when a weak mode was indexed.
     pub weak_mode_lookups: u64,
     pub token_slot_checks: u64,
@@ -497,17 +530,7 @@ pub struct ScanMeter {
 /// the request. This is not an observation of RSS or global allocation.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScanScratch {
-    /// `counts` zero-initialized to the node-slot length.
-    pub index_counts_inited: u64,
-    /// Capacity requested for `offsets` (`slots + 1`).
-    pub index_offsets_reserved: u64,
-    /// Elements pushed into `offsets`.
-    pub index_offsets_pushed: u64,
-    /// Elements copied into `cursor` from `offsets`.
-    pub index_cursor_copied: u64,
-    /// Outgoing index entries zero-initialized to the in-range edge total.
-    pub index_targets_inited: u64,
-    /// Slot-indexed modes zero-initialized on the first weak mode in the index.
+    /// Slot-indexed modes zero-initialized on the first weak mode during mark.
     pub weak_modes_inited: u64,
     /// Work-stack pushes. One per newly marked node. Not a reserve.
     pub work_pushed: u64,
@@ -528,18 +551,10 @@ pub(super) struct DoomedToken {
     pub(super) generation: u32,
 }
 
-/// Temporary outgoing-edge index for one mark. Offsets and entries drop when
-/// mark returns. Parsed weak modes move to sweep for that same collect and
-/// are not stored on the heap.
-struct OutgoingIndex {
-    offsets: Vec<u32>,
-    entries: Vec<u32>,
-    weak_modes: Option<Vec<WeakMode>>,
-}
-
-/// Weak modes parsed while building the outgoing index. Sweep borrows this
-/// for the same collect, then drops it. A close error before sweep drops it
-/// with the mark result, so the next collect parses again.
+/// Parsed weak modes for one collect. Built during the clear-mark slot walk
+/// from each table's direct `__mode` pointer, then borrowed by sweep. A close
+/// error before sweep drops it with the mark result, so the next collect
+/// parses again. It is not stored on the heap.
 pub(super) struct MarkSnapshot {
     modes: Option<Vec<WeakMode>>,
 }
@@ -597,7 +612,13 @@ pub struct LuaHeap {
     limits: HeapLimits,
     slots: Vec<Slot>,
     free_list: Vec<u32>,
-    edges: Vec<Edge>,
+    edge_slots: Vec<EdgeSlot>,
+    /// Free-list head of unoccupied edge records. Reused before the backing grows.
+    edge_free_head: Option<u32>,
+    /// Occupied edge records, including cursor gaps and excluding free slots.
+    occupied_edges: u32,
+    /// Occupied records whose value is not a cursor gap.
+    live_edge_count: u32,
     /// Stored metatable refs. Zero means mark does not read metatable slots.
     metatable_edges: u32,
     roots: Vec<Option<Rooted>>,
@@ -626,7 +647,10 @@ impl LuaHeap {
             limits,
             slots: Vec::new(),
             free_list: Vec::new(),
-            edges: Vec::new(),
+            edge_slots: Vec::new(),
+            edge_free_head: None,
+            occupied_edges: 0,
+            live_edge_count: 0,
             metatable_edges: 0,
             roots: Vec::new(),
             frames: Vec::new(),
@@ -680,6 +704,9 @@ impl LuaHeap {
             slot.token = None;
             slot.carrier = None;
             slot.metatable = None;
+            slot.edge_head = None;
+            slot.edge_tail = None;
+            slot.mode_edge = None;
             return Ok((index, slot.generation));
         }
         if self.slots.len() >= self.limits.nodes as usize {
@@ -696,6 +723,9 @@ impl LuaHeap {
             token: None,
             carrier: None,
             metatable: None,
+            edge_head: None,
+            edge_tail: None,
+            mode_edge: None,
         });
         self.note_node_peak();
         Ok((index, 1))
@@ -884,15 +914,7 @@ impl LuaHeap {
     pub fn clear_upvalue(&mut self, cell: UpvalueRef) -> Result<(), HeapError> {
         self.require_upvalue(cell)?;
         let key = EdgeKey::Field(CURRENT_EDGE);
-        let mut released = 0u64;
-        self.edges.retain(|edge| {
-            let drop = edge.from == cell.slot() && edge.key == key;
-            if drop {
-                released += edge_payload(edge);
-            }
-            !drop
-        });
-        self.payload_bytes -= released;
+        self.unlink_key(cell.slot(), &key);
         Ok(())
     }
 
@@ -1262,15 +1284,7 @@ impl LuaHeap {
     }
 
     fn clear_edge(&mut self, from: TableRef, key: &EdgeKey) {
-        let mut released = 0u64;
-        self.edges.retain(|edge| {
-            let drop = edge.from == from.slot() && &edge.key == key;
-            if drop {
-                released += edge_payload(edge);
-            }
-            !drop
-        });
-        self.payload_bytes -= released;
+        self.unlink_key(from.slot(), key);
     }
 
     fn write_table_edge(
@@ -1306,44 +1320,48 @@ impl LuaHeap {
         key: EdgeKey,
         value: EdgeValue,
     ) -> Result<(), HeapError> {
-        if let Some(index) = self
-            .edges
-            .iter()
-            .position(|edge| edge.from == from_slot && edge.key == key)
-        {
-            let removed = value_payload(&self.edges[index].value);
-            let added = value_payload(&value);
-            self.edges[index].value = value;
-            self.payload_bytes = self.payload_bytes - removed + added;
+        if let Some(index) = self.find_key(from_slot, &key) {
+            self.replace_edge_value(from_slot, index, value);
             return Ok(());
         }
-        if self.edges.len() >= self.limits.edges as usize && !self.reclaim_cursor_gap() {
+        if self.occupied_edges >= self.limits.edges && !self.reclaim_cursor_gap() {
             return Err(HeapError::EdgeCapacity);
         }
         let added = key_payload(&key) + value_payload(&value);
-        self.edges.push(Edge {
-            from: from_slot,
-            key,
-            value,
-        });
+        let index = self.take_edge_slot();
+        self.edge_slots[index as usize].edge = Some(Edge { key, value });
+        self.append_tail(from_slot, index);
         self.payload_bytes += added;
+        self.occupied_edges += 1;
+        self.live_edge_count += 1;
+        self.note_mode_pointer(from_slot, index);
         self.note_edge_peak();
         Ok(())
     }
 
     /// Drops one valueless cursor so a real edge can use that storage.
     /// Lua does not keep an old cursor valid across this structural change.
+    /// The search is one owner-chain walk and stops at the first gap. The
+    /// removal uses the same unlink as an explicit delete.
     fn reclaim_cursor_gap(&mut self) -> bool {
-        let Some(index) = self
-            .edges
-            .iter()
-            .position(|edge| edge.value.is_cursor_gap())
-        else {
-            return false;
-        };
-        let edge = self.edges.remove(index);
-        self.payload_bytes -= edge_payload(&edge);
-        true
+        for owner in 0..self.slots.len() {
+            let mut prev = None;
+            let mut cursor = self.slots[owner].edge_head;
+            while let Some(index) = cursor {
+                let next = self.edge_slots[index as usize].next;
+                let gap = self.edge_slots[index as usize]
+                    .edge
+                    .as_ref()
+                    .is_some_and(|edge| edge.value.is_cursor_gap());
+                if gap {
+                    self.unlink_at(owner as u32, prev, index);
+                    return true;
+                }
+                prev = Some(index);
+                cursor = next;
+            }
+        }
+        false
     }
 
     /// Reads the table target of a direct field through either alias of `from`.
@@ -1367,7 +1385,7 @@ impl LuaHeap {
         self.stored_value(from, |stored| stored.matches_name(name))
     }
 
-    /// Next raw entry of `table` after `cursor`, in stored edge order.
+    /// Next raw entry of `table` after `cursor`, in owner-chain order.
     ///
     /// `Value::Null` starts at the first valued edge. `None` is the end: one
     /// nil, not an empty pair. A weak-cleared entry keeps its key in that order
@@ -1375,10 +1393,12 @@ impl LuaHeap {
     /// with that key continues at the next valued entry or one nil at the end.
     /// A missing key and a non-guest key are errors, not the end and not a
     /// restart. An explicit removal drops the key. A later write of the same
-    /// key reuses the record. Inserting a different key may drop an old cursor
-    /// when edge storage is full; Lua does not keep cursors across that change.
-    /// This walks `edges`. It does not allocate another table and does not read
-    /// a metamethod.
+    /// key reuses that record in place. A new key, including a key that was
+    /// deleted, appends at the tail even when the record reuses a low slot.
+    /// Inserting a different key may drop an old cursor when edge storage is
+    /// full; Lua does not keep cursors across that change. This walks the
+    /// owner's chain. It does not allocate another table and does not read a
+    /// metamethod.
     pub fn next_guest(
         &self,
         table: TableRef,
@@ -1420,10 +1440,17 @@ impl LuaHeap {
         cursor: Option<NextCursor<'_>>,
     ) -> Result<Option<(Value, Value)>, HeapError> {
         let mut passed = cursor.is_none();
-        for edge in &self.edges {
-            if edge.from != slot {
-                continue;
-            }
+        let mut index = self
+            .slots
+            .get(slot as usize)
+            .and_then(|owner| owner.edge_head);
+        while let Some(current) = index {
+            let record = &self.edge_slots[current as usize];
+            let edge = record
+                .edge
+                .as_ref()
+                .expect("owner chain holds an occupied record");
+            index = record.next;
             if !passed {
                 if cursor
                     .as_ref()
@@ -1528,24 +1555,27 @@ impl LuaHeap {
     }
 
     fn stored_from(&self, from_slot: u32, key: &EdgeKey) -> Option<&EdgeValue> {
-        self.edges
-            .iter()
-            .find(|edge| edge.from == from_slot && &edge.key == key)
+        let index = self.find_key(from_slot, key)?;
+        self.edge_slots[index as usize]
+            .edge
+            .as_ref()
             .map(|edge| &edge.value)
     }
 
-    /// One scan of the heap edge vector. `from` is checked before any key test.
-    /// The predicate selects the stored key. This does not build another table.
+    /// One walk of the owner's chain. The predicate selects the stored key.
+    /// This does not build another table.
     fn read_edge(
         &self,
         from: TableRef,
         matches_key: impl Fn(&EdgeKey) -> bool,
     ) -> Result<Option<&EdgeValue>, HeapError> {
         self.require_live(from)?;
-        Ok(self
-            .edges
-            .iter()
-            .find(|edge| edge.from == from.slot() && matches_key(&edge.key))
+        let Some(index) = self.find_matching(from.slot(), matches_key) else {
+            return Ok(None);
+        };
+        Ok(self.edge_slots[index as usize]
+            .edge
+            .as_ref()
             .map(|edge| &edge.value))
     }
 
@@ -1848,14 +1878,10 @@ impl LuaHeap {
         HeapStats {
             live_nodes: self.live_nodes(),
             live_roots: self.live_roots(),
-            live_edges: self
-                .edges
-                .iter()
-                .filter(|edge| !edge.value.is_cursor_gap())
-                .count() as u32,
+            live_edges: self.live_edge_count,
             node_slots: self.slots.len() as u32,
             root_slots: self.roots.len() as u32,
-            edge_slots: self.edges.len() as u32,
+            edge_slots: self.occupied_edges,
             collections: self.collections,
             last_marked: self.last_marked,
             peak_nodes: self.peak_nodes,
@@ -1875,7 +1901,8 @@ impl LuaHeap {
     /// Charged:
     /// - each slot record (`slots.len()`, including a free or retired record
     ///   that still occupies the vector)
-    /// - each edge record (`edges.len()`, including a weak-cleared cursor gap)
+    /// - each edge record (`occupied_edges`, including a weak-cleared cursor
+    ///   gap and excluding a free slot and backing capacity)
     /// - the stored length of a string or byte payload in those edge records
     ///
     /// Not charged:
@@ -1897,7 +1924,7 @@ impl LuaHeap {
     /// one edge is charged once per edge.
     pub fn logical_bytes(&self) -> u64 {
         let nodes = (self.slots.len() as u64) * (std::mem::size_of::<Slot>() as u64);
-        let edges = (self.edges.len() as u64) * (std::mem::size_of::<Edge>() as u64);
+        let edges = (u64::from(self.occupied_edges)) * (std::mem::size_of::<Edge>() as u64);
         nodes + edges + self.payload_bytes
     }
 
@@ -1964,12 +1991,22 @@ impl LuaHeap {
     fn mark_reachable(&mut self) -> MarkSnapshot {
         self.scan.mark_passes += 1;
         self.scan.node_slot_visits += self.slots.len() as u64;
-        for slot in &mut self.slots {
-            if let SlotState::Live { marked } = &mut slot.state {
+        self.scan.weak_mode_slot_checks += self.slots.len() as u64;
+        let parse_modes = self.metatable_edges > 0;
+        let mut modes = None;
+        for index in 0..self.slots.len() {
+            if let SlotState::Live { marked } = &mut self.slots[index].state {
                 *marked = false;
             }
+            let mode_edge = self.slots[index].mode_edge;
+            let is_table = self.slots[index].kind == HandleKind::Table;
+            if parse_modes
+                && is_table
+                && let Some(edge_index) = mode_edge
+            {
+                self.record_mode(index, edge_index, &mut modes);
+            }
         }
-        let index = self.build_outgoing_index();
         let mut work = Vec::new();
         self.scan.root_slot_visits += self.roots.len() as u64;
         let rooted: Vec<Rooted> = self.roots.iter().copied().flatten().collect();
@@ -1984,20 +2021,29 @@ impl LuaHeap {
         while let Some(slot) = work.pop() {
             let from_table = self.slots[slot as usize].kind == HandleKind::Table;
             let mode = if from_table && follow_metatables {
-                self.follow_metatable(slot, &index, &mut work)
+                self.follow_metatable(slot, modes.as_ref(), &mut work)
             } else {
                 WeakMode::default()
             };
-            let start = index.offsets[slot as usize] as usize;
-            let end = index.offsets[slot as usize + 1] as usize;
-            self.scan.outgoing_edge_checks += (end - start) as u64;
-            for &entry in &index.entries[start..end] {
-                let gap = self.edges[entry as usize].value.is_cursor_gap();
+            self.scan.owner_head_checks += 1;
+            let mut cursor = self.slots[slot as usize].edge_head;
+            while let Some(index) = cursor {
+                let next = self.edge_slots[index as usize].next;
+                let gap = self.edge_slots[index as usize]
+                    .edge
+                    .as_ref()
+                    .is_some_and(|edge| edge.value.is_cursor_gap());
                 if gap {
+                    self.scan.outgoing_gap_checks += 1;
+                    cursor = next;
                     continue;
                 }
+                self.scan.outgoing_edge_checks += 1;
                 let (object_key, value_target) = {
-                    let edge = &self.edges[entry as usize];
+                    let edge = self.edge_slots[index as usize]
+                        .edge
+                        .as_ref()
+                        .expect("owner chain holds an occupied record");
                     let object_key = match &edge.key {
                         EdgeKey::Object {
                             slot,
@@ -2020,6 +2066,7 @@ impl LuaHeap {
                     };
                     (object_key, value_target)
                 };
+                cursor = next;
                 if from_table
                     && !mode.keys
                     && let Some((slot, generation, kind)) = object_key
@@ -2034,9 +2081,7 @@ impl LuaHeap {
                 }
             }
         }
-        MarkSnapshot {
-            modes: index.weak_modes,
-        }
+        MarkSnapshot { modes }
     }
 
     /// Follows one stored metatable ref. Absent refs are not edges and are
@@ -2044,7 +2089,7 @@ impl LuaHeap {
     fn follow_metatable(
         &mut self,
         slot: u32,
-        index: &OutgoingIndex,
+        modes: Option<&Vec<WeakMode>>,
         work: &mut Vec<u32>,
     ) -> WeakMode {
         let Some((to_slot, to_generation)) = self.slots[slot as usize].metatable else {
@@ -2052,7 +2097,7 @@ impl LuaHeap {
         };
         self.scan.metatable_edge_checks += 1;
         if self.follow_target(to_slot, to_generation, HandleKind::Table, work)
-            && let Some(modes) = &index.weak_modes
+            && let Some(modes) = modes
         {
             self.scan.weak_mode_lookups += 1;
             return modes[to_slot as usize];
@@ -2076,77 +2121,7 @@ impl LuaHeap {
         true
     }
 
-    /// Two passes over the stored edge vector, plus one pass over the counts
-    /// scratch to turn those counts into offsets. `index_slot_checks` is that
-    /// scratch pass. Heap node walks are counted separately. The index is
-    /// dropped at the end of mark.
-    fn build_outgoing_index(&mut self) -> OutgoingIndex {
-        let slot_count = self.slots.len();
-        let edge_count = self.edges.len();
-        self.scan.index_edge_checks += edge_count as u64;
-        let mut counts = vec![0u32; slot_count];
-        self.scan.scratch.index_counts_inited += counts.len() as u64;
-        for edge in &self.edges {
-            if edge.value.is_cursor_gap() {
-                continue;
-            }
-            if let Some(count) = counts.get_mut(edge.from as usize) {
-                *count = count.saturating_add(1);
-            }
-        }
-        self.scan.index_slot_checks += slot_count as u64;
-        let offset_request = slot_count + 1;
-        self.scan.scratch.index_offsets_reserved += offset_request as u64;
-        let mut offsets = Vec::with_capacity(offset_request);
-        offsets.push(0);
-        let mut running = 0u32;
-        for count in &counts {
-            running = running.saturating_add(*count);
-            offsets.push(running);
-        }
-        self.scan.scratch.index_offsets_pushed += offsets.len() as u64;
-        self.scan.index_edge_checks += edge_count as u64;
-        let mut cursor = offsets.clone();
-        self.scan.scratch.index_cursor_copied += cursor.len() as u64;
-        let mut entries = vec![0u32; running as usize];
-        self.scan.scratch.index_targets_inited += entries.len() as u64;
-        let mut weak_modes = None;
-        for (entry, edge) in self.edges.iter().enumerate() {
-            if edge.value.is_cursor_gap() {
-                continue;
-            }
-            let from = edge.from as usize;
-            if from >= slot_count {
-                continue;
-            }
-            let at = cursor[from] as usize;
-            if at < entries.len() {
-                entries[at] = entry as u32;
-                cursor[from] = cursor[from].saturating_add(1);
-            }
-            if self.metatable_edges > 0
-                && edge.key == EdgeKey::Field(Self::MODE_FIELD)
-                && self.slots[from].kind == HandleKind::Table
-                && let EdgeValue::Scalar(Value::String(mode)) = &edge.value
-            {
-                let mode = WeakMode::parse(mode, &mut self.scan.weak_mode_bytes);
-                if mode.keys || mode.values {
-                    let modes = weak_modes.get_or_insert_with(|| {
-                        self.scan.scratch.weak_modes_inited += slot_count as u64;
-                        vec![WeakMode::default(); slot_count]
-                    });
-                    modes[from] = mode;
-                }
-            }
-        }
-        OutgoingIndex {
-            offsets,
-            entries,
-            weak_modes,
-        }
-    }
-
-    /// One retain of stored edge records. Skipped when every live node is
+    /// One owner-chain walk of occupied records. Skipped when every live node is
     /// marked, so an all-live collect does not walk edges and does not build
     /// the mark bitmap. Weak-value flags come from `modes`, already parsed
     /// during mark. This does not scan edges to find `__mode`.
@@ -2167,9 +2142,6 @@ impl LuaHeap {
             .collect();
         self.scan.node_slot_visits += sweep.len() as u64;
         self.scan.scratch.sweep_bitmap_inited += sweep.len() as u64;
-        // Storage records this retain will visit. A later removal does not
-        // add a second counted pass.
-        self.scan.sweep_edge_checks += self.edges.len() as u64;
         let is_marked = |slot: u32| sweep.get(slot as usize).is_some_and(|found| found.marked);
         let typed = |slot: u32, generation: u32, kind: HandleKind| {
             sweep.get(slot as usize).is_some_and(|found| {
@@ -2213,55 +2185,81 @@ impl LuaHeap {
             } => typed(*slot, *generation, HandleKind::Table),
             EdgeKey::Object { .. } => false,
         };
-        // One pass updates a cleared cursor and drops a dead edge. A
-        // weak-value clear leaves the key in place with no value. That record
-        // is the cursor, not a second index. A dead key, a private field, or
-        // a strong edge is still removed.
-        let mut released = 0u64;
-        self.edges.retain_mut(|edge| {
-            let owner = edge.from as usize;
-            if is_marked(edge.from) && weak_values.get(owner).copied().unwrap_or(false) {
-                let value_dead = match &edge.value {
-                    EdgeValue::Scalar(_) => false,
-                    EdgeValue::Table { slot, .. } => !is_marked(*slot),
-                    EdgeValue::Closure { slot, generation } => {
-                        !typed(*slot, *generation, HandleKind::Closure)
-                    }
-                    EdgeValue::Upvalue { slot, generation } => {
-                        !typed(*slot, *generation, HandleKind::Upvalue)
+        // One pass per owner, with the predecessor kept so a removal does not
+        // rescan. A weak-value clear leaves the key in place with no value.
+        // That record is the cursor, not a second index. A dead key, a private
+        // field, or a strong edge is still removed.
+        let occupied_before = self.occupied_edges;
+        let mut visited = 0u64;
+        for owner in 0..self.slots.len() {
+            self.scan.owner_head_checks += 1;
+            let mut prev = None;
+            let mut cursor = self.slots[owner].edge_head;
+            while let Some(index) = cursor {
+                visited += 1;
+                let next = self.edge_slots[index as usize].next;
+                let action = {
+                    let edge = self.edge_slots[index as usize]
+                        .edge
+                        .as_ref()
+                        .expect("owner chain holds an occupied record");
+                    let owner_marked = is_marked(owner as u32);
+                    let weak = weak_values.get(owner).copied().unwrap_or(false);
+                    let value_dead = match &edge.value {
+                        EdgeValue::Scalar(_) => false,
+                        EdgeValue::Table { slot, .. } => !is_marked(*slot),
+                        EdgeValue::Closure { slot, generation } => {
+                            !typed(*slot, *generation, HandleKind::Closure)
+                        }
+                        EdgeValue::Upvalue { slot, generation } => {
+                            !typed(*slot, *generation, HandleKind::Upvalue)
+                        }
+                    };
+                    let make_gap = owner_marked && weak && value_dead && guest_cursor(&edge.key);
+                    let value_ok = make_gap
+                        || match &edge.value {
+                            EdgeValue::Table { slot, .. } => is_marked(*slot),
+                            EdgeValue::Scalar(_) => true,
+                            EdgeValue::Closure { slot, generation } => {
+                                typed(*slot, *generation, HandleKind::Closure)
+                            }
+                            EdgeValue::Upvalue { slot, generation } => {
+                                typed(*slot, *generation, HandleKind::Upvalue)
+                            }
+                        };
+                    let key_ok = match &edge.key {
+                        EdgeKey::Field(_) | EdgeKey::Utf8(_) | EdgeKey::Number(_) => true,
+                        EdgeKey::Object {
+                            slot,
+                            generation,
+                            kind,
+                        } if make_gap || edge.value.is_cursor_gap() => {
+                            typed(*slot, *generation, *kind)
+                        }
+                        EdgeKey::Object { slot, .. } => is_marked(*slot),
+                    };
+                    let keep = owner_marked && value_ok && key_ok;
+                    if !keep {
+                        SweepAction::Drop
+                    } else if make_gap && !edge.value.is_cursor_gap() {
+                        SweepAction::Gap
+                    } else {
+                        SweepAction::Keep
                     }
                 };
-                if value_dead && guest_cursor(&edge.key) {
-                    released += value_payload(&edge.value);
-                    edge.value = EdgeValue::Scalar(Value::Null);
-                }
-            }
-            let keep = is_marked(edge.from)
-                && match &edge.value {
-                    EdgeValue::Table { slot, .. } => is_marked(*slot),
-                    EdgeValue::Scalar(_) => true,
-                    EdgeValue::Closure { slot, generation } => {
-                        typed(*slot, *generation, HandleKind::Closure)
+                match action {
+                    SweepAction::Keep => prev = Some(index),
+                    SweepAction::Gap => {
+                        self.rewrite_gap(index);
+                        prev = Some(index);
                     }
-                    EdgeValue::Upvalue { slot, generation } => {
-                        typed(*slot, *generation, HandleKind::Upvalue)
-                    }
+                    SweepAction::Drop => self.unlink_at(owner as u32, prev, index),
                 }
-                && match &edge.key {
-                    EdgeKey::Field(_) | EdgeKey::Utf8(_) | EdgeKey::Number(_) => true,
-                    EdgeKey::Object {
-                        slot,
-                        generation,
-                        kind,
-                    } if edge.value.is_cursor_gap() => typed(*slot, *generation, *kind),
-                    EdgeKey::Object { slot, .. } => is_marked(*slot),
-                };
-            if !keep {
-                released += edge_payload(edge);
+                cursor = next;
             }
-            keep
-        });
-        self.payload_bytes -= released;
+        }
+        self.scan.sweep_edge_checks += visited;
+        debug_assert_eq!(visited, u64::from(occupied_before));
     }
 
     fn mark_slot(&mut self, index: u32, work: &mut Vec<u32>) {
@@ -2275,12 +2273,20 @@ impl LuaHeap {
     }
 
     fn release_slot(&mut self, index: u32) {
+        debug_assert!(
+            self.slots[index as usize].edge_head.is_none()
+                && self.slots[index as usize].edge_tail.is_none(),
+            "owner chain must already be unlinked; release does not scan edges"
+        );
         if self.slots[index as usize].metatable.take().is_some() {
             self.metatable_edges = self.metatable_edges.saturating_sub(1);
         }
         let slot = &mut self.slots[index as usize];
         slot.token = None;
         slot.carrier = None;
+        slot.edge_head = None;
+        slot.edge_tail = None;
+        slot.mode_edge = None;
         if slot.generation >= self.limits.max_generation {
             slot.state = SlotState::Retired;
             return;
@@ -2291,17 +2297,30 @@ impl LuaHeap {
     }
 
     fn remove_edges_touching(&mut self, slot: u32) {
-        let mut released = 0u64;
-        self.edges.retain(|edge| {
-            let keep = edge.from != slot
-                && edge.value.object_slot().is_none_or(|target| target != slot)
-                && !edge_key_is_slot(&edge.key, slot);
-            if !keep {
-                released += edge_payload(edge);
+        for owner in 0..self.slots.len() {
+            let mut prev = None;
+            let mut cursor = self.slots[owner].edge_head;
+            while let Some(index) = cursor {
+                let next = self.edge_slots[index as usize].next;
+                let incident = {
+                    let edge = self.edge_slots[index as usize]
+                        .edge
+                        .as_ref()
+                        .expect("owner chain holds an occupied record");
+                    owner as u32 == slot
+                        || edge.value.object_slot() == Some(slot)
+                        || edge_key_is_slot(&edge.key, slot)
+                };
+                if incident {
+                    self.unlink_at(owner as u32, prev, index);
+                } else {
+                    prev = Some(index);
+                }
+                cursor = next;
             }
-            keep
-        });
-        self.payload_bytes -= released;
+        }
+        debug_assert!(self.slots[slot as usize].edge_head.is_none());
+        debug_assert!(self.slots[slot as usize].edge_tail.is_none());
     }
 
     fn clear_roots_to(&mut self, handle: TableRef) {
@@ -2365,7 +2384,168 @@ impl LuaHeap {
     }
 
     fn note_edge_peak(&mut self) {
-        self.peak_edges = self.peak_edges.max(self.edges.len() as u32);
+        self.peak_edges = self.peak_edges.max(self.occupied_edges);
+    }
+
+    fn find_key(&self, owner: u32, key: &EdgeKey) -> Option<u32> {
+        self.find_matching(owner, |stored| stored == key)
+    }
+
+    fn find_matching(&self, owner: u32, matches_key: impl Fn(&EdgeKey) -> bool) -> Option<u32> {
+        let mut cursor = self.slots.get(owner as usize)?.edge_head;
+        while let Some(index) = cursor {
+            let record = &self.edge_slots[index as usize];
+            if record
+                .edge
+                .as_ref()
+                .is_some_and(|edge| matches_key(&edge.key))
+            {
+                return Some(index);
+            }
+            cursor = record.next;
+        }
+        None
+    }
+
+    fn take_edge_slot(&mut self) -> u32 {
+        if let Some(index) = self.edge_free_head {
+            let next = self.edge_slots[index as usize].next;
+            self.edge_free_head = next;
+            self.edge_slots[index as usize].next = None;
+            debug_assert!(self.edge_slots[index as usize].edge.is_none());
+            return index;
+        }
+        let index = u32::try_from(self.edge_slots.len()).expect("edge index fits in u32");
+        self.edge_slots.push(EdgeSlot {
+            next: None,
+            edge: None,
+        });
+        index
+    }
+
+    fn append_tail(&mut self, owner: u32, index: u32) {
+        self.edge_slots[index as usize].next = None;
+        let tail = self.slots[owner as usize].edge_tail;
+        match tail {
+            Some(tail) => self.edge_slots[tail as usize].next = Some(index),
+            None => self.slots[owner as usize].edge_head = Some(index),
+        }
+        self.slots[owner as usize].edge_tail = Some(index);
+    }
+
+    fn unlink_key(&mut self, owner: u32, key: &EdgeKey) {
+        let mut prev = None;
+        let mut cursor = self
+            .slots
+            .get(owner as usize)
+            .and_then(|slot| slot.edge_head);
+        while let Some(index) = cursor {
+            let next = self.edge_slots[index as usize].next;
+            let matched = self.edge_slots[index as usize]
+                .edge
+                .as_ref()
+                .is_some_and(|edge| edge.key == *key);
+            if matched {
+                self.unlink_at(owner, prev, index);
+                return;
+            }
+            prev = Some(index);
+            cursor = next;
+        }
+    }
+
+    fn unlink_at(&mut self, owner: u32, prev: Option<u32>, index: u32) {
+        let next = self.edge_slots[index as usize].next;
+        match prev {
+            Some(prev) => self.edge_slots[prev as usize].next = next,
+            None => self.slots[owner as usize].edge_head = next,
+        }
+        if self.slots[owner as usize].edge_tail == Some(index) {
+            self.slots[owner as usize].edge_tail = prev;
+        }
+        if self.slots[owner as usize].mode_edge == Some(index) {
+            self.slots[owner as usize].mode_edge = None;
+        }
+        self.free_edge_record(index);
+    }
+
+    fn free_edge_record(&mut self, index: u32) {
+        let edge = self.edge_slots[index as usize]
+            .edge
+            .take()
+            .expect("occupied edge record");
+        let gap = edge.value.is_cursor_gap();
+        self.payload_bytes -= edge_payload(&edge);
+        self.occupied_edges -= 1;
+        if !gap {
+            self.live_edge_count -= 1;
+        }
+        self.edge_slots[index as usize].next = self.edge_free_head;
+        self.edge_free_head = Some(index);
+    }
+
+    fn replace_edge_value(&mut self, owner: u32, index: u32, value: EdgeValue) {
+        let edge = self.edge_slots[index as usize]
+            .edge
+            .as_mut()
+            .expect("occupied edge record");
+        let old_gap = edge.value.is_cursor_gap();
+        self.payload_bytes -= value_payload(&edge.value);
+        edge.value = value;
+        let new_gap = edge.value.is_cursor_gap();
+        self.payload_bytes += value_payload(&edge.value);
+        match (old_gap, new_gap) {
+            (true, false) => self.live_edge_count += 1,
+            (false, true) => self.live_edge_count -= 1,
+            _ => {}
+        }
+        self.note_mode_pointer(owner, index);
+    }
+
+    fn rewrite_gap(&mut self, index: u32) {
+        let edge = self.edge_slots[index as usize]
+            .edge
+            .as_mut()
+            .expect("occupied edge record");
+        if edge.value.is_cursor_gap() {
+            return;
+        }
+        self.payload_bytes -= value_payload(&edge.value);
+        edge.value = EdgeValue::Scalar(Value::Null);
+        self.live_edge_count -= 1;
+    }
+
+    fn note_mode_pointer(&mut self, owner: u32, index: u32) {
+        let is_table = self.slots[owner as usize].kind == HandleKind::Table;
+        let is_mode = matches!(
+            self.edge_slots[index as usize]
+                .edge
+                .as_ref()
+                .map(|edge| &edge.key),
+            Some(EdgeKey::Field(field)) if *field == Self::MODE_FIELD
+        );
+        if is_table && is_mode {
+            self.slots[owner as usize].mode_edge = Some(index);
+        }
+    }
+
+    fn record_mode(&mut self, owner: usize, edge_index: u32, modes: &mut Option<Vec<WeakMode>>) {
+        self.scan.weak_mode_edge_checks += 1;
+        let Some(edge) = self.edge_slots[edge_index as usize].edge.as_ref() else {
+            return;
+        };
+        let EdgeValue::Scalar(Value::String(mode)) = &edge.value else {
+            return;
+        };
+        let parsed = WeakMode::parse(mode, &mut self.scan.weak_mode_bytes);
+        if parsed.keys || parsed.values {
+            let slot_count = self.slots.len();
+            let cache = modes.get_or_insert_with(|| {
+                self.scan.scratch.weak_modes_inited += slot_count as u64;
+                vec![WeakMode::default(); slot_count]
+            });
+            cache[owner] = parsed;
+        }
     }
 }
 

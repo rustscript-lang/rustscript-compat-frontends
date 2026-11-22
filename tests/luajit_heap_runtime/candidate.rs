@@ -1162,7 +1162,7 @@ fn note_collect(
         discarded_alive,
         returned_edge,
         metatable_edge_checks: meter.metatable_edge_checks,
-        index_edge_checks: meter.index_edge_checks,
+        outgoing_gap_checks: meter.outgoing_gap_checks,
         outgoing_edge_checks: meter.outgoing_edge_checks,
         sweep_edge_checks: meter.sweep_edge_checks,
     });
@@ -3657,7 +3657,7 @@ pub(super) struct CollectNote {
     pub returned_edge: EdgeView,
     /// Metatable references followed from marked nodes. Not a field-edge count.
     pub metatable_edge_checks: u64,
-    pub index_edge_checks: u64,
+    pub outgoing_gap_checks: u64,
     pub outgoing_edge_checks: u64,
     pub sweep_edge_checks: u64,
 }

@@ -7,6 +7,8 @@
 #[path = "../src/frontends/lua/heap.rs"]
 mod heap;
 
+#[path = "luajit_heap_runtime/owner_adjacency.rs"]
+mod owner_adjacency;
 #[path = "luajit_heap_runtime/mod.rs"]
 mod support;
 #[path = "luajit_heap_runtime/value_boundary_tests.rs"]
@@ -841,12 +843,12 @@ fn assert_linear_meter(label: &str, meter: &heap::ScanMeter, expect: LinearMeter
     assert_eq!(
         meter.mark_passes,
         1,
-        "{label} marks once (outgoing={} budget={outgoing} sweep={} token_slots={} closes={} index_edges={} node_slots={} root_slots={})",
+        "{label} marks once (outgoing={} budget={outgoing} sweep={} token_slots={} closes={} gaps={} node_slots={} root_slots={})",
         meter.outgoing_edge_checks,
         meter.sweep_edge_checks,
         meter.token_slot_checks,
         meter.token_closes,
-        meter.index_edge_checks,
+        meter.outgoing_gap_checks,
         meter.node_slot_visits,
         meter.root_slot_visits
     );
@@ -856,14 +858,13 @@ fn assert_linear_meter(label: &str, meter: &heap::ScanMeter, expect: LinearMeter
         meter.mark_passes, meter.sweep_edge_checks, meter.token_slot_checks
     );
     assert_eq!(
-        meter.index_edge_checks,
-        edges.saturating_mul(2),
-        "{label} index build examines each stored edge twice"
+        meter.outgoing_gap_checks, 0,
+        "{label} no cursor gaps at mark"
     );
-    assert_eq!(
-        meter.index_slot_checks, slots,
-        "{label} index build examines the counts scratch once"
-    );
+    assert_eq!(meter.weak_mode_slot_checks, slots, "{label} mode pointers");
+    assert_eq!(meter.weak_mode_edge_checks, 0, "{label} no mode edge");
+    let owner_heads = marked + if dead == 0 { 0 } else { slots };
+    assert_eq!(meter.owner_head_checks, owner_heads, "{label} owner heads");
     let sweep_budget = if dead == 0 { 0 } else { edges };
     assert_eq!(
         meter.sweep_edge_checks, sweep_budget,
@@ -896,29 +897,7 @@ fn assert_linear_meter(label: &str, meter: &heap::ScanMeter, expect: LinearMeter
         "{label} root slot visits"
     );
     let scratch = &meter.scratch;
-    assert_eq!(
-        scratch.index_counts_inited, slots,
-        "{label} counts init is the measured request, not allocator capacity"
-    );
-    assert_eq!(
-        scratch.index_offsets_reserved,
-        slots + 1,
-        "{label} offsets reserve"
-    );
-    assert_eq!(
-        scratch.index_offsets_pushed,
-        slots + 1,
-        "{label} offsets pushed"
-    );
-    assert_eq!(
-        scratch.index_cursor_copied,
-        slots + 1,
-        "{label} cursor copy"
-    );
-    assert_eq!(
-        scratch.index_targets_inited, edges,
-        "{label} targets init is the measured in-range edge total"
-    );
+    assert_eq!(scratch.weak_modes_inited, 0, "{label} no weak mode cache");
     assert_eq!(scratch.work_pushed, marked, "{label} work pushes");
     let pending = if enumerates_doomed { doomed_tokens } else { 0 };
     assert_eq!(
@@ -936,21 +915,13 @@ fn assert_linear_meter(label: &str, meter: &heap::ScanMeter, expect: LinearMeter
 fn eprintln_meter(label: &str, meter: &heap::ScanMeter) {
     let scratch = &meter.scratch;
     eprintln!(
-        "meter {label} mark={} index_edges={} index_slots={} outgoing={} sweep={} token_slots={} closes={} node_slots={} root_slots={} counts={} offsets_res={} offsets_pushed={} cursor={} targets={} work={} pending={} dead={} bitmap={}",
+        "meter {label} mark={} gaps={} heads={} mode_slots={} mode_edges={} modes={} work={} pending={} dead={} bitmap={}",
         meter.mark_passes,
-        meter.index_edge_checks,
-        meter.index_slot_checks,
-        meter.outgoing_edge_checks,
-        meter.sweep_edge_checks,
-        meter.token_slot_checks,
-        meter.token_closes,
-        meter.node_slot_visits,
-        meter.root_slot_visits,
-        scratch.index_counts_inited,
-        scratch.index_offsets_reserved,
-        scratch.index_offsets_pushed,
-        scratch.index_cursor_copied,
-        scratch.index_targets_inited,
+        meter.outgoing_gap_checks,
+        meter.owner_head_checks,
+        meter.weak_mode_slot_checks,
+        meter.weak_mode_edge_checks,
+        scratch.weak_modes_inited,
         scratch.work_pushed,
         scratch.pending_close_pushed,
         scratch.dead_slots_pushed,
@@ -1189,6 +1160,53 @@ fn collect_scan_small_graph_stays_inside_one_linear_pass() {
     collect_pure_shape(&pure);
     let host = scan_shape("small-host-death", 8, 1, 12, 2, true);
     collect_host_shape(&host, true);
+}
+
+/// Dead-zone mark walks the reachable owner's empty chain. It does not examine
+/// the unreachable edges. Sweep, which runs because those owners are dead,
+/// visits each occupied edge once.
+#[test]
+fn dead_zone_mark_does_not_rebuild_an_edge_index() {
+    let limits = HeapLimits::production();
+    let dead = scan_shape("dead-zone", limits.nodes, 1, limits.edges, 1, false);
+    let live = scan_shape("full-live", 16, 1, limits.edges, 16, true);
+    let dead_meter = collect_shape_meter(&dead);
+    let live_meter = collect_shape_meter(&live);
+    assert_eq!(dead_meter.outgoing_edge_checks, 0);
+    assert_eq!(dead_meter.outgoing_gap_checks, 0);
+    assert_eq!(dead_meter.sweep_edge_checks, u64::from(limits.edges));
+    assert_eq!(dead_meter.owner_head_checks, 1 + u64::from(limits.nodes));
+    assert_eq!(live_meter.outgoing_edge_checks, u64::from(limits.edges));
+    assert_eq!(live_meter.sweep_edge_checks, 0);
+    assert_eq!(live_meter.owner_head_checks, 16);
+    assert!(
+        dead_meter.outgoing_edge_checks < live_meter.outgoing_edge_checks,
+        "the same edge count is visited from marked owners, not from a rebuilt index"
+    );
+}
+
+fn collect_shape_meter(shape: &ScanShape) -> ScanMeter {
+    let mut heap = LuaHeap::new(HeapLimits {
+        nodes: shape.nodes,
+        roots: shape.roots,
+        edges: shape.edges,
+        max_generation: 4,
+    });
+    let mut nodes = Vec::with_capacity(shape.nodes as usize);
+    for _ in 0..shape.nodes {
+        nodes.push(heap.alloc().expect("node"));
+    }
+    let frame = heap.enter_roots(shape.roots).expect("root frame");
+    for root in 0..shape.roots {
+        heap.write_root(frame, root, nodes[root as usize])
+            .expect("root");
+    }
+    for (from, key, to) in plan_scan_edges(shape) {
+        heap.set_edge(nodes[from as usize], key, nodes[to as usize])
+            .expect("edge");
+    }
+    heap.collect();
+    heap.take_scan_meter()
 }
 
 #[test]
@@ -1592,12 +1610,6 @@ fn shared_metatable_sweep_reuses_marked_modes() {
         u64::from(more_edges.edges / narrow.edges)
     );
     assert_eq!(strong.sweep, u64::from(strong.edges));
-    assert_eq!(narrow.index, narrow.sweep * 2);
-    assert_eq!(more_owners.index, narrow.index);
-    assert_eq!(
-        more_edges.index / narrow.index,
-        more_edges.sweep / narrow.sweep
-    );
     assert_eq!(narrow.outgoing, narrow.sweep);
     assert_eq!(more_owners.outgoing, narrow.outgoing);
     assert_eq!(more_edges.outgoing, more_edges.sweep);
@@ -1616,7 +1628,6 @@ struct ModeSweep {
     bytes: u64,
     lookups: u64,
     sweep: u64,
-    index: u64,
     outgoing: u64,
     modes_inited: u64,
     nodes: u32,
@@ -1662,7 +1673,6 @@ fn collect_shared_mode(owners: u32, edges: u32, mode: &str) -> ModeSweep {
         bytes: meter.weak_mode_bytes,
         lookups: meter.weak_mode_lookups,
         sweep: meter.sweep_edge_checks,
-        index: meter.index_edge_checks,
         outgoing: meter.outgoing_edge_checks,
         modes_inited: meter.scratch.weak_modes_inited,
         nodes: heap.stats().node_slots,
@@ -1702,7 +1712,8 @@ fn assert_cleared_cursor_reuses_the_dead_slot() {
         meter.sweep_edge_checks, 3,
         "one pass over the stored records"
     );
-    assert_eq!(meter.index_edge_checks, 6);
+    assert_eq!(meter.outgoing_edge_checks, 3);
+    assert_eq!(meter.weak_mode_edge_checks, 1);
     assert_eq!(heap.object_value(owner, key).unwrap(), Value::Null);
     assert_eq!(
         heap.stats().edge_slots,

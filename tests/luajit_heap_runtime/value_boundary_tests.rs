@@ -801,10 +801,9 @@ setmetatable(owner, nil)
     format!("{source}{tail}")
 }
 
-fn first_collect_matrix(note: &candidate::CollectNote) -> (u64, u64, u64, u64, u32, u32, u64) {
+fn first_collect_matrix(note: &candidate::CollectNote) -> (u64, u64, u64, u32, u32, u64) {
     (
         note.metatable_edge_checks,
-        note.index_edge_checks,
         note.outgoing_edge_checks,
         note.sweep_edge_checks,
         note.marked_nodes,
@@ -836,12 +835,11 @@ fn lua_candidate_reads_metatable_identity_after_collect_then_reclaims_on_detach(
     assert!(!first.discarded_alive && first.returned_alive);
     assert_eq!(first.returned_edge, candidate::EdgeView::Absent);
     // Field edges are cycle.self and mt.__index. The metatable ref is not one
-    // of them: index is 2 passes x 2 field edges, outgoing follows only the
-    // marked mt field, sweep filters both because the cycle died. The
-    // metatable follow is the separate 1.
+    // of them: outgoing follows only the marked mt field, sweep filters both
+    // because the cycle died. The metatable follow is the separate 1.
     assert_eq!(
         first_collect_matrix(first),
-        (1, 4, 1, 2, 4, 4, 1),
+        (1, 1, 2, 4, 4, 1),
         "metatable follow must stay out of the field-edge counters"
     );
     assert_eq!(
@@ -874,7 +872,7 @@ fn lua_candidate_reads_metatable_identity_after_collect_then_reclaims_on_detach(
     // is 0. Sweep still filters that field edge.
     assert_eq!(
         first_collect_matrix(second),
-        (0, 2, 0, 1, 2, 2, 2),
+        (0, 0, 1, 2, 2, 2),
         "detach does not add a field edge, and the second collect reclaims both targets"
     );
     let key = heap::LuaTableResource::key();
@@ -915,7 +913,7 @@ fn lua_candidate_omitting_the_collect_after_detach_keeps_the_metatable_target() 
     let first = &witness.collects[0];
     assert_eq!(
         first_collect_matrix(first),
-        (1, 4, 1, 2, 4, 4, 1),
+        (1, 1, 2, 4, 4, 1),
         "the kept graph is the same one the reclaim test collects a second time"
     );
     assert_eq!(
@@ -2077,7 +2075,7 @@ return type(owner)
     let [first] = witness.collects.as_slice() else {
         panic!("expected one completed collection");
     };
-    assert_eq!(first_collect_matrix(first), (0, 8, 3, 4, 4, 4, 1));
+    assert_eq!(first_collect_matrix(first), (0, 3, 4, 4, 4, 1));
     assert_eq!(host.resource_count(), 4);
     let stats = heap::stats(&mut host).unwrap();
     assert_eq!(stats.live_edges, 3);
@@ -2161,12 +2159,12 @@ key = nil
         assert_eq!(witness.collects.len(), if second_collect { 2 } else { 1 });
         assert_eq!(
             first_collect_matrix(&witness.collects[0]),
-            (0, 6, 2, 3, 3, 3, 1)
+            (0, 2, 3, 3, 3, 1)
         );
         if second_collect {
             assert_eq!(
                 first_collect_matrix(&witness.collects[1]),
-                (0, 2, 0, 1, 1, 1, 2)
+                (0, 0, 1, 1, 1, 2)
             );
         }
         let resource_key = heap::LuaTableResource::key();
@@ -5664,8 +5662,8 @@ fn lua_file_count_reads_logical_kib_without_collecting() {
         collected_note[0].metatable_edge_checks
     );
     assert_eq!(
-        counted_note[0].index_edge_checks,
-        collected_note[0].index_edge_checks
+        counted_note[0].outgoing_gap_checks,
+        collected_note[0].outgoing_gap_checks
     );
     assert_eq!(
         counted_note[0].outgoing_edge_checks,
