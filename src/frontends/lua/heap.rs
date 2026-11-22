@@ -24,6 +24,13 @@
 //! This check is the experimental guest boundary for this slice. It is not a
 //! measured production collection scheme.
 //!
+//! Closure and upvalue nodes use the same slots, edges, roots, meter, and
+//! sweep. A root slot holds a table or a closure. A table field can point at
+//! a closure, a closure at one shared upvalue, and that upvalue at its current
+//! table or closure. A missing current edge is nil. Two closures can point at
+//! the same upvalue. Those nodes have no guest carrier and no Core resource
+//! token. They are not callable values.
+//!
 //! Later integration, not this kernel: LuaJIT `ordered.lua` plus the reverse
 //! and skip-collection controls in
 //! `/mnt/workspace/rustscript-lua/evidence/lua52-gc-arg-order/qualification.md`.
@@ -39,10 +46,11 @@ mod resource;
 #[path = "heap/table.rs"]
 mod table;
 
-pub use handle::{HandleKind, TableRef};
+pub use handle::{ClosureRef, HandleKind, TableRef, UpvalueRef};
 pub use resource::LuaTableResource;
 pub use table::{
-    CollectReport, GuestClass, HeapError, HeapLimits, HeapStats, LuaHeap, RootFrameId, ScanMeter,
+    CellValue, CollectReport, GuestClass, HeapError, HeapLimits, HeapStats, LuaHeap, RootFrameId,
+    ScanMeter,
 };
 
 use vm::{HostContext, Value};

@@ -1,11 +1,16 @@
-//! Private table handle. It is not a VM `Value` and has no bare-integer ABI.
+//! Private handles. They are not VM values and have no bare-integer ABI.
 
-/// Kind carried by a private handle. This milestone only allocates tables;
-/// every operation still rejects a different kind.
+/// Kind carried by a private handle. Table, closure, and upvalue nodes share
+/// one heap. An operation rejects a live node of a different kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HandleKind {
     /// A table node.
     Table,
+    /// A closure node. It is not a callable value.
+    Closure,
+    /// A shared upvalue node. Its current edge holds a table, a closure, or is
+    /// absent (nil). It has no open or closed flag.
+    Upvalue,
 }
 
 /// Domain-checked reference to one table node.
@@ -50,6 +55,91 @@ impl TableRef {
     }
 
     /// Handle kind. Table operations reject any other kind.
+    pub fn kind(self) -> HandleKind {
+        self.kind
+    }
+}
+
+/// Domain-checked reference to one closure node.
+///
+/// Construction stays inside the heap. A guest `Value` is not a `ClosureRef`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClosureRef {
+    domain: u64,
+    slot: u32,
+    generation: u32,
+    kind: HandleKind,
+}
+
+impl ClosureRef {
+    pub(super) fn closure(domain: u64, slot: u32, generation: u32) -> Self {
+        Self {
+            domain,
+            slot,
+            generation,
+            kind: HandleKind::Closure,
+        }
+    }
+
+    /// Heap domain that allocated this handle.
+    pub fn domain(self) -> u64 {
+        self.domain
+    }
+
+    /// Stable slot index. Collection does not move it.
+    pub fn slot(self) -> u32 {
+        self.slot
+    }
+
+    /// Generation observed when the handle was issued.
+    pub fn generation(self) -> u32 {
+        self.generation
+    }
+
+    /// Handle kind. Closure operations reject any other kind.
+    pub fn kind(self) -> HandleKind {
+        self.kind
+    }
+}
+
+/// Domain-checked reference to one shared upvalue node.
+///
+/// Construction stays inside the heap. The node has no open or closed flag.
+/// Its current edge is a table, a closure, or missing (nil).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UpvalueRef {
+    domain: u64,
+    slot: u32,
+    generation: u32,
+    kind: HandleKind,
+}
+
+impl UpvalueRef {
+    pub(super) fn upvalue(domain: u64, slot: u32, generation: u32) -> Self {
+        Self {
+            domain,
+            slot,
+            generation,
+            kind: HandleKind::Upvalue,
+        }
+    }
+
+    /// Heap domain that allocated this handle.
+    pub fn domain(self) -> u64 {
+        self.domain
+    }
+
+    /// Stable slot index. Collection does not move it.
+    pub fn slot(self) -> u32 {
+        self.slot
+    }
+
+    /// Generation observed when the handle was issued.
+    pub fn generation(self) -> u32 {
+        self.generation
+    }
+
+    /// Handle kind. Upvalue operations reject any other kind.
     pub fn kind(self) -> HandleKind {
         self.kind
     }

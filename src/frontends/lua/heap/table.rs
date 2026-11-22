@@ -1,4 +1,8 @@
-//! Non-moving mark/sweep table storage, explicit root frames, and hard caps.
+//! Non-moving mark/sweep storage for tables, closures, and shared cells.
+//!
+//! Closure and cell nodes use the same slots, edges, roots, and sweep as
+//! tables. A private field id is not a Lua number. Internal links are strong.
+//! Only a table entry follows that table's weak mode.
 
 use std::fmt;
 use std::sync::Arc;
@@ -6,9 +10,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use vm::{HostContextError, Value};
 
-use super::handle::{HandleKind, TableRef};
+use super::handle::{ClosureRef, HandleKind, TableRef, UpvalueRef};
 
 static NEXT_DOMAIN: AtomicU64 = AtomicU64::new(1);
+
+/// Closure-to-cell field. It is keyed only on a closure node. Field id 0 on a
+/// table remains `__mode`. This id is not a Lua number.
+const UPVALUE_EDGE: u32 = 0;
+/// Cell current-value field. It is keyed only on an upvalue node. A missing
+/// edge is nil. This id is not a Lua number.
+const CURRENT_EDGE: u32 = 0;
 
 /// Hard caps. Edges and root slots are counted separately so fields cannot
 /// grow past the edge cap by avoiding the node cap.
@@ -161,6 +172,7 @@ enum SlotState {
 
 struct Slot {
     generation: u32,
+    kind: HandleKind,
     state: SlotState,
     /// Raw resource handle for this node. Ownership metadata only: the mark
     /// phase does not read it, so the token is not a GC root.
@@ -188,16 +200,57 @@ enum EdgeValue {
         slot: u32,
         generation: u32,
     },
+    /// A closure target in the same edge record. Not a guest table value.
+    Closure {
+        slot: u32,
+        generation: u32,
+    },
+    /// A cell target in the same edge record. Not a guest table value.
+    Upvalue {
+        slot: u32,
+        generation: u32,
+    },
     /// One guest scalar in the same record as a table target. Field 0 is the
     /// only key whose string is read as `__mode`.
     Scalar(Value),
 }
 
 impl EdgeValue {
-    fn table(&self) -> Option<(u32, u32)> {
+    fn object_slot(&self) -> Option<u32> {
         match self {
-            Self::Table { slot, generation } => Some((*slot, *generation)),
+            Self::Table { slot, .. } | Self::Closure { slot, .. } | Self::Upvalue { slot, .. } => {
+                Some(*slot)
+            }
             Self::Scalar(_) => None,
+        }
+    }
+}
+
+/// Value stored in a shared cell's current edge.
+///
+/// A missing edge is nil and is not a variant. `None` from [`LuaHeap::read_cell`]
+/// is that nil. An error is an invalid handle, not nil. A cell is not issued
+/// as a table value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CellValue {
+    /// The cell currently holds a table.
+    Table(TableRef),
+    /// The cell currently holds a closure.
+    Closure(ClosureRef),
+}
+
+/// One explicit root. Table and closure roots share the root vector.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rooted {
+    Table(TableRef),
+    Closure(ClosureRef),
+}
+
+impl Rooted {
+    fn slot(self) -> u32 {
+        match self {
+            Self::Table(handle) => handle.slot(),
+            Self::Closure(handle) => handle.slot(),
         }
     }
 }
@@ -431,7 +484,7 @@ pub struct LuaHeap {
     edges: Vec<Edge>,
     /// Stored metatable refs. Zero means mark does not read metatable slots.
     metatable_edges: u32,
-    roots: Vec<Option<TableRef>>,
+    roots: Vec<Option<Rooted>>,
     frames: Vec<Frame>,
     next_frame_generation: u32,
     collections: u32,
@@ -478,16 +531,36 @@ impl LuaHeap {
 
     /// Reserves a live, unrooted table. Failure leaves occupancy unchanged.
     pub fn alloc(&mut self) -> Result<TableRef, HeapError> {
+        let (index, generation) = self.alloc_slot(HandleKind::Table)?;
+        Ok(TableRef::table(self.domain, index, generation))
+    }
+
+    /// Reserves a live, unrooted closure. It uses the same node cap as a table.
+    /// It has no guest carrier and no resource token.
+    pub fn alloc_closure(&mut self) -> Result<ClosureRef, HeapError> {
+        let (index, generation) = self.alloc_slot(HandleKind::Closure)?;
+        Ok(ClosureRef::closure(self.domain, index, generation))
+    }
+
+    /// Reserves a live, unrooted cell. It uses the same node cap as a table.
+    /// It has no guest carrier and no resource token.
+    pub fn alloc_upvalue(&mut self) -> Result<UpvalueRef, HeapError> {
+        let (index, generation) = self.alloc_slot(HandleKind::Upvalue)?;
+        Ok(UpvalueRef::upvalue(self.domain, index, generation))
+    }
+
+    fn alloc_slot(&mut self, kind: HandleKind) -> Result<(u32, u32), HeapError> {
         if let Some(index) = self.free_list.pop() {
             let slot = &mut self.slots[index as usize];
             if !matches!(slot.state, SlotState::Free) {
                 return Err(HeapError::StaleHandle);
             }
+            slot.kind = kind;
             slot.state = SlotState::Live { marked: false };
             slot.token = None;
             slot.carrier = None;
             slot.metatable = None;
-            return Ok(TableRef::table(self.domain, index, slot.generation));
+            return Ok((index, slot.generation));
         }
         if self.slots.len() >= self.limits.nodes as usize {
             return Err(HeapError::NodeCapacity);
@@ -498,13 +571,14 @@ impl LuaHeap {
         let index = u32::try_from(self.slots.len()).map_err(|_| HeapError::NodeCapacity)?;
         self.slots.push(Slot {
             generation: 1,
+            kind,
             state: SlotState::Live { marked: false },
             token: None,
             carrier: None,
             metatable: None,
         });
         self.note_node_peak();
-        Ok(TableRef::table(self.domain, index, 1))
+        Ok((index, 1))
     }
 
     /// Releases a reserved node. A stale or foreign handle is refused and the
@@ -583,6 +657,156 @@ impl LuaHeap {
     /// consume another edge slot. A new key at the cap fails without insert.
     pub fn set_edge(&mut self, from: TableRef, key: u32, to: TableRef) -> Result<(), HeapError> {
         self.write_table_edge(from, EdgeKey::Field(key), to)
+    }
+
+    /// Points a table field at a closure. The field id is not a Lua number.
+    pub fn set_closure_edge(
+        &mut self,
+        from: TableRef,
+        key: u32,
+        closure: ClosureRef,
+    ) -> Result<(), HeapError> {
+        self.require_live(from)?;
+        self.require_closure(closure)?;
+        self.write_from(
+            from.slot(),
+            EdgeKey::Field(key),
+            EdgeValue::Closure {
+                slot: closure.slot(),
+                generation: closure.generation(),
+            },
+        )
+    }
+
+    /// Points a closure at one shared cell. This is not an open-capture list.
+    pub fn set_upvalue_edge(
+        &mut self,
+        closure: ClosureRef,
+        cell: UpvalueRef,
+    ) -> Result<(), HeapError> {
+        self.require_closure(closure)?;
+        self.require_upvalue(cell)?;
+        self.write_from(
+            closure.slot(),
+            EdgeKey::Field(UPVALUE_EDGE),
+            EdgeValue::Upvalue {
+                slot: cell.slot(),
+                generation: cell.generation(),
+            },
+        )
+    }
+
+    /// Replaces the table currently stored in a shared cell.
+    ///
+    /// An existing current edge is overwritten. This does not insert a second
+    /// record. A closure target uses [`Self::write_closure_upvalue`].
+    pub fn write_upvalue(&mut self, cell: UpvalueRef, table: TableRef) -> Result<(), HeapError> {
+        self.require_upvalue(cell)?;
+        self.require_live(table)?;
+        self.write_from(
+            cell.slot(),
+            EdgeKey::Field(CURRENT_EDGE),
+            EdgeValue::Table {
+                slot: table.slot(),
+                generation: table.generation(),
+            },
+        )
+    }
+
+    /// Replaces the current edge with a closure. Same record as a table write.
+    pub fn write_closure_upvalue(
+        &mut self,
+        cell: UpvalueRef,
+        closure: ClosureRef,
+    ) -> Result<(), HeapError> {
+        self.require_upvalue(cell)?;
+        self.require_closure(closure)?;
+        self.write_from(
+            cell.slot(),
+            EdgeKey::Field(CURRENT_EDGE),
+            EdgeValue::Closure {
+                slot: closure.slot(),
+                generation: closure.generation(),
+            },
+        )
+    }
+
+    /// Removes the current edge. Nil is the missing edge, not a stored record.
+    pub fn clear_upvalue(&mut self, cell: UpvalueRef) -> Result<(), HeapError> {
+        self.require_upvalue(cell)?;
+        let key = EdgeKey::Field(CURRENT_EDGE);
+        self.edges
+            .retain(|edge| edge.from != cell.slot() || edge.key != key);
+        Ok(())
+    }
+
+    /// Reads the current edge through a closure.
+    ///
+    /// `Ok(None)` is nil. `Err` means the closure, its cell, or the stored
+    /// target is an invalid handle. A missing edge is not an invalid handle.
+    /// This does not call the closure.
+    pub fn read_cell(&self, closure: ClosureRef) -> Result<Option<CellValue>, HeapError> {
+        let cell = self.upvalue_of(closure)?;
+        let Some(value) = self.stored_from(cell.slot(), &EdgeKey::Field(CURRENT_EDGE)) else {
+            return Ok(None);
+        };
+        match value {
+            EdgeValue::Table { slot, generation } => {
+                let table = TableRef::table(self.domain, *slot, *generation);
+                self.require_live(table)?;
+                Ok(Some(CellValue::Table(table)))
+            }
+            EdgeValue::Closure { slot, generation } => {
+                let found = ClosureRef::closure(self.domain, *slot, *generation);
+                self.require_closure(found)?;
+                Ok(Some(CellValue::Closure(found)))
+            }
+            EdgeValue::Upvalue { .. } | EdgeValue::Scalar(_) => Err(HeapError::WrongKind),
+        }
+    }
+
+    /// Reads the table currently stored through a closure's cell.
+    ///
+    /// A closure target is `WrongKind`. A missing edge has no table, so this
+    /// table adapter returns `StaleHandle`. [`Self::read_cell`] returns `None`
+    /// for that nil.
+    pub fn read_upvalue(&self, closure: ClosureRef) -> Result<TableRef, HeapError> {
+        match self.read_cell(closure)? {
+            Some(CellValue::Table(table)) => Ok(table),
+            Some(CellValue::Closure(_)) => Err(HeapError::WrongKind),
+            None => Err(HeapError::StaleHandle),
+        }
+    }
+
+    /// The cell a closure points at. Two closures can return the same cell.
+    pub fn upvalue_of(&self, closure: ClosureRef) -> Result<UpvalueRef, HeapError> {
+        self.require_closure(closure)?;
+        let Some(value) = self.stored_from(closure.slot(), &EdgeKey::Field(UPVALUE_EDGE)) else {
+            return Err(HeapError::StaleHandle);
+        };
+        let EdgeValue::Upvalue { slot, generation } = value else {
+            return Err(HeapError::WrongKind);
+        };
+        let cell = UpvalueRef::upvalue(self.domain, *slot, *generation);
+        self.require_upvalue(cell)?;
+        Ok(cell)
+    }
+
+    /// Reads a table field that points at a closure.
+    ///
+    /// A missing field is `StaleHandle`. A table or scalar at that field is
+    /// `WrongKind`. The field id is not read as a Lua number.
+    pub fn closure_edge(&self, from: TableRef, key: u32) -> Result<ClosureRef, HeapError> {
+        self.require_live(from)?;
+        let Some(value) = self.stored_from(from.slot(), &EdgeKey::Field(key)) else {
+            return Err(HeapError::StaleHandle);
+        };
+        let EdgeValue::Closure { slot, generation } = value else {
+            return Err(HeapError::WrongKind);
+        };
+        let closure = ClosureRef::closure(self.domain, *slot, *generation);
+        self.require_closure(closure)?;
+        Ok(closure)
     }
 
     /// Writes a scalar into the same record and quota as a table edge.
@@ -785,10 +1009,19 @@ impl LuaHeap {
         key: EdgeKey,
         value: EdgeValue,
     ) -> Result<(), HeapError> {
+        self.write_from(from.slot(), key, value)
+    }
+
+    fn write_from(
+        &mut self,
+        from_slot: u32,
+        key: EdgeKey,
+        value: EdgeValue,
+    ) -> Result<(), HeapError> {
         if let Some(edge) = self
             .edges
             .iter_mut()
-            .find(|edge| edge.from == from.slot() && edge.key == key)
+            .find(|edge| edge.from == from_slot && edge.key == key)
         {
             edge.value = value;
             return Ok(());
@@ -797,7 +1030,7 @@ impl LuaHeap {
             return Err(HeapError::EdgeCapacity);
         }
         self.edges.push(Edge {
-            from: from.slot(),
+            from: from_slot,
             key,
             value,
         });
@@ -856,6 +1089,9 @@ impl LuaHeap {
                 self.issued_value(TableRef::table(self.domain, *slot, *generation))
             }
             Some(EdgeValue::Scalar(value)) => Ok(value.clone()),
+            Some(EdgeValue::Closure { .. } | EdgeValue::Upvalue { .. }) => {
+                Err(HeapError::WrongKind)
+            }
             None => Ok(Value::Null),
         }
     }
@@ -865,10 +1101,22 @@ impl LuaHeap {
         from: TableRef,
         matches_key: impl Fn(&EdgeKey) -> bool,
     ) -> Result<Option<TableRef>, HeapError> {
-        Ok(self
-            .read_edge(from, matches_key)?
-            .and_then(EdgeValue::table)
-            .map(|(slot, generation)| TableRef::table(self.domain, slot, generation)))
+        match self.read_edge(from, matches_key)? {
+            Some(EdgeValue::Table { slot, generation }) => {
+                Ok(Some(TableRef::table(self.domain, *slot, *generation)))
+            }
+            Some(EdgeValue::Scalar(_)) | None => Ok(None),
+            Some(EdgeValue::Closure { .. } | EdgeValue::Upvalue { .. }) => {
+                Err(HeapError::WrongKind)
+            }
+        }
+    }
+
+    fn stored_from(&self, from_slot: u32, key: &EdgeKey) -> Option<&EdgeValue> {
+        self.edges
+            .iter()
+            .find(|edge| edge.from == from_slot && &edge.key == key)
+            .map(|edge| &edge.value)
     }
 
     /// One scan of the heap edge vector. `from` is checked before any key test.
@@ -975,7 +1223,26 @@ impl LuaHeap {
             return Err(HeapError::StaleFrame);
         }
         let index = found.start as usize + slot as usize;
-        self.roots[index] = Some(handle);
+        self.roots[index] = Some(Rooted::Table(handle));
+        Ok(())
+    }
+
+    /// Stores a closure in an open frame. Same vector and quota as a table root.
+    ///
+    /// A stale, foreign, or wrong-kind handle is refused before the slot changes.
+    pub fn write_closure_root(
+        &mut self,
+        frame: RootFrameId,
+        slot: u32,
+        handle: ClosureRef,
+    ) -> Result<(), HeapError> {
+        self.require_closure(handle)?;
+        let found = self.frame(frame)?;
+        if slot >= found.width {
+            return Err(HeapError::StaleFrame);
+        }
+        let index = found.start as usize + slot as usize;
+        self.roots[index] = Some(Rooted::Closure(handle));
         Ok(())
     }
 
@@ -1129,6 +1396,16 @@ impl LuaHeap {
         self.require_live(handle).is_ok()
     }
 
+    /// Reports whether `handle` names a live closure in this heap.
+    pub fn closure_alive(&self, handle: ClosureRef) -> bool {
+        self.require_closure(handle).is_ok()
+    }
+
+    /// Reports whether `handle` names a live upvalue in this heap.
+    pub fn upvalue_alive(&self, handle: UpvalueRef) -> bool {
+        self.require_upvalue(handle).is_ok()
+    }
+
     /// Current occupancy. Peaks count storage, not only live objects.
     /// Does not collect and does not add scan counts.
     pub fn stats(&self) -> HeapStats {
@@ -1148,22 +1425,62 @@ impl LuaHeap {
     }
 
     fn require_live(&self, handle: TableRef) -> Result<(), HeapError> {
-        if handle.domain() != self.domain {
+        self.require_kind(
+            handle.domain(),
+            handle.slot(),
+            handle.generation(),
+            HandleKind::Table,
+        )
+    }
+
+    fn require_closure(&self, handle: ClosureRef) -> Result<(), HeapError> {
+        self.require_kind(
+            handle.domain(),
+            handle.slot(),
+            handle.generation(),
+            HandleKind::Closure,
+        )
+    }
+
+    fn require_upvalue(&self, handle: UpvalueRef) -> Result<(), HeapError> {
+        self.require_kind(
+            handle.domain(),
+            handle.slot(),
+            handle.generation(),
+            HandleKind::Upvalue,
+        )
+    }
+
+    fn require_kind(
+        &self,
+        domain: u64,
+        slot: u32,
+        generation: u32,
+        kind: HandleKind,
+    ) -> Result<(), HeapError> {
+        if domain != self.domain {
             return Err(HeapError::WrongDomain);
         }
-        if handle.kind() != HandleKind::Table {
-            return Err(HeapError::WrongKind);
+        if self.slot_matches(slot, generation, kind) {
+            return Ok(());
         }
-        if self.slot_live(handle.slot(), handle.generation()) {
-            Ok(())
+        let live_other_kind = self.slots.get(slot as usize).is_some_and(|stored| {
+            stored.generation == generation
+                && stored.kind != kind
+                && matches!(stored.state, SlotState::Live { .. })
+        });
+        if live_other_kind {
+            Err(HeapError::WrongKind)
         } else {
             Err(HeapError::StaleHandle)
         }
     }
 
-    fn slot_live(&self, index: u32, generation: u32) -> bool {
+    fn slot_matches(&self, index: u32, generation: u32, kind: HandleKind) -> bool {
         self.slots.get(index as usize).is_some_and(|slot| {
-            slot.generation == generation && matches!(slot.state, SlotState::Live { .. })
+            slot.generation == generation
+                && slot.kind == kind
+                && matches!(slot.state, SlotState::Live { .. })
         })
     }
 
@@ -1178,17 +1495,18 @@ impl LuaHeap {
         let index = self.build_outgoing_index();
         let mut work = Vec::new();
         self.scan.root_slot_visits += self.roots.len() as u64;
-        let rooted: Vec<TableRef> = self.roots.iter().copied().flatten().collect();
-        for handle in rooted {
+        let rooted: Vec<Rooted> = self.roots.iter().copied().flatten().collect();
+        for rooted in rooted {
             self.scan.node_slot_visits += 1;
-            if self.alive(handle) {
+            if self.rooted_alive(rooted) {
                 self.scan.node_slot_visits += 1;
-                self.mark_slot(handle.slot(), &mut work);
+                self.mark_slot(rooted.slot(), &mut work);
             }
         }
         let follow_metatables = self.metatable_edges > 0;
         while let Some(slot) = work.pop() {
-            let mode = if follow_metatables {
+            let from_table = self.slots[slot as usize].kind == HandleKind::Table;
+            let mode = if from_table && follow_metatables {
                 self.follow_metatable(slot, &index, &mut work)
             } else {
                 WeakMode::default()
@@ -1197,22 +1515,37 @@ impl LuaHeap {
             let end = index.offsets[slot as usize + 1] as usize;
             self.scan.outgoing_edge_checks += (end - start) as u64;
             for &entry in &index.entries[start..end] {
-                let edge = &self.edges[entry as usize];
-                let object_key = match &edge.key {
-                    EdgeKey::Object { slot, generation } => Some((*slot, *generation)),
-                    EdgeKey::Field(_) | EdgeKey::Utf8(_) | EdgeKey::Number(_) => None,
+                let (object_key, value_target) = {
+                    let edge = &self.edges[entry as usize];
+                    let object_key = match &edge.key {
+                        EdgeKey::Object { slot, generation } => Some((*slot, *generation)),
+                        EdgeKey::Field(_) | EdgeKey::Utf8(_) | EdgeKey::Number(_) => None,
+                    };
+                    let value_target = match &edge.value {
+                        EdgeValue::Table { slot, generation } => {
+                            Some((*slot, *generation, HandleKind::Table))
+                        }
+                        EdgeValue::Closure { slot, generation } => {
+                            Some((*slot, *generation, HandleKind::Closure))
+                        }
+                        EdgeValue::Upvalue { slot, generation } => {
+                            Some((*slot, *generation, HandleKind::Upvalue))
+                        }
+                        EdgeValue::Scalar(_) => None,
+                    };
+                    (object_key, value_target)
                 };
-                let value = edge.value.table();
-                if !mode.keys
+                if from_table
+                    && !mode.keys
                     && let Some((slot, generation)) = object_key
                 {
-                    self.follow_target(slot, generation, &mut work);
+                    self.follow_target(slot, generation, HandleKind::Table, &mut work);
                 }
-                // LuaJIT traces k-mode values even when their keys are unmarked.
-                if !mode.values
-                    && let Some((slot, generation)) = value
-                {
-                    self.follow_target(slot, generation, &mut work);
+                // A table entry follows that table's weak mode. A closure or
+                // cell link is not a table entry, so it stays strong.
+                let strong_value = !from_table || !mode.values;
+                if strong_value && let Some((slot, generation, kind)) = value_target {
+                    self.follow_target(slot, generation, kind, &mut work);
                 }
             }
         }
@@ -1230,7 +1563,7 @@ impl LuaHeap {
             return WeakMode::default();
         };
         self.scan.metatable_edge_checks += 1;
-        if self.follow_target(to_slot, to_generation, work)
+        if self.follow_target(to_slot, to_generation, HandleKind::Table, work)
             && let Some(modes) = &index.weak_modes
         {
             self.scan.weak_mode_lookups += 1;
@@ -1239,9 +1572,15 @@ impl LuaHeap {
         WeakMode::default()
     }
 
-    fn follow_target(&mut self, to_slot: u32, to_generation: u32, work: &mut Vec<u32>) -> bool {
+    fn follow_target(
+        &mut self,
+        to_slot: u32,
+        to_generation: u32,
+        kind: HandleKind,
+        work: &mut Vec<u32>,
+    ) -> bool {
         self.scan.node_slot_visits += 1;
-        if !self.slot_live(to_slot, to_generation) {
+        if !self.slot_matches(to_slot, to_generation, kind) {
             return false;
         }
         self.scan.node_slot_visits += 1;
@@ -1316,20 +1655,44 @@ impl LuaHeap {
     /// so an all-live collect does not walk edges again and does not build
     /// the mark bitmap.
     fn sweep_edges_once(&mut self) {
-        let marked: Vec<bool> = self
+        struct SweepSlot {
+            marked: bool,
+            kind: HandleKind,
+            generation: u32,
+        }
+        let sweep: Vec<SweepSlot> = self
             .slots
             .iter()
-            .map(|slot| matches!(slot.state, SlotState::Live { marked: true }))
+            .map(|slot| SweepSlot {
+                marked: matches!(slot.state, SlotState::Live { marked: true }),
+                kind: slot.kind,
+                generation: slot.generation,
+            })
             .collect();
-        self.scan.node_slot_visits += marked.len() as u64;
-        self.scan.scratch.sweep_bitmap_inited += marked.len() as u64;
+        self.scan.node_slot_visits += sweep.len() as u64;
+        self.scan.scratch.sweep_bitmap_inited += sweep.len() as u64;
         self.scan.sweep_edge_checks += self.edges.len() as u64;
-        let is_marked = |slot: u32| marked.get(slot as usize).copied().unwrap_or(false);
+        let is_marked = |slot: u32| sweep.get(slot as usize).is_some_and(|found| found.marked);
+        let typed = |slot: u32, generation: u32, kind: HandleKind| {
+            sweep.get(slot as usize).is_some_and(|found| {
+                found.marked && found.kind == kind && found.generation == generation
+            })
+        };
         // Strong endpoints of a marked owner were already marked. For weak
         // edges, either dead object endpoint invalidates the whole entry.
+        // Closure and cell targets are checked in this same retain.
         self.edges.retain(|edge| {
             is_marked(edge.from)
-                && edge.value.table().is_none_or(|(slot, _)| is_marked(slot))
+                && match &edge.value {
+                    EdgeValue::Table { slot, .. } => is_marked(*slot),
+                    EdgeValue::Scalar(_) => true,
+                    EdgeValue::Closure { slot, generation } => {
+                        typed(*slot, *generation, HandleKind::Closure)
+                    }
+                    EdgeValue::Upvalue { slot, generation } => {
+                        typed(*slot, *generation, HandleKind::Upvalue)
+                    }
+                }
                 && match &edge.key {
                     EdgeKey::Field(_) | EdgeKey::Utf8(_) | EdgeKey::Number(_) => true,
                     EdgeKey::Object { slot, .. } => is_marked(*slot),
@@ -1366,16 +1729,23 @@ impl LuaHeap {
     fn remove_edges_touching(&mut self, slot: u32) {
         self.edges.retain(|edge| {
             edge.from != slot
-                && edge.value.table().is_none_or(|(target, _)| target != slot)
+                && edge.value.object_slot().is_none_or(|target| target != slot)
                 && !edge_key_is_slot(&edge.key, slot)
         });
     }
 
     fn clear_roots_to(&mut self, handle: TableRef) {
         for root in &mut self.roots {
-            if *root == Some(handle) {
+            if *root == Some(Rooted::Table(handle)) {
                 *root = None;
             }
+        }
+    }
+
+    fn rooted_alive(&self, rooted: Rooted) -> bool {
+        match rooted {
+            Rooted::Table(handle) => self.alive(handle),
+            Rooted::Closure(handle) => self.closure_alive(handle),
         }
     }
 
@@ -1384,11 +1754,11 @@ impl LuaHeap {
         let len = self.roots.len();
         self.scan.root_slot_visits += len as u64;
         for index in 0..len {
-            let Some(handle) = self.roots[index] else {
+            let Some(rooted) = self.roots[index] else {
                 continue;
             };
             self.scan.node_slot_visits += 1;
-            if self.alive(handle) {
+            if self.rooted_alive(rooted) {
                 live += 1;
             } else {
                 self.roots[index] = None;
