@@ -1963,6 +1963,7 @@ impl LuaHeap {
             }
             if self.metatable_edges > 0
                 && edge.key == EdgeKey::Field(Self::MODE_FIELD)
+                && self.slots[from].kind == HandleKind::Table
                 && let EdgeValue::Scalar(Value::String(mode)) = &edge.value
             {
                 let mode = WeakMode::parse(mode, &mut self.scan.weak_mode_bytes);

@@ -2664,6 +2664,139 @@ fn shared_upvalue_text_and_bytes_keep_one_edge_and_collect_the_replaced_cycle() 
     });
 }
 
+/// A strong metatable edge does not turn a shared cell's UTF-8 text into
+/// `__mode`. Field 0 is also that cell's current edge. The text is longer than
+/// a mode name, contains `k` and `v` before an interior NUL, and stays on the
+/// cell. A later table mode string is the only parsed name. An independent
+/// weak value is what the second collection removes.
+#[test]
+fn shared_upvalue_text_is_not_parsed_as_a_weak_mode() {
+    super::super::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(
+            &mut host,
+            HeapLimits {
+                nodes: 7,
+                roots: 2,
+                edges: 7,
+                max_generation: 8,
+            },
+        )
+        .expect("install");
+        let anchor_raw = publish_raw(&mut host);
+        let anchor = table_ref(&host, anchor_raw);
+        let owner_raw = publish_raw(&mut host);
+        let owner = table_ref(&host, owner_raw);
+        let mode_raw = publish_raw(&mut host);
+        let mode_table = table_ref(&host, mode_raw);
+        let referent_raw = publish_raw(&mut host);
+        let referent = table_ref(&host, referent_raw);
+        let frame = heap::with_heap(&mut host, |heap| heap.enter_roots(2)).expect("two roots");
+        heap::with_heap(&mut host, |heap| heap.write_root(frame, 0, anchor)).expect("root");
+        heap::with_heap(&mut host, |heap| heap.write_root(frame, 1, owner)).expect("weak owner");
+
+        let (left, right, cell) = heap::with_heap(&mut host, |heap| {
+            let left = heap.alloc_closure()?;
+            let right = heap.alloc_closure()?;
+            let cell = heap.alloc_upvalue()?;
+            heap.set_closure_edge(anchor, LEFT_KEY, left)?;
+            heap.set_closure_edge(anchor, RIGHT_KEY, right)?;
+            heap.set_upvalue_edge(left, cell)?;
+            heap.set_upvalue_edge(right, cell)?;
+            heap.set_metatable(owner, Some(mode_table))?;
+            heap.set_edge(owner, 1, referent)?;
+            Ok((left, right, cell))
+        })
+        .expect("shared cell and strong metatable");
+
+        let mut raw = "é".repeat(24).into_bytes();
+        raw.extend_from_slice(b"kv\0");
+        raw.extend_from_slice("é".as_bytes());
+        assert!(raw.len() > 32, "the cell text is longer than a mode name");
+        let nul = raw
+            .iter()
+            .position(|byte| *byte == 0)
+            .expect("interior NUL");
+        assert!(
+            raw[..nul].windows(2).any(|pair| pair == b"kv"),
+            "k and v precede the NUL a mode scan would stop on"
+        );
+        let text = Value::string(String::from_utf8(raw.clone()).expect("utf-8"));
+        let text_arc = match &text {
+            Value::String(inner) => Arc::clone(inner),
+            other => panic!("text carrier is not a string: {other:?}"),
+        };
+        heap::with_heap(&mut host, |heap| heap.write_scalar_upvalue(cell, text))
+            .expect("store utf-8 text on the shared cell");
+        assert_shared_text(&mut host, left, right, &raw, &text_arc);
+
+        let _ = heap::take_scan_meter(&mut host).expect("clear setup meter");
+        heap::collect(&mut host).expect("strong metatable collect");
+        let strong = heap::take_scan_meter(&mut host).expect("strong meter");
+        assert_eq!(
+            strong.weak_mode_bytes, 0,
+            "a cell string is not scanned as a mode name"
+        );
+        assert_eq!(
+            strong.scratch.weak_modes_inited, 0,
+            "a cell string does not allocate weak-mode slots"
+        );
+        assert!(heap::with_heap(&mut host, |heap| Ok(heap.alive(anchor))).expect("root"));
+        assert!(heap::with_heap(&mut host, |heap| Ok(heap.upvalue_alive(cell))).expect("cell"));
+        assert!(
+            heap::with_heap(&mut host, |heap| Ok(heap.alive(referent))).expect("strong value"),
+            "a strong metatable does not collect the independent value"
+        );
+        assert!(token_open(&host, referent_raw));
+        assert_shared_text(&mut host, left, right, &raw, &text_arc);
+
+        let mode = "v";
+        heap::with_heap(&mut host, |heap| {
+            heap.set_mode_scalar(mode_table, Value::string(mode))
+        })
+        .expect("set the table mode");
+        assert!(
+            heap::with_heap(&mut host, |heap| Ok(heap.alive(referent))).expect("before collect"),
+            "the weak value stays until an explicit collect"
+        );
+        let before_weak = heap::stats(&mut host).expect("before weak collect");
+        heap::collect(&mut host).expect("weak value collect");
+        let weak = heap::take_scan_meter(&mut host).expect("weak meter");
+        assert_eq!(
+            weak.weak_mode_bytes,
+            mode.len() as u64,
+            "the scan counts only the table mode name"
+        );
+        assert!(
+            (raw.len() as u64) > weak.weak_mode_bytes,
+            "the cell text is not part of the mode count"
+        );
+        assert_eq!(
+            weak.scratch.weak_modes_inited,
+            u64::from(before_weak.node_slots),
+            "the real mode allocates one entry per node slot"
+        );
+        assert!(
+            !heap::with_heap(&mut host, |heap| Ok(heap.alive(referent))).expect("swept"),
+            "the independent weak value is collected"
+        );
+        assert!(
+            !token_open(&host, referent_raw),
+            "the weak value token is closed"
+        );
+        assert!(heap::with_heap(&mut host, |heap| Ok(heap.alive(anchor))).expect("root kept"));
+        assert!(
+            heap::with_heap(&mut host, |heap| Ok(heap.upvalue_alive(cell))).expect("cell kept")
+        );
+        assert!(heap::with_heap(&mut host, |heap| Ok(heap.closure_alive(left))).expect("left"));
+        assert!(heap::with_heap(&mut host, |heap| Ok(heap.closure_alive(right))).expect("right"));
+        assert!(token_open(&host, anchor_raw));
+        assert!(token_open(&host, owner_raw));
+        assert!(token_open(&host, mode_raw));
+        assert_shared_text(&mut host, left, right, &raw, &text_arc);
+    });
+}
+
 fn assert_shared_text(
     host: &mut HostContext<'_>,
     left: ClosureRef,
