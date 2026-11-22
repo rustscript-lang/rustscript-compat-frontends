@@ -60,6 +60,8 @@ pub enum HeapError {
     StaleFrame,
     /// The resource handle does not fit in a positive VM integer.
     CarrierOutOfRange,
+    /// A NaN is not a table key. LuaJIT reports this on write; a read is nil.
+    NanIndex,
     /// This scope already has a heap.
     AlreadyInstalled,
     /// Execution-scope or resource-table failure. `publish` rolls the reserved
@@ -86,6 +88,7 @@ impl fmt::Display for HeapError {
             Self::NoRootFrame => write!(formatter, "no lua root frame"),
             Self::StaleFrame => write!(formatter, "stale lua root frame"),
             Self::CarrierOutOfRange => write!(formatter, "lua resource carrier out of range"),
+            Self::NanIndex => write!(formatter, "table index is NaN"),
             Self::AlreadyInstalled => write!(formatter, "lua heap already installed"),
             Self::Scope(message) => write!(formatter, "lua heap scope error: {message}"),
         }
@@ -172,9 +175,10 @@ struct Slot {
 
 struct Edge {
     from: u32,
-    /// Field ids, object identities, and full string text share this record.
-    /// An object key is the live slot and generation. A string key is the
-    /// complete UTF-8 text, not a guest number and not a second edge table.
+    /// Field ids, object identities, string text, and binary64 numbers share
+    /// this record. An object key is the live slot and generation. A string
+    /// key is the complete UTF-8 text. A number key is canonical binary64
+    /// bits, not a field id and not a collectable node.
     key: EdgeKey,
     value: EdgeValue,
 }
@@ -207,6 +211,9 @@ enum EdgeKey {
     },
     /// Complete UTF-8 text, including interior NUL. Not a collectable table.
     Utf8(String),
+    /// Canonical binary64 bits. Positive and negative zero share the zero
+    /// bits. A NaN is never stored. This is not a field id and not a node.
+    Number(u64),
 }
 
 impl EdgeKey {
@@ -230,6 +237,14 @@ impl EdgeKey {
     /// The reserved mode name. Field id 0 is that key; a longer text is not.
     fn is_mode_name(name: &str) -> bool {
         name == "__mode"
+    }
+
+    /// One constructor for a numeric key. `+0` and `-0` share the zero bits.
+    /// The caller refuses NaN before this runs.
+    fn number(number: f64) -> Self {
+        debug_assert!(!number.is_nan());
+        let bits = if number == 0.0 { 0 } else { number.to_bits() };
+        Self::Number(bits)
     }
 
     /// Compares a borrowed lookup name with this stored key.
@@ -687,6 +702,60 @@ impl LuaHeap {
         Ok(())
     }
 
+    /// Writes one table under a binary64 key, in the same record as a field.
+    ///
+    /// NaN is refused before any lookup or insert. An integer resource carrier
+    /// is not a number key; callers pass `f64` only for `Value::Float`.
+    pub fn set_number_edge(
+        &mut self,
+        from: TableRef,
+        key: f64,
+        to: TableRef,
+    ) -> Result<(), HeapError> {
+        let key = Self::number_key(key)?;
+        self.write_table_edge(from, key, to)
+    }
+
+    /// Writes one string under a binary64 key. Nil removal stays on
+    /// [`Self::clear_number_edge`].
+    pub fn set_number_scalar(
+        &mut self,
+        from: TableRef,
+        key: f64,
+        value: Value,
+    ) -> Result<(), HeapError> {
+        debug_assert!(matches!(value, Value::String(_)));
+        let key = Self::number_key(key)?;
+        self.require_live(from)?;
+        self.write_edge(from, key, EdgeValue::Scalar(value))
+    }
+
+    /// Removes one binary64 record. A NaN write is an error and does not delete.
+    pub fn clear_number_edge(&mut self, from: TableRef, key: f64) -> Result<(), HeapError> {
+        let key = Self::number_key(key)?;
+        self.require_live(from)?;
+        self.clear_edge(from, &key);
+        Ok(())
+    }
+
+    /// Reads a binary64 key. NaN reads nil after the table is confirmed live.
+    /// `+0` and `-0` select the same record.
+    pub fn number_value(&self, from: TableRef, key: f64) -> Result<Value, HeapError> {
+        self.require_live(from)?;
+        if key.is_nan() {
+            return Ok(Value::Null);
+        }
+        let key = EdgeKey::number(key);
+        self.stored_value(from, |stored| stored == &key)
+    }
+
+    fn number_key(key: f64) -> Result<EdgeKey, HeapError> {
+        if key.is_nan() {
+            return Err(HeapError::NanIndex);
+        }
+        Ok(EdgeKey::number(key))
+    }
+
     fn clear_edge(&mut self, from: TableRef, key: &EdgeKey) {
         self.edges
             .retain(|edge| edge.from != from.slot() || &edge.key != key);
@@ -1131,7 +1200,7 @@ impl LuaHeap {
                 let edge = &self.edges[entry as usize];
                 let object_key = match &edge.key {
                     EdgeKey::Object { slot, generation } => Some((*slot, *generation)),
-                    EdgeKey::Field(_) | EdgeKey::Utf8(_) => None,
+                    EdgeKey::Field(_) | EdgeKey::Utf8(_) | EdgeKey::Number(_) => None,
                 };
                 let value = edge.value.table();
                 if !mode.keys
@@ -1262,7 +1331,7 @@ impl LuaHeap {
             is_marked(edge.from)
                 && edge.value.table().is_none_or(|(slot, _)| is_marked(slot))
                 && match &edge.key {
-                    EdgeKey::Field(_) | EdgeKey::Utf8(_) => true,
+                    EdgeKey::Field(_) | EdgeKey::Utf8(_) | EdgeKey::Number(_) => true,
                     EdgeKey::Object { slot, .. } => is_marked(*slot),
                 }
         });

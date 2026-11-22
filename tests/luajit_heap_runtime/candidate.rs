@@ -552,6 +552,31 @@ fn root_issued(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
     Ok(Value::Float(0.0))
 }
 
+fn write_number_edge(
+    call: &mut OwnedHostCall<'_>,
+    from: heap::TableRef,
+    key: f64,
+    to_value: &Value,
+) -> Result<(), VmError> {
+    if matches!(to_value, Value::Null) {
+        return heap::with_heap(&mut call.vm().host_context(), |heap| {
+            heap.clear_number_edge(from, key)
+        })
+        .map_err(heap_error);
+    }
+    let mut host = call.vm().host_context();
+    match classify(&mut host, to_value)? {
+        heap::GuestClass::Table(to) => {
+            heap::with_heap(&mut host, |heap| heap.set_number_edge(from, key, to))
+        }
+        heap::GuestClass::String => heap::with_heap(&mut host, |heap| {
+            heap.set_number_scalar(from, key, to_value.clone())
+        }),
+        _ => return Err(host_fault("edge target is not a table")),
+    }
+    .map_err(heap_error)
+}
+
 fn set_edge(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
     let (from, key_value, to_value) = match call.args() {
         [from, key, to] => (from.clone(), key.clone(), to.clone()),
@@ -590,6 +615,8 @@ fn set_edge(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
                 }
             })?;
         }
+        // Binary64 only. An integer resource carrier is not a number key.
+        Value::Float(number) => write_number_edge(call, from, number, &to_value)?,
         other => {
             let heap::GuestClass::Table(key) = classify(&mut call.vm().host_context(), &other)?
             else {
@@ -831,6 +858,10 @@ fn get_edge(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
     let mut host = call.vm().host_context();
     if let Value::String(name) = key_value {
         return heap::with_heap(&mut host, |heap| heap.named_value(table, &name))
+            .map_err(heap_error);
+    }
+    if let Value::Float(number) = key_value {
+        return heap::with_heap(&mut host, |heap| heap.number_value(table, number))
             .map_err(heap_error);
     }
     let heap::GuestClass::Table(key) = classify(&mut host, &key_value)? else {
@@ -1571,15 +1602,12 @@ impl Lower<'_> {
         key: &ast::Expr,
         span: ast::Span,
     ) -> Result<(LocalSlot, LocalSlot), ParseError> {
-        if index_key_is_number(key) {
-            return Err(ParseError::at_line(
-                self.line(span) as usize,
-                "numeric table keys are not in this field-key subset",
-            ));
-        }
         if !matches!(
             key,
-            ast::Expr::Name { .. } | ast::Expr::Paren { .. } | ast::Expr::String { .. }
+            ast::Expr::Name { .. }
+                | ast::Expr::Paren { .. }
+                | ast::Expr::String { .. }
+                | ast::Expr::Number { .. }
         ) {
             return Err(self.unsupported(key.span()));
         }
@@ -2239,14 +2267,6 @@ fn statement_receiver_width(stmt: &ast::Stmt) -> u32 {
 
 fn utf8_field(name: &[u8]) -> Result<String, ()> {
     String::from_utf8(name.to_vec()).map_err(|_| ())
-}
-
-fn index_key_is_number(key: &ast::Expr) -> bool {
-    match key {
-        ast::Expr::Number { .. } => true,
-        ast::Expr::Paren { inner, .. } => index_key_is_number(inner),
-        _ => false,
-    }
 }
 
 fn syntactic_direct_call(expr: &ast::Expr) -> bool {

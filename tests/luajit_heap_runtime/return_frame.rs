@@ -2,7 +2,8 @@
 //!
 //! The sources are legal Lua. The callee's `Ret` still carries one value, the
 //! private ordered result array. The caller binds that array into locals and
-//! reads those locals. `self` is an ordinary field name. Numeric keys are refused.
+//! reads those locals. `self` is an ordinary field name. A numeric key is a
+//! binary64 edge, not a private field id. An absent `t[1]` reads nil.
 
 use super::candidate::{self, EdgeView, ReturnWitness, ReturnedElement};
 use super::{catalog, heap, register_witnesses};
@@ -1360,10 +1361,10 @@ fn assert_value_oracle() {
 }
 
 #[test]
-fn numeric_table_keys_are_refused() {
-    let error = candidate::lower_returning("local t = {}; local n = t[1]\n", catalog(), true)
-        .expect_err("numeric keys stay outside this field-key subset");
-    assert!(error.to_string().contains("numeric table keys"), "{error}");
+fn numeric_table_key_read_returns_nil_when_absent() {
+    let mut vm = run("local t = {}; local n = t[1]; return type(n)\n", true);
+    assert_eq!(vm.run().expect("absent numeric key"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("nil")]);
 }
 
 fn assert_stale_edge(vm: &mut vm::Vm, table: heap::TableRef, key: Option<String>) {

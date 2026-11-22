@@ -160,6 +160,20 @@ pub(super) fn catalog() -> &'static Arc<vm::HostApiCatalog> {
             HostTypeSchema::Float,
         ));
         builder.function(HostFunctionSchema::with_return(
+            "lua_host::float_bits",
+            vec![HostParamSchema::value("tag", HostTypeSchema::Float)],
+            HostTypeSchema::Float,
+        ));
+        let table = HostTypeSchema::Resource(heap::LuaTableResource::key());
+        builder.function(HostFunctionSchema::with_return(
+            "lua_host::plant_private_field",
+            vec![
+                HostParamSchema::with_passing("owner", table.clone(), HostParamPassing::Borrow),
+                HostParamSchema::with_passing("value", table, HostParamPassing::Borrow),
+            ],
+            HostTypeSchema::Bool,
+        ));
+        builder.function(HostFunctionSchema::with_return(
             "lua_host::caller_reads",
             vec![
                 HostParamSchema::value("field_same", HostTypeSchema::Bool),
@@ -237,6 +251,8 @@ pub(super) fn register_witnesses(
         ("lua_host::observe_number", Witness::Number),
         ("lua_host::observe_table", Witness::TableAndNumber(0)),
         ("lua_host::observe_table_after", Witness::TableAndNumber(1)),
+        ("lua_host::float_bits", Witness::FloatBits),
+        ("lua_host::plant_private_field", Witness::PlantField),
     ] {
         let function = catalog.function(name).unwrap();
         registry
@@ -255,6 +271,8 @@ enum Witness {
     Tables,
     Number,
     TableAndNumber(usize),
+    FloatBits,
+    PlantField,
 }
 
 impl vm::HostOwnedFunction for Witness {
@@ -309,8 +327,47 @@ impl vm::HostOwnedFunction for Witness {
                 };
                 Value::Float(*number)
             }
+            Self::FloatBits => {
+                let [Value::Float(tag)] = args.as_slice() else {
+                    panic!("expected float tag")
+                };
+                Value::Float(special_float(*tag))
+            }
+            Self::PlantField => {
+                let [owner, planted] = args.as_slice() else {
+                    panic!("plant arity")
+                };
+                let key = heap::LuaTableResource::key();
+                let table_of = |value: &Value| {
+                    let Value::Int(raw) = value else {
+                        panic!("expected Core resource carrier")
+                    };
+                    let handle =
+                        vm::ResourceHandle::from_raw(u64::try_from(*raw).unwrap()).unwrap();
+                    host.borrow_resource_with_key::<heap::LuaTableResource>(handle, &key)
+                        .unwrap()
+                        .table()
+                };
+                let owner = table_of(owner);
+                let planted = table_of(planted);
+                heap::with_heap(&mut host, |heap| heap.set_edge(owner, 1, planted))
+                    .expect("plant private field 1");
+                Value::Bool(true)
+            }
         };
         Ok(vm::CallOutcome::Return(vm::CallReturn::one(value)))
+    }
+}
+
+fn special_float(tag: f64) -> f64 {
+    // Candidate source cannot spell these. The tags are ordinary numbers.
+    // The returned binary64 values are the typed inputs.
+    match tag {
+        1.0 => f64::from_bits(0x8000_0000_0000_0000),
+        2.0 => f64::NAN,
+        3.0 => f64::INFINITY,
+        4.0 => f64::NEG_INFINITY,
+        _ => panic!("unknown float tag {tag}"),
     }
 }
 
@@ -1579,7 +1636,7 @@ fn assert_object_string(
 
 #[test]
 fn lua_candidate_bracket_numbers_do_not_alias_private_field_ids() {
-    let source = r#"
+    let dynamic = r#"
 local function make()
   local owner = {}
   local value = {}
@@ -1590,9 +1647,365 @@ local owner = make()
 local number = 1
 return type(owner[number])
 "#;
+    let mut vm = candidate(dynamic);
+    assert_eq!(vm.run().expect("dynamic numeric read"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("nil")]);
+
+    let read = r#"
+local owner = {}
+local planted = {}
+local named = {}
+plant_private_field(owner, planted)
+owner.field = named
+owner["1"] = "text"
+observe_table(owner, 0)
+observe_table(planted, 0)
+observe_table(named, 0)
+return type(owner[1])
+"#;
+    let mut vm = candidate(read);
+    assert_eq!(
+        vm.run().expect("numeric read beside field 1"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::string("nil")]);
+    assert_private_field_untouched(&mut vm, 3);
+
+    let written = r#"
+local owner = {}
+local planted = {}
+local named = {}
+plant_private_field(owner, planted)
+owner.field = named
+owner["1"] = "text"
+owner[1] = "num"
+owner[1.0] = "num"
+observe_table(owner, 0)
+observe_table(planted, 0)
+observe_table(named, 0)
+return owner[1]
+"#;
+    let mut vm = candidate(written);
+    assert_eq!(vm.run().expect("numeric write"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("num")]);
+    assert_private_field_untouched(&mut vm, 4);
+    let owner = observed_tables(&mut vm)[0];
+    let text = heap::with_heap(&mut vm.host_context(), |heap| {
+        heap.named_value(owner.table, "1")
+    })
+    .unwrap();
+    assert_eq!(text, Value::string("text"));
+}
+
+fn assert_private_field_untouched(vm: &mut vm::Vm, edges: u32) {
+    let tables = observed_tables(vm);
+    let [owner, planted, named] = tables.as_slice() else {
+        panic!("expected owner, planted field, and named field");
+    };
+    let field = heap::with_heap(&mut vm.host_context(), |heap| heap.edge(owner.table, 1)).unwrap();
+    assert_eq!(
+        field,
+        Some(planted.table),
+        "field id 1 stays the planted table"
+    );
+    let by_name = heap::with_heap(&mut vm.host_context(), |heap| {
+        heap.named_edge(owner.table, "field")
+    })
+    .unwrap();
+    assert_eq!(by_name, Some(named.table));
+    assert_eq!(
+        heap::stats(&mut vm.host_context()).unwrap().live_edges,
+        edges
+    );
+}
+
+fn observed_tables(vm: &mut vm::Vm) -> Vec<ObservedTable> {
+    vm.host_context()
+        .scope_state::<Vec<ObservedTable>>()
+        .unwrap()
+        .clone()
+}
+
+#[test]
+fn lua_candidate_numeric_key_reuses_one_record() {
+    let overwrite = r#"
+local owner = {}
+local value = {}
+owner[1] = "first"
+local k = 1.0
+owner[k] = value
+observe_table(value, 0)
+observe_table(owner[1], 0)
+owner[1] = "second"
+return owner[1.0]
+"#;
+    let mut vm = candidate(overwrite);
+    assert_eq!(
+        vm.run().expect("overwrite one numeric record"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::string("second")]);
+    let tables = observed_tables(&mut vm);
+    assert_eq!(
+        tables[0], tables[1],
+        "literal and dynamic read the same table"
+    );
+    assert_eq!(heap::stats(&mut vm.host_context()).unwrap().live_edges, 1);
+
+    let missing = "local owner = {}\nowner[2] = nil\nreturn type(owner[2])\n";
+    let mut vm = candidate(missing);
+    assert_eq!(
+        vm.run().expect("nil write to a missing numeric key"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::string("nil")]);
+    assert_eq!(heap::stats(&mut vm.host_context()).unwrap().live_edges, 0);
+
+    let deleted = r#"
+local owner = {}
+local value = {}
+value.self = value
+observe_table(value, 0)
+owner[1] = value
+value = nil
+owner[1] = nil
+return type(owner[1])
+"#;
+    for collect in [false, true] {
+        let source = if collect {
+            deleted.replace(
+                "return type(owner[1])",
+                "collectgarbage(\"collect\")\nreturn type(owner[1])",
+            )
+        } else {
+            deleted.to_string()
+        };
+        let mut vm = candidate(&source);
+        assert_eq!(vm.run().expect("nil delete"), VmStatus::Halted, "{collect}");
+        assert_eq!(vm.stack(), &[Value::string("nil")]);
+        let value = observed_tables(&mut vm)[0];
+        let alive =
+            heap::with_heap(&mut vm.host_context(), |heap| Ok(heap.alive(value.table))).unwrap();
+        let token_alive = vm
+            .host_context()
+            .borrow_resource_with_key::<heap::LuaTableResource>(
+                value.token,
+                &heap::LuaTableResource::key(),
+            )
+            .is_ok();
+        assert_eq!(alive, !collect, "heap node after nil delete");
+        assert_eq!(token_alive, !collect, "token after nil delete");
+        let stats = heap::stats(&mut vm.host_context()).unwrap();
+        // The numeric record is gone. The value's own self edge remains until
+        // the explicit collection that reclaims the unrooted node.
+        assert_eq!(stats.live_edges, u32::from(!collect));
+        assert_eq!(stats.collections, u32::from(collect));
+    }
+}
+
+#[test]
+fn lua_candidate_numeric_fraction_does_not_alias_one_or_field_id() {
+    let source = r#"
+local owner = {}
+local planted = {}
+plant_private_field(owner, planted)
+owner[1.5] = "half"
+local k = 1.5
+observe_table(owner, 0)
+observe_table(planted, 0)
+return owner[k]
+"#;
     let mut vm = candidate(source);
-    assert!(matches!(vm.run(), Err(vm::VmError::HostError(message))
-        if message == "edge key is not a table"));
+    assert_eq!(vm.run().expect("fraction key"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("half")]);
+    let tables = observed_tables(&mut vm);
+    let field =
+        heap::with_heap(&mut vm.host_context(), |heap| heap.edge(tables[0].table, 1)).unwrap();
+    assert_eq!(field, Some(tables[1].table));
+    assert_eq!(heap::stats(&mut vm.host_context()).unwrap().live_edges, 2);
+
+    let other = source.replace("return owner[k]", "return type(owner[1])");
+    let mut vm = candidate(&other);
+    assert_eq!(
+        vm.run().expect("integer key stays absent"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::string("nil")]);
+    let text = source.replace("return owner[k]", "return type(owner[\"1.5\"])");
+    let mut vm = candidate(&text);
+    assert_eq!(vm.run().expect("text key stays absent"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("nil")]);
+}
+
+#[test]
+fn lua_candidate_numeric_zero_does_not_alias_mode_field() {
+    let mode = r#"
+local mt = {}
+mt.__mode = "v"
+mt[0] = "zero"
+return mt.__mode
+"#;
+    let mut vm = candidate(mode);
+    assert_eq!(vm.run().expect("mode field"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("v")]);
+    assert_eq!(heap::stats(&mut vm.host_context()).unwrap().live_edges, 2);
+
+    let zero = mode.replace("return mt.__mode", "return mt[0]");
+    let mut vm = candidate(&zero);
+    assert_eq!(vm.run().expect("numeric zero"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("zero")]);
+    assert_eq!(heap::stats(&mut vm.host_context()).unwrap().live_edges, 2);
+}
+
+#[test]
+fn lua_candidate_weak_numeric_value_clears_only_after_collect() {
+    let source = r#"
+local mt = {}
+mt.__mode = "v"
+local owner = {}
+setmetatable(owner, mt)
+local value = {}
+value.self = value
+local orphan = {}
+orphan.self = orphan
+owner[1] = value
+observe_table(orphan, 0)
+observe_table(value, 0)
+orphan = nil
+@collect@
+return type(owner[1])
+"#;
+    let omitted = source.replace("@collect@\n", "");
+    assert_weak_probe(&omitted, "table", &[true, true], 4, 0);
+
+    let rooted = source.replace("@collect@", "collectgarbage(\"collect\")");
+    assert_weak_probe(&rooted, "table", &[false, true], 3, 1);
+
+    let released = r#"
+local mt = {}
+mt.__mode = "v"
+local owner = {}
+setmetatable(owner, mt)
+local value = {}
+value.self = value
+owner[1] = value
+observe_table(value, 0)
+value = nil
+@collect@
+return type(owner[1])
+"#;
+    assert_weak_probe(&released.replace("@collect@\n", ""), "table", &[true], 3, 0);
+    assert_weak_probe(
+        &released.replace("@collect@", "collectgarbage(\"collect\")"),
+        "nil",
+        &[false],
+        1,
+        1,
+    );
+}
+
+#[test]
+fn lua_candidate_signed_zero_number_keys_share_one_record() {
+    let through_zero = r#"
+local neg = float_bits(1)
+local owner = {}
+owner[neg] = "neg"
+return owner[0]
+"#;
+    let mut vm = candidate(through_zero);
+    assert_eq!(vm.run().expect("read +0 after -0 write"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("neg")]);
+    assert_eq!(heap::stats(&mut vm.host_context()).unwrap().live_edges, 1);
+
+    let through_neg = r#"
+local neg = float_bits(1)
+local owner = {}
+owner[0] = "pos"
+return owner[neg]
+"#;
+    let mut vm = candidate(through_neg);
+    assert_eq!(vm.run().expect("read -0 after +0 write"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("pos")]);
+    assert_eq!(heap::stats(&mut vm.host_context()).unwrap().live_edges, 1);
+
+    let overwrite = r#"
+local neg = float_bits(1)
+local owner = {}
+owner[0] = "pos"
+owner[neg] = "neg"
+return owner[0]
+"#;
+    let mut vm = candidate(overwrite);
+    assert_eq!(vm.run().expect("signed zero overwrite"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("neg")]);
+    assert_eq!(heap::stats(&mut vm.host_context()).unwrap().live_edges, 1);
+}
+
+#[test]
+fn lua_candidate_infinities_are_distinct_number_keys() {
+    let source = r#"
+local pos = float_bits(3)
+local neg = float_bits(4)
+local owner = {}
+owner[pos] = "pos"
+owner[neg] = "neg"
+return owner[@which@]
+"#;
+    for (which, expected) in [("pos", "pos"), ("neg", "neg")] {
+        let mut vm = candidate(&source.replace("@which@", which));
+        assert_eq!(vm.run().expect(which), VmStatus::Halted);
+        assert_eq!(vm.stack(), &[Value::string(expected)]);
+        assert_eq!(heap::stats(&mut vm.host_context()).unwrap().live_edges, 2);
+    }
+}
+
+#[test]
+fn lua_candidate_nan_number_key_read_is_nil() {
+    let source = r#"
+local owner = {}
+owner[1] = "keep"
+local k = float_bits(2)
+return type(owner[k])
+"#;
+    let mut vm = candidate(source);
+    assert_eq!(vm.run().expect("NaN key read"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("nil")]);
+    assert_eq!(heap::stats(&mut vm.host_context()).unwrap().live_edges, 1);
+}
+
+#[test]
+fn lua_candidate_nan_number_key_string_write_is_refused() {
+    let source = r#"
+local owner = {}
+owner[1] = "keep"
+local k = float_bits(2)
+observe_table(owner, 0)
+owner[k] = "nope"
+"#;
+    assert_nan_index(source);
+}
+
+#[test]
+fn lua_candidate_nan_number_key_nil_write_is_refused() {
+    let source = r#"
+local owner = {}
+owner[1] = "keep"
+local k = float_bits(2)
+observe_table(owner, 0)
+owner[k] = nil
+"#;
+    assert_nan_index(source);
+}
+
+fn assert_nan_index(source: &str) {
+    let mut vm = candidate(source);
+    let error = vm.run().expect_err("NaN key write");
+    assert!(
+        matches!(error, vm::VmError::HostError(ref message) if message == "table index is NaN"),
+        "{error}"
+    );
+    assert_eq!(heap::stats(&mut vm.host_context()).unwrap().live_edges, 1);
+    assert_eq!(heap::stats(&mut vm.host_context()).unwrap().collections, 0);
 }
 
 #[test]
