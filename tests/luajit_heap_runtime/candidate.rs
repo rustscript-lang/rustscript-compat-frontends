@@ -1295,7 +1295,7 @@ impl Lower<'_> {
     /// once, at this statement's end, not at the label. This is not the
     /// `control.rs` state dispatcher.
     fn lower_do(&mut self, span: ast::Span, body: &ast::Block) -> Result<(), ParseError> {
-        for stmt in self.retained_statements(span, body)? {
+        for stmt in self.retained_statements(body)? {
             self.lower_stmt(stmt)?;
         }
         self.retire_block(span, body)
@@ -1312,10 +1312,9 @@ impl Lower<'_> {
     /// semicolons. The target id is matched by label span, not by name.
     fn retained_statements<'b>(
         &self,
-        span: ast::Span,
         body: &'b ast::Block,
     ) -> Result<Vec<&'b ast::Stmt>, ParseError> {
-        let skip = self.forward_goto_skip(span, body)?;
+        let skip = self.forward_goto_skip(body)?;
         let mut kept = Vec::new();
         for (index, stmt) in body.stmts.iter().enumerate() {
             if matches!(stmt, ast::Stmt::Label { .. }) {
@@ -1333,18 +1332,13 @@ impl Lower<'_> {
     }
 
     /// Bounds of the one direct forward `goto` this block can structure.
-    /// `None` is the straight path. The resolver target must be a direct child
-    /// later in this block. Its scope must be this block's scope when the
-    /// block has locals, and must not be a nested block's scope. Another goto
-    /// whose target lies in the skipped span is excluded: that shape needs a
-    /// graph, and this path does not invent one. A second direct goto, a
-    /// backward jump, or a target in another block stays unsupported instead
-    /// of falling through the skipped statements.
-    fn forward_goto_skip(
-        &self,
-        span: ast::Span,
-        body: &ast::Block,
-    ) -> Result<Option<(usize, usize)>, ParseError> {
+    /// `None` is the straight path. The resolver target must be a later
+    /// direct child of this block. Another goto whose target lies in the
+    /// skipped span is excluded: that shape needs a graph, and this path
+    /// does not invent one. A second direct goto, a backward jump, or a
+    /// target in another block stays unsupported instead of falling through
+    /// the skipped statements.
+    fn forward_goto_skip(&self, body: &ast::Block) -> Result<Option<(usize, usize)>, ParseError> {
         let mut found = None;
         for (index, stmt) in body.stmts.iter().enumerate() {
             let ast::Stmt::Goto {
@@ -1375,7 +1369,7 @@ impl Lower<'_> {
         let Some(label) = self.resolution.labels.get(target) else {
             return Err(self.statement_unsupported(goto_span));
         };
-        if label.function_id != 0 || !self.label_names_this_block(span, body, label) {
+        if label.function_id != 0 {
             return Err(self.statement_unsupported(goto_span));
         }
         let Some(label_index) = body.stmts.iter().position(
@@ -1389,34 +1383,6 @@ impl Lower<'_> {
             return Err(self.statement_unsupported(goto_span));
         }
         Ok(Some((goto_index, label_index)))
-    }
-
-    /// Direct-child span already places the label in this block. When the
-    /// block has locals, their `scope_id` must be the label's scope. A nested
-    /// block's binding uses another scope and must not share this name.
-    fn label_names_this_block(
-        &self,
-        span: ast::Span,
-        body: &ast::Block,
-        label: &resolve::LabelBinding,
-    ) -> bool {
-        for binding in &self.resolution.bindings {
-            if binding.function_id != 0 {
-                continue;
-            }
-            let inside = binding.span.start >= body.span.start && binding.span.end <= body.span.end;
-            if !inside {
-                continue;
-            }
-            if binding.visible_to == span.end {
-                if binding.scope_id != label.scope_id {
-                    return false;
-                }
-            } else if binding.scope_id == label.scope_id {
-                return false;
-            }
-        }
-        true
     }
 
     /// True when some other goto targets a label inside the skipped statements.
