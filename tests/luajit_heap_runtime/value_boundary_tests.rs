@@ -12,13 +12,13 @@ mod envelope_local_root;
 mod lexer;
 #[path = "../../src/frontends/lua/parser.rs"]
 mod parser;
+#[path = "rawset.rs"]
+mod rawset;
 #[path = "../../src/frontends/lua/resolve.rs"]
 mod resolve;
 mod return_frame;
 #[path = "source_closure.rs"]
 mod source_closure;
-#[path = "rawset.rs"]
-mod rawset;
 #[path = "string_byte_length.rs"]
 mod string_byte_length;
 #[path = "table_metatable_protection.rs"]
