@@ -28,8 +28,11 @@
 //! sweep. A root slot holds a table, a closure, or an upvalue. A table field can point at
 //! a closure, a closure at one shared upvalue, and that upvalue at its current
 //! table or closure. A missing current edge is nil. Two closures can point at
-//! the same upvalue. Those nodes have no guest carrier and no Core resource
-//! token. They are not callable values.
+//! the same upvalue. A table entry key can be a table or a closure. Both use
+//! the same object-key record: slot, generation, and kind. Mark and sweep walk
+//! that record in the existing pass. A closure key is not a field id and is
+//! not a guest value. Closure and upvalue nodes have no guest carrier and no
+//! Core resource token. They are not callable values.
 //!
 //! Later integration, not this kernel: LuaJIT `ordered.lua` plus the reverse
 //! and skip-collection controls in

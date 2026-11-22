@@ -2,7 +2,9 @@
 //!
 //! Closure and cell nodes use the same slots, edges, roots, and sweep as
 //! tables. A private field id is not a Lua number. Internal links are strong.
-//! Only a table entry follows that table's weak mode.
+//! Only a table entry follows that table's weak mode. An object key stores
+//! the slot, generation, and kind. A closure key is that record with closure
+//! kind. It is not a private field id and not a second edge table.
 
 use std::fmt;
 use std::sync::Arc;
@@ -188,8 +190,8 @@ struct Slot {
 struct Edge {
     from: u32,
     /// Field ids, object identities, string text, and binary64 numbers share
-    /// this record. An object key is the live slot and generation. A string
-    /// key is the complete UTF-8 text. A number key is canonical binary64
+    /// this record. An object key is the live slot, generation, and kind. A
+    /// string key is the complete UTF-8 text. A number key is canonical binary64
     /// bits, not a field id and not a collectable node.
     key: EdgeKey,
     value: EdgeValue,
@@ -263,6 +265,7 @@ enum EdgeKey {
     Object {
         slot: u32,
         generation: u32,
+        kind: HandleKind,
     },
     /// Complete UTF-8 text, including interior NUL. Not a collectable table.
     Utf8(String),
@@ -273,9 +276,19 @@ enum EdgeKey {
 
 impl EdgeKey {
     fn object(key: TableRef) -> Self {
+        Self::identity(key.slot(), key.generation(), key.kind())
+    }
+
+    fn closure_key(key: ClosureRef) -> Self {
+        Self::identity(key.slot(), key.generation(), key.kind())
+    }
+
+    /// One object-key record. Table and closure keys differ by `kind`.
+    fn identity(slot: u32, generation: u32, kind: HandleKind) -> Self {
         Self::Object {
-            slot: key.slot(),
-            generation: key.generation(),
+            slot,
+            generation,
+            kind,
         }
     }
 
@@ -928,6 +941,68 @@ impl LuaHeap {
         Ok(())
     }
 
+    /// Writes one table under a closure identity key.
+    ///
+    /// Same record and quota as a table object key. The key is the closure
+    /// slot, generation, and kind. A private field id is not this key. Handle
+    /// checks run before any stored entry is replaced.
+    pub fn set_closure_key_edge(
+        &mut self,
+        from: TableRef,
+        key: ClosureRef,
+        to: TableRef,
+    ) -> Result<(), HeapError> {
+        self.require_closure(key)?;
+        self.write_table_edge(from, EdgeKey::closure_key(key), to)
+    }
+
+    /// Writes one string under a closure identity key, in the same record.
+    ///
+    /// Nil removal stays on [`Self::clear_closure_key`]. A refused handle does
+    /// not replace an existing entry.
+    pub fn set_closure_key_scalar(
+        &mut self,
+        from: TableRef,
+        key: ClosureRef,
+        value: Value,
+    ) -> Result<(), HeapError> {
+        debug_assert!(matches!(value, Value::String(_)));
+        self.require_live(from)?;
+        self.require_closure(key)?;
+        self.write_edge(from, EdgeKey::closure_key(key), EdgeValue::Scalar(value))
+    }
+
+    /// Removes one closure-key record. Another closure, including one that
+    /// shares this key's cell, is a different identity and stays.
+    pub fn clear_closure_key(&mut self, from: TableRef, key: ClosureRef) -> Result<(), HeapError> {
+        self.require_live(from)?;
+        self.require_closure(key)?;
+        let key = EdgeKey::closure_key(key);
+        self.clear_edge(from, &key);
+        Ok(())
+    }
+
+    /// Reads a closure-key edge. The key domain, kind, and generation must
+    /// still name that live closure.
+    pub fn closure_key_edge(
+        &self,
+        from: TableRef,
+        key: ClosureRef,
+    ) -> Result<Option<TableRef>, HeapError> {
+        self.require_closure(key)?;
+        let key = EdgeKey::closure_key(key);
+        self.read_table_edge(from, |stored| stored == &key)
+    }
+
+    /// Reads a closure-key edge as the guest value.
+    ///
+    /// A stored string is that string. A stored table is its issued carrier.
+    pub fn closure_key_value(&self, from: TableRef, key: ClosureRef) -> Result<Value, HeapError> {
+        self.require_closure(key)?;
+        let key = EdgeKey::closure_key(key);
+        self.stored_value(from, |stored| stored == &key)
+    }
+
     /// Writes one table under a binary64 key, in the same record as a field.
     ///
     /// NaN is refused before any lookup or insert. An integer resource carrier
@@ -1539,7 +1614,11 @@ impl LuaHeap {
                 let (object_key, value_target) = {
                     let edge = &self.edges[entry as usize];
                     let object_key = match &edge.key {
-                        EdgeKey::Object { slot, generation } => Some((*slot, *generation)),
+                        EdgeKey::Object {
+                            slot,
+                            generation,
+                            kind,
+                        } => Some((*slot, *generation, *kind)),
                         EdgeKey::Field(_) | EdgeKey::Utf8(_) | EdgeKey::Number(_) => None,
                     };
                     let value_target = match &edge.value {
@@ -1558,9 +1637,9 @@ impl LuaHeap {
                 };
                 if from_table
                     && !mode.keys
-                    && let Some((slot, generation)) = object_key
+                    && let Some((slot, generation, kind)) = object_key
                 {
-                    self.follow_target(slot, generation, HandleKind::Table, &mut work);
+                    self.follow_target(slot, generation, kind, &mut work);
                 }
                 // A table entry follows that table's weak mode. A closure or
                 // cell link is not a table entry, so it stays strong.
@@ -1701,7 +1780,8 @@ impl LuaHeap {
         };
         // Strong endpoints of a marked owner were already marked. For weak
         // edges, either dead object endpoint invalidates the whole entry.
-        // Closure and cell targets are checked in this same retain.
+        // Closure and cell targets, and object keys of either stored kind,
+        // are checked in this same retain.
         self.edges.retain(|edge| {
             is_marked(edge.from)
                 && match &edge.value {

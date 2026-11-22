@@ -1710,3 +1710,525 @@ fn upvalue_root_rejects_foreign_and_stale_without_clobber() {
     assert!(heap.upvalue_alive(cell));
     assert!(heap.alive(table));
 }
+
+/// Private field on a value table that points back at its closure key.
+///
+/// Locked LuaJIT `96f7b297` with `-joff` and Lua 5.2 compat stores that
+/// back-edge as `{ key = key }` (`evidence/lua52-gc-weak-closure-modes`).
+/// This heap has no Lua source closure key. The value uses the existing
+/// private field, which is not a closure identity and not numeric key 1.
+const CLOSURE_KEY_BACKREF_FIELD: u32 = 1;
+
+fn closure_key_limits() -> HeapLimits {
+    HeapLimits {
+        nodes: 12,
+        roots: 4,
+        edges: 12,
+        max_generation: 8,
+    }
+}
+
+struct ClosureKeyGraph {
+    owner: TableRef,
+    survivor: TableRef,
+    survivor_raw: i64,
+    watch: TableRef,
+    orphan: TableRef,
+    orphan_raw: i64,
+    value: TableRef,
+    value_raw: i64,
+    isolated: ClosureRef,
+    linked: ClosureRef,
+    baseline_tokens: usize,
+}
+
+fn seed_closure_keys(host: &mut HostContext<'_>, mode: &str) -> ClosureKeyGraph {
+    heap::install(host, closure_key_limits()).expect("install");
+    let baseline_tokens = host.resource_count();
+    let owner_raw = publish_raw(host);
+    let owner = table_ref(host, owner_raw);
+    let mode_raw = publish_raw(host);
+    let mode_table = table_ref(host, mode_raw);
+    let survivor_raw = publish_raw(host);
+    let survivor = table_ref(host, survivor_raw);
+    let watch_raw = publish_raw(host);
+    let watch = table_ref(host, watch_raw);
+    let watch_mode_raw = publish_raw(host);
+    let watch_mode = table_ref(host, watch_mode_raw);
+    let orphan_raw = publish_raw(host);
+    let orphan = table_ref(host, orphan_raw);
+    let value_raw = publish_raw(host);
+    let value = table_ref(host, value_raw);
+    assert_eq!(host.resource_count() - baseline_tokens, 7);
+
+    let (isolated, linked) = heap::with_heap(host, |heap| {
+        let isolated = heap.alloc_closure()?;
+        let linked = heap.alloc_closure()?;
+        Ok((isolated, linked))
+    })
+    .expect("two closure keys");
+    assert_eq!(
+        host.resource_count() - baseline_tokens,
+        7,
+        "a closure key has no resource token"
+    );
+    assert_eq!(isolated.kind(), heap::HandleKind::Closure);
+    assert_eq!(linked.kind(), heap::HandleKind::Closure);
+    assert_eq!(isolated.domain(), owner.domain());
+    assert_ne!(isolated, linked);
+
+    let frame = heap::with_heap(host, |heap| heap.enter_roots(3)).expect("roots");
+    heap::with_heap(host, |heap| {
+        heap.write_root(frame, 0, owner)?;
+        heap.write_root(frame, 1, survivor)?;
+        heap.write_root(frame, 2, watch)?;
+        heap.set_mode_scalar(mode_table, Value::string(mode))?;
+        heap.set_metatable(owner, Some(mode_table))?;
+        heap.set_mode_scalar(watch_mode, Value::string("v"))?;
+        heap.set_metatable(watch, Some(watch_mode))?;
+        heap.set_closure_key_scalar(owner, isolated, Value::string("key-only"))?;
+        heap.set_closure_key_edge(owner, linked, value)?;
+        heap.set_closure_edge(value, CLOSURE_KEY_BACKREF_FIELD, linked)?;
+        heap.set_named_edge(watch, "orphan", orphan)?;
+        heap.set_named_edge(orphan, "self", orphan)?;
+        heap.set_named_scalar(survivor, "mark", Value::string("alive"))?;
+        Ok(())
+    })
+    .expect("publish closure keys");
+
+    assert_eq!(
+        heap::with_heap(host, |heap| heap
+            .closure_edge(value, CLOSURE_KEY_BACKREF_FIELD))
+        .expect("private back-edge"),
+        linked
+    );
+    assert_eq!(
+        heap::with_heap(host, |heap| heap.closure_key_edge(value, linked)).expect("not a key"),
+        None,
+        "the value holds the closure in a private field, not as a closure key"
+    );
+    assert!(
+        heap::with_heap(host, |heap| heap.edge(owner, isolated.slot()))
+            .expect("field read")
+            .is_none(),
+        "a closure key is not the field id of its slot"
+    );
+
+    ClosureKeyGraph {
+        owner,
+        survivor,
+        survivor_raw,
+        watch,
+        orphan,
+        orphan_raw,
+        value,
+        value_raw,
+        isolated,
+        linked,
+        baseline_tokens,
+    }
+}
+
+fn closure_key_string(
+    host: &mut HostContext<'_>,
+    graph: &ClosureKeyGraph,
+) -> Result<Value, HeapError> {
+    heap::with_heap(host, |heap| {
+        heap.closure_key_value(graph.owner, graph.isolated)
+    })
+}
+
+fn linked_key_table(
+    host: &mut HostContext<'_>,
+    graph: &ClosureKeyGraph,
+) -> Result<Option<TableRef>, HeapError> {
+    heap::with_heap(host, |heap| {
+        heap.closure_key_edge(graph.owner, graph.linked)
+    })
+}
+
+#[derive(Clone, Copy)]
+struct ClosureKeyExpect {
+    isolated_string: bool,
+    isolated_alive: bool,
+    linked_table: bool,
+    linked_alive: bool,
+    value_alive: bool,
+    orphan_alive: bool,
+    live_nodes: u32,
+    live_edges: u32,
+    tokens: usize,
+}
+
+fn assert_closure_key_graph(
+    host: &mut HostContext<'_>,
+    graph: &ClosureKeyGraph,
+    expect: ClosureKeyExpect,
+    label: &str,
+) {
+    let string = closure_key_string(host, graph);
+    if expect.isolated_alive {
+        assert_eq!(
+            string.expect(label),
+            Value::string("key-only"),
+            "{label}: isolated closure key string"
+        );
+        assert!(
+            heap::with_heap(host, |heap| Ok(heap.closure_alive(graph.isolated))).expect(label),
+            "{label}: isolated closure stays"
+        );
+    } else {
+        assert_eq!(string, Err(HeapError::StaleHandle), "{label}: isolated key");
+        assert!(
+            !heap::with_heap(host, |heap| Ok(heap.closure_alive(graph.isolated))).expect(label),
+            "{label}: isolated closure reclaimed"
+        );
+    }
+    assert_eq!(
+        expect.isolated_string, expect.isolated_alive,
+        "{label}: a dead closure key cannot keep its string entry"
+    );
+
+    let linked = linked_key_table(host, graph);
+    if expect.linked_alive {
+        assert_eq!(
+            linked.expect(label),
+            expect.linked_table.then_some(graph.value),
+            "{label}: linked entry"
+        );
+        assert!(
+            heap::with_heap(host, |heap| Ok(heap.closure_alive(graph.linked))).expect(label),
+            "{label}: linked closure"
+        );
+    } else {
+        assert_eq!(linked, Err(HeapError::StaleHandle), "{label}: linked key");
+        assert!(!heap::with_heap(host, |heap| Ok(heap.closure_alive(graph.linked))).expect(label));
+        assert!(!expect.linked_table, "{label}: a dead key has no entry");
+    }
+
+    assert_eq!(
+        heap::with_heap(host, |heap| Ok(heap.alive(graph.value))).expect(label),
+        expect.value_alive,
+        "{label}: value table"
+    );
+    assert_eq!(
+        token_open(host, graph.value_raw),
+        expect.value_alive,
+        "{label}: value token"
+    );
+    assert_eq!(
+        heap::with_heap(host, |heap| heap.named_edge(graph.watch, "orphan")).expect(label),
+        expect.orphan_alive.then_some(graph.orphan),
+        "{label}: weak orphan entry"
+    );
+    assert_eq!(
+        heap::with_heap(host, |heap| Ok(heap.alive(graph.orphan))).expect(label),
+        expect.orphan_alive,
+        "{label}: orphan node"
+    );
+    assert_eq!(
+        token_open(host, graph.orphan_raw),
+        expect.orphan_alive,
+        "{label}: orphan token"
+    );
+    assert!(
+        heap::with_heap(host, |heap| Ok(heap.alive(graph.survivor))).expect(label),
+        "{label}: survival control"
+    );
+    assert!(
+        token_open(host, graph.survivor_raw),
+        "{label}: survivor token"
+    );
+    assert_eq!(
+        heap::with_heap(host, |heap| heap.named_value(graph.survivor, "mark")).expect(label),
+        Value::string("alive"),
+        "{label}: survivor mark"
+    );
+
+    let stats = heap::stats(host).expect(label);
+    assert_eq!(stats.live_nodes, expect.live_nodes, "{label}: nodes");
+    assert_eq!(stats.live_edges, expect.live_edges, "{label}: edges");
+    assert_eq!(stats.live_roots, 3, "{label}: roots");
+    assert_eq!(
+        host.resource_count() - graph.baseline_tokens,
+        expect.tokens,
+        "{label}: open table tokens"
+    );
+}
+
+/// Closure identity keys on one heap, for `k` / `v` / `kv`, with and without
+/// collection.
+///
+/// The oracle removes an isolated closure key in `k` and `kv`, keeps it in
+/// `v`, and keeps a strong value's back-edge only in `k`. `v` marks that key
+/// while dropping the weak value, so the first collect must not be read as
+/// reclaiming the key. The next collect reclaims it. The rooted survivor and
+/// the weak orphan separate that from a collect that did not run.
+#[test]
+fn closure_key_weak_modes_keep_or_drop_entries_and_reclaim_on_the_next_pass() {
+    let seeded = ClosureKeyExpect {
+        isolated_string: true,
+        isolated_alive: true,
+        linked_table: true,
+        linked_alive: true,
+        value_alive: true,
+        orphan_alive: true,
+        live_nodes: 9,
+        live_edges: 8,
+        tokens: 7,
+    };
+    for mode in ["k", "v", "kv"] {
+        for collect in [false, true] {
+            super::super::support::with_idle_vm(|vm| {
+                let mut host = vm.host_context();
+                let graph = seed_closure_keys(&mut host, mode);
+                assert_closure_key_graph(&mut host, &graph, seeded, "before");
+                if !collect {
+                    assert_closure_key_graph(&mut host, &graph, seeded, "omit");
+                    assert_eq!(heap::stats(&mut host).expect("omit").collections, 0);
+                    return;
+                }
+
+                let report = heap::collect(&mut host).expect("collect");
+                let meter = heap::take_scan_meter(&mut host).expect("one pass");
+                assert_eq!(meter.mark_passes, 1, "{mode}: one mark pass");
+                assert_eq!(report.live_roots, 3, "{mode}: roots stay");
+                let after = match mode {
+                    "k" => ClosureKeyExpect {
+                        isolated_string: false,
+                        isolated_alive: false,
+                        linked_table: true,
+                        linked_alive: true,
+                        value_alive: true,
+                        orphan_alive: false,
+                        live_nodes: 7,
+                        live_edges: 5,
+                        tokens: 6,
+                    },
+                    "v" => ClosureKeyExpect {
+                        isolated_string: true,
+                        isolated_alive: true,
+                        linked_table: false,
+                        linked_alive: true,
+                        value_alive: false,
+                        orphan_alive: false,
+                        live_nodes: 7,
+                        live_edges: 4,
+                        tokens: 5,
+                    },
+                    "kv" => ClosureKeyExpect {
+                        isolated_string: false,
+                        isolated_alive: false,
+                        linked_table: false,
+                        linked_alive: false,
+                        value_alive: false,
+                        orphan_alive: false,
+                        live_nodes: 5,
+                        live_edges: 3,
+                        tokens: 5,
+                    },
+                    _ => unreachable!("mode is k, v, or kv"),
+                };
+                assert_closure_key_graph(&mut host, &graph, after, mode);
+                if mode != "v" {
+                    return;
+                }
+
+                let again = heap::collect(&mut host).expect("second collect");
+                let second = heap::take_scan_meter(&mut host).expect("second pass");
+                assert_eq!(second.mark_passes, 1, "the next collect is still one pass");
+                assert_eq!(
+                    again.live_nodes, 6,
+                    "the unreferenced closure key is reclaimed"
+                );
+                assert_closure_key_graph(
+                    &mut host,
+                    &graph,
+                    ClosureKeyExpect {
+                        isolated_string: true,
+                        isolated_alive: true,
+                        linked_table: false,
+                        linked_alive: false,
+                        value_alive: false,
+                        orphan_alive: false,
+                        live_nodes: 6,
+                        live_edges: 4,
+                        tokens: 5,
+                    },
+                    "v next",
+                );
+            });
+        }
+    }
+}
+
+/// Two closures can share one cell and still be different table keys.
+/// Deleting one entry leaves the other. A stale, foreign, or full-edge write
+/// is refused before it replaces a stored entry.
+#[test]
+fn closure_keys_sharing_a_cell_stay_distinct_and_refused_writes_keep_entries() {
+    let mut heap = heap::LuaHeap::new(HeapLimits {
+        nodes: 10,
+        roots: 1,
+        edges: 4,
+        max_generation: 4,
+    });
+    let owner = heap.alloc().expect("owner");
+    let table_value = heap.alloc().expect("table value");
+    let cell = heap.alloc_upvalue().expect("cell");
+    let left = heap.alloc_closure().expect("left");
+    let right = heap.alloc_closure().expect("right");
+    heap.set_upvalue_edge(left, cell).expect("left cell");
+    heap.set_upvalue_edge(right, cell).expect("right cell");
+    assert_eq!(heap.upvalue_of(left).expect("left"), cell);
+    assert_eq!(heap.upvalue_of(right).expect("right"), cell);
+    assert_ne!(left, right);
+    assert_ne!(left.slot(), right.slot());
+    assert_eq!(left.domain(), right.domain());
+    assert_eq!(left.kind(), heap::HandleKind::Closure);
+
+    let frame = heap.enter_roots(1).expect("frame");
+    heap.write_root(frame, 0, owner).expect("root");
+    heap.set_closure_key_scalar(owner, left, Value::string("left"))
+        .expect("left string");
+    heap.set_closure_key_edge(owner, right, table_value)
+        .expect("right table");
+    heap.issue_carrier(table_value)
+        .expect("issue the table value");
+    assert_eq!(
+        heap.closure_key_value(owner, left).expect("read left"),
+        Value::string("left")
+    );
+    assert_eq!(
+        heap.closure_key_edge(owner, right).expect("read right"),
+        Some(table_value)
+    );
+    assert_eq!(
+        heap.closure_key_value(owner, right).expect("issued read"),
+        heap.issued_value(table_value).expect("carrier")
+    );
+    assert_eq!(
+        heap.closure_key_edge(owner, left)
+            .expect("scalar is not a table"),
+        None
+    );
+    assert_eq!(heap.stats().live_edges, 4);
+
+    let table_key = heap.alloc().expect("table key");
+    assert_eq!(
+        heap.object_value(owner, table_key).expect("table key"),
+        Value::Null,
+        "a table key does not select a closure key"
+    );
+    assert_eq!(
+        heap.edge(owner, left.slot()).expect("field id"),
+        None,
+        "the closure slot is not a field key"
+    );
+
+    let extra = heap.alloc_closure().expect("extra");
+    let before = heap.stats();
+    assert_eq!(
+        heap.set_closure_key_scalar(owner, extra, Value::string("extra")),
+        Err(HeapError::EdgeCapacity)
+    );
+    assert_eq!(heap.stats().live_edges, before.live_edges);
+    assert_eq!(heap.stats().edge_slots, before.edge_slots);
+    assert_eq!(
+        heap.closure_key_value(owner, left)
+            .expect("capacity left the string"),
+        Value::string("left")
+    );
+    assert_eq!(
+        heap.closure_key_edge(owner, right)
+            .expect("capacity left the table"),
+        Some(table_value)
+    );
+
+    heap.clear_closure_key(owner, left).expect("delete left");
+    assert_eq!(
+        heap.closure_key_value(owner, left).expect("deleted"),
+        Value::Null
+    );
+    assert_eq!(
+        heap.closure_key_edge(owner, right).expect("right stays"),
+        Some(table_value)
+    );
+    assert!(heap.closure_alive(left));
+    assert!(heap.closure_alive(right));
+    assert_eq!(heap.upvalue_of(left).expect("cell stays"), cell);
+    assert_eq!(heap.upvalue_of(right).expect("shared cell"), cell);
+    heap.set_closure_key_scalar(owner, left, Value::string("left"))
+        .expect("restore left");
+
+    let doomed = heap.alloc().expect("doomed table");
+    let soon = heap.alloc_closure().expect("soon stale");
+    let soon_slot = soon.slot();
+    let soon_generation = soon.generation();
+    assert_eq!(heap.collect().live_nodes, 5, "unkeyed nodes are swept");
+    assert!(!heap.alive(doomed));
+    assert!(!heap.closure_alive(soon));
+    assert!(!heap.closure_alive(extra));
+    assert!(!heap.alive(table_key));
+    let reused = heap.alloc_closure().expect("reuse");
+    assert_eq!(reused.slot(), soon_slot);
+    assert_ne!(reused.generation(), soon_generation);
+    assert_eq!(reused.kind(), heap::HandleKind::Closure);
+    assert_eq!(
+        heap.set_closure_key_edge(owner, right, doomed),
+        Err(HeapError::StaleHandle)
+    );
+    assert_eq!(
+        heap.set_closure_key_scalar(owner, soon, Value::string("stale")),
+        Err(HeapError::StaleHandle)
+    );
+    assert_eq!(
+        heap.closure_key_value(owner, left)
+            .expect("stale write kept left"),
+        Value::string("left")
+    );
+    assert_eq!(
+        heap.closure_key_edge(owner, right)
+            .expect("stale write kept right"),
+        Some(table_value)
+    );
+
+    let mut other = heap::LuaHeap::new(HeapLimits {
+        nodes: 2,
+        roots: 1,
+        edges: 1,
+        max_generation: 4,
+    });
+    let foreign = other.alloc_closure().expect("foreign");
+    assert_ne!(foreign.domain(), owner.domain());
+    assert_eq!(foreign.kind(), heap::HandleKind::Closure);
+    let foreign_table = other.alloc().expect("foreign table");
+    assert_eq!(
+        heap.set_closure_key_scalar(owner, foreign, Value::string("foreign")),
+        Err(HeapError::WrongDomain)
+    );
+    assert_eq!(
+        heap.set_closure_key_edge(owner, right, foreign_table),
+        Err(HeapError::WrongDomain)
+    );
+    assert_eq!(
+        heap.clear_closure_key(owner, foreign),
+        Err(HeapError::WrongDomain)
+    );
+    assert_eq!(
+        heap.closure_key_value(owner, foreign),
+        Err(HeapError::WrongDomain)
+    );
+    assert_eq!(heap.stats().live_edges, 4);
+    assert_eq!(
+        heap.closure_key_value(owner, left)
+            .expect("foreign write kept left"),
+        Value::string("left")
+    );
+    assert_eq!(
+        heap.closure_key_edge(owner, right)
+            .expect("foreign write kept right"),
+        Some(table_value)
+    );
+    assert_eq!(heap.collect().live_nodes, 5);
+}
