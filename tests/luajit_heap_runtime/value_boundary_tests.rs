@@ -5,6 +5,8 @@ mod ast;
 mod candidate;
 #[path = "closure_graph.rs"]
 mod closure_graph;
+#[path = "envelope_local_root.rs"]
+mod envelope_local_root;
 #[path = "../../src/frontends/lua/lexer.rs"]
 #[allow(dead_code)]
 mod lexer;
