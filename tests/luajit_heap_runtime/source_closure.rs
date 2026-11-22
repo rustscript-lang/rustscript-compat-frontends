@@ -622,6 +622,52 @@ fn assert_call_value(arm: &Arm) {
     assert!(arm.call_values > 0, "missing CallValue");
 }
 
+fn assert_shared_upvalue_closure_assignment_unsupported(source: &str, line: usize) {
+    let options = CompileSourceFileOptions::new()
+        .with_source_plugin(&Plugin)
+        .with_host_api_catalog(Arc::clone(catalog()));
+    let error = match vm::compile_source_with_flavor_and_options(source, SourceFlavor::Lua, options)
+    {
+        Ok(_) => {
+            panic!("candidate accepted a closure assignment to a shared upvalue at line {line}")
+        }
+        Err(vm::SourcePathError::SourceWithMap {
+            error: vm::SourceError::Parse(error),
+            ..
+        }) => error,
+        Err(other) => panic!("expected a candidate lowering diagnostic, got {other}"),
+    };
+    assert_eq!(error.line, line, "{error}");
+    assert!(error.message.contains("not lowered yet"), "{error}");
+}
+
+#[test]
+fn shared_upvalue_closure_assignment_rejects_self_capture() {
+    let source = r#"do
+  local a = {}
+  a = function() return a end
+  local x = a
+  note_fn(x)
+end
+"#;
+    assert_shared_upvalue_closure_assignment_unsupported(source, 3);
+}
+
+#[test]
+fn shared_upvalue_closure_assignment_rejects_target_captured_by_another_closure() {
+    let source = r#"do
+  local a = {}
+  local held = {}
+  local get = nil
+  get = function() return a end
+  a = function() return held end
+  local x = a
+  note_fn(x)
+end
+"#;
+    assert_shared_upvalue_closure_assignment_unsupported(source, 6);
+}
+
 const WEAK_HEAD: &str = "\
 local mt = {}\n\
 mt.__mode = \"v\"\n\

@@ -2018,6 +2018,10 @@ impl Lower<'_> {
         name: &ast::Name,
         func: &ast::FuncBody,
     ) -> Result<(), ParseError> {
+        // Reads of this binding use the shared cell, which cannot hold a callable.
+        if self.anchor_of_name(name).is_some() {
+            return Err(self.unsupported(span));
+        }
         if !func.params.is_empty() || func.vararg || func.self_param {
             return Err(self.unsupported(func.span));
         }
