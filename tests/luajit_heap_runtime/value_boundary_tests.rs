@@ -5491,11 +5491,12 @@ return type(k)
 }
 
 fn run_lua_file(label: &str, source: &str) -> vm::Vm {
-    let root = std::env::var("TMPDIR").expect("count fixtures stay in the lease tmp");
-    let dir = std::path::PathBuf::from(root).join("lua-count-fixtures");
-    std::fs::create_dir_all(&dir).expect("lease fixture dir");
+    let dir = std::env::temp_dir().join("lua-count-fixtures");
+    std::fs::create_dir_all(&dir)
+        .unwrap_or_else(|error| panic!("create {}: {error}", dir.display()));
     let path = dir.join(format!("{label}-{}.lua", std::process::id()));
-    std::fs::write(&path, source).expect("write lua fixture");
+    std::fs::write(&path, source)
+        .unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
     let catalog = Arc::clone(catalog());
     let options = CompileSourceFileOptions::new()
         .with_source_plugin(&CandidatePlugin)

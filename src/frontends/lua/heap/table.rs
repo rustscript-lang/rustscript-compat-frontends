@@ -1891,9 +1891,9 @@ impl LuaHeap {
     /// LuaJIT allocator, not whole-VM bytes, and not string interning.
     ///
     /// The record product fits in `u64`: each vector length is capped by a
-    /// `u32` limit, and a record stride is far below `2^32`. The payload sum
-    /// is the sum of lengths this process stored; that sum cannot exceed the
-    /// bytes those allocations occupy.
+    /// `u32` limit, and a record stride is far below `2^32`. Each edge counts
+    /// its own reference payload. The same Core `Arc` referenced by more than
+    /// one edge is charged once per edge.
     pub fn logical_bytes(&self) -> u64 {
         let nodes = (self.slots.len() as u64) * (std::mem::size_of::<Slot>() as u64);
         let edges = (self.edges.len() as u64) * (std::mem::size_of::<Edge>() as u64);
