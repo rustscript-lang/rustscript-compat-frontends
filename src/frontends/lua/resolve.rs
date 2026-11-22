@@ -34,11 +34,10 @@ pub struct Resolution {
     /// one diagnostic, in frontend walk order. Later entries may repeat the
     /// same miss: a `for` can overflow on a hidden slot and again on a
     /// visible index. This is not LuaJIT's first error. LuaJIT can report a
-    /// local before it initializes that local's RHS. Diagnostics that are
-    /// not wired yet do not deduplicate this vector or add state.
+    /// local before it initializes that local's RHS.
     ///
-    /// Production lowering still reads `errors` only. This field is the
-    /// source-level check; it is not a LuaPlugin switch.
+    /// The control candidate checks this after `errors` and before lowering.
+    /// This does not change the production LuaPlugin entry.
     pub limits: Vec<LexicalLimit>,
 }
 

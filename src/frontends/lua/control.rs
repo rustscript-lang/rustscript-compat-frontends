@@ -57,7 +57,7 @@
 use super::ast::{self, BinOp, Block, Chunk, Expr, Name, NumberKind, Span, Stmt, UnOp};
 use super::lexer;
 use super::parser;
-use super::resolve::{self, Resolution, ResolveError};
+use super::resolve::{self, LexicalLimitKind, Resolution, ResolveError};
 use vm::compiler::HostCallResolver;
 use vm::{
     AssignmentKind, Expr as CoreExpr, FrontendIr, LocalIrBuilder, LocalSlot, ParseError,
@@ -84,6 +84,19 @@ pub(super) fn lower_source_with(
     if let Some(error) = resolution.errors.first() {
         let line = line_of(source, error_span(error));
         return Err(ParseError::at_line(line, static_message(error)));
+    }
+    if let Some(limit) = resolution.limits.first() {
+        let kind = match limit.kind {
+            LexicalLimitKind::Locals => "active local slots",
+            LexicalLimitKind::Upvalues => "distinct upvalues",
+        };
+        return Err(ParseError::at_line(
+            line_of(source, limit.span),
+            format!(
+                "Lua lexical limit exceeded: {kind} ({} > {})",
+                limit.count, limit.limit
+            ),
+        ));
     }
     let mut lower = Lower::new(
         source,

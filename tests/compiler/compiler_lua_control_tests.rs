@@ -968,6 +968,92 @@ fn jump_into_local_is_a_static_rejection() {
     );
 }
 
+fn numbered_locals(count: usize) -> String {
+    (1..=count)
+        .map(|index| format!("local v{index} = {index}\n"))
+        .collect()
+}
+
+fn expect_lexical_rejection(
+    label: &str,
+    source: &str,
+    line: usize,
+    message: &str,
+    oracle_kind: &str,
+) {
+    let path = write_fixture(label, source);
+    eprintln!("LUA_CONTROL lexical fixture={}", path.display());
+    if let Ok(oracle) = std::env::var("LUAJIT_ORACLE") {
+        let output = oracle_load_rejection(&oracle, &path);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{label}: {stderr}");
+        assert_eq!(output.stdout, b"jit=off\n", "{label}: oracle stdout");
+        assert_eq!(stderr.lines().next(), Some("LOAD_REJECT"));
+        assert!(stderr.contains(oracle_kind), "{label}: {stderr}");
+        eprintln!("LUA_CONTROL oracle {label} exit=2 {stderr}");
+    }
+
+    let error = compile_source_file_with_options(&path, candidate_options())
+        .err()
+        .unwrap_or_else(|| panic!("{label}: lexical overflow produced a program"));
+    let vm::SourcePathError::SourceWithMap {
+        error: vm::compiler::SourceError::Parse(error),
+        sources,
+    } = error
+    else {
+        panic!("{label}: expected a frontend parse error, got {error}");
+    };
+    assert!(error.message.contains(message), "{label}: {error}");
+    assert_eq!(error.line, line, "{label}: {error}");
+    let span = error.span.expect("file compile attaches a diagnostic span");
+    assert_eq!(sources.file_name(span.source_id), path.to_str());
+    assert_eq!(sources.span_text(span), source.lines().nth(line - 1));
+    eprintln!("LUA_CONTROL candidate {label} line={line} {error}");
+}
+
+#[test]
+fn lexical_admission_checks_active_local_boundary() {
+    expect_number(
+        "active_locals_200",
+        &format!("{}return v200\n", numbered_locals(200)),
+        200.0,
+    );
+    expect_lexical_rejection(
+        "active_locals_201",
+        &format!("{}return v201\n", numbered_locals(201)),
+        201,
+        "active local slots (201 > 200)",
+        "local variables",
+    );
+}
+
+#[test]
+fn lexical_admission_checks_upvalues_before_lowering() {
+    let source = |count| {
+        let captures = (1..=count)
+            .map(|index| format!("v{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "{}local function collect_values()\n  return {captures}\nend\nreturn 7\n",
+            numbered_locals(count)
+        )
+    };
+    // The admitted control subset does not lower the function. Pinned LuaJIT
+    // checks the legal 60-capture source with the function left uncalled.
+    if let Ok(oracle) = std::env::var("LUAJIT_ORACLE") {
+        let path = write_fixture("distinct_upvalues_60", &source(60));
+        assert_eq!(oracle_return(&oracle, &path), 7.0);
+    }
+    expect_lexical_rejection(
+        "distinct_upvalues_61",
+        &source(61),
+        63,
+        "distinct upvalues (61 > 60)",
+        "upvalues",
+    );
+}
+
 #[test]
 fn oracle_control_config_matches_locked_52_build() {
     let Ok(path) = std::env::var("LUAJIT_ORACLE") else {
