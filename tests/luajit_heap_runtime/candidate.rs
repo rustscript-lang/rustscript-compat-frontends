@@ -24,6 +24,7 @@ const BOOL_ARG: &str = "lua_internal::bool_arg";
 const STRING_ARG: &str = "lua_internal::string_arg";
 const GATHER_ROOT: &str = "lua_internal::gather_root";
 pub(super) const COLLECT: &str = "lua_internal::collect";
+const COUNT: &str = "lua_internal::count";
 const OPEN_CELL: &str = "lua_internal::open_cell";
 const READ_CELL: &str = "lua_internal::read_cell";
 const WRITE_CELL: &str = "lua_internal::write_cell";
@@ -82,6 +83,11 @@ pub(super) fn install_schemas(builder: &mut HostApiBuilder) {
         NEW_TABLE,
         vec![],
         HostTypeSchema::Unknown,
+    ));
+    builder.function(HostFunctionSchema::with_return(
+        COUNT,
+        vec![],
+        HostTypeSchema::Float,
     ));
     builder.function(HostFunctionSchema::with_return(
         COPY_FIELDS,
@@ -191,6 +197,7 @@ pub(super) fn register(
         Op::StringArg,
         Op::GatherRoot,
         Op::Collect,
+        Op::Count,
         Op::EnterResult,
         Op::EnterCallee,
         Op::RootIssued,
@@ -223,6 +230,7 @@ pub(super) fn register(
             Op::StringArg => STRING_ARG,
             Op::GatherRoot => GATHER_ROOT,
             Op::Collect => COLLECT,
+            Op::Count => COUNT,
             Op::EnterResult => ENTER_RESULT,
             Op::EnterCallee => ENTER_CALLEE,
             Op::RootIssued => ROOT_ISSUED,
@@ -265,6 +273,7 @@ enum Op {
     StringArg,
     GatherRoot,
     Collect,
+    Count,
     EnterResult,
     EnterCallee,
     RootIssued,
@@ -454,6 +463,12 @@ impl HostOwnedFunction for Op {
                 }
                 collect_at_safepoint(&mut call.vm().host_context(), &tables)?;
                 Value::Float(0.0)
+            }
+            Self::Count => {
+                let kib =
+                    heap::with_heap(&mut call.vm().host_context(), |heap| Ok(heap.logical_kib()))
+                        .map_err(|error| VmError::HostError(error.to_string()))?;
+                Value::Float(kib)
             }
             Self::EnterResult => enter_result(call)?,
             Self::EnterCallee => enter_callee(call)?,
@@ -3211,9 +3226,13 @@ impl Lower<'_> {
                 }
                 if name.is("collectgarbage")
                     && let [ast::Expr::String { bytes, .. }] = args.exprs.as_slice()
-                    && bytes == b"collect"
                 {
-                    return self.collect_expr(expr.span());
+                    if bytes == b"collect" {
+                        return self.collect_expr(expr.span());
+                    }
+                    if bytes == b"count" {
+                        return self.count_expr(expr.span());
+                    }
                 }
                 if name.is("copy_fields")
                     && let [arg] = args.exprs.as_slice()
@@ -3355,6 +3374,10 @@ impl Lower<'_> {
             roots = Expr::MoveVar(next);
         }
         self.call(COLLECT, vec![roots])
+    }
+
+    fn count_expr(&mut self, _span: ast::Span) -> Result<Expr, ParseError> {
+        self.call(COUNT, vec![])
     }
 
     fn call(&mut self, name: &str, args: Vec<Expr>) -> Result<Expr, ParseError> {

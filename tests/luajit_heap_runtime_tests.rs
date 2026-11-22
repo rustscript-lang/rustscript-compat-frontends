@@ -13,7 +13,8 @@ mod support;
 mod value_boundary_tests;
 
 use heap::{
-    CollectReport, HandleKind, HeapLimits, LuaHeap, LuaTableResource, RootFrameId, TableRef,
+    CollectReport, HandleKind, HeapLimits, LuaHeap, LuaTableResource, RootFrameId, ScanMeter,
+    TableRef,
 };
 use support::{Probe, run_probe, with_idle_vm};
 use vm::{HostContext, ResourceHandle, Value};
@@ -1779,4 +1780,138 @@ fn assert_host_collect_keeps_the_marked_mode() {
         })
         .expect("host sweep used the marked mode");
     });
+}
+
+#[test]
+fn logical_count_follows_replace_delete_gap_rollback_and_domain() {
+    let limits = HeapLimits {
+        nodes: 8,
+        roots: 4,
+        edges: 8,
+        max_generation: 8,
+    };
+    let mut heap = LuaHeap::new(limits);
+    assert_eq!(heap.logical_bytes(), 0);
+    assert_eq!(heap.logical_kib(), 0.0);
+    let collections = heap.stats().collections;
+    assert_eq!(heap.logical_kib(), 0.0);
+    assert_eq!(heap.stats().collections, collections);
+    assert_eq!(heap.take_scan_meter(), ScanMeter::default());
+
+    let first = heap.alloc().expect("node");
+    let node = heap.logical_bytes();
+    assert!(node > 0, "a live slot record is charged");
+    let second = heap.alloc().expect("second node");
+    assert_eq!(
+        heap.logical_bytes() - node,
+        node,
+        "the next slot charges one record, not the Vec reserve"
+    );
+    heap.rollback(second).expect("drop the second node");
+    assert_eq!(
+        heap.logical_bytes(),
+        node * 2,
+        "a free slot record stays; rollback of an edgeless node adds no payload"
+    );
+
+    let before_edge = heap.logical_bytes();
+    heap.set_edge(first, 1, first).expect("field edge");
+    let edge = heap.logical_bytes() - before_edge;
+    assert!(edge > 0);
+    heap.set_field_scalar(first, 1, Value::Null)
+        .expect("clear field");
+    assert_eq!(heap.logical_bytes(), before_edge);
+
+    heap.set_named_scalar(first, "k", Value::string("ab"))
+        .expect("string field");
+    let held = heap.logical_bytes();
+    assert_eq!(held, before_edge + edge + 1 + 2);
+    heap.set_named_scalar(first, "k", Value::string("abcd"))
+        .expect("replace value");
+    assert_eq!(
+        heap.logical_bytes(),
+        held + 2,
+        "replacement charges the value delta, not a second edge"
+    );
+    heap.set_named_scalar(first, "k", Value::Null)
+        .expect("delete");
+    assert_eq!(
+        heap.logical_bytes(),
+        before_edge,
+        "delete releases the key, the value, and the edge record"
+    );
+
+    let cell = heap.alloc_upvalue().expect("cell");
+    let before_bytes = heap.logical_bytes();
+    heap.write_scalar_upvalue(cell, Value::bytes(vec![1, 2, 3, 4]))
+        .expect("bytes");
+    assert_eq!(heap.logical_bytes(), before_bytes + edge + 4);
+    heap.write_scalar_upvalue(cell, Value::bytes(vec![9]))
+        .expect("shorter bytes");
+    assert_eq!(heap.logical_bytes(), before_bytes + edge + 1);
+    heap.clear_upvalue(cell).expect("clear bytes");
+    assert_eq!(heap.logical_bytes(), before_bytes);
+
+    let isolated = heap.logical_bytes();
+    let mut tight = LuaHeap::new(HeapLimits {
+        nodes: 1,
+        roots: 1,
+        edges: 1,
+        max_generation: 4,
+    });
+    let only = tight.alloc().expect("only node");
+    let tight_node = tight.logical_bytes();
+    tight
+        .set_named_scalar(only, "k", Value::string("ab"))
+        .expect("one edge");
+    let tight_held = tight.logical_bytes();
+    assert_eq!(tight_held, tight_node + edge + 1 + 2);
+    assert!(
+        tight
+            .set_named_scalar(only, "other", Value::string("zzzz"))
+            .is_err(),
+        "edge cap"
+    );
+    assert_eq!(
+        tight.logical_bytes(),
+        tight_held,
+        "a refused write leaves no payload"
+    );
+    tight.rollback(only).expect("rollback the charged edge");
+    assert_eq!(
+        tight.logical_bytes(),
+        tight_node,
+        "rollback releases the edge payload and keeps the free slot record"
+    );
+    assert_eq!(
+        heap.logical_bytes(),
+        isolated,
+        "the other heap's meter is a different domain"
+    );
+
+    let mt = heap.alloc().expect("metatable");
+    let owner = heap.alloc().expect("weak owner");
+    let dead = heap.alloc().expect("weak value");
+    let frame = heap.enter_roots(2).expect("roots");
+    heap.write_root(frame, 0, mt).expect("root metatable");
+    heap.write_root(frame, 1, owner).expect("root owner");
+    heap.set_metatable(owner, Some(mt)).expect("metatable");
+    heap.set_mode_scalar(mt, Value::string("v")).expect("mode");
+    heap.set_named_edge(owner, "keep", dead).expect("weak key");
+    let before_collect = heap.logical_bytes();
+    let collections = heap.stats().collections;
+    let _ = heap.logical_kib();
+    assert_eq!(heap.stats().collections, collections);
+    heap.collect();
+    assert!(!heap.alive(dead), "the weak value is reclaimed");
+    assert_eq!(heap.stats().collections, collections + 1);
+    assert_eq!(
+        heap.logical_bytes(),
+        before_collect,
+        "the cursor key stays charged while the gap record remains"
+    );
+    let gap = heap.logical_bytes();
+    heap.set_named_scalar(owner, "keep", Value::Null)
+        .expect("drop the gap");
+    assert_eq!(heap.logical_bytes(), gap - edge - 4);
 }

@@ -5489,3 +5489,235 @@ return type(k)
         "the consumed receiver temp must not remain a root"
     );
 }
+
+fn run_lua_file(label: &str, source: &str) -> vm::Vm {
+    let root = std::env::var("TMPDIR").expect("count fixtures stay in the lease tmp");
+    let dir = std::path::PathBuf::from(root).join("lua-count-fixtures");
+    std::fs::create_dir_all(&dir).expect("lease fixture dir");
+    let path = dir.join(format!("{label}-{}.lua", std::process::id()));
+    std::fs::write(&path, source).expect("write lua fixture");
+    let catalog = Arc::clone(catalog());
+    let options = CompileSourceFileOptions::new()
+        .with_source_plugin(&CandidatePlugin)
+        .with_host_api_catalog(Arc::clone(&catalog));
+    let mut vm = vm::compile_source_file_with_options(&path, options)
+        .unwrap_or_else(|error| panic!("{label}: compile {} failed: {error}", path.display()))
+        .into_vm()
+        .unwrap_or_else(|error| panic!("{label}: vm: {error}"));
+    let mut registry = HostFunctionRegistry::empty();
+    candidate::register(&mut registry, &catalog).expect("register candidate hosts");
+    register_witnesses(&mut registry, &catalog);
+    registry.bind_vm_cached(&mut vm).expect("bind hosts");
+    vm
+}
+
+fn halt_lua_file(label: &str, source: &str) -> vm::Vm {
+    let mut vm = run_lua_file(label, source);
+    let status = vm
+        .run()
+        .unwrap_or_else(|error| panic!("{label}: run: {error}"));
+    assert_eq!(status, VmStatus::Halted, "{label}");
+    vm
+}
+
+fn float_kib(vm: &vm::Vm) -> f64 {
+    match vm.stack() {
+        [Value::Float(kib)] => *kib,
+        other => panic!("count must return one float KiB, got {other:?}"),
+    }
+}
+
+const WEAK_CYCLE: &str = "\
+local mt = {}\n\
+mt.__mode = \"v\"\n\
+local weak = {}\n\
+setmetatable(weak, mt)\n\
+local cycle = {}\n\
+cycle.self = cycle\n\
+observe_table(cycle, 0)\n\
+weak[1] = cycle\n\
+cycle = nil\n\
+";
+
+fn payload_count_source(bytes: &str, drop_root: bool, collect: bool) -> String {
+    let mut source = format!("local holder = {{}}\nholder.payload = \"{bytes}\"\n");
+    if drop_root {
+        source.push_str("holder = nil\n");
+    }
+    if collect {
+        source.push_str("collectgarbage(\"collect\")\n");
+    }
+    source.push_str("return collectgarbage(\"count\")\n");
+    source
+}
+
+#[test]
+fn lua_file_count_reads_logical_kib_without_collecting() {
+    let bare = halt_lua_file("count-bare", "return collectgarbage(\"count\")\n");
+    let bare_kib = float_kib(&bare);
+    assert!(
+        bare_kib.is_finite() && bare_kib >= 0.0,
+        "bare count is {bare_kib}"
+    );
+
+    let mut counted = halt_lua_file(
+        "count-keeps-cycle",
+        &format!(
+            "{WEAK_CYCLE}collectgarbage(\"count\")\ncollectgarbage(\"count\")\nreturn type(weak[1])\n"
+        ),
+    );
+    assert_eq!(counted.stack(), &[Value::string("table")]);
+    let cycle = observed_tables(&mut counted);
+    assert_eq!(cycle.len(), 1);
+    assert_table_lifetime(&mut counted.host_context(), cycle[0], true);
+    let counted_stats = heap::stats(&mut counted.host_context()).expect("heap stats");
+    let counted_meter = heap::take_scan_meter(&mut counted.host_context()).expect("scan meter");
+    assert_eq!(counted_stats.collections, 0, "count must not collect");
+
+    let mut control = halt_lua_file(
+        "count-control-no-count",
+        &format!("{WEAK_CYCLE}return type(weak[1])\n"),
+    );
+    assert_eq!(
+        control.stack(),
+        &[Value::string("table")],
+        "the same graph stays without count; a table result is not a skipped body"
+    );
+    let control_cycle = observed_tables(&mut control);
+    assert_table_lifetime(&mut control.host_context(), control_cycle[0], true);
+    assert_eq!(
+        heap::stats(&mut control.host_context())
+            .expect("control stats")
+            .collections,
+        0
+    );
+    let control_meter = heap::take_scan_meter(&mut control.host_context()).expect("control meter");
+    assert_eq!(
+        counted_meter, control_meter,
+        "count must not change the scan meter of the same graph"
+    );
+
+    let mut first = halt_lua_file(
+        "count-first",
+        &format!("{WEAK_CYCLE}return collectgarbage(\"count\")\n"),
+    );
+    let second = halt_lua_file(
+        "count-second",
+        &format!("{WEAK_CYCLE}collectgarbage(\"count\")\nreturn collectgarbage(\"count\")\n"),
+    );
+    assert_eq!(
+        float_kib(&first),
+        float_kib(&second),
+        "a second count of the same retained graph must not move the reading"
+    );
+    assert_eq!(
+        heap::stats(&mut first.host_context())
+            .expect("first stats")
+            .collections,
+        0
+    );
+
+    let mut collected = halt_lua_file(
+        "count-collect-control",
+        &format!("{WEAK_CYCLE}collectgarbage(\"collect\")\nreturn type(weak[1])\n"),
+    );
+    let mut counted_then_collected = halt_lua_file(
+        "count-then-collect",
+        &format!(
+            "{WEAK_CYCLE}collectgarbage(\"count\")\ncollectgarbage(\"collect\")\nreturn type(weak[1])\n"
+        ),
+    );
+    assert_eq!(collected.stack(), &[Value::string("nil")]);
+    assert_eq!(counted_then_collected.stack(), &[Value::string("nil")]);
+    let collected_cycle = observed_tables(&mut collected);
+    assert_table_lifetime(&mut collected.host_context(), collected_cycle[0], false);
+    let collected_note = collected
+        .host_context()
+        .scope_state::<candidate::ReturnWitness>()
+        .expect("collect note")
+        .collects
+        .clone();
+    let counted_note = counted_then_collected
+        .host_context()
+        .scope_state::<candidate::ReturnWitness>()
+        .expect("count then collect note")
+        .collects
+        .clone();
+    assert_eq!(collected_note.len(), 1, "one explicit collection");
+    assert_eq!(counted_note.len(), 1, "count must not record a collection");
+    assert!(
+        collected_note[0].swept >= 1,
+        "the weak-only cycle must actually reclaim a node, swept {}",
+        collected_note[0].swept
+    );
+    assert_eq!(
+        counted_note[0].swept, collected_note[0].swept,
+        "count must not change how many nodes the same collection reclaims"
+    );
+    assert_eq!(
+        counted_note[0].metatable_edge_checks,
+        collected_note[0].metatable_edge_checks
+    );
+    assert_eq!(
+        counted_note[0].index_edge_checks,
+        collected_note[0].index_edge_checks
+    );
+    assert_eq!(
+        counted_note[0].outgoing_edge_checks,
+        collected_note[0].outgoing_edge_checks
+    );
+    assert_eq!(
+        counted_note[0].sweep_edge_checks,
+        collected_note[0].sweep_edge_checks
+    );
+
+    let short = "x";
+    let long = "x".repeat(256);
+    let small = float_kib(&halt_lua_file(
+        "count-small-payload",
+        &payload_count_source(short, false, false),
+    ));
+    let large = float_kib(&halt_lua_file(
+        "count-large-payload",
+        &payload_count_source(&long, false, false),
+    ));
+    assert!(
+        large > small,
+        "a longer string stored on the table must raise logical KiB: small {small}, large {large}"
+    );
+
+    let held = float_kib(&halt_lua_file(
+        "count-held",
+        &payload_count_source(&long, false, false),
+    ));
+    let mut pending = halt_lua_file("count-pending", &payload_count_source(&long, true, false));
+    let pending_kib = float_kib(&pending);
+    assert_eq!(
+        pending_kib, held,
+        "dropping the last root must not release the record before an explicit collection"
+    );
+    assert_eq!(
+        heap::stats(&mut pending.host_context())
+            .expect("pending stats")
+            .collections,
+        0
+    );
+    let mut reclaimed = halt_lua_file("count-reclaimed", &payload_count_source(&long, true, true));
+    let reclaimed_kib = float_kib(&reclaimed);
+    assert!(
+        reclaimed_kib < pending_kib,
+        "explicit collection of the unrooted payload must lower the reading: pending {pending_kib}, reclaimed {reclaimed_kib}"
+    );
+    let reclaimed_note = reclaimed
+        .host_context()
+        .scope_state::<candidate::ReturnWitness>()
+        .expect("reclaimed note")
+        .collects
+        .clone();
+    assert_eq!(reclaimed_note.len(), 1);
+    assert!(
+        reclaimed_note[0].swept >= 1,
+        "the dropped payload table must be reclaimed, swept {}",
+        reclaimed_note[0].swept
+    );
+}

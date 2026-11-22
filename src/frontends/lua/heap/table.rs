@@ -198,6 +198,35 @@ struct Slot {
     metatable: Option<(u32, u32)>,
 }
 
+/// Bytes of a string or byte payload stored in a heap record. Capacity is not
+/// part of the logical extent: only the stored length is. `usize` fits in
+/// `u64` on every Rust target, so the conversion is exact.
+fn stored_len(len: usize) -> u64 {
+    len as u64
+}
+
+fn key_payload(key: &EdgeKey) -> u64 {
+    match key {
+        EdgeKey::Utf8(text) => stored_len(text.len()),
+        EdgeKey::Field(_) | EdgeKey::Object { .. } | EdgeKey::Number(_) => 0,
+    }
+}
+
+fn value_payload(value: &EdgeValue) -> u64 {
+    match value {
+        EdgeValue::Scalar(Value::String(text)) => stored_len(text.len()),
+        EdgeValue::Scalar(Value::Bytes(bytes)) => stored_len(bytes.len()),
+        EdgeValue::Scalar(_)
+        | EdgeValue::Table { .. }
+        | EdgeValue::Closure { .. }
+        | EdgeValue::Upvalue { .. } => 0,
+    }
+}
+
+fn edge_payload(edge: &Edge) -> u64 {
+    key_payload(&edge.key) + value_payload(&edge.value)
+}
+
 struct Edge {
     from: u32,
     /// Field ids, object identities, string text, and binary64 numbers share
@@ -580,6 +609,9 @@ pub struct LuaHeap {
     peak_roots: u32,
     peak_edges: u32,
     scan: ScanMeter,
+    /// String and byte lengths stored in edge records. Not Vec capacity, not
+    /// Core locals, and not a second scan of `edges`.
+    payload_bytes: u64,
 }
 
 impl LuaHeap {
@@ -605,6 +637,7 @@ impl LuaHeap {
             peak_roots: 0,
             peak_edges: 0,
             scan: ScanMeter::default(),
+            payload_bytes: 0,
         }
     }
 
@@ -851,8 +884,15 @@ impl LuaHeap {
     pub fn clear_upvalue(&mut self, cell: UpvalueRef) -> Result<(), HeapError> {
         self.require_upvalue(cell)?;
         let key = EdgeKey::Field(CURRENT_EDGE);
-        self.edges
-            .retain(|edge| edge.from != cell.slot() || edge.key != key);
+        let mut released = 0u64;
+        self.edges.retain(|edge| {
+            let drop = edge.from == cell.slot() && edge.key == key;
+            if drop {
+                released += edge_payload(edge);
+            }
+            !drop
+        });
+        self.payload_bytes -= released;
         Ok(())
     }
 
@@ -1221,8 +1261,15 @@ impl LuaHeap {
     }
 
     fn clear_edge(&mut self, from: TableRef, key: &EdgeKey) {
-        self.edges
-            .retain(|edge| edge.from != from.slot() || &edge.key != key);
+        let mut released = 0u64;
+        self.edges.retain(|edge| {
+            let drop = edge.from == from.slot() && &edge.key == key;
+            if drop {
+                released += edge_payload(edge);
+            }
+            !drop
+        });
+        self.payload_bytes -= released;
     }
 
     fn write_table_edge(
@@ -1258,22 +1305,27 @@ impl LuaHeap {
         key: EdgeKey,
         value: EdgeValue,
     ) -> Result<(), HeapError> {
-        if let Some(edge) = self
+        if let Some(index) = self
             .edges
-            .iter_mut()
-            .find(|edge| edge.from == from_slot && edge.key == key)
+            .iter()
+            .position(|edge| edge.from == from_slot && edge.key == key)
         {
-            edge.value = value;
+            let removed = value_payload(&self.edges[index].value);
+            let added = value_payload(&value);
+            self.edges[index].value = value;
+            self.payload_bytes = self.payload_bytes - removed + added;
             return Ok(());
         }
         if self.edges.len() >= self.limits.edges as usize && !self.reclaim_cursor_gap() {
             return Err(HeapError::EdgeCapacity);
         }
+        let added = key_payload(&key) + value_payload(&value);
         self.edges.push(Edge {
             from: from_slot,
             key,
             value,
         });
+        self.payload_bytes += added;
         self.note_edge_peak();
         Ok(())
     }
@@ -1288,7 +1340,8 @@ impl LuaHeap {
         else {
             return false;
         };
-        self.edges.remove(index);
+        let edge = self.edges.remove(index);
+        self.payload_bytes -= edge_payload(&edge);
         true
     }
 
@@ -1810,6 +1863,43 @@ impl LuaHeap {
         }
     }
 
+    /// Logical bytes of this private heap, as KiB. Same meter as
+    /// [`Self::logical_bytes`]. Does not collect and does not touch the scan meter.
+    pub fn logical_kib(&self) -> f64 {
+        self.logical_bytes() as f64 / 1024.0
+    }
+
+    /// Logical allocated bytes of this private heap.
+    ///
+    /// Charged:
+    /// - each slot record (`slots.len()`, including a free or retired record
+    ///   that still occupies the vector)
+    /// - each edge record (`edges.len()`, including a weak-cleared cursor gap)
+    /// - the stored length of a string or byte payload in those edge records
+    ///
+    /// Not charged:
+    /// - `Vec` capacity above `len`, and string or byte capacity above `len`
+    /// - root frames and the free-list (a frame leave truncates roots before
+    ///   collection, so charging them would drop the reading first)
+    /// - the issued carrier array (Core identity, not a string payload)
+    /// - Core locals, temporaries, and strings that are not stored in an edge
+    /// - the borrowed `next` cursor (not a heap record)
+    ///
+    /// A weak clear keeps the cursor key charged and releases only the value
+    /// payload. The read is the two lengths plus one counter: no scan, no
+    /// mark, and no change to `collections` or the scan meter. This is not a
+    /// LuaJIT allocator, not whole-VM bytes, and not string interning.
+    ///
+    /// The record product fits in `u64`: each vector length is capped by a
+    /// `u32` limit, and a record stride is far below `2^32`. The payload sum
+    /// is the sum of lengths this process stored; that sum cannot exceed the
+    /// bytes those allocations occupy.
+    pub fn logical_bytes(&self) -> u64 {
+        let nodes = (self.slots.len() as u64) * (std::mem::size_of::<Slot>() as u64);
+        let edges = (self.edges.len() as u64) * (std::mem::size_of::<Edge>() as u64);
+        nodes + edges + self.payload_bytes
+    }
+
     fn require_live(&self, handle: TableRef) -> Result<(), HeapError> {
         self.require_kind(
             handle.domain(),
@@ -2126,6 +2216,7 @@ impl LuaHeap {
         // weak-value clear leaves the key in place with no value. That record
         // is the cursor, not a second index. A dead key, a private field, or
         // a strong edge is still removed.
+        let mut released = 0u64;
         self.edges.retain_mut(|edge| {
             let owner = edge.from as usize;
             if is_marked(edge.from) && weak_values.get(owner).copied().unwrap_or(false) {
@@ -2140,10 +2231,11 @@ impl LuaHeap {
                     }
                 };
                 if value_dead && guest_cursor(&edge.key) {
+                    released += value_payload(&edge.value);
                     edge.value = EdgeValue::Scalar(Value::Null);
                 }
             }
-            is_marked(edge.from)
+            let keep = is_marked(edge.from)
                 && match &edge.value {
                     EdgeValue::Table { slot, .. } => is_marked(*slot),
                     EdgeValue::Scalar(_) => true,
@@ -2162,8 +2254,13 @@ impl LuaHeap {
                         kind,
                     } if edge.value.is_cursor_gap() => typed(*slot, *generation, *kind),
                     EdgeKey::Object { slot, .. } => is_marked(*slot),
-                }
+                };
+            if !keep {
+                released += edge_payload(edge);
+            }
+            keep
         });
+        self.payload_bytes -= released;
     }
 
     fn mark_slot(&mut self, index: u32, work: &mut Vec<u32>) {
@@ -2193,11 +2290,17 @@ impl LuaHeap {
     }
 
     fn remove_edges_touching(&mut self, slot: u32) {
+        let mut released = 0u64;
         self.edges.retain(|edge| {
-            edge.from != slot
+            let keep = edge.from != slot
                 && edge.value.object_slot().is_none_or(|target| target != slot)
-                && !edge_key_is_slot(&edge.key, slot)
+                && !edge_key_is_slot(&edge.key, slot);
+            if !keep {
+                released += edge_payload(edge);
+            }
+            keep
         });
+        self.payload_bytes -= released;
     }
 
     fn clear_roots_to(&mut self, handle: TableRef) {
