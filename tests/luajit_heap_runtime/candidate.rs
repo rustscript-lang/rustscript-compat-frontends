@@ -706,13 +706,10 @@ fn set_edge(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
                     heap::with_heap(&mut host, |heap| heap.set_named_edge(from, &name, to))
                 }
                 class
-                    if matches!(class, heap::GuestClass::String)
+                    if matches!(class, heap::GuestClass::String | heap::GuestClass::Boolean)
                         || matches!(to_value, Value::Null)
                         || (heap::LuaHeap::names_mode_field(&name)
-                            && matches!(
-                                class,
-                                heap::GuestClass::Number | heap::GuestClass::Boolean
-                            )) =>
+                            && matches!(class, heap::GuestClass::Number)) =>
                 {
                     heap::with_heap(&mut host, |heap| {
                         heap.set_named_scalar(from, &name, to_value)
@@ -3140,6 +3137,7 @@ impl Lower<'_> {
             ast::Expr::String { bytes, .. } => String::from_utf8(bytes.clone())
                 .map(Expr::String)
                 .map_err(|_| self.unsupported(expr.span())),
+            ast::Expr::Bool { value, .. } => Ok(Expr::Bool(*value)),
             ast::Expr::Number {
                 raw,
                 kind: ast::NumberKind::Integer | ast::NumberKind::Float,

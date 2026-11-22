@@ -66,7 +66,6 @@ struct Run {
 enum Note {
     Text,
     Bool,
-    RawFalse,
 }
 
 #[derive(Default)]
@@ -78,34 +77,6 @@ struct Notes {
 impl vm::HostOwnedFunction for Note {
     fn call(&mut self, call: &mut vm::OwnedHostCall<'_>) -> Result<vm::CallOutcome, vm::VmError> {
         let args = call.args().to_vec();
-        if matches!(self, Self::RawFalse) {
-            let owner = match args.as_slice() {
-                [owner] => owner.clone(),
-                _ => {
-                    return Err(vm::VmError::HostError(
-                        "false guard plant expected one table".to_string(),
-                    ));
-                }
-            };
-            let mut host = call.vm().host_context();
-            let table = match super::heap::with_heap(&mut host, |heap| Ok(heap.guest_class(&owner)))
-                .map_err(|error| vm::VmError::HostError(error.to_string()))?
-            {
-                super::heap::GuestClass::Table(table) => table,
-                _ => {
-                    return Err(vm::VmError::HostError(
-                        "false guard plant expected a table".to_string(),
-                    ));
-                }
-            };
-            super::heap::with_heap(&mut host, |heap| {
-                heap.set_named_scalar(table, "__metatable", Value::Bool(false))
-            })
-            .map_err(|error| vm::VmError::HostError(error.to_string()))?;
-            return Ok(vm::CallOutcome::Return(vm::CallReturn::one(Value::Bool(
-                true,
-            ))));
-        }
         let mut host = call.vm().host_context();
         let notes = host
             .scope_state_or_insert_with(Notes::default)
@@ -129,7 +100,6 @@ impl vm::HostOwnedFunction for Note {
                 };
                 notes.flags.push((tag, flag));
             }
-            Self::RawFalse => unreachable!("planted before notes"),
         }
         Ok(vm::CallOutcome::Return(vm::CallReturn::one(Value::Bool(
             true,
@@ -198,7 +168,6 @@ fn run_file(source: &str) -> Run {
     for (name, note) in [
         ("lua_host::note_text", Note::Text),
         ("lua_host::note_bool", Note::Bool),
-        ("lua_host::plant_raw_false", Note::RawFalse),
     ] {
         if let Err(error) = register_note(&mut registry, &catalog, name, note) {
             return Run {
@@ -568,25 +537,29 @@ return type(weak[key])\n";
     assert_eq!(alive, (false, true), "weak cycle cleared, rooted peer kept");
 }
 
-/// `false` is a raw guard in LuaJIT, but this heap refuses a boolean named
-/// field other than `__mode`. The plant reaches that assert; the query itself
-/// already treats every non-nil raw field, including false, as protection.
+/// `false` is a raw guard. A real field write stores it; `getmetatable`
+/// returns that boolean, and `setmetatable` cannot replace or clear the
+/// owner until the raw field is nil.
 #[test]
 fn false_guard_is_returned_and_blocks_replacement() {
     let exposed = run_file(
         "local owner = {}\n\
          local mt = {}\n\
-         plant_raw_false(mt)\n\
+         mt.__metatable = false\n\
          setmetatable(owner, mt)\n\
          note_bool(1, getmetatable(owner))\n\
-         return type(getmetatable(owner))\n",
+         return getmetatable(owner)\n",
     );
     assert!(
         matches!(exposed.status, Ok(VmStatus::Halted)),
-        "false must be stored as a raw field before the guard can be read: {:?}",
+        "false must be stored by field assignment before the guard can be read: {:?}",
         exposed.status
     );
-    assert_eq!(exposed.stack, vec![Value::string("boolean")]);
+    assert_eq!(
+        exposed.stack,
+        vec![Value::Bool(false)],
+        "getmetatable must return the stored false, not a string or the real metatable"
+    );
     let flags = exposed
         .vm
         .expect("vm")
@@ -601,15 +574,15 @@ fn false_guard_is_returned_and_blocks_replacement() {
          local mt = {}\n\
          observe_table(owner, 0)\n\
          observe_table(mt, 0)\n\
-         plant_raw_false(mt)\n\
+         mt.__metatable = false\n\
          setmetatable(owner, mt)\n\
          setmetatable(owner, {})\n\
          return 1\n",
     );
-    let error = blocked.status.expect_err("false must protect");
+    let error = blocked.status.expect_err("false must protect replacement");
     assert!(
         error.contains("cannot change a protected metatable"),
-        "{error}"
+        "candidate host error, not a pcall string: {error}"
     );
     let vm = blocked.vm.as_mut().expect("vm");
     let observed = vm
@@ -622,4 +595,46 @@ fn false_guard_is_returned_and_blocks_replacement() {
     })
     .expect("read metatable");
     assert_eq!(current, Some(observed[1].table));
+
+    let mut cleared = run_file(
+        "local owner = {}\n\
+         local mt = {}\n\
+         observe_table(owner, 0)\n\
+         observe_table(mt, 0)\n\
+         mt.__metatable = false\n\
+         setmetatable(owner, mt)\n\
+         setmetatable(owner, nil)\n\
+         return 1\n",
+    );
+    let error = cleared.status.expect_err("false must protect clear");
+    assert!(
+        error.contains("cannot change a protected metatable"),
+        "{error}"
+    );
+    let vm = cleared.vm.as_mut().expect("vm");
+    let observed = vm
+        .host_context()
+        .scope_state::<Vec<super::ObservedTable>>()
+        .cloned()
+        .unwrap_or_default();
+    let current = super::heap::with_heap(&mut vm.host_context(), |heap| {
+        heap.metatable(observed[0].table)
+    })
+    .expect("read metatable");
+    assert_eq!(current, Some(observed[1].table));
+
+    let released = run_file(
+        "local owner = {}\n\
+         local mt = {}\n\
+         mt.__metatable = false\n\
+         setmetatable(owner, mt)\n\
+         mt.__metatable = nil\n\
+         return same_table(setmetatable(owner, nil), owner)\n",
+    );
+    assert!(
+        matches!(released.status, Ok(VmStatus::Halted)),
+        "nil raw field must allow a later clear: {:?}",
+        released.status
+    );
+    assert_eq!(released.stack, vec![Value::Bool(true)]);
 }

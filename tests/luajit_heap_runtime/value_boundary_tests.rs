@@ -188,11 +188,6 @@ pub(super) fn catalog() -> &'static Arc<vm::HostApiCatalog> {
             HostTypeSchema::Bool,
         ));
         builder.function(HostFunctionSchema::with_return(
-            "lua_host::plant_raw_false",
-            vec![HostParamSchema::value("owner", HostTypeSchema::Unknown)],
-            HostTypeSchema::Bool,
-        ));
-        builder.function(HostFunctionSchema::with_return(
             "lua_host::caller_reads",
             vec![
                 HostParamSchema::value("field_same", HostTypeSchema::Bool),

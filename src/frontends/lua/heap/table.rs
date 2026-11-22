@@ -1066,8 +1066,9 @@ impl LuaHeap {
 
     /// Writes a scalar under a Lua string key, or deletes that record on nil.
     ///
-    /// A number or boolean is accepted only for the reserved mode field. The
-    /// direct numeric field API stays available for heap tests.
+    /// A boolean may occupy any raw named field. A number remains only the
+    /// reserved mode field. The direct numeric field API stays available for
+    /// heap tests.
     pub fn set_named_scalar(
         &mut self,
         from: TableRef,
@@ -1077,8 +1078,8 @@ impl LuaHeap {
         let key = EdgeKey::named(name);
         let mode = matches!(key, EdgeKey::Field(Self::MODE_FIELD));
         debug_assert!(
-            matches!(value, Value::Null | Value::String(_))
-                || (mode && matches!(value, Value::Float(_) | Value::Bool(_)))
+            matches!(value, Value::Null | Value::String(_) | Value::Bool(_))
+                || (mode && matches!(value, Value::Float(_)))
         );
         self.require_live(from)?;
         if matches!(value, Value::Null) {
