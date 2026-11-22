@@ -860,28 +860,11 @@ impl LuaHeap {
     ///
     /// `Ok(None)` is nil. `Err` means the closure, its cell, or the stored
     /// target is an invalid handle. A missing edge is not an invalid handle.
-    /// This does not call the closure.
+    /// This does not call the closure. The edge itself is decoded by
+    /// [`Self::current_edge`].
     pub fn read_cell(&self, closure: ClosureRef) -> Result<Option<CellValue>, HeapError> {
         let cell = self.upvalue_of(closure)?;
-        let Some(value) = self.stored_from(cell.slot(), &EdgeKey::Field(CURRENT_EDGE)) else {
-            return Ok(None);
-        };
-        match value {
-            EdgeValue::Table { slot, generation } => {
-                let table = TableRef::table(self.domain, *slot, *generation);
-                self.require_live(table)?;
-                Ok(Some(CellValue::Table(table)))
-            }
-            EdgeValue::Closure { slot, generation } => {
-                let found = ClosureRef::closure(self.domain, *slot, *generation);
-                self.require_closure(found)?;
-                Ok(Some(CellValue::Closure(found)))
-            }
-            EdgeValue::Scalar(
-                value @ (Value::Bool(_) | Value::Float(_) | Value::String(_) | Value::Bytes(_)),
-            ) => Ok(Some(CellValue::Scalar(value.clone()))),
-            EdgeValue::Upvalue { .. } | EdgeValue::Scalar(_) => Err(HeapError::WrongKind),
-        }
+        self.current_edge(cell)
     }
 
     /// Reads the table currently stored through a closure's cell.
@@ -890,9 +873,9 @@ impl LuaHeap {
     /// so this table adapter returns `StaleHandle`. [`Self::read_cell`] returns
     /// `None` for that nil.
     pub fn read_upvalue(&self, closure: ClosureRef) -> Result<TableRef, HeapError> {
-        match self.read_cell(closure)? {
-            Some(CellValue::Table(table)) => Ok(table),
-            Some(CellValue::Closure(_) | CellValue::Scalar(_)) => Err(HeapError::WrongKind),
+        let cell = self.upvalue_of(closure)?;
+        match self.current_table(cell)? {
+            Some(table) => Ok(table),
             None => Err(HeapError::StaleHandle),
         }
     }
@@ -963,8 +946,25 @@ impl LuaHeap {
     /// The table currently stored in a cell.
     ///
     /// `Ok(None)` is a missing current edge, which is nil. This does not go
-    /// through a closure.
+    /// through a closure. A scalar or closure edge is `WrongKind`, not a table
+    /// and not nil. The edge bytes are decoded only by [`Self::current_edge`].
     pub fn current_table(&self, cell: UpvalueRef) -> Result<Option<TableRef>, HeapError> {
+        match self.current_edge(cell)? {
+            Some(CellValue::Table(table)) => Ok(Some(table)),
+            None => Ok(None),
+            Some(_) => Err(HeapError::WrongKind),
+        }
+    }
+
+    /// Decodes the one current edge of an upvalue.
+    ///
+    /// The caller passes an upvalue, and this checks that handle before
+    /// reading. A missing edge is nil. Table, boolean, binary64, string,
+    /// bytes, and closure stay distinct carriers. An integer or any other
+    /// scalar is `WrongKind` and is not turned into a number or a table.
+    /// This reads the existing edge record. It does not allocate a value slot
+    /// or a root.
+    pub fn current_edge(&self, cell: UpvalueRef) -> Result<Option<CellValue>, HeapError> {
         self.require_upvalue(cell)?;
         let Some(value) = self.stored_from(cell.slot(), &EdgeKey::Field(CURRENT_EDGE)) else {
             return Ok(None);
@@ -973,9 +973,17 @@ impl LuaHeap {
             EdgeValue::Table { slot, generation } => {
                 let table = TableRef::table(self.domain, *slot, *generation);
                 self.require_live(table)?;
-                Ok(Some(table))
+                Ok(Some(CellValue::Table(table)))
             }
-            _ => Err(HeapError::WrongKind),
+            EdgeValue::Closure { slot, generation } => {
+                let found = ClosureRef::closure(self.domain, *slot, *generation);
+                self.require_closure(found)?;
+                Ok(Some(CellValue::Closure(found)))
+            }
+            EdgeValue::Scalar(
+                value @ (Value::Bool(_) | Value::Float(_) | Value::String(_) | Value::Bytes(_)),
+            ) => Ok(Some(CellValue::Scalar(value.clone()))),
+            EdgeValue::Upvalue { .. } | EdgeValue::Scalar(_) => Err(HeapError::WrongKind),
         }
     }
 

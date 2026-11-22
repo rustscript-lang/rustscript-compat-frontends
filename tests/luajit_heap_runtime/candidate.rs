@@ -1185,14 +1185,18 @@ fn read_cell(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
     with_capture(&mut call.vm().host_context(), |graph| graph.reads += 1)?;
     let current = heap::with_heap(&mut call.vm().host_context(), |heap| {
         let cell = heap.cell_edge(table)?;
-        heap.current_table(cell)
+        heap.current_edge(cell)
     })
     .map_err(heap_error)?;
     match current {
-        Some(table) => heap::with_heap(&mut call.vm().host_context(), |heap| {
-            heap.issued_value(table)
-        })
-        .map_err(heap_error),
+        Some(heap::CellValue::Table(table)) => {
+            heap::with_heap(&mut call.vm().host_context(), |heap| {
+                heap.issued_value(table)
+            })
+            .map_err(heap_error)
+        }
+        Some(heap::CellValue::Scalar(value)) => Ok(value),
+        Some(heap::CellValue::Closure(_)) => Err(host_fault("Lua cell holds a closure")),
         None => Ok(Value::Null),
     }
 }
@@ -1207,16 +1211,25 @@ fn write_cell(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
         }
     };
     let table = issued_table(&mut call.vm().host_context(), &table)?;
-    let next_table = match &next {
-        Value::Null => None,
-        other => Some(issued_table(&mut call.vm().host_context(), other)?),
+    enum NextWrite {
+        Clear,
+        Scalar(Value),
+        Table(heap::TableRef),
+    }
+    let next_write = match next {
+        Value::Null => NextWrite::Clear,
+        value @ (Value::Bool(_) | Value::Float(_) | Value::String(_) | Value::Bytes(_)) => {
+            NextWrite::Scalar(value)
+        }
+        other => NextWrite::Table(issued_table(&mut call.vm().host_context(), &other)?),
     };
     let before = root_count(&mut call.vm().host_context())?;
     heap::with_heap(&mut call.vm().host_context(), |heap| {
         let cell = heap.cell_edge(table)?;
-        match next_table {
-            None => heap.clear_upvalue(cell),
-            Some(next) => heap.write_upvalue(cell, next),
+        match next_write {
+            NextWrite::Clear => heap.clear_upvalue(cell),
+            NextWrite::Scalar(value) => heap.write_scalar_upvalue(cell, value),
+            NextWrite::Table(next) => heap.write_upvalue(cell, next),
         }
     })
     .map_err(heap_error)?;
@@ -2419,15 +2432,29 @@ impl Lower<'_> {
                 },
             ] if targets.len() == 1
                 && values.exprs.len() == 1
-                && self.target_is_binding(&targets[0], binding)
-                && matches!(
+                && self.target_is_binding(&targets[0], binding) =>
+            {
+                let span = *span;
+                if let Some(literal) = self.proven_scalar_literal(&values.exprs[0])? {
+                    return self
+                        .call(WRITE_CELL, vec![Expr::Var(captured), literal])
+                        .map_err(|_| self.unsupported(span));
+                }
+                if matches!(values.exprs[0], ast::Expr::Nil { .. }) {
+                    return self
+                        .call(WRITE_CELL, vec![Expr::Var(captured), Expr::Null])
+                        .map_err(|_| self.unsupported(span));
+                }
+                if matches!(
                     values.exprs[0],
                     ast::Expr::Table { ref fields, .. } if fields.is_empty()
-                ) =>
-            {
-                let next = self.call(NEW_TABLE, vec![])?;
-                self.call(WRITE_CELL, vec![Expr::Var(captured), next])
-                    .map_err(|_| self.unsupported(*span))
+                ) {
+                    let next = self.call(NEW_TABLE, vec![])?;
+                    return self
+                        .call(WRITE_CELL, vec![Expr::Var(captured), next])
+                        .map_err(|_| self.unsupported(span));
+                }
+                Err(self.unsupported(span))
             }
             [other, ..] => Err(self.unsupported(stmt_span(other))),
             [] => Err(self.unsupported(func.span)),
@@ -2463,12 +2490,94 @@ impl Lower<'_> {
         self.capture_envelopes.get(&binding).copied()
     }
 
+    fn proven_scalar_literal(&self, expr: &ast::Expr) -> Result<Option<Expr>, ParseError> {
+        match expr {
+            ast::Expr::Bool { value, .. } => Ok(Some(Expr::Bool(*value))),
+            ast::Expr::Number { raw, kind, span } => {
+                Ok(Some(self.proven_number(raw, *kind, *span)?))
+            }
+            ast::Expr::Unary {
+                op: ast::UnOp::Neg,
+                expr,
+                span,
+            } => Ok(Some(self.neg_zero(expr, *span)?)),
+            ast::Expr::String { bytes, .. } => Ok(Some(self.string_literal(bytes))),
+            _ => Ok(None),
+        }
+    }
+
+    /// Decimal integer or float only. Hex, binary, and 64-bit suffixes stay
+    /// outside this slice, so a raw token is not reinterpreted.
+    fn proven_number(
+        &self,
+        raw: &str,
+        kind: ast::NumberKind,
+        span: ast::Span,
+    ) -> Result<Expr, ParseError> {
+        match kind {
+            ast::NumberKind::Integer | ast::NumberKind::Float => raw
+                .parse::<f64>()
+                .map(Expr::Float)
+                .map_err(|_| self.unsupported(span)),
+            ast::NumberKind::HexInteger
+            | ast::NumberKind::HexFloat
+            | ast::NumberKind::Binary
+            | ast::NumberKind::Signed64
+            | ast::NumberKind::Unsigned64
+            | ast::NumberKind::Imaginary => Err(self.unsupported(span)),
+        }
+    }
+
+    /// Only unary minus of a positive zero. The result keeps the negative-zero
+    /// bits. Any other negation is not this slice.
+    fn neg_zero(&self, expr: &ast::Expr, span: ast::Span) -> Result<Expr, ParseError> {
+        let ast::Expr::Number { raw, kind, .. } = expr else {
+            return Err(self.unsupported(span));
+        };
+        let value = match self.proven_number(raw, *kind, span)? {
+            Expr::Float(value) => value,
+            _ => return Err(self.unsupported(span)),
+        };
+        if value != 0.0 || value.is_sign_negative() {
+            return Err(self.unsupported(span));
+        }
+        Ok(Expr::Float(-0.0))
+    }
+
+    /// UTF-8, including an interior NUL, stays a string. Any other byte stays
+    /// bytes. The two carriers are not converted.
+    fn string_literal(&self, bytes: &[u8]) -> Expr {
+        match std::str::from_utf8(bytes) {
+            Ok(text) => Expr::String(text.to_string()),
+            Err(_) => Expr::Bytes(bytes.to_vec()),
+        }
+    }
+
     fn lower_assign(
         &mut self,
         span: ast::Span,
         target: &ast::AssignTarget,
         value: &ast::Expr,
     ) -> Result<(), ParseError> {
+        if let ast::AssignTarget::Name(name) = target
+            && let Some(literal) = self.proven_scalar_literal(value)?
+        {
+            let anchor = self
+                .anchor_of_name(name)
+                .ok_or_else(|| self.unsupported(span))?;
+            let written = self.call(WRITE_CELL, vec![Expr::Var(anchor), literal])?;
+            self.emit_ignored(written, self.line(span))?;
+            if let Some(slot) = self.locals.get(&name.bytes).copied() {
+                self.live_locals.retain(|local| *local != slot);
+                self.stmts.push(Stmt::Assign {
+                    kind: AssignmentKind::Set,
+                    index: slot,
+                    expr: Expr::Null,
+                    line: self.line(span),
+                });
+            }
+            return Ok(());
+        }
         match (target, value) {
             (ast::AssignTarget::Name(name), ast::Expr::Nil { .. }) => {
                 let slot = self

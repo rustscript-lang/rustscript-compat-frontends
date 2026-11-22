@@ -6,6 +6,8 @@
 //! mutable capture. Host observers record handles and booleans; they do not
 //! root, collect, call the closures, or write the cell.
 
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use vm::{
@@ -23,6 +25,7 @@ const NOTE_FN: &str = "lua_host::note_fn";
 const NOTE_PHASE: &str = "lua_host::note_phase";
 const NOTE_NIL: &str = "lua_host::note_nil";
 const NOTE_GRAPH: &str = "lua_host::note_graph";
+const NOTE_SCALAR: &str = "lua_host::note_scalar";
 
 const SOURCE: &str = r#"
 local mt = {}
@@ -77,6 +80,10 @@ struct Phase {
     next: bool,
     held_alive: bool,
     orphan_alive: bool,
+    /// Tag 1 is a table whose `self` edge points at itself.
+    self_cycle: bool,
+    /// Collections already performed when this phase was observed.
+    collections: u32,
 }
 
 /// Read-only closure and cell snapshot. Not a root and not a publication.
@@ -96,6 +103,7 @@ struct Obs {
     phases: Vec<Phase>,
     nils: Vec<bool>,
     graphs: Vec<GraphNote>,
+    scalars: Vec<Value>,
 }
 
 struct ObserveTable;
@@ -103,6 +111,7 @@ struct NoteFn;
 struct NotePhase;
 struct NoteNil;
 struct NoteGraph;
+struct NoteScalar;
 
 fn catalog() -> &'static Arc<vm::HostApiCatalog> {
     static CATALOG: OnceLock<Arc<vm::HostApiCatalog>> = OnceLock::new();
@@ -141,6 +150,11 @@ fn catalog() -> &'static Arc<vm::HostApiCatalog> {
             vec![HostParamSchema::value("id", HostTypeSchema::Float)],
             HostTypeSchema::Float,
         ));
+        builder.function(HostFunctionSchema::with_return(
+            NOTE_SCALAR,
+            vec![HostParamSchema::value("value", HostTypeSchema::Unknown)],
+            HostTypeSchema::Float,
+        ));
         Arc::new(builder.build().expect("shared-closure catalog"))
     })
 }
@@ -166,7 +180,14 @@ impl SourcePlugin for Plugin {
 }
 
 fn register(registry: &mut HostFunctionRegistry, catalog: &vm::HostApiCatalog) {
-    for name in [OBSERVE, NOTE_FN, NOTE_PHASE, NOTE_NIL, NOTE_GRAPH] {
+    for name in [
+        OBSERVE,
+        NOTE_FN,
+        NOTE_PHASE,
+        NOTE_NIL,
+        NOTE_GRAPH,
+        NOTE_SCALAR,
+    ] {
         let function = catalog.function(name).expect("observer schema");
         registry
             .register_exact_owned(
@@ -186,6 +207,7 @@ fn ctor_box(name: &str) -> Box<dyn HostOwnedFunction> {
         NOTE_PHASE => Box::new(NotePhase),
         NOTE_NIL => Box::new(NoteNil),
         NOTE_GRAPH => Box::new(NoteGraph),
+        NOTE_SCALAR => Box::new(NoteScalar),
         _ => unreachable!("observer name"),
     }
 }
@@ -275,7 +297,7 @@ impl HostOwnedFunction for NotePhase {
                     .map(|(_, table)| *table),
             )
         };
-        let (old, orphan, next, held_alive, orphan_alive) = {
+        let (old, orphan, next, held_alive, orphan_alive, self_cycle) = {
             let mut host = call.vm().host_context();
             heap::with_heap(&mut host, |heap| {
                 Ok((
@@ -284,6 +306,13 @@ impl HostOwnedFunction for NotePhase {
                     heap.named_edge(weak, "next")?.is_some(),
                     held.is_some_and(|table| heap.alive(table)),
                     orphan_ref.is_some_and(|table| heap.alive(table)),
+                    held.is_some_and(|table| {
+                        heap.alive(table)
+                            && matches!(
+                                heap.named_edge(table, "self"),
+                                Ok(Some(target)) if target == table
+                            )
+                    }),
                 ))
             })
             .map_err(|error| host_fault(&error.to_string()))?
@@ -295,6 +324,8 @@ impl HostOwnedFunction for NotePhase {
             next,
             held_alive,
             orphan_alive,
+            self_cycle,
+            collections: before.collections,
         });
         let after = heap::stats(&mut call.vm().host_context())
             .map_err(|error| host_fault(&error.to_string()))?;
@@ -361,6 +392,24 @@ impl HostOwnedFunction for NoteGraph {
             .map_err(|error| host_fault(&error.to_string()))?;
         if after.live_roots != before.live_roots || after.collections != before.collections {
             return Err(host_fault("note_graph rooted or collected"));
+        }
+        Ok(CallOutcome::Return(CallReturn::one(Value::Float(0.0))))
+    }
+}
+
+impl HostOwnedFunction for NoteScalar {
+    fn call(&mut self, call: &mut OwnedHostCall<'_>) -> Result<CallOutcome, VmError> {
+        let before = heap::stats(&mut call.vm().host_context())
+            .map_err(|error| host_fault(&error.to_string()))?;
+        let value = match call.args() {
+            [value] => value.clone(),
+            _ => return Err(host_fault("note_scalar arity")),
+        };
+        obs(&mut call.vm().host_context())?.scalars.push(value);
+        let after = heap::stats(&mut call.vm().host_context())
+            .map_err(|error| host_fault(&error.to_string()))?;
+        if after.live_roots != before.live_roots || after.collections != before.collections {
+            return Err(host_fault("note_scalar rooted or collected"));
         }
         Ok(CallOutcome::Return(CallReturn::one(Value::Float(0.0))))
     }
@@ -980,4 +1029,294 @@ note_graph(2)\n"
     let after = phase(&arm.obs, 2);
     assert!(!after.next, "block exit left the replacement table rooted");
     assert!(!alive(&mut arm.vm, tagged(&arm.obs, 3)));
+}
+
+fn namespace_fixture(label: &str, source: &str) -> PathBuf {
+    // Same directory as `namespace_case_root` in tests/common. This test crate
+    // does not include that module. A missing target dir must not fall back to /tmp.
+    let target = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| {
+        panic!("CARGO_TARGET_DIR must name the slot target; refusing to write a fixture elsewhere")
+    });
+    let root = PathBuf::from(target)
+        .join("compat-frontends-namespace-cases")
+        .join(label);
+    fs::create_dir_all(&root).unwrap_or_else(|error| panic!("create {}: {error}", root.display()));
+    let path = root.join("chunk.lua");
+    fs::write(&path, source).unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
+    path
+}
+
+fn run_lua_file(path: &Path) -> Arm {
+    let catalog = Arc::clone(catalog());
+    let options = CompileSourceFileOptions::new()
+        .with_source_plugin(&Plugin)
+        .with_host_api_catalog(Arc::clone(&catalog));
+    let prepared = vm::compile_source_file_with_options(path, options)
+        .unwrap_or_else(|error| panic!("lower/compile rejected {}: {error}", path.display()));
+    let mut vm = prepared.into_vm().expect("create VM");
+    let mut registry = HostFunctionRegistry::empty();
+    candidate::register(&mut registry, &catalog).expect("register candidate runtime");
+    register(&mut registry, &catalog);
+    registry.bind_vm_cached(&mut vm).expect("bind runtime");
+    let (call_values, call_scripts) = opcode_counts(vm.program());
+    assert_eq!(
+        vm.run().expect("run lua file"),
+        VmStatus::Halted,
+        "{}",
+        path.display()
+    );
+    let notes = candidate::capture_notes(&mut vm);
+    let (reads, writes) = candidate::capture_counts(&mut vm);
+    let obs = vm
+        .host_context()
+        .scope_state::<Obs>()
+        .cloned()
+        .unwrap_or_default();
+    Arm {
+        vm,
+        notes,
+        reads,
+        writes,
+        obs,
+        call_values,
+        call_scripts,
+    }
+}
+
+fn assert_scalar(actual: &Value, expected: &Value) {
+    match (actual, expected) {
+        (Value::Float(got), Value::Float(want)) => assert_eq!(
+            got.to_bits(),
+            want.to_bits(),
+            "float bits differ: got {got:?}, want {want:?}"
+        ),
+        (Value::String(got), Value::String(want)) => {
+            assert_eq!(got.as_str(), want.as_str(), "string bytes differ")
+        }
+        (Value::Bytes(got), Value::Bytes(want)) => {
+            assert_eq!(got.as_slice(), want.as_slice(), "byte string differs")
+        }
+        (got, want) => assert_eq!(got, want, "scalar carrier mismatch"),
+    }
+}
+
+#[test]
+fn source_file_shared_scalar_upvalue_collects_replaced_cycle() {
+    let path = namespace_fixture(
+        "lua52_source_shared_scalars",
+        r#"
+local mt = {}
+mt.__mode = "v"
+local weak = {}
+setmetatable(weak, mt)
+observe_table(weak, 0)
+do
+  local get = nil
+  local set_false = nil
+  local set_neg = nil
+  local set_text = nil
+  local set_bytes = nil
+  local set_nil = nil
+  do
+    local held = {}
+    held.self = held
+    weak.old = held
+    observe_table(held, 1)
+    get = function()
+      return held
+    end
+    set_false = function()
+      held = false
+    end
+    set_neg = function()
+      held = -0.0
+    end
+    set_text = function()
+      held = "text\0tail"
+    end
+    set_bytes = function()
+      held = "\255\0tail"
+    end
+    set_nil = function()
+      held = nil
+    end
+  end
+  note_fn(get)
+  note_fn(set_false)
+  note_fn(set_neg)
+  note_fn(set_text)
+  note_fn(set_bytes)
+  note_fn(set_nil)
+  local orphan = {}
+  weak.orphan = orphan
+  observe_table(orphan, 2)
+  orphan = nil
+  collectgarbage("collect")
+  note_phase(weak, 1)
+  local seen = get()
+  observe_table(seen, 3)
+  seen = nil
+  set_false()
+  collectgarbage("collect")
+  note_phase(weak, 2)
+  note_graph(1)
+  local got_false = get()
+  note_scalar(got_false)
+  got_false = nil
+  set_neg()
+  local got_neg = get()
+  note_scalar(got_neg)
+  got_neg = nil
+  set_text()
+  local got_text = get()
+  note_scalar(got_text)
+  got_text = nil
+  set_bytes()
+  local got_bytes = get()
+  note_scalar(got_bytes)
+  got_bytes = nil
+  set_nil()
+  local got_nil = get()
+  note_scalar(got_nil)
+  got_nil = nil
+  get = nil
+  set_false = nil
+  set_neg = nil
+  set_text = nil
+  set_bytes = nil
+  set_nil = nil
+end
+"#,
+    );
+    let mut arm = run_lua_file(&path);
+    assert_eq!(
+        arm.call_scripts, 0,
+        "static CallScript must not implement the calls"
+    );
+    assert!(
+        arm.call_values > 0,
+        "the file did not execute through CallValue"
+    );
+    assert_eq!(arm.notes.len(), 6, "six closures share the cell");
+    let cell = arm.notes[0].cell;
+    assert!(
+        arm.notes.iter().all(|note| note.cell == cell),
+        "closures did not share one cell"
+    );
+    assert_eq!(arm.reads, 10, "shared reads did not go through the cell");
+    assert_eq!(arm.writes, 5, "scalar writes did not go through the cell");
+    assert_eq!(
+        tagged(&arm.obs, 1),
+        tagged(&arm.obs, 3),
+        "getter did not keep the original self-cycle after the local block"
+    );
+    let kept = phase(&arm.obs, 1);
+    assert!(kept.self_cycle, "held table was not a self-cycle");
+    assert!(
+        kept.old && kept.held_alive,
+        "getter did not keep the cycle alive"
+    );
+    assert!(
+        !kept.orphan && !kept.orphan_alive,
+        "first collect did not run"
+    );
+    assert!(kept.collections >= 1, "first collect was not recorded");
+    let cleared = phase(&arm.obs, 2);
+    assert!(
+        cleared.collections > kept.collections,
+        "second collect did not run"
+    );
+    assert!(!cleared.old, "weak value still named the replaced cycle");
+    assert!(
+        !cleared.held_alive,
+        "self-cycle stayed alive after the cell moved to false"
+    );
+    let snap = graph(&arm.obs, 1);
+    assert!(
+        snap.closure_alive.iter().all(|alive| *alive),
+        "getter died before it could observe false"
+    );
+    assert!(
+        snap.cell_has_table.iter().all(|has| !has),
+        "cell still held a table after the false write"
+    );
+    assert_eq!(
+        arm.obs.scalars.len(),
+        5,
+        "getter did not return every replacement"
+    );
+    assert_scalar(&arm.obs.scalars[0], &Value::Bool(false));
+    assert_scalar(&arm.obs.scalars[1], &Value::Float(-0.0));
+    assert_scalar(&arm.obs.scalars[2], &Value::string("text\0tail"));
+    assert_scalar(
+        &arm.obs.scalars[3],
+        &Value::bytes([0xff, 0, b't', b'a', b'i', b'l']),
+    );
+    assert_scalar(&arm.obs.scalars[4], &Value::Null);
+    assert!(
+        !alive(&mut arm.vm, tagged(&arm.obs, 1)),
+        "replaced self-cycle was still reachable after the run"
+    );
+}
+
+#[test]
+fn source_file_scalar_write_follows_binding_not_name() {
+    let path = namespace_fixture(
+        "lua52_source_shared_scalar_shadow",
+        r#"
+do
+  local held = {}
+  observe_table(held, 1)
+  local get = nil
+  get = function()
+    return held
+  end
+  do
+    local held = {}
+    observe_table(held, 2)
+    local inner_get = nil
+    local inner_set = nil
+    inner_get = function()
+      return held
+    end
+    inner_set = function()
+      held = false
+    end
+    inner_set()
+    local inner_seen = inner_get()
+    note_scalar(inner_seen)
+    local outer_seen = get()
+    observe_table(outer_seen, 3)
+    note_fn(inner_get)
+    note_fn(inner_set)
+    inner_get = nil
+    inner_set = nil
+  end
+  note_fn(get)
+  get = nil
+end
+"#,
+    );
+    let arm = run_lua_file(&path);
+    assert_eq!(
+        arm.notes.len(),
+        3,
+        "outer getter, inner getter, inner setter"
+    );
+    assert_eq!(
+        arm.notes[1].cell, arm.notes[2].cell,
+        "inner closures did not share the inner binding"
+    );
+    assert_ne!(
+        arm.notes[0].cell, arm.notes[1].cell,
+        "same name collapsed two bindings onto one cell"
+    );
+    assert_eq!(arm.obs.scalars.len(), 1);
+    assert_scalar(&arm.obs.scalars[0], &Value::Bool(false));
+    assert_eq!(
+        tagged(&arm.obs, 1),
+        tagged(&arm.obs, 3),
+        "outer binding changed when the inner name was written"
+    );
+    assert_ne!(tagged(&arm.obs, 1), tagged(&arm.obs, 2));
 }
