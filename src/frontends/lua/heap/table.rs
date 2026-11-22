@@ -405,9 +405,10 @@ struct Frame {
 /// that build the outgoing index (2E). `outgoing_edge_checks` counts records
 /// inspected from marked nodes. Each followed object target contributes
 /// separately to `node_slot_visits`; skipped weak targets do not.
-/// `sweep_edge_checks` is the one edge filter,
-/// and it is zero when every live node is marked. Adding those fields is not
-/// a total GC cost.
+/// `sweep_edge_checks` is that one retain of stored records. It is zero when
+/// every live node is marked. Sweep reads modes parsed during mark and does
+/// not scan edges again to find `__mode`. Adding those fields is not a total
+/// GC cost.
 ///
 /// A metatable is not in that edge vector. `metatable_edge_checks` counts
 /// stored metatable refs followed from marked nodes. A collect with none
@@ -498,12 +499,26 @@ pub(super) struct DoomedToken {
     pub(super) generation: u32,
 }
 
-/// Temporary outgoing-edge index for one mark. Dropped when mark returns.
-/// Not stored on the heap, so it is not a second persistent graph.
+/// Temporary outgoing-edge index for one mark. Offsets and entries drop when
+/// mark returns. Parsed weak modes move to sweep for that same collect and
+/// are not stored on the heap.
 struct OutgoingIndex {
     offsets: Vec<u32>,
     entries: Vec<u32>,
     weak_modes: Option<Vec<WeakMode>>,
+}
+
+/// Weak modes parsed while building the outgoing index. Sweep borrows this
+/// for the same collect, then drops it. A close error before sweep drops it
+/// with the mark result, so the next collect parses again.
+pub(super) struct MarkSnapshot {
+    modes: Option<Vec<WeakMode>>,
+}
+
+/// Doomed host tokens, plus the modes sweep needs after those tokens close.
+pub(super) struct DoomedMark {
+    pub(super) tokens: Vec<DoomedToken>,
+    pub(super) modes: MarkSnapshot,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1678,12 +1693,14 @@ impl LuaHeap {
         true
     }
 
-    /// Marks once and returns unreachable stored tokens with their slots.
-    /// Does not release nodes. The caller closes those tokens, then
-    /// [`Self::sweep_marked`] uses this same mark.
-    pub(super) fn mark_and_doomed_tokens(&mut self) -> Vec<DoomedToken> {
-        self.mark_reachable();
-        let doomed: Vec<DoomedToken> = self
+    /// Marks once and returns unreachable stored tokens with their slots,
+    /// plus the weak modes sweep needs after those tokens close. Does not
+    /// release nodes. A close error drops the modes with this result; the
+    /// next collect marks and parses again. [`Self::sweep_marked`] uses this
+    /// same mark and does not build another mode index.
+    pub(super) fn mark_and_doomed_tokens(&mut self) -> DoomedMark {
+        let modes = self.mark_reachable();
+        let tokens: Vec<DoomedToken> = self
             .slots
             .iter()
             .enumerate()
@@ -1697,8 +1714,8 @@ impl LuaHeap {
             })
             .collect();
         self.scan.node_slot_visits += self.slots.len() as u64;
-        self.scan.scratch.pending_close_pushed += doomed.len() as u64;
-        doomed
+        self.scan.scratch.pending_close_pushed += tokens.len() as u64;
+        DoomedMark { tokens, modes }
     }
 
     /// Non-moving mark from explicit roots, then one sweep of unmarked nodes.
@@ -1709,8 +1726,8 @@ impl LuaHeap {
     /// which closes tokens before [`Self::sweep_marked`]. Calling this on a
     /// host heap would skip that close.
     pub fn collect(&mut self) -> CollectReport {
-        self.mark_reachable();
-        self.sweep_marked()
+        let modes = self.mark_reachable();
+        self.sweep_marked(modes)
     }
 
     /// Releases nodes the current mark did not reach. Does not mark again.
@@ -1719,7 +1736,7 @@ impl LuaHeap {
     /// every unmarked live node is released, so remaining live nodes are the
     /// marked count. The report uses that count instead of walking the slot
     /// vector again.
-    pub(super) fn sweep_marked(&mut self) -> CollectReport {
+    pub(super) fn sweep_marked(&mut self, modes: MarkSnapshot) -> CollectReport {
         let mut swept = Vec::new();
         let mut marked_nodes = 0u32;
         self.scan.node_slot_visits += self.slots.len() as u64;
@@ -1732,7 +1749,7 @@ impl LuaHeap {
         }
         self.scan.scratch.dead_slots_pushed += swept.len() as u64;
         if !swept.is_empty() {
-            self.sweep_edges_once();
+            self.sweep_edges_once(&modes);
             for index in swept {
                 self.scan.node_slot_visits += 1;
                 self.release_slot(index);
@@ -1845,7 +1862,7 @@ impl LuaHeap {
         })
     }
 
-    fn mark_reachable(&mut self) {
+    fn mark_reachable(&mut self) -> MarkSnapshot {
         self.scan.mark_passes += 1;
         self.scan.node_slot_visits += self.slots.len() as u64;
         for slot in &mut self.slots {
@@ -1917,6 +1934,9 @@ impl LuaHeap {
                     self.follow_target(slot, generation, kind, &mut work);
                 }
             }
+        }
+        MarkSnapshot {
+            modes: index.weak_modes,
         }
     }
 
@@ -2027,10 +2047,11 @@ impl LuaHeap {
         }
     }
 
-    /// One filter of the edge vector. Skipped when every live node is marked,
-    /// so an all-live collect does not walk edges again and does not build
-    /// the mark bitmap.
-    fn sweep_edges_once(&mut self) {
+    /// One retain of stored edge records. Skipped when every live node is
+    /// marked, so an all-live collect does not walk edges and does not build
+    /// the mark bitmap. Weak-value flags come from `modes`, already parsed
+    /// during mark. This does not scan edges to find `__mode`.
+    fn sweep_edges_once(&mut self, modes: &MarkSnapshot) {
         struct SweepSlot {
             marked: bool,
             kind: HandleKind,
@@ -2047,6 +2068,8 @@ impl LuaHeap {
             .collect();
         self.scan.node_slot_visits += sweep.len() as u64;
         self.scan.scratch.sweep_bitmap_inited += sweep.len() as u64;
+        // Storage records this retain will visit. A later removal does not
+        // add a second counted pass.
         self.scan.sweep_edge_checks += self.edges.len() as u64;
         let is_marked = |slot: u32| sweep.get(slot as usize).is_some_and(|found| found.marked);
         let typed = |slot: u32, generation: u32, kind: HandleKind| {
@@ -2054,34 +2077,33 @@ impl LuaHeap {
                 found.marked && found.kind == kind && found.generation == generation
             })
         };
-        let weak_values: Vec<bool> = sweep
-            .iter()
-            .enumerate()
-            .map(|(index, found)| {
-                if !found.marked || found.kind != HandleKind::Table {
-                    return false;
-                }
-                let Some((mt_slot, mt_generation)) = self.slots[index].metatable else {
-                    return false;
-                };
-                let Some(mt) = sweep.get(mt_slot as usize) else {
-                    return false;
-                };
-                if !mt.marked || mt.kind != HandleKind::Table || mt.generation != mt_generation {
-                    return false;
-                }
-                self.edges.iter().any(|edge| {
-                    if edge.from != mt_slot || edge.key != EdgeKey::Field(Self::MODE_FIELD) {
+        let weak_values = match modes.modes.as_ref() {
+            // No stored weak mode: every owner is strong. Do not read
+            // metatable slots or edges to rediscover that.
+            None => Vec::new(),
+            Some(stored) => sweep
+                .iter()
+                .enumerate()
+                .map(|(index, found)| {
+                    if !found.marked || found.kind != HandleKind::Table {
                         return false;
                     }
-                    let EdgeValue::Scalar(Value::String(mode)) = &edge.value else {
+                    let Some((mt_slot, mt_generation)) = self.slots[index].metatable else {
                         return false;
                     };
-                    let mut ignored = 0u64;
-                    WeakMode::parse(mode, &mut ignored).values
+                    let Some(mt) = sweep.get(mt_slot as usize) else {
+                        return false;
+                    };
+                    if !mt.marked || mt.kind != HandleKind::Table || mt.generation != mt_generation
+                    {
+                        return false;
+                    }
+                    // Mark already counted this lookup. Reading the stored
+                    // flag is not another parse and is not an edge scan.
+                    stored.get(mt_slot as usize).is_some_and(|mode| mode.values)
                 })
-            })
-            .collect();
+                .collect(),
+        };
         let guest_cursor = |key: &EdgeKey| match key {
             EdgeKey::Utf8(_) | EdgeKey::Number(_) => true,
             EdgeKey::Field(_) => false,
@@ -2092,33 +2114,27 @@ impl LuaHeap {
             } => typed(*slot, *generation, HandleKind::Table),
             EdgeKey::Object { .. } => false,
         };
-        // A weak-value clear leaves the key in place with no value. The record
-        // is the cursor. It is not a second index. A dead key, a private field,
-        // or a strong edge is still removed.
-        for edge in &mut self.edges {
+        // One pass updates a cleared cursor and drops a dead edge. A
+        // weak-value clear leaves the key in place with no value. That record
+        // is the cursor, not a second index. A dead key, a private field, or
+        // a strong edge is still removed.
+        self.edges.retain_mut(|edge| {
             let owner = edge.from as usize;
-            if !is_marked(edge.from) || !weak_values.get(owner).copied().unwrap_or(false) {
-                continue;
-            }
-            let value_dead = match &edge.value {
-                EdgeValue::Scalar(_) => false,
-                EdgeValue::Table { slot, .. } => !is_marked(*slot),
-                EdgeValue::Closure { slot, generation } => {
-                    !typed(*slot, *generation, HandleKind::Closure)
+            if is_marked(edge.from) && weak_values.get(owner).copied().unwrap_or(false) {
+                let value_dead = match &edge.value {
+                    EdgeValue::Scalar(_) => false,
+                    EdgeValue::Table { slot, .. } => !is_marked(*slot),
+                    EdgeValue::Closure { slot, generation } => {
+                        !typed(*slot, *generation, HandleKind::Closure)
+                    }
+                    EdgeValue::Upvalue { slot, generation } => {
+                        !typed(*slot, *generation, HandleKind::Upvalue)
+                    }
+                };
+                if value_dead && guest_cursor(&edge.key) {
+                    edge.value = EdgeValue::Scalar(Value::Null);
                 }
-                EdgeValue::Upvalue { slot, generation } => {
-                    !typed(*slot, *generation, HandleKind::Upvalue)
-                }
-            };
-            if !value_dead || !guest_cursor(&edge.key) {
-                continue;
             }
-            edge.value = EdgeValue::Scalar(Value::Null);
-        }
-        // Strong endpoints of a marked owner were already marked. A valueless
-        // cursor stays when its key is still usable. Closure and cell targets,
-        // and object keys of either stored kind, are checked in this same retain.
-        self.edges.retain(|edge| {
             is_marked(edge.from)
                 && match &edge.value {
                     EdgeValue::Table { slot, .. } => is_marked(*slot),

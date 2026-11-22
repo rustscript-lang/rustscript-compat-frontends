@@ -1557,3 +1557,226 @@ fn assert_type_mismatch(error: &heap::HeapError) {
         other => panic!("expected a scope close error, got {other:?}"),
     }
 }
+
+#[test]
+fn shared_metatable_sweep_reuses_marked_modes() {
+    let mode = "xxv";
+    let narrow = collect_shared_mode(4, 16, mode);
+    let more_owners = collect_shared_mode(16, 16, mode);
+    let more_edges = collect_shared_mode(4, 64, mode);
+    let strong = collect_shared_mode(16, 16, "s");
+
+    assert_eq!(narrow.bytes, mode.len() as u64, "mark parses the mode once");
+    assert_eq!(more_owners.bytes, narrow.bytes);
+    assert_eq!(more_edges.bytes, narrow.bytes);
+    assert_eq!(strong.bytes, 1, "a non-weak mode is still parsed once");
+
+    assert_eq!(narrow.lookups, u64::from(narrow.owners));
+    assert_eq!(
+        more_owners.lookups / narrow.lookups,
+        u64::from(more_owners.owners / narrow.owners),
+        "lookups grow with owners, not with owners times edges"
+    );
+    assert_eq!(more_edges.lookups, narrow.lookups);
+    assert_eq!(strong.lookups, 0);
+    assert_eq!(strong.modes_inited, 0);
+
+    assert_eq!(narrow.sweep, u64::from(narrow.edges));
+    assert_eq!(
+        more_owners.sweep, narrow.sweep,
+        "extra owners do not add an edge sweep"
+    );
+    assert_eq!(
+        more_edges.sweep / narrow.sweep,
+        u64::from(more_edges.edges / narrow.edges)
+    );
+    assert_eq!(strong.sweep, u64::from(strong.edges));
+    assert_eq!(narrow.index, narrow.sweep * 2);
+    assert_eq!(more_owners.index, narrow.index);
+    assert_eq!(
+        more_edges.index / narrow.index,
+        more_edges.sweep / narrow.sweep
+    );
+    assert_eq!(narrow.outgoing, narrow.sweep);
+    assert_eq!(more_owners.outgoing, narrow.outgoing);
+    assert_eq!(more_edges.outgoing, more_edges.sweep);
+
+    assert_eq!(narrow.modes_inited, u64::from(narrow.nodes));
+    assert_eq!(more_edges.modes_inited, narrow.modes_inited);
+    assert!(more_owners.modes_inited > narrow.modes_inited);
+
+    assert_cleared_cursor_reuses_the_dead_slot();
+    assert_host_collect_keeps_the_marked_mode();
+}
+
+struct ModeSweep {
+    owners: u32,
+    edges: u32,
+    bytes: u64,
+    lookups: u64,
+    sweep: u64,
+    index: u64,
+    outgoing: u64,
+    modes_inited: u64,
+    nodes: u32,
+}
+
+/// One shared metatable, `owners` marked tables, `edges` stored records, and
+/// one dead node so sweep runs. Padding fields are written first, so the mode
+/// string is the last edge.
+fn collect_shared_mode(owners: u32, edges: u32, mode: &str) -> ModeSweep {
+    let mut heap = LuaHeap::new(HeapLimits {
+        nodes: owners + 2,
+        roots: owners + 1,
+        edges,
+        max_generation: 8,
+    });
+    let mt = heap.alloc().unwrap();
+    let mut owner_refs = Vec::new();
+    for _ in 0..owners {
+        owner_refs.push(heap.alloc().unwrap());
+    }
+    let _dead = heap.alloc().unwrap();
+    let frame = heap.enter_roots(owners + 1).unwrap();
+    heap.write_root(frame, 0, mt).unwrap();
+    for (index, owner) in owner_refs.iter().enumerate() {
+        heap.write_root(frame, index as u32 + 1, *owner).unwrap();
+        heap.set_metatable(*owner, Some(mt)).unwrap();
+    }
+    for field in 1..edges {
+        heap.set_field_scalar(mt, field, Value::string("pad"))
+            .unwrap();
+    }
+    heap.set_mode_scalar(mt, Value::string(mode)).unwrap();
+    assert_eq!(
+        heap.stats().edge_slots,
+        edges,
+        "mode is the last stored edge"
+    );
+    heap.collect();
+    let meter = heap.take_scan_meter();
+    ModeSweep {
+        owners,
+        edges,
+        bytes: meter.weak_mode_bytes,
+        lookups: meter.weak_mode_lookups,
+        sweep: meter.sweep_edge_checks,
+        index: meter.index_edge_checks,
+        outgoing: meter.outgoing_edge_checks,
+        modes_inited: meter.scratch.weak_modes_inited,
+        nodes: heap.stats().node_slots,
+    }
+}
+
+fn assert_cleared_cursor_reuses_the_dead_slot() {
+    let mut heap = LuaHeap::new(HeapLimits {
+        nodes: 8,
+        roots: 4,
+        edges: 4,
+        max_generation: 8,
+    });
+    let mt = heap.alloc().unwrap();
+    let owner = heap.alloc().unwrap();
+    let key = heap.alloc().unwrap();
+    let kept = heap.alloc().unwrap();
+    let dead = heap.alloc().unwrap();
+    let frame = heap.enter_roots(4).unwrap();
+    heap.write_root(frame, 0, mt).unwrap();
+    heap.write_root(frame, 1, owner).unwrap();
+    heap.write_root(frame, 2, key).unwrap();
+    heap.write_root(frame, 3, kept).unwrap();
+    heap.set_metatable(owner, Some(mt)).unwrap();
+    heap.set_object_edge(owner, key, dead).unwrap();
+    heap.set_named_edge(owner, "keep", kept).unwrap();
+    heap.set_mode_scalar(mt, Value::string("v")).unwrap();
+    heap.issue_carrier(kept).unwrap();
+    assert_eq!(heap.stats().edge_slots, 3);
+    assert_eq!(heap.stats().live_edges, 3);
+
+    heap.collect();
+    let meter = heap.take_scan_meter();
+    assert_eq!(meter.weak_mode_bytes, 1);
+    assert_eq!(meter.weak_mode_lookups, 1);
+    assert_eq!(
+        meter.sweep_edge_checks, 3,
+        "one pass over the stored records"
+    );
+    assert_eq!(meter.index_edge_checks, 6);
+    assert_eq!(heap.object_value(owner, key).unwrap(), Value::Null);
+    assert_eq!(
+        heap.stats().edge_slots,
+        3,
+        "the cleared key still occupies storage"
+    );
+    assert_eq!(heap.stats().live_edges, 2, "mode and the live entry");
+    assert!(!heap.alive(dead));
+
+    let reused = heap.alloc().unwrap();
+    assert_eq!(reused.slot(), dead.slot());
+    assert_ne!(reused.generation(), dead.generation());
+    assert!(heap.alive(reused));
+    assert!(!heap.alive(dead));
+
+    let key_value = heap.issue_carrier(key).unwrap();
+    let continued = heap.next_guest(owner, &key_value).unwrap().unwrap();
+    assert_eq!(continued.0, Value::string("keep"));
+    assert_eq!(continued.1, heap.issued_value(kept).unwrap());
+}
+
+fn assert_host_collect_keeps_the_marked_mode() {
+    with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(
+            &mut host,
+            HeapLimits {
+                nodes: 8,
+                roots: 4,
+                edges: 4,
+                max_generation: 8,
+            },
+        )
+        .expect("install");
+        let mt_raw = publish_raw(&mut host);
+        let owner_raw = publish_raw(&mut host);
+        let key_raw = publish_raw(&mut host);
+        let kept_raw = publish_raw(&mut host);
+        let dead_raw = publish_raw(&mut host);
+        let mt = table_ref(&host, mt_raw);
+        let owner = table_ref(&host, owner_raw);
+        let key = table_ref(&host, key_raw);
+        let kept = table_ref(&host, kept_raw);
+        let dead = table_ref(&host, dead_raw);
+        heap::with_heap(&mut host, |heap| {
+            let frame = heap.enter_roots(4)?;
+            heap.write_root(frame, 0, mt)?;
+            heap.write_root(frame, 1, owner)?;
+            heap.write_root(frame, 2, key)?;
+            heap.write_root(frame, 3, kept)?;
+            heap.set_metatable(owner, Some(mt))?;
+            heap.set_object_edge(owner, key, dead)?;
+            heap.set_named_edge(owner, "keep", kept)?;
+            heap.set_mode_scalar(mt, Value::string("v"))?;
+            Ok(())
+        })
+        .expect("shape");
+
+        heap::collect(&mut host).expect("host collect");
+        let reused_raw = publish_raw(&mut host);
+        let reused = table_ref(&host, reused_raw);
+        heap::with_heap(&mut host, |heap| {
+            assert_eq!(heap.object_value(owner, key)?, Value::Null);
+            assert_eq!(heap.named_edge(owner, "keep")?, Some(kept));
+            assert!(!heap.alive(dead));
+            assert_eq!(reused.slot(), dead.slot());
+            assert_ne!(reused.generation(), dead.generation());
+            let meter = heap.take_scan_meter();
+            assert_eq!(meter.weak_mode_bytes, 1);
+            assert_eq!(meter.weak_mode_lookups, 1);
+            assert_eq!(meter.sweep_edge_checks, 3);
+            assert_eq!(heap.stats().edge_slots, 3);
+            assert_eq!(heap.stats().live_edges, 2);
+            Ok(())
+        })
+        .expect("host sweep used the marked mode");
+    });
+}

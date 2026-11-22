@@ -145,11 +145,14 @@ pub fn with_heap<T>(
     body(heap)
 }
 
-/// Host-side collection. One mark lists unreachable tokens. Each token is
-/// closed through `HostContext::close_resource` before the heap sweep, so the
-/// scope quota comes back in this same VM. Stored handles are not roots.
+/// Host-side collection. One mark lists unreachable tokens and keeps the
+/// parsed weak modes for sweep. Each token is closed through
+/// `HostContext::close_resource` before the heap sweep, so the scope quota
+/// comes back in this same VM. Stored handles are not roots.
 ///
-/// Close checks the slot and generation captured at mark time. It does not
+/// A close error returns before sweep. That snapshot is dropped with the
+/// mark result, and the next collect marks again. Close checks the slot and
+/// generation captured at mark time. It does not
 /// search the slot vector. For that exact stored token only,
 /// `ResourceAlreadyClosed` (slot not reused) and `ResourceStale` (slot reused)
 /// are retired: the identified slot is cleared and the sweep continues. A
@@ -168,11 +171,11 @@ pub fn with_heap<T>(
 /// A Pending result is an error. This type has no path that starts an
 /// asynchronous close, and this collector does not add one.
 pub fn collect(host: &mut HostContext) -> Result<table::CollectReport, HeapError> {
-    let doomed = with_heap(host, |heap| Ok(heap.mark_and_doomed_tokens()))?;
-    for token in doomed {
+    let marked = with_heap(host, |heap| Ok(heap.mark_and_doomed_tokens()))?;
+    for token in marked.tokens {
         retire_doomed_token(host, token)?;
     }
-    with_heap(host, |heap| Ok(heap.sweep_marked()))
+    with_heap(host, |heap| Ok(heap.sweep_marked(marked.modes)))
 }
 
 fn retire_doomed_token(host: &mut HostContext, token: table::DoomedToken) -> Result<(), HeapError> {
