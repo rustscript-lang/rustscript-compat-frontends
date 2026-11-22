@@ -239,11 +239,12 @@ pub enum CellValue {
     Closure(ClosureRef),
 }
 
-/// One explicit root. Table and closure roots share the root vector.
+/// One explicit root. Table, closure, and upvalue roots share the root vector.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Rooted {
     Table(TableRef),
     Closure(ClosureRef),
+    Upvalue(UpvalueRef),
 }
 
 impl Rooted {
@@ -251,6 +252,7 @@ impl Rooted {
         match self {
             Self::Table(handle) => handle.slot(),
             Self::Closure(handle) => handle.slot(),
+            Self::Upvalue(handle) => handle.slot(),
         }
     }
 }
@@ -1209,8 +1211,9 @@ impl LuaHeap {
         })
     }
 
-    /// Stores `handle` in an open frame. The frame does not have to be the
-    /// top frame; a stale id is refused.
+    /// Stores `handle` in an open frame. A closure uses [`Self::write_closure_root`].
+    /// An upvalue uses [`Self::write_upvalue_root`]. The frame does not have to
+    /// be the top frame; a stale id is refused.
     pub fn write_root(
         &mut self,
         frame: RootFrameId,
@@ -1218,13 +1221,7 @@ impl LuaHeap {
         handle: TableRef,
     ) -> Result<(), HeapError> {
         self.require_live(handle)?;
-        let found = self.frame(frame)?;
-        if slot >= found.width {
-            return Err(HeapError::StaleFrame);
-        }
-        let index = found.start as usize + slot as usize;
-        self.roots[index] = Some(Rooted::Table(handle));
-        Ok(())
+        self.store_root(frame, slot, Rooted::Table(handle))
     }
 
     /// Stores a closure in an open frame. Same vector and quota as a table root.
@@ -1237,12 +1234,36 @@ impl LuaHeap {
         handle: ClosureRef,
     ) -> Result<(), HeapError> {
         self.require_closure(handle)?;
+        self.store_root(frame, slot, Rooted::Closure(handle))
+    }
+
+    /// Stores an upvalue in an open frame. Same vector, quota, and collector
+    /// as a table or closure root.
+    ///
+    /// The slot roots the cell. It does not copy or clear the current edge.
+    /// A stale, foreign, or wrong-kind handle is refused before the slot changes.
+    pub fn write_upvalue_root(
+        &mut self,
+        frame: RootFrameId,
+        slot: u32,
+        handle: UpvalueRef,
+    ) -> Result<(), HeapError> {
+        self.require_upvalue(handle)?;
+        self.store_root(frame, slot, Rooted::Upvalue(handle))
+    }
+
+    fn store_root(
+        &mut self,
+        frame: RootFrameId,
+        slot: u32,
+        rooted: Rooted,
+    ) -> Result<(), HeapError> {
         let found = self.frame(frame)?;
         if slot >= found.width {
             return Err(HeapError::StaleFrame);
         }
         let index = found.start as usize + slot as usize;
-        self.roots[index] = Some(Rooted::Closure(handle));
+        self.roots[index] = Some(rooted);
         Ok(())
     }
 
@@ -1746,6 +1767,7 @@ impl LuaHeap {
         match rooted {
             Rooted::Table(handle) => self.alive(handle),
             Rooted::Closure(handle) => self.closure_alive(handle),
+            Rooted::Upvalue(handle) => self.upvalue_alive(handle),
         }
     }
 

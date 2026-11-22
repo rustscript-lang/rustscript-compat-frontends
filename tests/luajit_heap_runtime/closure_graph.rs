@@ -1265,3 +1265,448 @@ fn closure_root_recursive_cell_omitting_the_final_collect_leaves_the_cycle() {
         );
     });
 }
+
+/// One frame slot roots the open cell. The captured table has no root of its own.
+struct OpenCell {
+    frame: heap::RootFrameId,
+    cell: UpvalueRef,
+    original: TableRef,
+    original_raw: i64,
+    original_carrier: Value,
+    sibling: TableRef,
+    sibling_raw: i64,
+}
+
+fn open_cell_limits() -> HeapLimits {
+    HeapLimits {
+        nodes: 4,
+        roots: 1,
+        edges: 2,
+        max_generation: 4,
+    }
+}
+
+fn root_open_cell(host: &mut HostContext<'_>) -> OpenCell {
+    heap::install(host, open_cell_limits()).expect("install");
+    let original_raw = publish_raw(host);
+    let original = table_ref(host, original_raw);
+    let sibling_raw = publish_raw(host);
+    let sibling = table_ref(host, sibling_raw);
+    let cell = heap::with_heap(host, |heap| heap.alloc_upvalue()).expect("cell");
+    heap::with_heap(host, |heap| heap.write_upvalue(cell, original)).expect("capture");
+    let frame = heap::with_heap(host, |heap| heap.enter_roots(1)).expect("one slot");
+    heap::with_heap(host, |heap| heap.write_upvalue_root(frame, 0, cell))
+        .expect("the frame slot roots the cell");
+    assert_eq!(
+        heap::with_heap(host, |heap| heap.enter_roots(1)).expect_err("shared quota"),
+        HeapError::RootCapacity,
+        "an upvalue root spends the same root quota as a table root"
+    );
+    let stats = heap::stats(host).expect("rooted cell");
+    assert_eq!(stats.live_roots, 1, "the cell is the only root");
+    assert_eq!(
+        stats.root_slots, 1,
+        "the table has no independent root slot"
+    );
+    assert_eq!(
+        stats.live_edges, 1,
+        "the current edge is the only stored value"
+    );
+    assert_eq!(stats.live_nodes, 3, "two tables and one cell");
+    let original_carrier = issue(host, original);
+    OpenCell {
+        frame,
+        cell,
+        original,
+        original_raw,
+        original_carrier,
+        sibling,
+        sibling_raw,
+    }
+}
+
+fn collect_open_sibling(host: &mut HostContext<'_>, open: &OpenCell) {
+    let _ = heap::take_scan_meter(host).expect("clear setup meter");
+    let report = heap::collect(host).expect("collect the unrooted sibling");
+    let meter = heap::take_scan_meter(host).expect("same collector");
+    assert_eq!(meter.mark_passes, 1);
+    assert_eq!(
+        meter.outgoing_edge_checks, 1,
+        "mark follows the current edge from the rooted cell"
+    );
+    assert_eq!(
+        meter.root_slot_visits, 2,
+        "mark and the dead-root sweep each visit the one frame slot"
+    );
+    assert_eq!(
+        meter.token_closes, 1,
+        "the sibling token is closed by this collect"
+    );
+    assert_eq!(report.live_nodes, 2, "the cell and its current table stay");
+    assert_eq!(report.live_roots, 1);
+    assert!(heap::with_heap(host, |heap| Ok(heap.upvalue_alive(open.cell))).expect("cell"));
+    assert!(heap::with_heap(host, |heap| Ok(heap.alive(open.original))).expect("table"));
+    assert!(!heap::with_heap(host, |heap| Ok(heap.alive(open.sibling))).expect("sibling"));
+    assert!(token_open(host, open.original_raw));
+    assert!(!token_open(host, open.sibling_raw));
+    assert_eq!(host.resource_count(), 1);
+    assert_eq!(
+        heap::with_heap(host, |heap| Ok(heap.guest_class(&open.original_carrier))).expect("class"),
+        heap::GuestClass::Table(open.original)
+    );
+}
+
+/// The active frame's one slot keeps the captured table. No table root is stored.
+/// After that collect, clearing the slot lets the unescaped cell and table die.
+#[test]
+fn frame_owned_cell_keeps_the_table_then_clear_and_collect_reclaims_it() {
+    super::super::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        let open = root_open_cell(&mut host);
+        collect_open_sibling(&mut host, &open);
+
+        let reader = heap::with_heap(&mut host, |heap| heap.alloc_closure()).expect("reader");
+        assert_eq!(
+            reader.slot(),
+            open.sibling.slot(),
+            "the swept sibling slot is reused"
+        );
+        assert_ne!(reader.generation(), open.sibling.generation());
+        heap::with_heap(&mut host, |heap| heap.set_upvalue_edge(reader, open.cell))
+            .expect("read through the surviving cell");
+        let seen = read_carrier(&mut host, reader);
+        assert_eq!(
+            carrier_ptr(&seen),
+            carrier_ptr(&open.original_carrier),
+            "clearing is not required for the current edge to stay the original table"
+        );
+
+        heap::with_heap(&mut host, |heap| heap.clear_root(open.frame, 0)).expect("block exit");
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| Ok(heap.current_frame())).expect("frame"),
+            Some(open.frame),
+            "clearing the slot does not retire the frame"
+        );
+        assert_eq!(heap::stats(&mut host).expect("cleared").live_roots, 0);
+        assert_eq!(heap::stats(&mut host).expect("cleared").root_slots, 1);
+        let still = read_carrier(&mut host, reader);
+        assert_eq!(
+            carrier_ptr(&still),
+            carrier_ptr(&open.original_carrier),
+            "clearing the root must not copy or clear the current value"
+        );
+
+        let report = heap::collect(&mut host).expect("collect the unescaped cell");
+        assert_eq!(report.live_nodes, 0);
+        assert_eq!(report.live_roots, 0);
+        assert!(
+            !heap::with_heap(&mut host, |heap| Ok(heap.upvalue_alive(open.cell))).expect("cell")
+        );
+        assert!(!heap::with_heap(&mut host, |heap| Ok(heap.alive(open.original))).expect("table"));
+        assert!(!token_open(&host, open.original_raw));
+        assert_eq!(host.resource_count(), 0);
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| Ok(
+                heap.guest_class(&open.original_carrier)
+            ))
+            .expect("class"),
+            heap::GuestClass::Unissued
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| heap.read_cell(reader)).expect_err("swept reader"),
+            HeapError::StaleHandle
+        );
+    });
+}
+
+/// Clearing the frame slot does not destroy the cell. The paired collect does.
+#[test]
+fn frame_owned_cell_clear_without_collect_keeps_the_table() {
+    super::super::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        let open = root_open_cell(&mut host);
+        collect_open_sibling(&mut host, &open);
+        heap::with_heap(&mut host, |heap| heap.clear_root(open.frame, 0)).expect("block exit");
+        let stats = heap::stats(&mut host).expect("omitted collect");
+        assert_eq!(stats.collections, 1, "only the sibling collect ran");
+        assert_eq!(stats.live_nodes, 2);
+        assert_eq!(stats.live_roots, 0);
+        assert_eq!(stats.root_slots, 1, "the frame is still active");
+        assert!(
+            heap::with_heap(&mut host, |heap| Ok(heap.upvalue_alive(open.cell))).expect("cell")
+        );
+        assert!(heap::with_heap(&mut host, |heap| Ok(heap.alive(open.original))).expect("table"));
+        assert!(token_open(&host, open.original_raw));
+        assert!(!token_open(&host, open.sibling_raw));
+        assert_eq!(host.resource_count(), 1);
+        let reader = heap::with_heap(&mut host, |heap| heap.alloc_closure()).expect("reader");
+        heap::with_heap(&mut host, |heap| heap.set_upvalue_edge(reader, open.cell)).expect("link");
+        let seen = read_carrier(&mut host, reader);
+        assert_eq!(
+            carrier_ptr(&seen),
+            carrier_ptr(&open.original_carrier),
+            "root cleanup must not copy or clear the current value"
+        );
+    });
+}
+
+fn shared_slot_limits() -> HeapLimits {
+    HeapLimits {
+        nodes: 8,
+        roots: 3,
+        edges: 4,
+        max_generation: 8,
+    }
+}
+
+/// Two closures share the old cell. Block exit clears only that root slot.
+/// The same slot then roots a new cell. The old closures still read the old value.
+#[test]
+fn escaped_closures_keep_the_old_cell_after_the_frame_slot_is_reused() {
+    super::super::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, shared_slot_limits()).expect("install");
+        let original_raw = publish_raw(&mut host);
+        let original = table_ref(&host, original_raw);
+        let orphan_raw = publish_raw(&mut host);
+        let orphan = table_ref(&host, orphan_raw);
+        let (left, right, old_cell) = heap::with_heap(&mut host, |heap| {
+            let left = heap.alloc_closure()?;
+            let right = heap.alloc_closure()?;
+            let old_cell = heap.alloc_upvalue()?;
+            heap.set_upvalue_edge(left, old_cell)?;
+            heap.set_upvalue_edge(right, old_cell)?;
+            heap.write_upvalue(old_cell, original)?;
+            Ok((left, right, old_cell))
+        })
+        .expect("two closures, one cell");
+        let frame = heap::with_heap(&mut host, |heap| heap.enter_roots(3)).expect("outer frame");
+        heap::with_heap(&mut host, |heap| {
+            heap.write_upvalue_root(frame, 0, old_cell)
+        })
+        .expect("open cell root");
+        heap::with_heap(&mut host, |heap| heap.write_closure_root(frame, 1, left))
+            .expect("left escape root");
+        heap::with_heap(&mut host, |heap| heap.write_closure_root(frame, 2, right))
+            .expect("right escape root");
+        let original_carrier = issue(&mut host, original);
+
+        let _ = heap::take_scan_meter(&mut host).expect("clear setup meter");
+        let first = heap::collect(&mut host).expect("collect the orphan");
+        let first_meter = heap::take_scan_meter(&mut host).expect("first meter");
+        assert_eq!(first_meter.mark_passes, 1);
+        assert_eq!(first_meter.outgoing_edge_checks, 3);
+        assert_eq!(first_meter.root_slot_visits, 6);
+        assert_eq!(first_meter.token_closes, 1);
+        assert_eq!(first.live_nodes, 4);
+        assert!(!token_open(&host, orphan_raw));
+        assert!(token_open(&host, original_raw));
+        assert_eq!(
+            carrier_ptr(&read_carrier(&mut host, left)),
+            carrier_ptr(&original_carrier)
+        );
+        assert_eq!(
+            carrier_ptr(&read_carrier(&mut host, right)),
+            carrier_ptr(&original_carrier)
+        );
+
+        heap::with_heap(&mut host, |heap| heap.clear_root(frame, 0)).expect("block exit");
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| Ok(heap.current_frame())).expect("outer frame"),
+            Some(frame),
+            "block exit clears one slot and leaves the outer frame active"
+        );
+        assert_eq!(heap::stats(&mut host).expect("after exit").live_roots, 2);
+        assert_eq!(heap::stats(&mut host).expect("after exit").root_slots, 3);
+        assert_eq!(
+            carrier_ptr(&read_carrier(&mut host, left)),
+            carrier_ptr(&original_carrier),
+            "clearing the open root must not copy or clear the old value"
+        );
+
+        let new_cell = heap::with_heap(&mut host, |heap| heap.alloc_upvalue()).expect("new cell");
+        assert_eq!(
+            new_cell.slot(),
+            orphan.slot(),
+            "the swept orphan slot is reused"
+        );
+        assert_ne!(new_cell.generation(), orphan.generation());
+        heap::with_heap(&mut host, |heap| {
+            heap.write_upvalue_root(frame, 0, new_cell)
+        })
+        .expect("reuse the same frame slot");
+        assert_eq!(heap::stats(&mut host).expect("reused").live_roots, 3);
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| heap.upvalue_of(left)).expect("left still old"),
+            old_cell
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| heap.upvalue_of(right)).expect("right still old"),
+            old_cell
+        );
+
+        let fresh_raw = publish_raw(&mut host);
+        let fresh = table_ref(&host, fresh_raw);
+        heap::with_heap(&mut host, |heap| heap.write_upvalue(new_cell, fresh))
+            .expect("first new value");
+        let fresh_carrier = issue(&mut host, fresh);
+        let replacement_raw = publish_raw(&mut host);
+        let replacement = table_ref(&host, replacement_raw);
+        heap::with_heap(&mut host, |heap| heap.write_upvalue(new_cell, replacement))
+            .expect("change the new cell");
+        let replacement_carrier = issue(&mut host, replacement);
+        assert_eq!(heap::stats(&mut host).expect("overwrite").edge_slots, 4);
+        assert_eq!(
+            carrier_ptr(&read_carrier(&mut host, right)),
+            carrier_ptr(&original_carrier),
+            "the old closure still reads the original table"
+        );
+        assert_ne!(
+            carrier_ptr(&read_carrier(&mut host, left)),
+            carrier_ptr(&replacement_carrier)
+        );
+        assert_ne!(
+            carrier_ptr(&read_carrier(&mut host, left)),
+            carrier_ptr(&fresh_carrier)
+        );
+
+        let middle = heap::collect(&mut host).expect("survival follows existing roots");
+        let middle_meter = heap::take_scan_meter(&mut host).expect("middle meter");
+        assert_eq!(middle_meter.mark_passes, 1);
+        assert_eq!(middle_meter.outgoing_edge_checks, 4);
+        assert_eq!(middle_meter.root_slot_visits, 6);
+        assert_eq!(middle_meter.token_closes, 1);
+        assert_eq!(middle.live_nodes, 6);
+        assert_eq!(middle.live_roots, 3);
+        assert!(
+            !token_open(&host, fresh_raw),
+            "the replaced new value is collected"
+        );
+        assert!(token_open(&host, original_raw));
+        assert!(token_open(&host, replacement_raw));
+        assert_eq!(host.resource_count(), 2);
+        assert!(
+            heap::with_heap(&mut host, |heap| Ok(heap.upvalue_alive(old_cell))).expect("old cell")
+        );
+        assert!(
+            heap::with_heap(&mut host, |heap| Ok(heap.upvalue_alive(new_cell))).expect("new cell")
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| Ok(heap.guest_class(&fresh_carrier))).expect("fresh"),
+            heap::GuestClass::Unissued
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| Ok(heap.guest_class(&replacement_carrier)))
+                .expect("replacement"),
+            heap::GuestClass::Table(replacement)
+        );
+
+        heap::with_heap(&mut host, |heap| heap.clear_root(frame, 1)).expect("drop left root");
+        heap::with_heap(&mut host, |heap| heap.clear_root(frame, 2)).expect("drop right root");
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| Ok(heap.current_frame())).expect("still outer"),
+            Some(frame)
+        );
+        assert_eq!(heap::stats(&mut host).expect("roots dropped").live_roots, 1);
+        assert!(
+            heap::with_heap(&mut host, |heap| Ok(heap.upvalue_alive(old_cell)))
+                .expect("clear does not destroy")
+        );
+        assert_eq!(
+            carrier_ptr(&read_carrier(&mut host, left)),
+            carrier_ptr(&original_carrier),
+            "dropping the closure roots must not rewrite the old cell"
+        );
+
+        let final_report = heap::collect(&mut host).expect("collect the old path");
+        let final_meter = heap::take_scan_meter(&mut host).expect("final meter");
+        assert_eq!(final_meter.mark_passes, 1);
+        assert_eq!(final_meter.outgoing_edge_checks, 1);
+        assert_eq!(final_meter.token_closes, 1);
+        assert_eq!(
+            final_report.live_nodes, 2,
+            "the new cell and its table stay"
+        );
+        assert_eq!(final_report.live_roots, 1);
+        assert!(!heap::with_heap(&mut host, |heap| Ok(heap.upvalue_alive(old_cell))).expect("old"));
+        assert!(!heap::with_heap(&mut host, |heap| Ok(heap.closure_alive(left))).expect("left"));
+        assert!(!heap::with_heap(&mut host, |heap| Ok(heap.closure_alive(right))).expect("right"));
+        assert!(!heap::with_heap(&mut host, |heap| Ok(heap.alive(original))).expect("old table"));
+        assert!(heap::with_heap(&mut host, |heap| Ok(heap.upvalue_alive(new_cell))).expect("new"));
+        assert!(heap::with_heap(&mut host, |heap| Ok(heap.alive(replacement))).expect("new table"));
+        assert!(
+            !token_open(&host, original_raw),
+            "the old table token is retired"
+        );
+        assert!(token_open(&host, replacement_raw));
+        assert_eq!(host.resource_count(), 1);
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| Ok(heap.guest_class(&original_carrier)))
+                .expect("old class"),
+            heap::GuestClass::Unissued
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| Ok(heap.guest_class(&replacement_carrier)))
+                .expect("new class"),
+            heap::GuestClass::Table(replacement)
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| heap.upvalue_of(left)).expect_err("old path"),
+            HeapError::StaleHandle
+        );
+    });
+}
+
+/// A foreign or retired cell is refused by the existing handle check.
+/// The occupied frame slot stays on the live cell.
+#[test]
+fn upvalue_root_rejects_foreign_and_stale_without_clobber() {
+    let mut heap = heap::LuaHeap::new(HeapLimits {
+        nodes: 4,
+        roots: 1,
+        edges: 1,
+        max_generation: 4,
+    });
+    let table = heap.alloc().expect("table");
+    let cell = heap.alloc_upvalue().expect("cell");
+    heap.write_upvalue(cell, table).expect("capture");
+    let frame = heap.enter_roots(1).expect("frame");
+    heap.write_upvalue_root(frame, 0, cell).expect("root");
+
+    let mut other = heap::LuaHeap::new(HeapLimits {
+        nodes: 1,
+        roots: 1,
+        edges: 1,
+        max_generation: 4,
+    });
+    let foreign = other.alloc_upvalue().expect("foreign");
+    assert_eq!(
+        heap.write_upvalue_root(frame, 0, foreign),
+        Err(HeapError::WrongDomain)
+    );
+    assert_eq!(heap.stats().live_roots, 1);
+    assert_eq!(
+        heap.collect().live_nodes,
+        2,
+        "the foreign write did not replace the slot"
+    );
+    assert!(heap.upvalue_alive(cell));
+    assert!(heap.alive(table));
+
+    let stale = heap.alloc_upvalue().expect("soon stale");
+    assert_eq!(heap.collect().live_nodes, 2, "the unrooted cell is swept");
+    assert!(!heap.upvalue_alive(stale));
+    assert_eq!(
+        heap.write_upvalue_root(frame, 0, stale),
+        Err(HeapError::StaleHandle)
+    );
+    assert_eq!(heap.stats().live_roots, 1);
+    assert_eq!(heap.stats().live_edges, 1);
+    assert_eq!(
+        heap.collect().live_nodes,
+        2,
+        "the stale write did not clear the slot"
+    );
+    assert!(heap.upvalue_alive(cell));
+    assert!(heap.alive(table));
+}

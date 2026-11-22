@@ -25,7 +25,7 @@
 //! measured production collection scheme.
 //!
 //! Closure and upvalue nodes use the same slots, edges, roots, meter, and
-//! sweep. A root slot holds a table or a closure. A table field can point at
+//! sweep. A root slot holds a table, a closure, or an upvalue. A table field can point at
 //! a closure, a closure at one shared upvalue, and that upvalue at its current
 //! table or closure. A missing current edge is nil. Two closures can point at
 //! the same upvalue. Those nodes have no guest carrier and no Core resource
@@ -36,8 +36,8 @@
 //! `/mnt/workspace/rustscript-lua/evidence/lua52-gc-arg-order/qualification.md`.
 //! When `.lua` is connected, that stage consumes the sample. A collection
 //! witness must be a helper that only returns a boolean; do not inline-read a
-//! weak referent from the caller. This milestone has no Lua weak tables
-//! (`__mode`).
+//! weak referent from the caller. Only a table entry follows `__mode`. A
+//! frame root is not a weak edge.
 
 #[path = "heap/handle.rs"]
 mod handle;
