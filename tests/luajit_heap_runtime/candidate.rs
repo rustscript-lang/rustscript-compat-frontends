@@ -1279,7 +1279,7 @@ impl Lower<'_> {
                 Ok(())
             }
             ast::Stmt::Empty { .. } => Ok(()),
-            ast::Stmt::Do { span, body } if !self.in_function => self.lower_do(*span, body),
+            ast::Stmt::Do { span, body } if !self.in_function => self.lower_do(*span, body, None),
             other => Err(ParseError::at_line(
                 self.line(stmt_span(other)) as usize,
                 "Lua statement not lowered yet",
@@ -1291,14 +1291,129 @@ impl Lower<'_> {
     /// `live_locals`. Same-name outer slots stay where they are, including a
     /// slot already removed by `= nil`. A function body is not this path.
     ///
-    /// The lowered list is one retained segment. `retire_block` still runs
-    /// once, at this statement's end, not at the label. This is not the
-    /// `control.rs` state dispatcher.
-    fn lower_do(&mut self, span: ast::Span, body: &ast::Block) -> Result<(), ParseError> {
+    /// A same-block forward `goto` still uses `retained_statements`. One direct
+    /// child `do` may instead carry `pending`: the resolver target span of its
+    /// single unconditional `goto`, already known to be a later direct label
+    /// of this block. That child lowers its prefix and `retire_block` drops
+    /// only its slots. This walk then continues after the label. `retire_block`
+    /// still runs once, at this statement's end, not at the label.
+    fn lower_do(
+        &mut self,
+        span: ast::Span,
+        body: &ast::Block,
+        pending: Option<ast::Span>,
+    ) -> Result<(), ParseError> {
+        if let Some(label_span) = pending {
+            let goto_index = self
+                .goto_targeting(body, label_span)
+                .ok_or_else(|| self.statement_unsupported(span))?;
+            for stmt in &body.stmts[..goto_index] {
+                if !matches!(stmt, ast::Stmt::Label { .. }) {
+                    self.lower_stmt(stmt)?;
+                }
+            }
+            return self.retire_block(span, body);
+        }
+        // A same-block skip owns this block. Do not also structure a nested
+        // jump; `forward_goto_skip` already drops or keeps that child.
+        if self.forward_goto_skip(body)?.is_none()
+            && let Some((child_index, label_index, label_span)) = self.outward_forward_goto(body)?
+        {
+            for (index, stmt) in body.stmts.iter().enumerate() {
+                if matches!(stmt, ast::Stmt::Label { .. }) {
+                    continue;
+                }
+                if index == child_index {
+                    let ast::Stmt::Do {
+                        span: child_span,
+                        body: child_body,
+                    } = stmt
+                    else {
+                        return Err(self.statement_unsupported(stmt_span(stmt)));
+                    };
+                    self.lower_do(*child_span, child_body, Some(label_span))?;
+                    continue;
+                }
+                if index > child_index && index < label_index {
+                    continue;
+                }
+                self.lower_stmt(stmt)?;
+            }
+            return self.retire_block(span, body);
+        }
         for stmt in self.retained_statements(body)? {
             self.lower_stmt(stmt)?;
         }
         self.retire_block(span, body)
+    }
+
+    /// Direct child `do` whose one direct `goto` resolves to a later direct
+    /// label of `body`. The label is `GotoUse::target`'s span, not a name
+    /// match. A backward target or a second such child is unsupported. A
+    /// target outside this block is left for that child to reject.
+    fn outward_forward_goto(
+        &self,
+        body: &ast::Block,
+    ) -> Result<Option<(usize, usize, ast::Span)>, ParseError> {
+        let mut found = None;
+        for (index, stmt) in body.stmts.iter().enumerate() {
+            let ast::Stmt::Do { body: child, .. } = stmt else {
+                continue;
+            };
+            let mut goto_span = None;
+            for child_stmt in &child.stmts {
+                let ast::Stmt::Goto { span, .. } = child_stmt else {
+                    continue;
+                };
+                if goto_span.is_some() {
+                    goto_span = None;
+                    break;
+                }
+                goto_span = Some(*span);
+            }
+            let Some(goto_span) = goto_span else {
+                continue;
+            };
+            let Some(label) = self.chunk_target_label(goto_span) else {
+                continue;
+            };
+            let Some(label_index) = body.stmts.iter().position(
+                |stmt| matches!(stmt, ast::Stmt::Label { name, .. } if name.span == label.span),
+            ) else {
+                continue;
+            };
+            if label_index <= index || found.is_some() {
+                return Err(self.statement_unsupported(goto_span));
+            }
+            found = Some((index, label_index, label.span));
+        }
+        Ok(found)
+    }
+
+    /// Index of the one direct `goto` whose resolver target span is `label_span`.
+    fn goto_targeting(&self, body: &ast::Block, label_span: ast::Span) -> Option<usize> {
+        let mut found = None;
+        for (index, stmt) in body.stmts.iter().enumerate() {
+            let ast::Stmt::Goto { span, .. } = stmt else {
+                continue;
+            };
+            let label = self.chunk_target_label(*span)?;
+            if label.span != label_span || found.is_some() {
+                return None;
+            }
+            found = Some(index);
+        }
+        found
+    }
+
+    fn chunk_target_label(&self, goto_span: ast::Span) -> Option<&resolve::LabelBinding> {
+        let jump = self
+            .resolution
+            .gotos
+            .iter()
+            .find(|jump| jump.span == goto_span && jump.function_id == 0)?;
+        let label = self.resolution.labels.get(jump.target?)?;
+        (label.function_id == 0).then_some(label)
     }
 
     /// Statements this chunk `do` lowers, in source order. Labels are not

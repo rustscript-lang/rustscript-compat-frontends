@@ -4206,3 +4206,319 @@ return type(weak.seen)
         assert_eq!(host.resource_count(), resources, "{label}");
     }
 }
+
+// One unconditional goto in a direct inner chunk `do` targets the direct outer
+// `do`'s later label. Resolve picks that label id; the earlier sibling
+// `::resume::` has the same name and a different span. The inner `retire_block`
+// drops only the inner slot. The outer slot stays until the outer block exits.
+// An inner collect keeps both. A collect at the outer label reclaims only the
+// inner object. Omitting that collect leaves it. An exit collect then reclaims
+// the outer object. Omitting the goto runs both skipped writes. Observation is
+// the existing `observe_table` / `type` / heap stats path, not a second API.
+#[test]
+fn lua_candidate_chunk_inner_do_goto_outer_label_retires_inner_root() {
+    let source = r#"
+local mt = {}
+mt.__mode = "v"
+local weak = {}
+setmetatable(weak, mt)
+local marker = {}
+observe_table(weak, 0)
+observe_table(marker, 0)
+do
+  do
+    ::resume::
+  end
+  local a = {}
+  a.self = a
+  weak.a = a
+  observe_table(a, 0)
+  do
+    local b = {}
+    b.self = b
+    weak.b = b
+    observe_table(b, 0)
+    collectgarbage("collect")
+    observe_table(a, 0)
+    observe_table(weak.a, 0)
+    observe_table(b, 0)
+    observe_table(weak.b, 0)
+@jump@
+    marker.inner = {}
+  end
+  marker.outer = {}
+  ::resume::
+  observe_table(a, 0)
+  observe_table(weak.a, 0)
+  observe_table(weak.b, 0)
+@label@
+end
+@after@
+"#;
+    let jump = "  goto resume\n";
+    let label_collect = "\
+  collectgarbage(\"collect\")
+  observe_table(a, 0)
+  observe_table(weak.a, 0)
+";
+    let no_label_collect = "";
+    let after_label_only = "\
+observe_table(weak.a, 0)
+observe_table(weak, 0)
+observe_table(marker, 0)
+return type(weak.b)
+";
+    let after_exit_collect = "\
+collectgarbage(\"collect\")
+observe_table(weak, 0)
+observe_table(marker, 0)
+return type(weak.a)
+";
+    let after_omit = "\
+observe_table(weak.b, 0)
+observe_table(weak.a, 0)
+observe_table(weak, 0)
+observe_table(marker, 0)
+return type(weak.b)
+";
+    let label_fall = "\
+  collectgarbage(\"collect\")
+  observe_table(a, 0)
+  observe_table(weak.a, 0)
+  observe_table(marker.inner, 0)
+  observe_table(marker.outer, 0)
+";
+    let after_fall = "\
+collectgarbage(\"collect\")
+observe_table(marker.inner, 0)
+observe_table(marker.outer, 0)
+observe_table(weak, 0)
+observe_table(marker, 0)
+return type(weak.a)
+";
+
+    let jumped = source
+        .replace("@jump@", jump)
+        .replace("@label@", label_collect)
+        .replace("@after@", after_label_only);
+    let parsed = parser::parse_chunk(jumped.as_bytes()).expect("parse outward goto");
+    let resolution = resolve::resolve(&parsed);
+    assert!(
+        resolution.errors.is_empty(),
+        "resolve names the outer label: {:?}",
+        resolution.errors
+    );
+    assert_eq!(resolution.gotos.len(), 1, "one unconditional goto");
+    let target = resolution.gotos[0].target.expect("resolved target id");
+    let label = &resolution.labels[target];
+    assert_eq!(label.name, b"resume");
+    let same_name: Vec<_> = resolution
+        .labels
+        .iter()
+        .filter(|item| item.name == b"resume")
+        .collect();
+    assert_eq!(same_name.len(), 2, "sibling and outer share the name");
+    assert!(
+        same_name.iter().any(|item| item.span != label.span),
+        "the other resume is not the resolved target"
+    );
+    let outer = parsed
+        .body
+        .stmts
+        .iter()
+        .find_map(|stmt| {
+            let ast::Stmt::Do { body, .. } = stmt else {
+                return None;
+            };
+            body.stmts
+                .iter()
+                .any(
+                    |stmt| matches!(stmt, ast::Stmt::Label { name, .. } if name.span == label.span),
+                )
+                .then_some(body)
+        })
+        .expect("outer do owns the resolved label");
+    let sibling = outer
+        .stmts
+        .iter()
+        .find_map(|stmt| {
+            let ast::Stmt::Do { body, .. } = stmt else {
+                return None;
+            };
+            body.stmts.iter().find_map(|stmt| {
+                let ast::Stmt::Label { name, .. } = stmt else {
+                    return None;
+                };
+                (name.bytes == b"resume").then_some(name.span)
+            })
+        })
+        .expect("sibling resume");
+    assert_ne!(sibling, label.span, "resolve did not pick the sibling span");
+    let inner = outer
+        .stmts
+        .iter()
+        .find_map(|stmt| {
+            let ast::Stmt::Do { body, .. } = stmt else {
+                return None;
+            };
+            body.stmts
+                .iter()
+                .any(|stmt| matches!(stmt, ast::Stmt::Goto { .. }))
+                .then_some(body)
+        })
+        .expect("inner do owns the goto");
+    assert!(
+        inner.stmts.iter().all(|stmt| {
+            !matches!(stmt, ast::Stmt::Label { name, .. } if name.span == label.span)
+        }),
+        "the resolved label is not an inner direct child"
+    );
+
+    let run = |jump_text: &str, label_text: &str, after_text: &str, result: &str| {
+        let program = source
+            .replace("@jump@", jump_text)
+            .replace("@label@", label_text)
+            .replace("@after@", after_text);
+        let mut vm = candidate(&program);
+        assert_eq!(
+            vm.run().expect("run outward goto"),
+            VmStatus::Halted,
+            "{result}"
+        );
+        assert_eq!(vm.stack(), &[Value::string(result)], "{result}");
+        vm
+    };
+
+    let mut vm = run(jump, label_collect, after_label_only, "nil");
+    let tables = observed_tables(&mut vm);
+    assert_eq!(tables.len(), 16, "label collect, no exit collect");
+    let weak = tables[0];
+    let marker = tables[1];
+    let created_a = tables[2];
+    let created_b = tables[3];
+    assert_ne!(created_a, created_b);
+    assert_ne!(created_a, weak);
+    assert_ne!(created_b, marker);
+    assert_eq!(tables[4], created_a, "inner collect keeps a");
+    assert_eq!(tables[5], created_a, "weak.a inside is a");
+    assert_eq!(tables[6], created_b, "inner collect keeps b");
+    assert_eq!(tables[7], created_b, "weak.b inside is b");
+    assert_eq!(tables[8], created_a, "a is still rooted at the outer label");
+    assert_eq!(tables[9], created_a, "weak.a before the label collect is a");
+    assert_eq!(tables[10], created_b, "the jump has not collected b");
+    assert_eq!(tables[11], created_a, "label collect keeps a");
+    assert_eq!(tables[12], created_a, "weak.a after the label collect is a");
+    assert_eq!(
+        tables[13], created_a,
+        "leaving the outer block does not collect a"
+    );
+    assert_eq!(tables[14], weak);
+    assert_eq!(tables[15], marker);
+    let mut host = vm.host_context();
+    assert_table_lifetime(&mut host, created_b, false);
+    assert_table_lifetime(&mut host, created_a, true);
+    assert_table_lifetime(&mut host, weak, true);
+    assert_table_lifetime(&mut host, marker, true);
+    let stats = heap::stats(&mut host).unwrap();
+    assert_eq!(stats.collections, 2);
+    assert_eq!(stats.live_nodes, 4);
+    assert_eq!(stats.live_edges, 3);
+    assert_eq!(stats.live_roots, 0);
+    assert_eq!(stats.last_marked, 4, "label collect marks a and not b");
+    assert_eq!(
+        stats.peak_roots, 5,
+        "inner collect rooted both block locals"
+    );
+    assert_eq!(host.resource_count(), 4);
+
+    let mut vm = run(jump, label_collect, after_exit_collect, "nil");
+    let tables = observed_tables(&mut vm);
+    assert_eq!(tables.len(), 15, "label collect and exit collect");
+    let created_a = tables[2];
+    let created_b = tables[3];
+    assert_eq!(
+        tables[10], created_b,
+        "b is alive at the label before collect"
+    );
+    assert_eq!(tables[11], created_a, "label collect keeps a");
+    assert_eq!(tables[12], created_a);
+    assert_eq!(tables[13], tables[0]);
+    assert_eq!(tables[14], tables[1]);
+    let mut host = vm.host_context();
+    assert_table_lifetime(&mut host, created_b, false);
+    assert_table_lifetime(&mut host, created_a, false);
+    assert_table_lifetime(&mut host, tables[0], true);
+    assert_table_lifetime(&mut host, tables[1], true);
+    let stats = heap::stats(&mut host).unwrap();
+    assert_eq!(stats.collections, 3);
+    assert_eq!(stats.live_nodes, 3);
+    assert_eq!(stats.live_edges, 1);
+    assert_eq!(stats.live_roots, 0);
+    assert_eq!(stats.last_marked, 3);
+    assert_eq!(host.resource_count(), 3);
+
+    let mut vm = run(jump, no_label_collect, after_omit, "table");
+    let tables = observed_tables(&mut vm);
+    assert_eq!(tables.len(), 15, "omit label collect");
+    let created_a = tables[2];
+    let created_b = tables[3];
+    assert_eq!(tables[8], created_a);
+    assert_eq!(tables[9], created_a);
+    assert_eq!(tables[10], created_b, "weak.b at the label is still b");
+    assert_eq!(tables[11], created_b, "no collect after the jump leaves b");
+    assert_eq!(tables[12], created_a, "no exit collect leaves a");
+    assert_eq!(tables[13], tables[0]);
+    assert_eq!(tables[14], tables[1]);
+    let mut host = vm.host_context();
+    assert_table_lifetime(&mut host, created_b, true);
+    assert_table_lifetime(&mut host, created_a, true);
+    let stats = heap::stats(&mut host).unwrap();
+    assert_eq!(stats.collections, 1);
+    assert_eq!(stats.live_nodes, 5);
+    assert_eq!(stats.live_edges, 5);
+    assert_eq!(stats.live_roots, 0);
+    assert_eq!(stats.last_marked, 5);
+    assert_eq!(host.resource_count(), 5);
+
+    let mut vm = run("", label_fall, after_fall, "nil");
+    let tables = observed_tables(&mut vm);
+    assert_eq!(tables.len(), 19, "fallthrough runs both skipped writes");
+    let created_a = tables[2];
+    let created_b = tables[3];
+    assert_eq!(tables[4], created_a, "inner collect keeps a");
+    assert_eq!(tables[6], created_b, "inner collect keeps b");
+    assert_eq!(tables[8], created_a, "fallthrough still reaches a");
+    assert_eq!(
+        tables[10], created_b,
+        "b is alive at the label before collect"
+    );
+    assert_eq!(tables[11], created_a, "label collect keeps a");
+    let inner_write = tables[13];
+    let outer_write = tables[14];
+    assert_ne!(inner_write, created_a);
+    assert_ne!(inner_write, created_b);
+    assert_ne!(outer_write, inner_write);
+    assert_ne!(outer_write, tables[1], "marker.outer is not marker");
+    assert_eq!(
+        tables[15], inner_write,
+        "exit collect keeps the strong inner write"
+    );
+    assert_eq!(
+        tables[16], outer_write,
+        "exit collect keeps the strong outer write"
+    );
+    assert_eq!(tables[17], tables[0]);
+    assert_eq!(tables[18], tables[1]);
+    let mut host = vm.host_context();
+    assert_table_lifetime(&mut host, created_b, false);
+    assert_table_lifetime(&mut host, created_a, false);
+    assert_table_lifetime(&mut host, inner_write, true);
+    assert_table_lifetime(&mut host, outer_write, true);
+    let stats = heap::stats(&mut host).unwrap();
+    assert_eq!(stats.collections, 3);
+    assert_eq!(stats.live_nodes, 5);
+    assert_eq!(stats.live_edges, 3);
+    assert_eq!(stats.live_roots, 0);
+    assert_eq!(stats.last_marked, 5);
+    assert_eq!(host.resource_count(), 5);
+}
