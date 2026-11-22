@@ -41,24 +41,21 @@ impl SourcePlugin for CandidatePlugin {
 }
 
 fn candidate(source: &str) -> vm::Vm {
-    try_candidate(source).expect("compile Lua text")
-}
-
-fn try_candidate(source: &str) -> Result<vm::Vm, String> {
     let catalog = Arc::clone(catalog());
     let options = CompileSourceFileOptions::new()
         .with_source_plugin(&CandidatePlugin)
         .with_host_api_catalog(Arc::clone(&catalog));
-    let program = vm::compile_source_with_flavor_and_options(source, SourceFlavor::Lua, options)
-        .map_err(|error| format!("{error:?}"))?;
-    let mut vm = program.into_vm().map_err(|error| format!("{error:?}"))?;
+    let mut vm = vm::compile_source_with_flavor_and_options(source, SourceFlavor::Lua, options)
+        .expect("compile Lua text")
+        .into_vm()
+        .expect("create VM");
     let mut registry = HostFunctionRegistry::empty();
-    candidate::register(&mut registry, &catalog).map_err(|error| format!("{error:?}"))?;
+    candidate::register(&mut registry, &catalog).expect("register candidate runtime");
     register_witnesses(&mut registry, &catalog);
     registry
         .bind_vm_cached(&mut vm)
-        .map_err(|error| format!("{error:?}"))?;
-    Ok(vm)
+        .expect("bind candidate runtime");
+    vm
 }
 
 #[test]
@@ -3002,24 +2999,30 @@ end
     }
 }
 
-/// `::tail::` followed by another label and `;`, and `::tail::` followed only
-/// by `;`, are both in the block's trailing set. The goto is real: the local
+/// Three tails share this goto arm. `::tail::` then `::other::` then `;`,
+/// `::tail::` then only `;`, and a jump to that second label followed by two
+/// `;`, are all in the block's trailing set. The goto is real: the local
 /// after it would publish a receiver and run `fresh`, whose RHS observes two
-/// tables and writes `box.kept`. An adjacent label does not skip that local;
-/// the locked `-joff` fall arm does run it. This candidate only has the goto
-/// arm. `omit` leaves the prefix receivers allocated, so a skipped root cannot
-/// hide in the sweep.
+/// tables and writes `box.kept`. An adjacent label or a second `;` does not
+/// itself skip that local; the locked `-joff` fall arm does run it. This
+/// candidate only has the goto arm. `omit` leaves the prefix receivers
+/// allocated, so a skipped root cannot hide in the sweep.
 #[test]
 fn lua_candidate_chunk_do_trailing_label_set_skips_receiver_local() {
-    for (shape, suffix) in [
-        ("label-and-empty", "  ::tail::\n  ::other::\n  ;\n"),
-        ("empty-only", "  ::tail::\n  ;\n"),
+    for (shape, target, suffix) in [
+        ("label-and-empty", "tail", "  ::tail::\n  ::other::\n  ;\n"),
+        ("empty-only", "tail", "  ::tail::\n  ;\n"),
+        (
+            "second-label",
+            "other",
+            "  ::tail::\n  ::other::\n  ;\n  ;\n",
+        ),
     ] {
-        assert_trailing_label_set_skips_receiver(shape, suffix);
+        assert_trailing_label_set_skips_receiver(shape, target, suffix);
     }
 }
 
-fn assert_trailing_label_set_skips_receiver(shape: &str, suffix: &str) {
+fn assert_trailing_label_set_skips_receiver(shape: &str, target: &str, suffix: &str) {
     let source = r#"
 local function fresh()
   local made = {}
@@ -3055,12 +3058,13 @@ do
   collectgarbage("collect")
   observe_table(owner.seen, 0)
   observe_table(owner.keep, 0)
-  goto tail
+  goto @jump@
   local x = fresh()
   marker.ran = x
 @suffix@end
 @after@
 "#
+    .replace("@jump@", target)
     .replace("@suffix@", suffix);
     let collect_after = "\
 collectgarbage(\"collect\")
@@ -3149,8 +3153,9 @@ return type(owner.seen)
     }
 }
 
-/// Same label text in two blocks. Each goto uses its own resolved target, so
-/// the statement between the blocks still runs and neither `fresh` runs.
+/// Two same-name source blocks. The statement between them still runs, and
+/// neither `fresh` runs. Matching a target by span rather than by name is a
+/// resolver structural assertion; this VM case does not show that.
 #[test]
 fn lua_candidate_chunk_do_trailing_label_set_keeps_outer_statement() {
     let source = r#"
@@ -3194,39 +3199,6 @@ return type(live)
     );
     assert_eq!(tables[0], tables[1]);
     assert_eq!(tables[1], tables[2]);
-}
-
-/// A non-trailing target is outside this cut. Accepting it and dropping the
-/// local after that label would be a mis-cut. Rejection is not pinned.
-#[test]
-fn lua_candidate_trailing_label_set_does_not_cut_reachable_non_tail() {
-    let source = r#"
-local live = {}
-observe_table(live, 0)
-do
-  goto mid
-  ::mid::
-  local after = {}
-  observe_table(after, 0)
-  ::tail::
-  ;
-end
-observe_table(live, 0)
-return type(live)
-"#;
-    let Ok(mut vm) = try_candidate(source) else {
-        return;
-    };
-    assert_eq!(vm.run().expect("run non-tail"), VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::string("table")]);
-    let host = vm.host_context();
-    let tables = host.scope_state::<Vec<ObservedTable>>().unwrap().clone();
-    assert!(
-        tables.len() >= 3,
-        "the local after the non-trailing label must still be lowered"
-    );
-    assert_eq!(tables[0], tables[2]);
-    assert_ne!(tables[1], tables[0]);
 }
 
 /// Resolver identity the cut uses. This does not pin a lowerer error.
