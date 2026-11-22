@@ -78,6 +78,10 @@ pub enum HeapError {
     CarrierOutOfRange,
     /// A NaN is not a table key. LuaJIT reports this on write; a read is nil.
     NanIndex,
+    /// `next` was given a key that is not stored. This is not the end.
+    NextCursorMissing,
+    /// A cursor or stored entry has no guest key. This is not the end.
+    NextUnsupported,
     /// This scope already has a heap.
     AlreadyInstalled,
     /// Execution-scope or resource-table failure. `publish` rolls the reserved
@@ -105,6 +109,8 @@ impl fmt::Display for HeapError {
             Self::StaleFrame => write!(formatter, "stale lua root frame"),
             Self::CarrierOutOfRange => write!(formatter, "lua resource carrier out of range"),
             Self::NanIndex => write!(formatter, "table index is NaN"),
+            Self::NextCursorMissing => write!(formatter, "invalid key to next"),
+            Self::NextUnsupported => write!(formatter, "next key is not a guest key"),
             Self::AlreadyInstalled => write!(formatter, "lua heap already installed"),
             Self::Scope(message) => write!(formatter, "lua heap scope error: {message}"),
         }
@@ -328,6 +334,40 @@ impl EdgeKey {
             matches!(self, Self::Field(field) if *field == LuaHeap::MODE_FIELD)
         } else {
             matches!(self, Self::Utf8(stored) if stored == name)
+        }
+    }
+}
+
+/// Cursor for [`LuaHeap::next_guest`]. `None` at the call site means start.
+enum NextCursor<'a> {
+    Name(&'a str),
+    Number(u64),
+    Object {
+        slot: u32,
+        generation: u32,
+        kind: HandleKind,
+    },
+}
+
+impl NextCursor<'_> {
+    fn matches(&self, key: &EdgeKey) -> bool {
+        match self {
+            Self::Name(name) => key.matches_name(name),
+            Self::Number(bits) => matches!(key, EdgeKey::Number(stored) if stored == bits),
+            Self::Object {
+                slot,
+                generation,
+                kind,
+            } => matches!(
+                key,
+                EdgeKey::Object {
+                    slot: stored_slot,
+                    generation: stored_generation,
+                    kind: stored_kind,
+                } if stored_slot == slot
+                    && stored_generation == generation
+                    && stored_kind == kind
+            ),
         }
     }
 }
@@ -1188,6 +1228,105 @@ impl LuaHeap {
     /// A cloned string in the returned value is the stored scalar, not the lookup.
     pub fn named_value(&self, from: TableRef, name: &str) -> Result<Value, HeapError> {
         self.stored_value(from, |stored| stored.matches_name(name))
+    }
+
+    /// Next raw entry of `table` after `cursor`, in stored edge order.
+    ///
+    /// `Value::Null` starts at the first edge. `None` is the end: one nil, not
+    /// an empty pair. A missing cursor and a non-guest key are errors, not the
+    /// end and not a restart. This walks `edges`, the same vector weak sweep
+    /// retains. It does not allocate another table and does not read a
+    /// metamethod.
+    pub fn next_guest(
+        &self,
+        table: TableRef,
+        cursor: &Value,
+    ) -> Result<Option<(Value, Value)>, HeapError> {
+        self.require_live(table)?;
+        let slot = table.slot();
+        match cursor {
+            Value::Null => self.next_after(slot, None),
+            Value::Bool(_) => Err(HeapError::NextUnsupported),
+            Value::String(name) => self.next_after(slot, Some(NextCursor::Name(name.as_str()))),
+            Value::Float(number) => {
+                if number.is_nan() {
+                    return Err(HeapError::NanIndex);
+                }
+                let bits = if *number == 0.0 { 0 } else { number.to_bits() };
+                self.next_after(slot, Some(NextCursor::Number(bits)))
+            }
+            other => match self.guest_class(other) {
+                GuestClass::Table(key) => {
+                    self.require_live(key)?;
+                    self.next_after(
+                        slot,
+                        Some(NextCursor::Object {
+                            slot: key.slot(),
+                            generation: key.generation(),
+                            kind: key.kind(),
+                        }),
+                    )
+                }
+                _ => Err(HeapError::NextUnsupported),
+            },
+        }
+    }
+
+    fn next_after(
+        &self,
+        slot: u32,
+        cursor: Option<NextCursor<'_>>,
+    ) -> Result<Option<(Value, Value)>, HeapError> {
+        let mut passed = cursor.is_none();
+        for edge in &self.edges {
+            if edge.from != slot {
+                continue;
+            }
+            if !passed {
+                if cursor
+                    .as_ref()
+                    .is_some_and(|cursor| cursor.matches(&edge.key))
+                {
+                    passed = true;
+                }
+                continue;
+            }
+            return Ok(Some((
+                self.guest_key(&edge.key)?,
+                self.guest_edge_value(&edge.value)?,
+            )));
+        }
+        if !passed {
+            return Err(HeapError::NextCursorMissing);
+        }
+        Ok(None)
+    }
+
+    fn guest_key(&self, key: &EdgeKey) -> Result<Value, HeapError> {
+        match key {
+            EdgeKey::Field(field) if *field == Self::MODE_FIELD => Ok(Value::string("__mode")),
+            EdgeKey::Field(_) => Err(HeapError::NextUnsupported),
+            EdgeKey::Utf8(text) => Ok(Value::string(text)),
+            EdgeKey::Number(bits) => Ok(Value::Float(f64::from_bits(*bits))),
+            EdgeKey::Object {
+                slot,
+                generation,
+                kind: HandleKind::Table,
+            } => self.issued_value(TableRef::table(self.domain, *slot, *generation)),
+            EdgeKey::Object { .. } => Err(HeapError::NextUnsupported),
+        }
+    }
+
+    fn guest_edge_value(&self, value: &EdgeValue) -> Result<Value, HeapError> {
+        match value {
+            EdgeValue::Scalar(value) => Ok(value.clone()),
+            EdgeValue::Table { slot, generation } => {
+                self.issued_value(TableRef::table(self.domain, *slot, *generation))
+            }
+            EdgeValue::Closure { .. } | EdgeValue::Upvalue { .. } => {
+                Err(HeapError::NextUnsupported)
+            }
+        }
     }
 
     /// Reads an object-key edge. The key generation must still be that live slot.

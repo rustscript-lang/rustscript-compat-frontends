@@ -4526,3 +4526,247 @@ return type(weak.a)
     assert_eq!(stats.last_marked, 5);
     assert_eq!(host.resource_count(), 5);
 }
+
+/// Source bindings are the locals and `return type(...)`. `next_counts` is the
+/// IR consumer's Core `len` of the existing return transport. Source has no
+/// `select`, so that vector is not a source multi-return count.
+#[test]
+fn lua_candidate_next_and_rawget_agree_after_weak_collect() {
+    let prefix = r#"
+local mt = {}
+mt.__mode = "v"
+local owner = {}
+setmetatable(owner, mt)
+local key = {}
+local cycle = {}
+cycle.self = cycle
+local rooted = {}
+owner[key] = cycle
+owner[1] = rooted
+observe_table(key, 0)
+observe_table(cycle, 0)
+observe_table(rooted, 0)
+local k1, v1 = next(owner, nil)
+local k2, v2 = next(owner, k1)
+local k3, v3 = next(owner, k2)
+observe_table(v1, 0)
+observe_table(v2, 0)
+observe_table(rawget(owner, k1), 0)
+observe_table(rawget(owner, k2), 0)
+observe_table(rawget(owner, 1), 0)
+k1 = nil
+v1 = nil
+k2 = nil
+v2 = nil
+k3 = nil
+v3 = nil
+cycle = nil
+collectgarbage("collect")
+local gone = rawget(owner, key)
+local a, b = next(owner)
+local c, d = next(owner, a)
+observe_table(b, 0)
+observe_table(rawget(owner, 1), 0)
+observe_table(rawget(owner, a), 0)
+"#;
+    let gone = run_next(&format!("{prefix}return type(gone)\n"));
+    assert_eq!(gone.stack, &[Value::string("nil")]);
+    assert_eq!(gone.counts, vec![2, 2, 1, 2, 1]);
+    assert_weak_next_identities(&gone.tables);
+    let end = run_next(&format!("{prefix}return type(c)\n"));
+    assert_eq!(end.stack, &[Value::string("nil")]);
+    assert_eq!(end.counts, vec![2, 2, 1, 2, 1]);
+    assert_weak_next_identities(&end.tables);
+    let padded = run_next(&format!("{prefix}return type(d)\n"));
+    assert_eq!(padded.stack, &[Value::string("nil")]);
+    assert_eq!(padded.counts, vec![2, 2, 1, 2, 1]);
+    assert_weak_next_identities(&padded.tables);
+}
+
+fn assert_weak_next_identities(seen: &[ObservedTable]) {
+    let key = seen[0].table;
+    let cycle = seen[1].table;
+    let rooted = seen[2].table;
+    let before = [seen[3].table, seen[4].table];
+    assert!(before.contains(&cycle) && before.contains(&rooted));
+    assert_ne!(cycle, rooted);
+    assert_eq!(
+        seen[3].table, seen[5].table,
+        "rawget agrees with the first value"
+    );
+    assert_eq!(
+        seen[4].table, seen[6].table,
+        "rawget agrees with the second value"
+    );
+    assert_eq!(seen[7].table, rooted);
+    assert_eq!(
+        seen[8].table, rooted,
+        "next after collect returns the strong root"
+    );
+    assert_eq!(seen[9].table, rooted);
+    assert_eq!(seen[10].table, rooted);
+    assert_ne!(seen[8].table, cycle);
+    assert_ne!(seen[8].table, key);
+}
+
+#[test]
+fn lua_candidate_next_on_empty_or_cleared_returns_one_nil() {
+    let empty_key = run_next("local k, v = next({})\nreturn type(k)\n");
+    assert_eq!(empty_key.stack, &[Value::string("nil")]);
+    assert_eq!(empty_key.counts, vec![1]);
+    let empty_pad = run_next("local k, v = next({})\nreturn type(v)\n");
+    assert_eq!(empty_pad.stack, &[Value::string("nil")]);
+    assert_eq!(empty_pad.counts, vec![1]);
+
+    // The cycle lives only inside `seed`. This lowerer does not capture
+    // upvalues, so the function returns the weak table the same way the
+    // existing rawget probe does.
+    let cleared = r#"
+local function seed()
+  local mt = {}
+  mt.__mode = "v"
+  local owner = {}
+  setmetatable(owner, mt)
+  local cycle = {}
+  cycle.self = cycle
+  owner[1] = cycle
+  return owner
+end
+local owner = seed()
+collectgarbage("collect")
+local k, v = next(owner, nil)
+"#;
+    let key = run_next(&format!("{cleared}return type(k)\n"));
+    assert_eq!(key.stack, &[Value::string("nil")]);
+    assert_eq!(key.counts, vec![1]);
+    let pad = run_next(&format!("{cleared}return type(v)\n"));
+    assert_eq!(pad.stack, &[Value::string("nil")]);
+    assert_eq!(pad.counts, vec![1]);
+    let raw = run_next(&format!("{cleared}return type(rawget(owner, 1))\n"));
+    assert_eq!(raw.stack, &[Value::string("nil")]);
+    assert_eq!(raw.counts, vec![1]);
+}
+
+#[test]
+fn lua_candidate_next_returns_mode_name_not_a_field_id() {
+    let source = r#"
+local mt = {}
+mt.__mode = "v"
+local k, v = next(mt)
+local n = next(mt, k)
+"#;
+    let key = run_next(&format!("{source}return k\n"));
+    assert_eq!(key.stack, &[Value::string("__mode")]);
+    assert_eq!(key.counts, vec![2, 1]);
+    let value = run_next(&format!("{source}return v\n"));
+    assert_eq!(value.stack, &[Value::string("v")]);
+    assert_eq!(value.counts, vec![2, 1]);
+    let end = run_next(&format!("{source}return type(n)\n"));
+    assert_eq!(end.stack, &[Value::string("nil")]);
+    assert_eq!(end.counts, vec![2, 1]);
+}
+
+#[test]
+fn lua_candidate_next_returns_a_string_key_and_stops() {
+    let source = r#"
+local owner = {}
+owner.keep = "yes"
+local k, v = next(owner)
+local n = next(owner, k)
+"#;
+    let key = run_next(&format!("{source}return k\n"));
+    assert_eq!(key.stack, &[Value::string("keep")]);
+    assert_eq!(key.counts, vec![2, 1]);
+    let value = run_next(&format!("{source}return v\n"));
+    assert_eq!(value.stack, &[Value::string("yes")]);
+    assert_eq!(value.counts, vec![2, 1]);
+    let end = run_next(&format!("{source}return type(n)\n"));
+    assert_eq!(end.stack, &[Value::string("nil")]);
+    assert_eq!(end.counts, vec![2, 1]);
+}
+
+#[test]
+fn lua_candidate_next_object_key_keeps_issued_identity() {
+    let source = r#"
+local owner = {}
+local key = {}
+local value = {}
+owner[key] = value
+observe_table(key, 0)
+observe_table(value, 0)
+local k, v = next(owner)
+observe_table(k, 0)
+observe_table(v, 0)
+observe_table(rawget(owner, k), 0)
+local n = next(owner, k)
+return type(n)
+"#;
+    let run = run_next(source);
+    assert_eq!(run.stack, &[Value::string("nil")]);
+    assert_eq!(run.counts, vec![2, 1]);
+    assert_eq!(run.tables[2].table, run.tables[0].table);
+    assert_eq!(run.tables[3].table, run.tables[1].table);
+    assert_eq!(run.tables[4].table, run.tables[1].table);
+}
+
+#[test]
+fn lua_candidate_next_single_value_takes_the_first_result() {
+    let source = r#"
+local owner = {}
+local value = {}
+owner[1] = value
+local k = next(owner)
+return type(k)
+"#;
+    let run = run_next(source);
+    assert_eq!(run.stack, &[Value::string("number")]);
+    assert_eq!(run.counts, vec![2]);
+    let omitted = run_next("return type(next({}))\n");
+    assert_eq!(omitted.stack, &[Value::string("nil")]);
+    assert_eq!(omitted.counts, vec![1]);
+}
+
+#[test]
+fn lua_candidate_next_refuses_a_private_field_id() {
+    let source = r#"
+local owner = {}
+owner.keep = "yes"
+local planted = {}
+plant_private_field(owner, planted)
+local k, v = next(owner)
+local n = next(owner, k)
+return k
+"#;
+    let mut vm = candidate(source);
+    let error = vm.run().expect_err("private field is not a guest key");
+    assert!(
+        matches!(error, vm::VmError::HostError(ref message) if message.contains("guest key")),
+        "{error}"
+    );
+    assert_ne!(
+        candidate::next_counts(&mut vm),
+        vec![1],
+        "an unsupported entry is not the end of iteration"
+    );
+}
+
+struct NextRun {
+    stack: Vec<Value>,
+    tables: Vec<ObservedTable>,
+    counts: Vec<u32>,
+}
+
+fn run_next(source: &str) -> NextRun {
+    let mut vm = candidate(source);
+    let status = vm.run().expect("run next");
+    assert_eq!(status, VmStatus::Halted);
+    NextRun {
+        stack: vm.stack().to_vec(),
+        tables: vm
+            .host_context()
+            .scope_state::<Vec<ObservedTable>>()
+            .cloned()
+            .unwrap_or_default(),
+        counts: candidate::next_counts(&mut vm),
+    }
+}

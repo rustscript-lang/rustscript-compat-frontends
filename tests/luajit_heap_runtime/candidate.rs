@@ -32,6 +32,8 @@ const ENTER_CALLEE: &str = "lua_internal::enter_callee_frame";
 const ROOT_ISSUED: &str = "lua_internal::root_issued";
 const SET_EDGE: &str = "lua_internal::set_edge";
 const GET_EDGE: &str = "lua_internal::get_edge";
+const NEXT: &str = "lua_internal::next";
+const NOTE_NEXT_COUNT: &str = "lua_internal::note_next_count";
 const SET_METATABLE: &str = "lua_internal::set_metatable";
 const GET_METATABLE: &str = "lua_internal::get_metatable";
 pub(super) const FINISH_RETURN: &str = "lua_internal::finish_return";
@@ -47,6 +49,22 @@ const RELEASE_RESULT: &str = "lua_internal::release_result";
 // They are not Lua syntax and are not registered on the production entry.
 const COPY_FIELDS: &str = "lua_internal::copy_fields";
 const EXTERNAL_SHAPE: &str = "lua_internal::external_shape";
+
+/// Lengths the IR consumer read from `next`'s return transport with Core `len`.
+///
+/// Source has no `select`. These lengths are not a source multi-return count
+/// and are not the host array length recorded by `next` itself.
+#[derive(Clone, Debug, Default)]
+pub(super) struct NextCounts {
+    pub consumed: Vec<u32>,
+}
+
+pub(super) fn next_counts(vm: &mut vm::Vm) -> Vec<u32> {
+    vm.host_context()
+        .scope_state::<NextCounts>()
+        .map(|counts| counts.consumed.clone())
+        .unwrap_or_default()
+}
 
 pub(super) fn install_schemas(builder: &mut HostApiBuilder) {
     builder.function(HostFunctionSchema::with_return(
@@ -115,6 +133,8 @@ pub(super) fn install_schemas(builder: &mut HostApiBuilder) {
         ),
         (SET_EDGE, vec!["from", "key", "to"], HostTypeSchema::Float),
         (GET_EDGE, vec!["table", "key"], HostTypeSchema::Unknown),
+        (NEXT, vec!["table", "cursor"], HostTypeSchema::Unknown),
+        (NOTE_NEXT_COUNT, vec!["count"], HostTypeSchema::Float),
         (
             SET_METATABLE,
             vec!["owner", "metatable"],
@@ -169,6 +189,8 @@ pub(super) fn register(
         Op::RootIssued,
         Op::SetEdge,
         Op::GetEdge,
+        Op::Next,
+        Op::NoteNextCount,
         Op::SetMetatable,
         Op::GetMetatable,
         Op::FinishReturn,
@@ -198,6 +220,8 @@ pub(super) fn register(
             Op::RootIssued => ROOT_ISSUED,
             Op::SetEdge => SET_EDGE,
             Op::GetEdge => GET_EDGE,
+            Op::Next => NEXT,
+            Op::NoteNextCount => NOTE_NEXT_COUNT,
             Op::SetMetatable => SET_METATABLE,
             Op::GetMetatable => GET_METATABLE,
             Op::FinishReturn => FINISH_RETURN,
@@ -237,6 +261,8 @@ enum Op {
     RootIssued,
     SetEdge,
     GetEdge,
+    Next,
+    NoteNextCount,
     SetMetatable,
     GetMetatable,
     FinishReturn,
@@ -424,6 +450,8 @@ impl HostOwnedFunction for Op {
             Self::RootIssued => root_issued(call)?,
             Self::SetEdge => set_edge(call)?,
             Self::GetEdge => get_edge(call)?,
+            Self::Next => next_entry(call)?,
+            Self::NoteNextCount => note_next_count(call)?,
             Self::SetMetatable => set_metatable(call)?,
             Self::GetMetatable => get_metatable(call)?,
             Self::FinishReturn => finish_return(call)?,
@@ -907,6 +935,45 @@ fn get_edge(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
         return Err(host_fault("edge key is not a table"));
     };
     heap::with_heap(&mut host, |heap| heap.object_value(table, key)).map_err(heap_error)
+}
+
+fn next_entry(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
+    let (table_value, cursor) = match call.args() {
+        [table, cursor] => (table.clone(), cursor.clone()),
+        _ => return Err(host_fault("invalid next")),
+    };
+    let table = match classify(&mut call.vm().host_context(), &table_value)? {
+        heap::GuestClass::Table(table) => table,
+        _ => return Err(host_fault("next target is not a table")),
+    };
+    let step = heap::with_heap(&mut call.vm().host_context(), |heap| {
+        heap.next_guest(table, &cursor)
+    })
+    .map_err(heap_error)?;
+    // The array is the same unissued return transport a multi-local already
+    // consumes with Get. It is not a second protocol and not a Lua table.
+    // End is one nil. An entry is the key and the value.
+    let values = match step {
+        None => vec![Value::Null],
+        Some((key, value)) => vec![key, value],
+    };
+    Ok(Value::array(values))
+}
+
+fn note_next_count(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
+    let count = match call.args() {
+        [Value::Int(count)] => {
+            u32::try_from(*count).map_err(|_| host_fault("next result count"))?
+        }
+        _ => return Err(host_fault("next result count")),
+    };
+    call.vm()
+        .host_context()
+        .scope_state_or_insert_with(NextCounts::default)
+        .map_err(|error| VmError::HostError(error.to_string()))?
+        .consumed
+        .push(count);
+    Ok(Value::Float(0.0))
 }
 
 fn set_metatable(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
@@ -1479,6 +1546,13 @@ impl Lower<'_> {
                 span,
                 names,
                 values,
+            } if values.exprs.len() == 1 && self.is_next_call(&values.exprs[0]) => {
+                self.lower_next_local(*span, names, &values.exprs[0])
+            }
+            ast::Stmt::Local {
+                span,
+                names,
+                values,
             } if let ([name], [value]) = (names.as_slice(), values.exprs.as_slice()) => {
                 self.lower_local(*span, &name.name, value)
             }
@@ -1872,6 +1946,199 @@ impl Lower<'_> {
                     && binding.visible_from == span.end
             })
             .ok_or_else(|| self.unsupported(span))
+    }
+
+    fn is_next_call(&self, expr: &ast::Expr) -> bool {
+        let ast::Expr::SuffixChain { base, steps, .. } = expr else {
+            return false;
+        };
+        let ast::Expr::Name { name, .. } = base.as_ref() else {
+            return false;
+        };
+        if !name.is("next") || self.functions.contains_key(&name.bytes) {
+            return false;
+        }
+        matches!(
+            steps.as_slice(),
+            [ast::Suffix::Call {
+                args: ast::Args::List(_),
+                nav: false,
+                ..
+            }]
+        )
+    }
+
+    /// `local k, v = next(...)` binds through the existing array transport.
+    ///
+    /// Chunk `return next(...)` stays one value: the chunk return path only
+    /// carries a scalar. A single-value expression uses the first result.
+    fn lower_next_local(
+        &mut self,
+        span: ast::Span,
+        names: &[ast::LocalName],
+        call: &ast::Expr,
+    ) -> Result<(), ParseError> {
+        let line = self.line(span);
+        let transport = self.next_transport(call, span)?;
+        let mut slots = Vec::with_capacity(names.len());
+        for (offset, name) in names.iter().enumerate() {
+            let index = self
+                .builder
+                .alloc_local_named(&format!("#{offset}:{}", span.start))?;
+            self.remember_binding(span, &name.name, index)?;
+            self.live_locals.push(index);
+            slots.push(index);
+        }
+        self.bind_transport(transport, &slots, line)
+    }
+
+    fn next_expr(&mut self, args: &ast::ExprList, span: ast::Span) -> Result<Expr, ParseError> {
+        let transport = self.next_transport_exprs(&args.exprs, span)?;
+        let get = vm::BuiltinFunction::Get.call_index();
+        Ok(Expr::Call(
+            get,
+            vec![],
+            vec![Expr::Var(transport), Expr::Int(0)],
+            None,
+            None,
+        ))
+    }
+
+    fn next_transport(
+        &mut self,
+        call: &ast::Expr,
+        span: ast::Span,
+    ) -> Result<LocalSlot, ParseError> {
+        let ast::Expr::SuffixChain { steps, .. } = call else {
+            return Err(self.unsupported(span));
+        };
+        let [
+            ast::Suffix::Call {
+                args: ast::Args::List(list),
+                ..
+            },
+        ] = steps.as_slice()
+        else {
+            return Err(self.unsupported(span));
+        };
+        self.next_transport_exprs(&list.exprs, span)
+    }
+
+    fn next_transport_exprs(
+        &mut self,
+        args: &[ast::Expr],
+        span: ast::Span,
+    ) -> Result<LocalSlot, ParseError> {
+        let (table, cursor) = match args {
+            [table] => (table, None),
+            [table, cursor] => (table, Some(cursor)),
+            _ => return Err(self.unsupported(span)),
+        };
+        let table = self.expr(table)?;
+        let table = self.operand_slot(table, span)?;
+        let cursor = match cursor {
+            Some(ast::Expr::Nil { .. }) => Expr::Null,
+            Some(cursor) => self.expr(cursor)?,
+            None => Expr::Null,
+        };
+        let cursor = self.operand_slot(cursor, span)?;
+        let line = self.line(span);
+        let transport = self
+            .builder
+            .alloc_local_named(&format!("#next:{}", span.start))?;
+        let call = self.call(NEXT, vec![Expr::Var(table), Expr::Var(cursor)])?;
+        self.stmts.push(Stmt::Let {
+            index: transport,
+            declared_schema: None,
+            expr: call,
+            line,
+        });
+        self.note_next_len(transport, line)?;
+        Ok(transport)
+    }
+
+    /// Records Core `len` of the return transport. `next` itself does not
+    /// write this count.
+    fn note_next_len(&mut self, transport: LocalSlot, line: u32) -> Result<(), ParseError> {
+        let len = vm::BuiltinFunction::Len.call_index();
+        let count = self
+            .builder
+            .alloc_local_named(&format!("#next-len:{line}"))?;
+        self.stmts.push(Stmt::Let {
+            index: count,
+            declared_schema: None,
+            expr: Expr::Call(len, vec![], vec![Expr::Var(transport)], None, None),
+            line,
+        });
+        let note = self.call(NOTE_NEXT_COUNT, vec![Expr::Var(count)])?;
+        self.emit_ignored(note, line)
+    }
+
+    fn bind_transport(
+        &mut self,
+        transport: LocalSlot,
+        slots: &[LocalSlot],
+        line: u32,
+    ) -> Result<(), ParseError> {
+        let has = vm::BuiltinFunction::Has.call_index();
+        let get = vm::BuiltinFunction::Get.call_index();
+        for (index, slot) in slots.iter().enumerate() {
+            self.stmts.push(Stmt::Let {
+                index: *slot,
+                declared_schema: None,
+                expr: Expr::Null,
+                line,
+            });
+            let present = self
+                .builder
+                .alloc_local_named(&format!("#next-has:{line}:{index}"))?;
+            self.stmts.push(Stmt::Let {
+                index: present,
+                declared_schema: None,
+                expr: Expr::Call(
+                    has,
+                    vec![],
+                    vec![Expr::Var(transport), Expr::Int(index as i64)],
+                    None,
+                    None,
+                ),
+                line,
+            });
+            self.stmts.push(Stmt::IfElse {
+                condition: Expr::Var(present),
+                then_branch: vec![Stmt::Assign {
+                    kind: AssignmentKind::Set,
+                    index: *slot,
+                    expr: Expr::Call(
+                        get,
+                        vec![],
+                        vec![Expr::Var(transport), Expr::Int(index as i64)],
+                        None,
+                        None,
+                    ),
+                    line,
+                }],
+                else_branch: vec![],
+                line,
+            });
+        }
+        Ok(())
+    }
+
+    fn operand_slot(&mut self, expr: Expr, span: ast::Span) -> Result<LocalSlot, ParseError> {
+        if let Expr::Var(slot) = expr {
+            return Ok(slot);
+        }
+        let slot = self
+            .builder
+            .alloc_local_named(&format!("#next-arg:{}", self.stmts.len()))?;
+        self.stmts.push(Stmt::Let {
+            index: slot,
+            declared_schema: None,
+            expr,
+            line: self.line(span),
+        });
+        Ok(slot)
     }
 
     fn lower_local(
@@ -2751,6 +3018,9 @@ impl Lower<'_> {
                 {
                     let owner = self.expr(owner)?;
                     return self.call(GET_METATABLE, vec![owner]);
+                }
+                if name.is("next") && !self.functions.contains_key(&name.bytes) {
+                    return self.next_expr(args, expr.span());
                 }
                 if name.is("rawget") {
                     // Exact two arguments. Same GET_EDGE path as t[k]. No metamethod.
