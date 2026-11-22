@@ -23,6 +23,11 @@ const BOOL_ARG: &str = "lua_internal::bool_arg";
 const STRING_ARG: &str = "lua_internal::string_arg";
 const GATHER_ROOT: &str = "lua_internal::gather_root";
 pub(super) const COLLECT: &str = "lua_internal::collect";
+const OPEN_CELL: &str = "lua_internal::open_cell";
+const READ_CELL: &str = "lua_internal::read_cell";
+const WRITE_CELL: &str = "lua_internal::write_cell";
+const TRACK_CLOSURE: &str = "lua_internal::track_closure";
+const RETIRE_CLOSURE: &str = "lua_internal::retire_closure";
 const ENTER_RESULT: &str = "lua_internal::enter_result_frame";
 const ENTER_CALLEE: &str = "lua_internal::enter_callee_frame";
 const ROOT_ISSUED: &str = "lua_internal::root_issued";
@@ -125,6 +130,15 @@ pub(super) fn install_schemas(builder: &mut HostApiBuilder) {
         (RETIRE_CALLEE, vec!["flag", "frame"], HostTypeSchema::Float),
         (RETIRE_CHUNK, vec!["frame"], HostTypeSchema::Float),
         (RELEASE_RESULT, vec!["frame", "slot"], HostTypeSchema::Float),
+        (OPEN_CELL, vec!["table"], HostTypeSchema::Unknown),
+        (READ_CELL, vec!["envelope"], HostTypeSchema::Unknown),
+        (WRITE_CELL, vec!["envelope", "table"], HostTypeSchema::Float),
+        (
+            TRACK_CLOSURE,
+            vec!["closure", "envelope"],
+            HostTypeSchema::Float,
+        ),
+        (RETIRE_CLOSURE, vec!["closure"], HostTypeSchema::Float),
     ] {
         builder.function(HostFunctionSchema::with_return(
             name,
@@ -165,6 +179,11 @@ pub(super) fn register(
         Op::ReleaseResult,
         Op::CopyFields,
         Op::ExternalShape,
+        Op::OpenCell,
+        Op::ReadCell,
+        Op::WriteCell,
+        Op::TrackClosure,
+        Op::RetireClosure,
     ] {
         let name = match op {
             Op::NewTable => NEW_TABLE,
@@ -190,6 +209,11 @@ pub(super) fn register(
             Op::ReleaseResult => RELEASE_RESULT,
             Op::CopyFields => COPY_FIELDS,
             Op::ExternalShape => EXTERNAL_SHAPE,
+            Op::OpenCell => OPEN_CELL,
+            Op::ReadCell => READ_CELL,
+            Op::WriteCell => WRITE_CELL,
+            Op::TrackClosure => TRACK_CLOSURE,
+            Op::RetireClosure => RETIRE_CLOSURE,
         };
         let function = catalog.function(name).expect("private Lua operation");
         let schema = HostImportSchema::from_function(catalog, function);
@@ -225,6 +249,11 @@ enum Op {
     ReleaseResult,
     CopyFields,
     ExternalShape,
+    OpenCell,
+    ReadCell,
+    WriteCell,
+    TrackClosure,
+    RetireClosure,
 }
 
 impl HostOwnedFunction for Op {
@@ -341,9 +370,7 @@ impl HostOwnedFunction for Op {
                     | heap::GuestClass::Boolean
                     | heap::GuestClass::String => None,
                     heap::GuestClass::Unissued => {
-                        return Err(VmError::HostError(
-                            "invalid private Lua root candidate".to_string(),
-                        ));
+                        published_capture(&mut call.vm().host_context(), &value)?
                     }
                 };
                 let root_list = call.take_arg(0)?;
@@ -409,6 +436,11 @@ impl HostOwnedFunction for Op {
                 }
             },
             Self::ExternalShape => Value::array(vec![Value::Int(0), Value::Int(1)]),
+            Self::OpenCell => open_cell(call)?,
+            Self::ReadCell => read_cell(call)?,
+            Self::WriteCell => write_cell(call)?,
+            Self::TrackClosure => track_closure(call)?,
+            Self::RetireClosure => retire_closure(call)?,
         };
         Ok(CallOutcome::Return(CallReturn::one(value)))
     }
@@ -998,6 +1030,273 @@ fn note_collect(
     Ok(())
 }
 
+/// A callable is not a [`heap::TableRef`]. Gather publishes the issued envelope
+/// the closure copy-captured, so `collect_at_safepoint` still receives only
+/// table roots. Retiring the callable drops that publication.
+fn published_capture(
+    host: &mut vm::HostContext<'_>,
+    value: &Value,
+) -> Result<Option<Value>, VmError> {
+    let Value::Callable(callable) = value else {
+        return Err(host_fault("invalid private Lua root candidate"));
+    };
+    let ptr = std::sync::Arc::as_ptr(callable) as usize;
+    let envelope = host.scope_state::<CaptureGraph>().and_then(|graph| {
+        graph
+            .published
+            .iter()
+            .find(|(found, _)| *found == ptr)
+            .map(|(_, envelope)| *envelope)
+    });
+    let Some(envelope) = envelope else {
+        return Err(host_fault("invalid private Lua root candidate"));
+    };
+    heap::with_heap(host, |heap| heap.issued_value(envelope))
+        .map_err(heap_error)
+        .map(Some)
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct CaptureNote {
+    pub envelope: heap::TableRef,
+    pub closure: heap::ClosureRef,
+    pub cell: heap::UpvalueRef,
+    pub callable: usize,
+}
+
+struct CaptureGraph {
+    cells: Vec<(heap::TableRef, heap::UpvalueRef)>,
+    published: Vec<(usize, heap::TableRef)>,
+    notes: Vec<CaptureNote>,
+    reads: u32,
+    writes: u32,
+}
+
+fn with_capture<T>(
+    host: &mut vm::HostContext<'_>,
+    body: impl FnOnce(&mut CaptureGraph) -> T,
+) -> Result<T, VmError> {
+    let graph = host
+        .scope_state_or_insert_with(|| CaptureGraph {
+            cells: Vec::new(),
+            published: Vec::new(),
+            notes: Vec::new(),
+            reads: 0,
+            writes: 0,
+        })
+        .map_err(|error| host_fault(&error.to_string()))?;
+    Ok(body(graph))
+}
+
+fn root_count(host: &mut vm::HostContext<'_>) -> Result<u32, VmError> {
+    heap::stats(host)
+        .map(|stats| stats.live_roots)
+        .map_err(heap_error)
+}
+
+fn refuse_root_change(
+    before: u32,
+    host: &mut vm::HostContext<'_>,
+    what: &str,
+) -> Result<(), VmError> {
+    let after = root_count(host)?;
+    if after != before {
+        return Err(host_fault(what));
+    }
+    Ok(())
+}
+
+fn issued_table(host: &mut vm::HostContext<'_>, value: &Value) -> Result<heap::TableRef, VmError> {
+    match classify(host, value)? {
+        heap::GuestClass::Table(table) => Ok(table),
+        _ => Err(host_fault("Lua cell operand is not an issued table")),
+    }
+}
+
+fn open_cell(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
+    let table = match call.args() {
+        [table] => table.clone(),
+        _ => return Err(host_fault("open_cell needs the initial table")),
+    };
+    let initial = issued_table(&mut call.vm().host_context(), &table)?;
+    let before = root_count(&mut call.vm().host_context())?;
+    let issued = heap::with_heap(&mut call.vm().host_context(), |heap| {
+        let envelope = heap.alloc()?;
+        let carrier = heap.issue_carrier(envelope)?;
+        let cell = heap.alloc_upvalue()?;
+        heap.write_upvalue(cell, initial)?;
+        Ok((carrier, envelope, cell))
+    })
+    .map_err(heap_error)?;
+    let (carrier, envelope, cell) = issued;
+    with_capture(&mut call.vm().host_context(), |graph| {
+        graph.cells.push((envelope, cell));
+    })?;
+    refuse_root_change(
+        before,
+        &mut call.vm().host_context(),
+        "open_cell published a heap root",
+    )?;
+    Ok(carrier)
+}
+
+fn cell_of(
+    host: &mut vm::HostContext<'_>,
+    envelope: heap::TableRef,
+) -> Result<heap::UpvalueRef, VmError> {
+    with_capture(host, |graph| {
+        graph
+            .cells
+            .iter()
+            .find(|(found, _)| *found == envelope)
+            .map(|(_, cell)| *cell)
+    })?
+    .ok_or_else(|| host_fault("envelope has no shared cell"))
+}
+
+fn read_cell(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
+    let envelope = match call.args() {
+        [envelope] => envelope.clone(),
+        _ => return Err(host_fault("read_cell needs the captured envelope")),
+    };
+    let envelope = issued_table(&mut call.vm().host_context(), &envelope)?;
+    let cell = cell_of(&mut call.vm().host_context(), envelope)?;
+    let closure = heap::with_heap(&mut call.vm().host_context(), |heap| {
+        heap.closure_edge(envelope, 1)
+    })
+    .map_err(heap_error)?;
+    let same = heap::with_heap(&mut call.vm().host_context(), |heap| {
+        heap.upvalue_of(closure)
+    })
+    .map_err(heap_error)?;
+    if same != cell {
+        return Err(host_fault("closure edge does not share the opened cell"));
+    }
+    with_capture(&mut call.vm().host_context(), |graph| graph.reads += 1)?;
+    let table = heap::with_heap(&mut call.vm().host_context(), |heap| {
+        heap.read_upvalue(closure)
+    })
+    .map_err(heap_error)?;
+    heap::with_heap(&mut call.vm().host_context(), |heap| {
+        heap.issued_value(table)
+    })
+    .map_err(heap_error)
+}
+
+fn write_cell(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
+    let (envelope, next) = match call.args() {
+        [envelope, next] => (envelope.clone(), next.clone()),
+        _ => {
+            return Err(host_fault(
+                "write_cell needs the envelope and the next table",
+            ));
+        }
+    };
+    let envelope = issued_table(&mut call.vm().host_context(), &envelope)?;
+    let next = issued_table(&mut call.vm().host_context(), &next)?;
+    let cell = cell_of(&mut call.vm().host_context(), envelope)?;
+    let before = root_count(&mut call.vm().host_context())?;
+    heap::with_heap(&mut call.vm().host_context(), |heap| {
+        heap.write_upvalue(cell, next)
+    })
+    .map_err(heap_error)?;
+    with_capture(&mut call.vm().host_context(), |graph| graph.writes += 1)?;
+    refuse_root_change(
+        before,
+        &mut call.vm().host_context(),
+        "write_cell published a heap root",
+    )?;
+    Ok(Value::Float(0.0))
+}
+
+fn track_closure(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
+    let (closure, envelope) = match call.args() {
+        [closure, envelope] => (closure.clone(), envelope.clone()),
+        _ => {
+            return Err(host_fault(
+                "track_closure needs the callable and its envelope",
+            ));
+        }
+    };
+    let Value::Callable(callable) = &closure else {
+        return Err(host_fault("tracked closure is not a callable"));
+    };
+    let ptr = std::sync::Arc::as_ptr(callable) as usize;
+    let envelope = issued_table(&mut call.vm().host_context(), &envelope)?;
+    let cell = cell_of(&mut call.vm().host_context(), envelope)?;
+    let before = root_count(&mut call.vm().host_context())?;
+    let field = with_capture(&mut call.vm().host_context(), |graph| {
+        1 + graph
+            .notes
+            .iter()
+            .filter(|note| note.envelope == envelope)
+            .count() as u32
+    })?;
+    let node = heap::with_heap(&mut call.vm().host_context(), |heap| {
+        let node = heap.alloc_closure()?;
+        heap.set_upvalue_edge(node, cell)?;
+        heap.set_closure_edge(envelope, field, node)?;
+        Ok(node)
+    })
+    .map_err(heap_error)?;
+    with_capture(&mut call.vm().host_context(), |graph| {
+        graph.published.push((ptr, envelope));
+        graph.notes.push(CaptureNote {
+            envelope,
+            closure: node,
+            cell,
+            callable: ptr,
+        });
+    })?;
+    refuse_root_change(
+        before,
+        &mut call.vm().host_context(),
+        "track_closure published a heap root",
+    )?;
+    Ok(Value::Float(0.0))
+}
+
+fn retire_closure(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
+    let closure = match call.args() {
+        [closure] => closure.clone(),
+        _ => return Err(host_fault("retire_closure needs the callable")),
+    };
+    let Some(ptr) = callable_ptr(&closure) else {
+        return Ok(Value::Float(0.0));
+    };
+    let before = root_count(&mut call.vm().host_context())?;
+    let _ = with_capture(&mut call.vm().host_context(), |graph| {
+        graph.published.retain(|(found, _)| *found != ptr);
+    });
+    refuse_root_change(
+        before,
+        &mut call.vm().host_context(),
+        "retire_closure published a heap root",
+    )?;
+    Ok(Value::Float(0.0))
+}
+
+fn callable_ptr(value: &Value) -> Option<usize> {
+    match value {
+        Value::Callable(callable) => Some(std::sync::Arc::as_ptr(callable) as usize),
+        _ => None,
+    }
+}
+
+pub(super) fn capture_notes(vm: &mut vm::Vm) -> Vec<CaptureNote> {
+    vm.host_context()
+        .scope_state::<CaptureGraph>()
+        .map(|graph| graph.notes.clone())
+        .unwrap_or_default()
+}
+
+pub(super) fn capture_counts(vm: &mut vm::Vm) -> (u32, u32) {
+    vm.host_context()
+        .scope_state::<CaptureGraph>()
+        .map(|graph| (graph.reads, graph.writes))
+        .unwrap_or((0, 0))
+}
+
 fn collect_at_safepoint(
     host: &mut vm::HostContext<'_>,
     roots: &[heap::TableRef],
@@ -1070,6 +1369,8 @@ pub(super) fn lower_returning(
         ignored_slot: None,
         resolution: &resolution,
         binding_slots: vec![None; resolution.bindings.len()],
+        capture_envelopes: HashMap::new(),
+        closure_slots: HashSet::new(),
     };
     if lower.receiver_width > 0 {
         let slot = lower.builder.alloc_local_named("#caller-frame")?;
@@ -1227,6 +1528,8 @@ struct Lower<'a> {
     ignored_slot: Option<LocalSlot>,
     resolution: &'a resolve::Resolution,
     binding_slots: Vec<Option<LocalSlot>>,
+    capture_envelopes: HashMap<usize, LocalSlot>,
+    closure_slots: HashSet<LocalSlot>,
 }
 
 #[derive(Clone, Copy)]
@@ -1655,7 +1958,10 @@ impl Lower<'_> {
             .builder
             .alloc_local_named(&format!("#{}", span.start))?;
         self.remember_binding(span, name, index)?;
-        self.live_locals.push(index);
+        let nil_init = matches!(value, ast::Expr::Nil { .. });
+        if !nil_init {
+            self.live_locals.push(index);
+        }
         self.stmts.push(Stmt::Let {
             index,
             declared_schema: None,
@@ -1682,7 +1988,160 @@ impl Lower<'_> {
             )?;
             self.emit_ignored(expr, self.line(span))?;
         }
+        if !nil_init {
+            self.open_captured_cell(span, name, index)?;
+        }
         Ok(())
+    }
+
+    fn open_captured_cell(
+        &mut self,
+        span: ast::Span,
+        name: &ast::Name,
+        slot: LocalSlot,
+    ) -> Result<(), ParseError> {
+        let Ok(binding) = self.chunk_binding(name, span) else {
+            return Ok(());
+        };
+        if !self.binding_is_captured(binding) {
+            return Ok(());
+        }
+        let envelope = self.builder.alloc_local_named("#envelope")?;
+        let expr = self.call(OPEN_CELL, vec![Expr::Var(slot)])?;
+        self.stmts.push(Stmt::Let {
+            index: envelope,
+            declared_schema: None,
+            expr,
+            line: self.line(span),
+        });
+        self.capture_envelopes.insert(binding, envelope);
+        Ok(())
+    }
+
+    fn binding_is_captured(&self, binding: usize) -> bool {
+        let owner = self.resolution.bindings[binding].function_id;
+        self.resolution
+            .uses
+            .iter()
+            .any(|use_site| use_site.binding == Some(binding) && use_site.function_id != owner)
+    }
+
+    fn captures_in(&self, span: ast::Span) -> Vec<usize> {
+        let mut found = Vec::new();
+        for use_site in &self.resolution.uses {
+            if use_site.span.start < span.start || use_site.span.end > span.end {
+                continue;
+            }
+            let Some(binding) = use_site.binding else {
+                continue;
+            };
+            if self.resolution.bindings[binding].function_id == use_site.function_id {
+                continue;
+            }
+            if !found.contains(&binding) {
+                found.push(binding);
+            }
+        }
+        found
+    }
+
+    fn lower_closure_assign(
+        &mut self,
+        span: ast::Span,
+        name: &ast::Name,
+        func: &ast::FuncBody,
+    ) -> Result<(), ParseError> {
+        if !func.params.is_empty() || func.vararg || func.self_param {
+            return Err(self.unsupported(func.span));
+        }
+        let captures = self.captures_in(func.span);
+        let [binding] = captures.as_slice() else {
+            return Err(self.unsupported(func.span));
+        };
+        let envelope = self
+            .capture_envelopes
+            .get(binding)
+            .copied()
+            .ok_or_else(|| self.unsupported(func.span))?;
+        let slot = self
+            .locals
+            .get(&name.bytes)
+            .copied()
+            .ok_or_else(|| self.unsupported(span))?;
+        let captured = self.builder.alloc_local_named("#capture")?;
+        let body = self.closure_body(func, *binding, captured)?;
+        self.stmts.push(Stmt::Assign {
+            kind: AssignmentKind::Set,
+            index: slot,
+            expr: Expr::Closure(vm::ClosureExpr {
+                param_slots: Vec::new(),
+                capture_copies: vec![(envelope, captured)],
+                body: Box::new(body),
+            }),
+            line: self.line(span),
+        });
+        let track = self.call(TRACK_CLOSURE, vec![Expr::Var(slot), Expr::Var(envelope)])?;
+        self.emit_ignored(track, self.line(span))?;
+        if !self.live_locals.contains(&slot) {
+            self.live_locals.push(slot);
+        }
+        self.closure_slots.insert(slot);
+        Ok(())
+    }
+
+    fn closure_body(
+        &mut self,
+        func: &ast::FuncBody,
+        binding: usize,
+        captured: LocalSlot,
+    ) -> Result<Expr, ParseError> {
+        match func.body.stmts.as_slice() {
+            [ast::Stmt::Return { values, .. }]
+                if values.exprs.len() == 1 && self.use_is_binding(&values.exprs[0], binding) =>
+            {
+                self.call(READ_CELL, vec![Expr::Var(captured)])
+            }
+            [
+                ast::Stmt::Assign {
+                    targets,
+                    values,
+                    span,
+                },
+            ] if targets.len() == 1
+                && values.exprs.len() == 1
+                && self.target_is_binding(&targets[0], binding)
+                && matches!(
+                    values.exprs[0],
+                    ast::Expr::Table { ref fields, .. } if fields.is_empty()
+                ) =>
+            {
+                let next = self.call(NEW_TABLE, vec![])?;
+                self.call(WRITE_CELL, vec![Expr::Var(captured), next])
+                    .map_err(|_| self.unsupported(*span))
+            }
+            [other, ..] => Err(self.unsupported(stmt_span(other))),
+            [] => Err(self.unsupported(func.span)),
+        }
+    }
+
+    fn use_is_binding(&self, expr: &ast::Expr, binding: usize) -> bool {
+        let ast::Expr::Name { name, .. } = expr else {
+            return false;
+        };
+        self.resolution
+            .uses
+            .iter()
+            .any(|use_site| use_site.span == name.span && use_site.binding == Some(binding))
+    }
+
+    fn target_is_binding(&self, target: &ast::AssignTarget, binding: usize) -> bool {
+        let ast::AssignTarget::Name(name) = target else {
+            return false;
+        };
+        self.resolution
+            .uses
+            .iter()
+            .any(|use_site| use_site.span == name.span && use_site.binding == Some(binding))
     }
 
     fn lower_assign(
@@ -1698,6 +2157,11 @@ impl Lower<'_> {
                     .get(&name.bytes)
                     .copied()
                     .ok_or_else(|| self.unsupported(span))?;
+                if self.closure_slots.contains(&slot) {
+                    let retire = self.call(RETIRE_CLOSURE, vec![Expr::Var(slot)])?;
+                    self.emit_ignored(retire, self.line(span))?;
+                    self.closure_slots.remove(&slot);
+                }
                 self.stmts.push(Stmt::Assign {
                     kind: AssignmentKind::Set,
                     index: slot,
@@ -1739,6 +2203,9 @@ impl Lower<'_> {
                 },
                 _,
             ) => self.lower_index_assign(span, table, key, value),
+            (ast::AssignTarget::Name(name), ast::Expr::Function { body, .. }) => {
+                self.lower_closure_assign(span, name, body)
+            }
             _ => Err(self.unsupported(span)),
         }
     }
@@ -2128,6 +2595,7 @@ impl Lower<'_> {
                 .copied()
                 .map(Expr::Var)
                 .ok_or_else(|| self.unsupported(expr.span())),
+            ast::Expr::Nil { .. } => Ok(Expr::Null),
             ast::Expr::Paren { inner, .. } => self.expr(inner),
             ast::Expr::BinaryChain { span, base, steps } => {
                 let mut left = self.expr(base)?;
@@ -2168,6 +2636,20 @@ impl Lower<'_> {
                 ] = steps.as_slice() =>
             {
                 self.field_read(base, &name.bytes, *span)
+            }
+            ast::Expr::SuffixChain { base, steps, .. }
+                if let ast::Expr::Name { name, .. } = base.as_ref()
+                    && let Some(slot) = self.locals.get(&name.bytes).copied()
+                    && let [
+                        ast::Suffix::Call {
+                            args: ast::Args::List(args),
+                            nav: false,
+                            ..
+                        },
+                    ] = steps.as_slice()
+                    && args.exprs.is_empty() =>
+            {
+                Ok(Expr::LocalCall(slot, Vec::new(), Vec::new(), None))
             }
             ast::Expr::SuffixChain { base, steps, .. }
                 if let ast::Expr::Name { name, .. } = base.as_ref()
@@ -2268,17 +2750,6 @@ impl Lower<'_> {
         let mut checked = Vec::new();
         let temp_base = self.active_temps.len();
         for (arg, param) in args.iter().zip(&function.params) {
-            let adapter = match (&param.ty, param.passing) {
-                (HostTypeSchema::Float, vm::HostParamPassing::Value) => NUMBER_ARG,
-                (HostTypeSchema::Bool, vm::HostParamPassing::Value) => BOOL_ARG,
-                (HostTypeSchema::String, vm::HostParamPassing::Value) => STRING_ARG,
-                (HostTypeSchema::Resource(key), vm::HostParamPassing::Borrow)
-                    if *key == heap::LuaTableResource::key() =>
-                {
-                    TABLE_ARG
-                }
-                _ => return Err(self.unsupported(span)),
-            };
             let value = self.expr(arg)?;
             let slot = self
                 .builder
@@ -2290,7 +2761,22 @@ impl Lower<'_> {
                 line: self.line(span),
             });
             self.active_temps.push(slot);
-            checked.push(self.call(adapter, vec![Expr::Var(slot)])?);
+            let forwarded = match (&param.ty, param.passing) {
+                (HostTypeSchema::Float, vm::HostParamPassing::Value) => NUMBER_ARG,
+                (HostTypeSchema::Bool, vm::HostParamPassing::Value) => BOOL_ARG,
+                (HostTypeSchema::String, vm::HostParamPassing::Value) => STRING_ARG,
+                (HostTypeSchema::Resource(key), vm::HostParamPassing::Borrow)
+                    if *key == heap::LuaTableResource::key() =>
+                {
+                    TABLE_ARG
+                }
+                (HostTypeSchema::Unknown, vm::HostParamPassing::Value) => {
+                    checked.push(Expr::Var(slot));
+                    continue;
+                }
+                _ => return Err(self.unsupported(span)),
+            };
+            checked.push(self.call(forwarded, vec![Expr::Var(slot)])?);
         }
         self.active_temps.truncate(temp_base);
         self.call(name, checked)

@@ -15,6 +15,8 @@ mod parser;
 #[path = "../../src/frontends/lua/resolve.rs"]
 mod resolve;
 mod return_frame;
+#[path = "source_closure.rs"]
+mod source_closure;
 
 use super::heap;
 use super::support;

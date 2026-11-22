@@ -13,6 +13,9 @@ pub struct Resolution {
     pub labels: Vec<LabelBinding>,
     pub gotos: Vec<GotoUse>,
     pub imports: Vec<ImportSite>,
+    /// Name reads and assignments, recorded from the resolver's own scope stack.
+    /// A use whose function differs from the binding's function is a capture.
+    pub uses: Vec<NameUse>,
     pub errors: Vec<ResolveError>,
 }
 
@@ -35,6 +38,13 @@ pub struct Binding {
     pub visible_from: u32,
     pub visible_to: u32,
     pub const_binding: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NameUse {
+    pub span: Span,
+    pub binding: Option<usize>,
+    pub function_id: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -151,6 +161,7 @@ pub fn resolve(chunk: &Chunk) -> Resolution {
             labels: Vec::new(),
             gotos: Vec::new(),
             imports: Vec::new(),
+            uses: Vec::new(),
             errors: Vec::new(),
         },
         funcs: Vec::new(),
@@ -324,7 +335,25 @@ impl Cx {
             .any(|local| local.name == name && local.const_binding)
     }
 
+    fn lookup_binding(&self, name: &[u8]) -> Option<usize> {
+        self.locals
+            .iter()
+            .rev()
+            .find(|local| local.name == name)
+            .map(|local| local.binding_index)
+    }
+
+    fn note_name(&mut self, name: &Name) {
+        let function_id = self.funcs.last().expect("function").id;
+        self.resolution.uses.push(NameUse {
+            span: name.span,
+            binding: self.lookup_binding(&name.bytes),
+            function_id,
+        });
+    }
+
     fn assign_name(&mut self, name: &Name) {
+        self.note_name(name);
         if self.lookup_const(&name.bytes) {
             self.resolution.errors.push(ResolveError::AssignConst {
                 span: name.span,
@@ -663,11 +692,8 @@ impl Cx {
 
     fn walk_expr(&mut self, expr: &Expr) {
         match expr {
-            Expr::Nil { .. }
-            | Expr::Bool { .. }
-            | Expr::Number { .. }
-            | Expr::String { .. }
-            | Expr::Name { .. } => {}
+            Expr::Nil { .. } | Expr::Bool { .. } | Expr::Number { .. } | Expr::String { .. } => {}
+            Expr::Name { name, .. } => self.note_name(name),
             Expr::Vararg { span } => {
                 if !self.funcs.last().is_some_and(|func| func.vararg) {
                     self.resolution
