@@ -150,7 +150,7 @@ pub(super) fn install_schemas(builder: &mut HostApiBuilder) {
         (
             SET_METATABLE,
             vec!["owner", "metatable"],
-            HostTypeSchema::Float,
+            HostTypeSchema::Unknown,
         ),
         (GET_METATABLE, vec!["owner"], HostTypeSchema::Unknown),
         (
@@ -1042,11 +1042,18 @@ fn set_metatable(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
             _ => return Err(host_fault("metatable target is not a table")),
         },
     };
-    heap::with_heap(&mut call.vm().host_context(), |heap| {
-        heap.set_metatable(owner, mt)
+    let protected = heap::with_heap(&mut call.vm().host_context(), |heap| {
+        raw_metatable_guard(heap, owner)
     })
     .map_err(heap_error)?;
-    Ok(Value::Float(0.0))
+    if protected.is_some() {
+        return Err(host_fault("cannot change a protected metatable"));
+    }
+    heap::with_heap(&mut call.vm().host_context(), |heap| {
+        heap.set_metatable(owner, mt)?;
+        heap.issued_value(owner)
+    })
+    .map_err(heap_error)
 }
 
 fn get_metatable(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
@@ -1058,15 +1065,31 @@ fn get_metatable(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
         heap::GuestClass::Table(table) => table,
         _ => return Err(host_fault("metatable owner is not a table")),
     };
-    let target = heap::with_heap(&mut call.vm().host_context(), |heap| heap.metatable(owner))
-        .map_err(heap_error)?;
-    let Some(target) = target else {
-        return Ok(Value::Null);
-    };
     heap::with_heap(&mut call.vm().host_context(), |heap| {
-        heap.issued_value(target)
+        if let Some(field) = raw_metatable_guard(heap, owner)? {
+            return Ok(field);
+        }
+        match heap.metatable(owner)? {
+            Some(target) => heap.issued_value(target),
+            None => Ok(Value::Null),
+        }
     })
     .map_err(heap_error)
+}
+
+fn raw_metatable_guard(
+    heap: &heap::LuaHeap,
+    owner: heap::TableRef,
+) -> Result<Option<Value>, heap::HeapError> {
+    let Some(mt) = heap.metatable(owner)? else {
+        return Ok(None);
+    };
+    let field = heap.named_value(mt, "__metatable")?;
+    if matches!(field, Value::Null) {
+        Ok(None)
+    } else {
+        Ok(Some(field))
+    }
 }
 
 fn release_result(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {

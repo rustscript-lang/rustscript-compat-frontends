@@ -19,6 +19,8 @@ mod return_frame;
 mod source_closure;
 #[path = "string_byte_length.rs"]
 mod string_byte_length;
+#[path = "table_metatable_protection.rs"]
+mod table_metatable_protection;
 
 use super::heap;
 use super::support;
@@ -183,6 +185,11 @@ pub(super) fn catalog() -> &'static Arc<vm::HostApiCatalog> {
                 HostParamSchema::with_passing("owner", table.clone(), HostParamPassing::Borrow),
                 HostParamSchema::with_passing("value", table, HostParamPassing::Borrow),
             ],
+            HostTypeSchema::Bool,
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            "lua_host::plant_raw_false",
+            vec![HostParamSchema::value("owner", HostTypeSchema::Unknown)],
             HostTypeSchema::Bool,
         ));
         builder.function(HostFunctionSchema::with_return(
