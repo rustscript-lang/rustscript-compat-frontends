@@ -2488,12 +2488,7 @@ fn shared_upvalue_scalar_replaces_object_edge_and_collect_reclaims_only_that_cyc
         let kept = shared_current(&mut host, left, right);
         let edges_kept = heap::stats(&mut host).expect("restored").live_edges;
         assert_eq!(edges_kept, linked.live_edges - 1);
-        for value in [
-            Value::Null,
-            Value::Int(1),
-            Value::string("no"),
-            independent_carrier,
-        ] {
+        for value in [Value::Null, Value::Int(1), independent_carrier] {
             assert_eq!(
                 heap::with_heap(&mut host, |heap| heap.write_scalar_upvalue(cell, value))
                     .expect_err("unsupported value"),
@@ -2511,4 +2506,200 @@ fn shared_upvalue_scalar_replaces_object_edge_and_collect_reclaims_only_that_cyc
             independent
         );
     });
+}
+
+/// Two closures read one cell. UTF-8 text with an interior NUL and bytes with
+/// NUL plus 0xFF stay on that cell's only current edge. Replacing a self-cycle
+/// with the text leaves the cycle live until an explicit collect.
+#[test]
+fn shared_upvalue_text_and_bytes_keep_one_edge_and_collect_the_replaced_cycle() {
+    super::super::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(
+            &mut host,
+            HeapLimits {
+                nodes: 6,
+                roots: 1,
+                edges: 6,
+                max_generation: 8,
+            },
+        )
+        .expect("install");
+        let root_raw = publish_raw(&mut host);
+        let root = table_ref(&host, root_raw);
+        let frame = heap::with_heap(&mut host, |heap| heap.enter_roots(1)).expect("one root");
+        heap::with_heap(&mut host, |heap| heap.write_root(frame, 0, root)).expect("root the owner");
+
+        let (left, right, cell) = heap::with_heap(&mut host, |heap| {
+            let left = heap.alloc_closure()?;
+            let right = heap.alloc_closure()?;
+            let cell = heap.alloc_upvalue()?;
+            heap.set_closure_edge(root, LEFT_KEY, left)?;
+            heap.set_closure_edge(root, RIGHT_KEY, right)?;
+            heap.set_upvalue_edge(left, cell)?;
+            heap.set_upvalue_edge(right, cell)?;
+            Ok((left, right, cell))
+        })
+        .expect("two closures, one cell");
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| heap.upvalue_of(left)).expect("left cell"),
+            heap::with_heap(&mut host, |heap| heap.upvalue_of(right)).expect("right cell"),
+            "both closures name one upvalue"
+        );
+
+        let original_raw = publish_raw(&mut host);
+        let original = table_ref(&host, original_raw);
+        heap::with_heap(&mut host, |heap| heap.write_upvalue(cell, original)).expect("capture");
+        heap::with_heap(&mut host, |heap| {
+            heap.set_edge(original, BACK_KEY, original)
+        })
+        .expect("self-cycle");
+        let linked = heap::stats(&mut host).expect("linked");
+        assert_eq!(linked.live_nodes, 5, "two tables, two closures, one cell");
+        assert_eq!(
+            linked.live_edges, 6,
+            "fields, closure links, current edge, self-edge"
+        );
+
+        let utf8 = [0x61_u8, 0x00, 0xC3, 0xA9];
+        let text = Value::string(String::from_utf8(utf8.to_vec()).expect("utf-8"));
+        let text_arc = match &text {
+            Value::String(inner) => Arc::clone(inner),
+            other => panic!("text carrier is not a string: {other:?}"),
+        };
+        heap::with_heap(&mut host, |heap| heap.write_scalar_upvalue(cell, text))
+            .expect("store utf-8 text on the current edge");
+        assert_eq!(
+            heap::stats(&mut host).expect("text overwrite").live_edges,
+            linked.live_edges,
+            "text replaces the object edge and does not add one"
+        );
+        assert_shared_text(&mut host, left, right, &utf8, &text_arc);
+        assert!(
+            heap::with_heap(&mut host, |heap| Ok(heap.alive(original))).expect("still live"),
+            "the replaced self-cycle stays live before collect"
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| heap.edge(original, BACK_KEY)).expect("self-edge"),
+            Some(original)
+        );
+        assert!(
+            token_open(&host, original_raw),
+            "token stays open without collect"
+        );
+
+        heap::collect(&mut host).expect("collect the replaced cycle");
+        assert!(
+            !heap::with_heap(&mut host, |heap| Ok(heap.alive(original))).expect("swept"),
+            "explicit collect drops the unreachable self-cycle"
+        );
+        assert!(
+            !token_open(&host, original_raw),
+            "the captured table token is closed"
+        );
+        assert!(token_open(&host, root_raw));
+        assert_eq!(
+            heap::stats(&mut host).expect("after sweep").live_edges,
+            linked.live_edges - 1,
+            "sweep drops the self-edge and keeps the current text record"
+        );
+        assert_shared_text(&mut host, left, right, &utf8, &text_arc);
+
+        let raw = vec![0x00_u8, 0xFF, 0x5A];
+        assert!(
+            std::str::from_utf8(&raw).is_err(),
+            "the byte carrier is not UTF-8"
+        );
+        let bytes = Value::bytes(raw.to_vec());
+        let bytes_arc = match &bytes {
+            Value::Bytes(inner) => Arc::clone(inner),
+            other => panic!("byte carrier is not bytes: {other:?}"),
+        };
+        let after_sweep = heap::stats(&mut host).expect("before bytes").live_edges;
+        heap::with_heap(&mut host, |heap| heap.write_scalar_upvalue(cell, bytes))
+            .expect("store bytes on the same edge");
+        assert_eq!(
+            heap::stats(&mut host).expect("bytes overwrite").live_edges,
+            after_sweep,
+            "bytes replace the text record and do not add an edge"
+        );
+        assert_shared_bytes(&mut host, left, right, &raw, &bytes_arc);
+
+        let next = [0x62_u8, 0x00, 0x63];
+        let replacement = Value::string(String::from_utf8(next.to_vec()).expect("utf-8"));
+        let replacement_arc = match &replacement {
+            Value::String(inner) => Arc::clone(inner),
+            other => panic!("replacement carrier is not a string: {other:?}"),
+        };
+        heap::with_heap(&mut host, |heap| {
+            heap.write_scalar_upvalue(cell, replacement)
+        })
+        .expect("replace bytes with another string");
+        assert_eq!(
+            heap::stats(&mut host).expect("second text").live_edges,
+            after_sweep,
+            "another string overwrites the same record"
+        );
+        assert_shared_text(&mut host, left, right, &next, &replacement_arc);
+        assert!(
+            !Arc::ptr_eq(&replacement_arc, &text_arc),
+            "the replacement is a different string carrier"
+        );
+
+        heap::with_heap(&mut host, |heap| heap.clear_upvalue(cell)).expect("nil");
+        assert_eq!(shared_current(&mut host, left, right), None);
+        assert_eq!(
+            heap::stats(&mut host).expect("cleared").live_edges,
+            after_sweep - 1,
+            "nil deletes the current record"
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| heap.upvalue_of(left)).expect("left still shared"),
+            cell
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| heap.upvalue_of(right)).expect("right still shared"),
+            cell
+        );
+    });
+}
+
+fn assert_shared_text(
+    host: &mut HostContext<'_>,
+    left: ClosureRef,
+    right: ClosureRef,
+    bytes: &[u8],
+    stored: &Arc<String>,
+) {
+    match shared_current(host, left, right) {
+        Some(CellValue::Scalar(Value::String(text))) => {
+            assert!(
+                Arc::ptr_eq(&text, stored),
+                "the string carrier is stored as given"
+            );
+            assert_eq!(text.as_bytes(), bytes, "every text byte is preserved");
+            assert!(bytes.contains(&0), "the fixture contains an interior NUL");
+        }
+        other => panic!("expected a string scalar, got {other:?}"),
+    }
+}
+
+fn assert_shared_bytes(
+    host: &mut HostContext<'_>,
+    left: ClosureRef,
+    right: ClosureRef,
+    bytes: &[u8],
+    stored: &Arc<Vec<u8>>,
+) {
+    match shared_current(host, left, right) {
+        Some(CellValue::Scalar(Value::Bytes(raw))) => {
+            assert!(
+                Arc::ptr_eq(&raw, stored),
+                "the bytes carrier is stored as given"
+            );
+            assert_eq!(raw.as_slice(), bytes, "every byte is preserved");
+            assert!(bytes.contains(&0) && bytes.contains(&0xFF));
+        }
+        other => panic!("expected a bytes scalar, got {other:?}"),
+    }
 }

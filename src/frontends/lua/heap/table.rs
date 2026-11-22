@@ -223,7 +223,8 @@ enum EdgeValue {
     },
     /// One guest scalar in the same record as a table target. Field 0 on a
     /// table is the only key whose string is read as `__mode`. A cell current
-    /// edge may hold a boolean or binary64; that value is not a key.
+    /// edge may hold a boolean, binary64, string, or bytes; that value is not
+    /// a key.
     Scalar(Value),
 }
 
@@ -250,7 +251,8 @@ pub enum CellValue {
     Table(TableRef),
     /// The cell currently holds a closure.
     Closure(ClosureRef),
-    /// The cell currently holds a boolean or binary64. Not a table key.
+    /// The cell currently holds a boolean, binary64, string, or bytes. Not a
+    /// table key.
     Scalar(Value),
 }
 
@@ -762,7 +764,8 @@ impl LuaHeap {
     ///
     /// An existing current edge is overwritten. This does not insert a second
     /// record. A closure target uses [`Self::write_closure_upvalue`]. A
-    /// boolean or binary64 uses [`Self::write_scalar_upvalue`].
+    /// boolean, binary64, string, or bytes value uses
+    /// [`Self::write_scalar_upvalue`].
     pub fn write_upvalue(&mut self, cell: UpvalueRef, table: TableRef) -> Result<(), HeapError> {
         self.require_upvalue(cell)?;
         self.require_live(table)?;
@@ -794,19 +797,23 @@ impl LuaHeap {
         )
     }
 
-    /// Replaces the current edge with a boolean or binary64 scalar.
+    /// Replaces the current edge with a boolean, binary64, string, or bytes scalar.
     ///
     /// Same record as [`Self::write_upvalue`]. An existing edge is overwritten.
     /// Nil is not stored here; [`Self::clear_upvalue`] deletes that record.
     /// Any other guest value is refused at entry and leaves the stored edge
     /// unchanged. The number is stored as given: signed zero is not
-    /// canonicalized, and NaN is not treated as a table key.
+    /// canonicalized, and NaN is not treated as a table key. A string or bytes
+    /// value is stored as given. The two carriers are not converted or compared.
     pub fn write_scalar_upvalue(
         &mut self,
         cell: UpvalueRef,
         value: Value,
     ) -> Result<(), HeapError> {
-        if !matches!(value, Value::Bool(_) | Value::Float(_)) {
+        if !matches!(
+            value,
+            Value::Bool(_) | Value::Float(_) | Value::String(_) | Value::Bytes(_)
+        ) {
             return Err(HeapError::WrongKind);
         }
         self.require_upvalue(cell)?;
@@ -847,9 +854,9 @@ impl LuaHeap {
                 self.require_closure(found)?;
                 Ok(Some(CellValue::Closure(found)))
             }
-            EdgeValue::Scalar(value @ (Value::Bool(_) | Value::Float(_))) => {
-                Ok(Some(CellValue::Scalar(value.clone())))
-            }
+            EdgeValue::Scalar(
+                value @ (Value::Bool(_) | Value::Float(_) | Value::String(_) | Value::Bytes(_)),
+            ) => Ok(Some(CellValue::Scalar(value.clone()))),
             EdgeValue::Upvalue { .. } | EdgeValue::Scalar(_) => Err(HeapError::WrongKind),
         }
     }

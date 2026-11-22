@@ -8,8 +8,9 @@ pub enum HandleKind {
     Table,
     /// A closure node. It is not a callable value.
     Closure,
-    /// A shared upvalue node. Its current edge holds a table, a closure, or is
-    /// absent (nil). It has no open or closed flag.
+    /// A shared upvalue node. Its current edge holds a table, a closure, or a
+    /// scalar (boolean, binary64, string, or bytes), or is absent (nil). It has
+    /// no open or closed flag.
     Upvalue,
 }
 
@@ -105,7 +106,8 @@ impl ClosureRef {
 /// Domain-checked reference to one shared upvalue node.
 ///
 /// Construction stays inside the heap. The node has no open or closed flag.
-/// Its current edge is a table, a closure, or missing (nil).
+/// Its current edge is a table, a closure, a scalar (boolean, binary64, string,
+/// or bytes), or missing (nil).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UpvalueRef {
     domain: u64,
