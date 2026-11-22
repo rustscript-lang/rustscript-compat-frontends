@@ -144,6 +144,15 @@ pub fn lex(source: &[u8]) -> Result<Lexed, SyntaxError> {
     })
 }
 
+/// Width of a Lua newline at the start of the byte slice, or zero.
+pub(super) fn newline_width(source: &[u8]) -> usize {
+    match source {
+        [b'\r', b'\n', ..] | [b'\n', b'\r', ..] => 2,
+        [b'\r' | b'\n', ..] => 1,
+        _ => 0,
+    }
+}
+
 impl<'a> Scan<'a> {
     fn cur(&self) -> Option<u8> {
         self.src.get(self.pos).copied()
@@ -187,14 +196,7 @@ impl<'a> Scan<'a> {
     }
 
     fn finish_newline(&mut self) {
-        let old = self.cur();
-        self.advance();
-        if let Some(next) = self.cur()
-            && Self::is_eol(next)
-            && Some(next) != old
-        {
-            self.advance();
-        }
+        self.pos += newline_width(&self.src[self.pos..]);
         self.line = self.line.saturating_add(1);
     }
 

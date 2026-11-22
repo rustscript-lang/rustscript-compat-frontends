@@ -415,6 +415,30 @@ fn static_link_keeps_multiline_require_line() {
 }
 
 #[test]
+fn static_link_reports_physical_require_lines() {
+    for (eol, expected) in [
+        ("\n", 2),
+        ("\r", 2),
+        ("\r\n", 2),
+        ("\n\r", 2),
+        ("\r\r", 3),
+        ("\n\n", 3),
+    ] {
+        let source = format!("-- header{eol}local imported = require(\"./missing.rss\")");
+        let imports = static_imports(&source);
+        assert_eq!(imports.len(), 1, "EOL {eol:?}");
+        assert_eq!(imports[0].line, expected, "EOL {eol:?}");
+        assert_namespace(&imports[0], "./missing.rss", "imported", expected);
+    }
+
+    let source = "-- header\r\n# 90 \"virtual.lua\"\n\rlocal first =\rrequire(\"./one.rss\")\r\rlocal second = require(\"./two.rss\").tag";
+    let imports = static_imports(source);
+    assert_eq!(imports.len(), 2);
+    assert_namespace(&imports[0], "./one.rss", "first", 4);
+    assert_named(&imports[1], "./two.rss", "tag", "second", 6);
+}
+
+#[test]
 fn static_link_keeps_named_member_clause() {
     let source = "local tag = require(\"./left.rss\").tag\n";
     let imports = static_imports(source);
@@ -466,6 +490,34 @@ fn named_missing_export_is_invalid_import_syntax() {
         }
         other => panic!("expected InvalidImportSyntax from Core's export check, got {other:?}"),
     }
+}
+
+#[test]
+fn named_missing_export_reports_physical_require_line() {
+    let root = owned_root("missing_export_physical_line");
+    write_present(&root);
+    let source = "-- header\r\n\rlocal missing = require(\"./present.rss\").gone\n\r";
+    let main_path = write_source(&root, "main.lua", source);
+    let err = expect_load_error(compile_candidate(&main_path), "missing export");
+    match err {
+        SourcePathError::InvalidImportSyntax {
+            line,
+            message,
+            path,
+        } => {
+            assert_eq!(line, 3);
+            assert_eq!(path, main_path.canonicalize().expect("real Lua path"));
+            assert_eq!(
+                message,
+                "module './present.rss' has no public function 'gone'"
+            );
+        }
+        other => panic!("expected InvalidImportSyntax from Core's export check, got {other:?}"),
+    }
+
+    let imports = static_imports(source);
+    assert_eq!(imports.len(), 1);
+    assert_named(&imports[0], "./present.rss", "gone", "missing", 3);
 }
 
 #[test]

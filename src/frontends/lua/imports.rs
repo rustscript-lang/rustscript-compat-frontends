@@ -13,9 +13,14 @@ use vm::{ImportClause, ModuleImport, NamedImport, ParseError, SourceError, Sourc
 pub(super) fn static_module_imports(source: &str) -> Result<Vec<ModuleImport>, SourcePathError> {
     let chunk = parser::parse_chunk(source.as_bytes()).map_err(syntax_to_path_error)?;
     let mut imports = Vec::new();
+    let mut lines = PhysicalLines {
+        source: source.as_bytes(),
+        offset: 0,
+        line: 1,
+    };
     let mut require_shadowed = false;
     for stmt in &chunk.body.stmts {
-        if !require_shadowed && let Some(import) = local_static_link(source, stmt) {
+        if !require_shadowed && let Some(import) = local_static_link(stmt, &mut lines) {
             imports.push(import);
         }
         if binds_require(stmt) {
@@ -32,7 +37,7 @@ fn syntax_to_path_error(err: lexer::SyntaxError) -> SourcePathError {
     )))
 }
 
-fn local_static_link(source: &str, stmt: &Stmt) -> Option<ModuleImport> {
+fn local_static_link(stmt: &Stmt, lines: &mut PhysicalLines<'_>) -> Option<ModuleImport> {
     let Stmt::Local { names, values, .. } = stmt else {
         return None;
     };
@@ -55,7 +60,7 @@ fn local_static_link(source: &str, stmt: &Stmt) -> Option<ModuleImport> {
     };
     Some(ModuleImport {
         spec: link.spec,
-        line: line_at(source, link.name_start),
+        line: lines.line_at(link.name_start),
         clause,
     })
 }
@@ -148,8 +153,21 @@ fn utf8_bytes(bytes: &[u8]) -> Option<String> {
     String::from_utf8(bytes.to_vec()).ok()
 }
 
-fn line_at(source: &str, offset: u32) -> usize {
-    let end = usize::try_from(offset).unwrap_or(source.len());
-    let prefix = source.get(..end.min(source.len())).unwrap_or("");
-    prefix.bytes().filter(|byte| *byte == b'\n').count() + 1
+// Links arrive in source order. Count raw bytes once, independently of Lua
+// line directives that remap the lexer token lines used for diagnostics.
+struct PhysicalLines<'a> {
+    source: &'a [u8],
+    offset: usize,
+    line: usize,
+}
+
+impl PhysicalLines<'_> {
+    fn line_at(&mut self, name_start: u32) -> usize {
+        while self.offset < name_start as usize {
+            let width = lexer::newline_width(&self.source[self.offset..]);
+            self.line += usize::from(width != 0);
+            self.offset += width.max(1);
+        }
+        self.line
+    }
 }
