@@ -4,8 +4,18 @@
 //! block, a trailing label sits at the block's starting local count, and a
 //! forward jump into a local's scope is an error. Const bindings cannot be
 //! redeclared or assigned, including from a nested function.
+//!
+//! Active local slots and distinct upvalues follow pinned LuaJIT `load`. The
+//! counts are recorded on `Resolution::limits` and do not change binding
+//! identity, goto slots, or `ResolveError`.
 
 use super::ast::*;
+
+/// LuaJIT `LJ_MAX_LOCVAR` / `LJ_MAX_UPVAL` (`lj_def.h`).
+const MAX_LOCAL_SLOTS: u32 = 200;
+const MAX_UPVALUES: u32 = 60;
+/// Numeric and generic `for` reserve index, limit, and step before the names.
+const FOR_HIDDEN_SLOTS: u32 = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Resolution {
@@ -17,6 +27,11 @@ pub struct Resolution {
     /// A use whose function differs from the binding's function is a capture.
     pub uses: Vec<NameUse>,
     pub errors: Vec<ResolveError>,
+    /// First overflows of the pinned local-slot and upvalue caps.
+    ///
+    /// Production lowering still reads `errors` only. This field is the
+    /// source-level check; it is not a LuaPlugin switch.
+    pub limits: Vec<LexicalLimit>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,6 +121,22 @@ pub enum ResolveError {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LexicalLimitKind {
+    Locals,
+    Upvalues,
+}
+
+/// One static overflow. `count` is the first slot past the pinned cap.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LexicalLimit {
+    pub kind: LexicalLimitKind,
+    pub span: Span,
+    /// One-based count of the slot that did not fit (`limit + 1` on the first miss).
+    pub count: u32,
+    pub limit: u32,
+}
+
 struct LocalSlot {
     name: Vec<u8>,
     const_binding: bool,
@@ -136,6 +167,7 @@ struct JumpRec {
 struct ScopeFrame {
     id: u32,
     start_local: usize,
+    hidden_base: u32,
     labels: Vec<LabelRec>,
     jumps: Vec<JumpRec>,
 }
@@ -144,6 +176,10 @@ struct FuncFrame {
     id: u32,
     vararg: bool,
     scope_base: usize,
+    /// Slots reserved for `for` headers. Not guest bindings and not goto slots.
+    hidden: u32,
+    /// Binding indexes already closed over by this active function.
+    upvalues: Vec<usize>,
 }
 
 struct Cx {
@@ -163,6 +199,7 @@ pub fn resolve(chunk: &Chunk) -> Resolution {
             imports: Vec::new(),
             uses: Vec::new(),
             errors: Vec::new(),
+            limits: Vec::new(),
         },
         funcs: Vec::new(),
         scopes: Vec::new(),
@@ -183,6 +220,8 @@ impl Cx {
             id,
             vararg,
             scope_base: self.scopes.len(),
+            hidden: 0,
+            upvalues: Vec::new(),
         });
         self.enter_scope();
     }
@@ -190,9 +229,11 @@ impl Cx {
     fn enter_scope(&mut self) {
         let id = self.next_scope;
         self.next_scope += 1;
+        let hidden_base = self.funcs.last().map(|func| func.hidden).unwrap_or(0);
         self.scopes.push(ScopeFrame {
             id,
             start_local: self.locals.len(),
+            hidden_base,
             labels: Vec::new(),
             jumps: Vec::new(),
         });
@@ -230,6 +271,9 @@ impl Cx {
     }
 
     fn close_scope(&mut self, scope: ScopeFrame, end: u32, is_loop: bool) {
+        if let Some(func) = self.funcs.last_mut() {
+            func.hidden = scope.hidden_base;
+        }
         for local in self.locals.iter().skip(scope.start_local) {
             self.resolution.bindings[local.binding_index].visible_to = end;
         }
@@ -296,6 +340,7 @@ impl Cx {
         visible_from: u32,
         pending_consts: &[Vec<u8>],
     ) {
+        self.charge_local(name.span);
         let active_const = self
             .locals
             .iter()
@@ -335,6 +380,84 @@ impl Cx {
             .any(|local| local.name == name && local.const_binding)
     }
 
+    fn function_local_base(&self) -> usize {
+        let scope_base = self.funcs.last().expect("function").scope_base;
+        self.scopes[scope_base].start_local
+    }
+
+    fn active_slots(&self) -> u32 {
+        let guest = self.locals.len().saturating_sub(self.function_local_base());
+        let hidden = self.funcs.last().map(|func| func.hidden).unwrap_or(0);
+        u32::try_from(guest)
+            .unwrap_or(u32::MAX)
+            .saturating_add(hidden)
+    }
+
+    fn push_limit(&mut self, kind: LexicalLimitKind, span: Span, count: u32, limit: u32) {
+        self.resolution.limits.push(LexicalLimit {
+            kind,
+            span,
+            count,
+            limit,
+        });
+    }
+
+    fn charge_local(&mut self, span: Span) {
+        let active = self.active_slots();
+        if active >= MAX_LOCAL_SLOTS {
+            self.push_limit(LexicalLimitKind::Locals, span, active + 1, MAX_LOCAL_SLOTS);
+        }
+    }
+
+    fn note_hidden_slots(&mut self, extra: u32, span: Span) {
+        let active = self.active_slots();
+        for offset in 0..extra {
+            let slot = active.saturating_add(offset);
+            if slot >= MAX_LOCAL_SLOTS {
+                self.push_limit(LexicalLimitKind::Locals, span, slot + 1, MAX_LOCAL_SLOTS);
+                return;
+            }
+        }
+    }
+
+    fn activate_hidden(&mut self, extra: u32) {
+        if let Some(func) = self.funcs.last_mut() {
+            func.hidden = func.hidden.saturating_add(extra);
+        }
+    }
+
+    /// Relay a capture along the active function stack. Identity is the binding
+    /// index, not nesting depth, so sibling functions share one parent slot.
+    fn account_upvalue(&mut self, span: Span, binding: Option<usize>, function_id: u32) {
+        let Some(binding_index) = binding else {
+            return;
+        };
+        let owner = self.resolution.bindings[binding_index].function_id;
+        if owner == function_id {
+            return;
+        }
+        let Some(start) = self.funcs.iter().rposition(|func| func.id == function_id) else {
+            return;
+        };
+        let Some(owner_at) = self.funcs.iter().rposition(|func| func.id == owner) else {
+            return;
+        };
+        if owner_at >= start {
+            return;
+        }
+        for index in (owner_at + 1..=start).rev() {
+            if self.funcs[index].upvalues.contains(&binding_index) {
+                return;
+            }
+            let count = u32::try_from(self.funcs[index].upvalues.len()).unwrap_or(u32::MAX);
+            if count >= MAX_UPVALUES {
+                self.push_limit(LexicalLimitKind::Upvalues, span, count + 1, MAX_UPVALUES);
+                return;
+            }
+            self.funcs[index].upvalues.push(binding_index);
+        }
+    }
+
     fn lookup_binding(&self, name: &[u8]) -> Option<usize> {
         self.locals
             .iter()
@@ -343,11 +466,16 @@ impl Cx {
             .map(|local| local.binding_index)
     }
 
+    /// Shared name-access point. The closure candidate records `NameUse` from
+    /// this same nearest-binding lookup. Keep capture charging here so
+    /// integration does not grow a second walk.
     fn note_name(&mut self, name: &Name) {
         let function_id = self.funcs.last().expect("function").id;
+        let binding = self.lookup_binding(&name.bytes);
+        self.account_upvalue(name.span, binding, function_id);
         self.resolution.uses.push(NameUse {
             span: name.span,
-            binding: self.lookup_binding(&name.bytes),
+            binding,
             function_id,
         });
     }
@@ -537,12 +665,14 @@ impl Cx {
                 span,
                 ..
             } => {
+                self.note_hidden_slots(FOR_HIDDEN_SLOTS, name.span);
                 self.walk_expr(start);
                 self.walk_expr(limit);
                 if let Some(step) = step {
                     self.walk_expr(step);
                 }
                 self.enter_scope();
+                self.activate_hidden(FOR_HIDDEN_SLOTS);
                 self.add_binding(name, BindingKind::ForIndex, false, body.span.start, &[]);
                 self.walk_block(body, true, true);
                 self.leave_loop(span.end);
@@ -554,8 +684,11 @@ impl Cx {
                 span,
                 ..
             } => {
+                let anchor = names.first().map(|name| name.span).unwrap_or(*span);
+                self.note_hidden_slots(FOR_HIDDEN_SLOTS, anchor);
                 self.walk_expr_list(iters);
                 self.enter_scope();
+                self.activate_hidden(FOR_HIDDEN_SLOTS);
                 for name in names {
                     self.add_binding(name, BindingKind::ForIndex, false, body.span.start, &[]);
                 }
@@ -603,6 +736,8 @@ impl Cx {
             Stmt::Function { name, body, .. } => {
                 if name.method.is_none() && name.segments.len() == 1 {
                     self.assign_name(&name.segments[0]);
+                } else if let Some(base) = name.segments.first() {
+                    self.note_name(base);
                 }
                 self.walk_func(body, name.method.is_some());
             }

@@ -47,21 +47,30 @@ fn configured_oracle() -> Option<String> {
 
 fn syntax_ok(source: &[u8]) -> bool {
     match parser::parse_chunk(source) {
-        Ok(chunk) => resolve::resolve(&chunk).errors.is_empty(),
+        Ok(chunk) => {
+            let resolution = resolve::resolve(&chunk);
+            resolution.errors.is_empty() && resolution.limits.is_empty()
+        }
         Err(_) => false,
     }
 }
 
 fn spawn_oracle(path: &str, args: &[&str], stdin_bytes: Option<&[u8]>) -> std::process::Output {
     let mut cmd = Command::new(path);
-    cmd.args(args)
-        .stdin(if stdin_bytes.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    // Pin is -joff. Drop Lua startup files so load() sees only the driver.
+    cmd.arg("-joff").args(args);
+    for (key, _) in std::env::vars() {
+        if key.starts_with("LUA") {
+            cmd.env_remove(&key);
+        }
+    }
+    cmd.stdin(if stdin_bytes.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
     #[cfg(target_os = "linux")]
     unsafe {
         use std::os::unix::process::CommandExt;
@@ -642,14 +651,24 @@ fn differential_matches_locked_luajit() {
             ));
         }
     }
-    for (name, source, _) in boundary_samples() {
+    let lexical = lexical_limit_samples();
+    let lexical_count = lexical.len() as u32;
+    let mut lexical_accept = 0u32;
+    let mut lexical_reject = 0u32;
+    let mut compare = |name: &str, source: &[u8], lexical_sample: bool| {
         compared += 1;
-        let ours = syntax_ok(&source);
-        let theirs = oracle_accepts(&path, &source);
+        let ours = syntax_ok(source);
+        let theirs = oracle_accepts(&path, source);
         if theirs {
             accept += 1;
+            if lexical_sample {
+                lexical_accept += 1;
+            }
         } else {
             reject += 1;
+            if lexical_sample {
+                lexical_reject += 1;
+            }
         }
         if ours != theirs {
             mismatches.push(format!(
@@ -658,9 +677,15 @@ fn differential_matches_locked_luajit() {
                 if theirs { "ACCEPT" } else { "REJECT" }
             ));
         }
+    };
+    for (name, source, _) in boundary_samples() {
+        compare(&name, &source, false);
+    }
+    for (name, source, _) in lexical {
+        compare(&name, &source, true);
     }
     eprintln!(
-        "oracle differential cases={compared} accept={accept} reject={reject} scope=load(..., \"t\") source={ORACLE_SHA}"
+        "oracle differential cases={compared} accept={accept} reject={reject} lexical={lexical_count} lexical_accept={lexical_accept} lexical_reject={lexical_reject} scope=load(..., \"t\") source={ORACLE_SHA}"
     );
     assert!(
         mismatches.is_empty(),
@@ -1336,4 +1361,607 @@ fn long_flat_chains_finish_on_the_default_test_thread() {
             "LuaJIT rejected the call chain"
         );
     }
+}
+
+fn numbered(prefix: &str, count: usize) -> String {
+    (1..=count)
+        .map(|index| format!("{prefix}{index}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn local_decl(prefix: &str, count: usize) -> String {
+    format!("local {}", numbered(prefix, count))
+}
+
+fn line_locals(prefix: &str, count: usize) -> String {
+    (1..=count)
+        .map(|index| format!("local {prefix}{index} = {index}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn capture_return(count: usize) -> String {
+    let names = numbered("u", count);
+    format!(
+        "{}\nlocal function f()\nreturn {names}\nend\n",
+        line_locals("u", count)
+    )
+}
+
+fn capture_assign(count: usize) -> String {
+    let writes = (1..=count)
+        .map(|index| format!("u{index} = u{index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "{}\nlocal function f()\n{writes}\nreturn {}\nend\n",
+        line_locals("u", count),
+        numbered("u", count)
+    )
+}
+
+fn const_capture(count: usize) -> String {
+    let decls = (1..=count)
+        .map(|index| format!("const c{index} = {index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "{decls}\nlocal function f()\nreturn {}\nend\n",
+        numbered("c", count)
+    )
+}
+
+fn released_blocks(count: usize) -> String {
+    (1..=count)
+        .map(|index| format!("do local x{index} = 1 end\n"))
+        .collect()
+}
+
+/// Accept/reject matrix measured with pinned LuaJIT `load(..., "t")` at
+/// 96f7b297, `-joff`. 200 active locals and 60 distinct upvalues are the
+/// last accepted counts. Hidden `for` slots and implicit `self` are included.
+/// `...` is not a local slot. A `const` binding is an upvalue when captured.
+/// Literal constants and globals are not.
+fn lexical_limit_samples() -> Vec<(String, Vec<u8>, bool)> {
+    let mut samples = Vec::new();
+    let mut add = |name: &str, source: String, accept: bool| {
+        samples.push((name.to_string(), source.into_bytes(), accept));
+    };
+
+    add("locals_200", local_decl("v", 200), true);
+    add("locals_201", local_decl("v", 201), false);
+    add(
+        "params_200",
+        format!("function f({})\nend\n", numbered("p", 200)),
+        true,
+    );
+    add(
+        "params_201",
+        format!("function f({})\nend\n", numbered("p", 201)),
+        false,
+    );
+    add(
+        "params_200_local",
+        format!("function f({})\nlocal extra = 1\nend\n", numbered("p", 200)),
+        false,
+    );
+    add(
+        "params_199_local",
+        format!("function f({})\nlocal extra = 1\nend\n", numbered("p", 199)),
+        true,
+    );
+    add(
+        "params_200_dots",
+        format!("function f({}, ...)\nend\n", numbered("p", 200)),
+        true,
+    );
+    add(
+        "method_199",
+        format!("function t:m({})\nend\n", numbered("p", 199)),
+        true,
+    );
+    add(
+        "method_200",
+        format!("function t:m({})\nend\n", numbered("p", 200)),
+        false,
+    );
+    add(
+        "method_198_local",
+        format!(
+            "function t:m({})\nlocal extra = 1\nend\n",
+            numbered("p", 198)
+        ),
+        true,
+    );
+    add(
+        "method_199_local",
+        format!(
+            "function t:m({})\nlocal extra = 1\nend\n",
+            numbered("p", 199)
+        ),
+        false,
+    );
+    add("release_202", released_blocks(202), true);
+    add(
+        "nfor_196",
+        format!("{}\nfor i = 1, 2 do end\n", local_decl("v", 196)),
+        true,
+    );
+    add(
+        "nfor_197",
+        format!("{}\nfor overflow = 1, 2 do end\n", local_decl("v", 197)),
+        false,
+    );
+    add(
+        "gfor1_196",
+        format!("{}\nfor i in pairs do end\n", local_decl("v", 196)),
+        true,
+    );
+    add(
+        "gfor1_197",
+        format!("{}\nfor overflow in pairs do end\n", local_decl("v", 197)),
+        false,
+    );
+    add(
+        "gfor2_195",
+        format!("{}\nfor i, j in pairs do end\n", local_decl("v", 195)),
+        true,
+    );
+    add(
+        "gfor2_196",
+        format!(
+            "{}\nfor i, overflow in pairs do end\n",
+            local_decl("v", 196)
+        ),
+        false,
+    );
+    add(
+        "dup_198",
+        format!("{}\nlocal same, same = 1\n", local_decl("v", 198)),
+        true,
+    );
+    add(
+        "dup_199",
+        format!("{}\nlocal same, overflow = 1\n", local_decl("v", 199)),
+        false,
+    );
+    add(
+        "nfor_196_then",
+        format!(
+            "{}\nfor i = 1, 2 do end\nlocal extra = 1\n",
+            local_decl("v", 196)
+        ),
+        true,
+    );
+    add(
+        "do_200_then",
+        format!("do {} end\nlocal extra = 1\n", local_decl("v", 200)),
+        true,
+    );
+    add(
+        "inner_200_parent_199",
+        format!(
+            "local function f()\n{}\nend\n{}\n",
+            local_decl("a", 200),
+            local_decl("b", 199)
+        ),
+        true,
+    );
+    add(
+        "inner_200_parent_200",
+        format!(
+            "local function f()\n{}\nend\n{}\n",
+            local_decl("a", 200),
+            local_decl("b", 200)
+        ),
+        false,
+    );
+    add(
+        "wrapped_inner_200",
+        format!(
+            "do local function f()\n{}\nend end\n{}\n",
+            local_decl("a", 200),
+            local_decl("b", 200)
+        ),
+        true,
+    );
+    add("up_60", capture_return(60), true);
+    add("up_61", capture_return(61), false);
+    add("up_60_rw", capture_assign(60), true);
+    add("up_61_rw", capture_assign(61), false);
+    add(
+        "globals_79",
+        format!("local function f()\nreturn {}\nend\n", numbered("g", 79)),
+        true,
+    );
+    add(
+        "literals_beside_60",
+        format!(
+            "{}\nlocal function g()\nreturn 1, 2, 'abc'\nend\n",
+            capture_return(60)
+        ),
+        true,
+    );
+    add("const_60", const_capture(60), true);
+    add("const_61", const_capture(61), false);
+    add("forward_60", forward_mid(60, false), true);
+    add("forward_60_plus", forward_mid(60, true), false);
+    add("shared_60", shared_mid(60, false), true);
+    add("shared_60_plus", shared_mid(60, true), false);
+    add("func_base_60", func_base(60, false), true);
+    add("func_base_61", func_base(61, false), false);
+    add("method_base_61", func_base(61, true), false);
+    add("short_60", short_capture(60), true);
+    add("short_61", short_capture(61), false);
+    add("bounds_60", for_bounds_capture(60), true);
+    add("body_60", for_body_capture(60), false);
+    add("init_60", initializer_capture(60), true);
+    add("rec_59", recursive_capture(59), true);
+    add("rec_60", recursive_capture(60), false);
+    add(
+        "shadow_60",
+        format!(
+            "{}\nlocal function mid()\n{}\nlocal function inner()\nreturn {}\nend\nend\n",
+            line_locals("u", 60),
+            local_decl("u", 60),
+            numbered("u", 60)
+        ),
+        true,
+    );
+    samples
+}
+
+fn forward_mid(count: usize, extra: bool) -> String {
+    let names = numbered("u", count);
+    let tail = if extra { "\nreturn x\n" } else { "\n" };
+    let marker = if extra { "\nlocal x = 9\n" } else { "\n" };
+    format!(
+        "{}\n{marker}local function mid()\nlocal function inner()\nreturn {names}\nend{tail}end\n",
+        line_locals("u", count)
+    )
+}
+
+fn shared_mid(count: usize, extra: bool) -> String {
+    let names = numbered("u", count);
+    let tail = if extra { "\nreturn x\n" } else { "\n" };
+    let marker = if extra { "\nlocal x = 9\n" } else { "\n" };
+    format!(
+        "{}\n{marker}local function mid()\nlocal function a()\nreturn {names}\nend\nlocal function b()\nreturn {names}\nend{tail}end\n",
+        line_locals("u", count)
+    )
+}
+
+fn func_base(count: usize, method: bool) -> String {
+    let sep = if method { ":" } else { "." };
+    let calls = (1..=count)
+        .map(|index| format!("function a{index}{sep}b() end"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "{}\nlocal function mid()\n{calls}\nend\n",
+        (1..=count)
+            .map(|index| format!("local a{index} = {{}}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
+}
+
+fn short_capture(count: usize) -> String {
+    let bodies = (1..=count)
+        .map(|index| format!("local f{index} = |x| -> u{index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "{}\nlocal function mid()\n{bodies}\nend\n",
+        line_locals("u", count)
+    )
+}
+
+fn for_bounds_capture(count: usize) -> String {
+    format!(
+        "{}\nfor i = (function() return {}, i end)(), 2 do end\n",
+        line_locals("u", count),
+        numbered("u", count)
+    )
+}
+
+fn for_body_capture(count: usize) -> String {
+    format!(
+        "{}\nfor i = 1, 2 do local function f() return {}, i end end\n",
+        line_locals("u", count),
+        numbered("u", count)
+    )
+}
+
+fn initializer_capture(count: usize) -> String {
+    format!(
+        "{}\nlocal fresh = (function() return {}, fresh end)()\n",
+        line_locals("u", count),
+        numbered("u", count)
+    )
+}
+
+fn recursive_capture(count: usize) -> String {
+    format!(
+        "{}\nlocal function f()\nreturn {}, f\nend\n",
+        line_locals("u", count),
+        numbered("u", count)
+    )
+}
+
+#[test]
+fn lexical_limits_follow_pinned_load() {
+    let mut failed = Vec::new();
+    for (name, source, accept) in lexical_limit_samples() {
+        let got = syntax_ok(&source);
+        if got != accept {
+            failed.push(format!(
+                "{name}: parse_chunk+resolve {} expected {}",
+                if got { "ACCEPT" } else { "REJECT" },
+                if accept { "ACCEPT" } else { "REJECT" }
+            ));
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "lexical limits disagree with pinned load(..., \"t\"):\n{}",
+        failed.join("\n")
+    );
+}
+
+fn sample_source(name: &str) -> Vec<u8> {
+    lexical_limit_samples()
+        .into_iter()
+        .find(|(sample, _, _)| sample == name)
+        .map(|(_, source, _)| source)
+        .unwrap_or_else(|| panic!("missing sample {name}"))
+}
+
+fn is_ident_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn ident_spans(source: &[u8], ident: &str) -> Vec<ast::Span> {
+    let needle = ident.as_bytes();
+    let mut spans = Vec::new();
+    let mut offset = 0;
+    while offset + needle.len() <= source.len() {
+        let Some(found) = source[offset..]
+            .windows(needle.len())
+            .position(|window| window == needle)
+        else {
+            break;
+        };
+        let start = offset + found;
+        let end = start + needle.len();
+        let before_ok = start == 0 || !is_ident_byte(source[start - 1]);
+        let after_ok = end == source.len() || !is_ident_byte(source[end]);
+        if before_ok && after_ok {
+            spans.push(ast::Span {
+                start: start as u32,
+                end: end as u32,
+            });
+        }
+        offset = start + 1;
+    }
+    spans
+}
+
+fn resolved(source: &[u8]) -> resolve::Resolution {
+    let chunk = parser::parse_chunk(source).unwrap_or_else(|err| panic!("parse failed: {err:?}"));
+    resolve::resolve(&chunk)
+}
+
+fn assert_first_limit(
+    name: &str,
+    source: &[u8],
+    kind: resolve::LexicalLimitKind,
+    count: u32,
+    span: ast::Span,
+) {
+    let resolution = resolved(source);
+    assert!(
+        resolution.errors.is_empty(),
+        "{name} mixed a syntax error into the limit: {:?}",
+        resolution.errors
+    );
+    let limit = resolution
+        .limits
+        .first()
+        .unwrap_or_else(|| panic!("{name} accepted a pinned overflow"));
+    assert_eq!(limit.kind, kind, "{name} kind");
+    assert_eq!(limit.count, count, "{name} first overflow count");
+    assert_eq!(
+        limit.limit,
+        if kind == resolve::LexicalLimitKind::Locals {
+            200
+        } else {
+            60
+        }
+    );
+    assert_eq!(limit.span, span, "{name} span");
+}
+
+#[test]
+fn lexical_limit_reports_first_overflow() {
+    let locals = sample_source("locals_201");
+    assert_first_limit(
+        "locals_201",
+        &locals,
+        resolve::LexicalLimitKind::Locals,
+        201,
+        ident_spans(&locals, "v201")[0],
+    );
+
+    let params = sample_source("params_200_local");
+    assert_first_limit(
+        "params_200_local",
+        &params,
+        resolve::LexicalLimitKind::Locals,
+        201,
+        ident_spans(&params, "extra")[0],
+    );
+
+    let method = sample_source("method_200");
+    assert_first_limit(
+        "method_200",
+        &method,
+        resolve::LexicalLimitKind::Locals,
+        201,
+        ident_spans(&method, "p200")[0],
+    );
+
+    let numeric = sample_source("nfor_197");
+    assert_first_limit(
+        "nfor_197",
+        &numeric,
+        resolve::LexicalLimitKind::Locals,
+        201,
+        ident_spans(&numeric, "overflow")[0],
+    );
+
+    let hidden = format!("{}\nfor overflow = 1, 2 do end\n", local_decl("v", 198));
+    let hidden_bytes = hidden.as_bytes();
+    assert_first_limit(
+        "nfor_hidden_198",
+        hidden_bytes,
+        resolve::LexicalLimitKind::Locals,
+        201,
+        ident_spans(hidden_bytes, "overflow")[0],
+    );
+    let hidden_resolution = resolved(hidden_bytes);
+    assert_eq!(
+        hidden_resolution
+            .bindings
+            .iter()
+            .filter(|binding| binding.kind == resolve::BindingKind::ForIndex)
+            .count(),
+        1,
+        "hidden for slots must not become guest bindings"
+    );
+
+    let generic = sample_source("gfor2_196");
+    assert_first_limit(
+        "gfor2_196",
+        &generic,
+        resolve::LexicalLimitKind::Locals,
+        201,
+        ident_spans(&generic, "overflow")[0],
+    );
+
+    let duplicate = sample_source("dup_199");
+    assert_first_limit(
+        "dup_199",
+        &duplicate,
+        resolve::LexicalLimitKind::Locals,
+        201,
+        ident_spans(&duplicate, "overflow")[0],
+    );
+    let same = sample_source("dup_198");
+    let same_resolution = resolved(&same);
+    assert!(same_resolution.limits.is_empty());
+    assert_eq!(
+        same_resolution
+            .bindings
+            .iter()
+            .filter(|binding| binding.name == b"same")
+            .count(),
+        2,
+        "repeated names still take two slots"
+    );
+
+    let upvalues = sample_source("up_61");
+    let up_spans = ident_spans(&upvalues, "u61");
+    assert_first_limit(
+        "up_61",
+        &upvalues,
+        resolve::LexicalLimitKind::Upvalues,
+        61,
+        *up_spans.last().expect("u61 use"),
+    );
+
+    let constants = sample_source("const_61");
+    assert_first_limit(
+        "const_61",
+        &constants,
+        resolve::LexicalLimitKind::Upvalues,
+        61,
+        *ident_spans(&constants, "c61").last().expect("c61 use"),
+    );
+
+    let forwarded = sample_source("forward_60_plus");
+    assert_first_limit(
+        "forward_60_plus",
+        &forwarded,
+        resolve::LexicalLimitKind::Upvalues,
+        61,
+        *ident_spans(&forwarded, "x").last().expect("x use"),
+    );
+
+    let shared = sample_source("shared_60_plus");
+    assert_first_limit(
+        "shared_60_plus",
+        &shared,
+        resolve::LexicalLimitKind::Upvalues,
+        61,
+        *ident_spans(&shared, "x").last().expect("x use"),
+    );
+
+    let base = sample_source("func_base_61");
+    assert_first_limit(
+        "func_base_61",
+        &base,
+        resolve::LexicalLimitKind::Upvalues,
+        61,
+        *ident_spans(&base, "a61").last().expect("a61 use"),
+    );
+
+    let method_base = sample_source("method_base_61");
+    assert_first_limit(
+        "method_base_61",
+        &method_base,
+        resolve::LexicalLimitKind::Upvalues,
+        61,
+        *ident_spans(&method_base, "a61").last().expect("a61 use"),
+    );
+
+    let short = sample_source("short_61");
+    assert_first_limit(
+        "short_61",
+        &short,
+        resolve::LexicalLimitKind::Upvalues,
+        61,
+        *ident_spans(&short, "u61").last().expect("u61 use"),
+    );
+
+    let body = sample_source("body_60");
+    assert_first_limit(
+        "body_60",
+        &body,
+        resolve::LexicalLimitKind::Upvalues,
+        61,
+        *ident_spans(&body, "i").last().expect("loop variable use"),
+    );
+
+    let recursive = sample_source("rec_60");
+    assert_first_limit(
+        "rec_60",
+        &recursive,
+        resolve::LexicalLimitKind::Upvalues,
+        61,
+        *ident_spans(&recursive, "f")
+            .last()
+            .expect("function name use"),
+    );
+
+    let goto_source = b"local a = 1\nfor i = 1, 2 do\ngoto L\n::L::\nend\n";
+    let goto_resolution = resolved(goto_source);
+    assert!(goto_resolution.errors.is_empty());
+    assert!(goto_resolution.limits.is_empty());
+    assert_eq!(goto_resolution.bindings.len(), 2);
+    assert_eq!(
+        goto_resolution.gotos[0].active_locals, 2,
+        "hidden for slots must not change goto active locals"
+    );
 }
