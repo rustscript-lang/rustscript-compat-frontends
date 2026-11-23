@@ -277,7 +277,7 @@ fn run_source(source: &str) -> Ran {
     }
 }
 
-fn snap<'a>(ran: &'a Ran, tag: f64) -> &'a Snap {
+fn snap(ran: &Ran, tag: f64) -> &Snap {
     ran.obs
         .snaps
         .iter()
@@ -546,8 +546,8 @@ fn assert_collect_witness(ran: &Ran, early_is_target: bool) {
         7,
         "four receivers plus three already-evaluated values"
     );
-    assert_eq!(during.peeked_alive[1], false, "orphan has no root");
-    assert_eq!(during.token_open[1], false, "orphan token closed");
+    assert!(!during.peeked_alive[1], "orphan has no root");
+    assert!(!during.token_open[1], "orphan token closed");
     assert!(
         during.resources < before.resources,
         "orphan resource collected"
@@ -556,11 +556,8 @@ fn assert_collect_witness(ran: &Ran, early_is_target: bool) {
     assert_eq!(ran.obs.notes[2], (3.0, "nil".to_string()));
     assert_eq!(ran.obs.notes[3], (4.0, "nil".to_string()));
     if early_is_target {
-        assert_eq!(
-            during.peeked_alive[0], true,
-            "early RHS root kept the target"
-        );
-        assert_eq!(during.token_open[0], true);
+        assert!(during.peeked_alive[0], "early RHS root kept the target");
+        assert!(during.token_open[0]);
         assert_eq!(
             during.live_roots - before.live_roots,
             5,
@@ -568,12 +565,9 @@ fn assert_collect_witness(ran: &Ran, early_is_target: bool) {
         );
         assert_eq!(ran.obs.notes[0], (1.0, "table".to_string()));
         assert_eq!(ran.obs.edges, vec![Some(target.table)]);
-        assert_eq!(written.peeked_alive[0], true);
-        assert_eq!(
-            cleared.peeked_alive[0], false,
-            "cleared edge lets the target die"
-        );
-        assert_eq!(cleared.token_open[0], false);
+        assert!(written.peeked_alive[0]);
+        assert!(!cleared.peeked_alive[0], "cleared edge lets the target die");
+        assert!(!cleared.token_open[0]);
         assert!(cleared.resources < written.resources);
         assert_eq!(ran.obs.notes[4], (5.0, "nil".to_string()));
         assert_eq!(cleared.collections, 2);
