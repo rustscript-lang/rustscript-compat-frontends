@@ -16,6 +16,7 @@ const NEW_TABLE: &str = "lua_internal::new_table";
 const TYPE: &str = "lua_internal::type_of";
 const ADD: &str = "lua_internal::add";
 pub(super) const STRING_BYTE_LEN: &str = "lua_internal::string_byte_len";
+const RAW_LEN: &str = "lua_internal::raw_len";
 const RETURN_SCALAR: &str = "lua_internal::return_scalar";
 
 const TABLE_ARG: &str = "lua_internal::table_arg";
@@ -118,6 +119,11 @@ pub(super) fn install_schemas(builder: &mut HostApiBuilder) {
         HostTypeSchema::Float,
     ));
     builder.function(HostFunctionSchema::with_return(
+        RAW_LEN,
+        vec![HostParamSchema::value("value", HostTypeSchema::Unknown)],
+        HostTypeSchema::Float,
+    ));
+    builder.function(HostFunctionSchema::with_return(
         RETURN_SCALAR,
         vec![HostParamSchema::value("value", HostTypeSchema::Unknown)],
         HostTypeSchema::Unknown,
@@ -191,6 +197,7 @@ pub(super) fn register(
         Op::Type,
         Op::Add,
         Op::StringByteLen,
+        Op::RawLen,
         Op::ReturnScalar,
         Op::TableArg,
         Op::NumberArg,
@@ -224,6 +231,7 @@ pub(super) fn register(
             Op::Type => TYPE,
             Op::Add => ADD,
             Op::StringByteLen => STRING_BYTE_LEN,
+            Op::RawLen => RAW_LEN,
             Op::ReturnScalar => RETURN_SCALAR,
             Op::TableArg => TABLE_ARG,
             Op::NumberArg => NUMBER_ARG,
@@ -267,6 +275,7 @@ enum Op {
     Type,
     Add,
     StringByteLen,
+    RawLen,
     ReturnScalar,
     TableArg,
     NumberArg,
@@ -354,6 +363,7 @@ impl HostOwnedFunction for Op {
                 }
             }
             Self::StringByteLen => string_byte_len(call)?,
+            Self::RawLen => raw_len(call)?,
             Self::ReturnScalar => match call.args() {
                 [value @ (Value::Float(_) | Value::String(_) | Value::Bool(_) | Value::Null)] => {
                     value.clone()
@@ -502,14 +512,22 @@ impl HostOwnedFunction for Op {
     }
 }
 
-/// Byte length of a Lua string.
+/// Byte length of a Lua string or binary string.
 ///
 /// Core `len` is not this operation: it counts Rust `char`s for
 /// `Value::String`, returns `Value::Int`, and also accepts arrays and maps.
+fn byte_len_of(value: &Value) -> Option<usize> {
+    match value {
+        Value::String(text) => Some(text.len()),
+        Value::Bytes(bytes) => Some(bytes.len()),
+        _ => None,
+    }
+}
+
 fn string_byte_len(call: &OwnedHostCall<'_>) -> Result<Value, VmError> {
     let len = match call.args() {
-        [Value::String(text)] => text.len(),
-        [Value::Bytes(bytes)] => bytes.len(),
+        [value] => byte_len_of(value)
+            .ok_or_else(|| VmError::HostError("Lua length operand is not a string".to_string()))?,
         _ => {
             return Err(VmError::HostError(
                 "Lua length operand is not a string".to_string(),
@@ -517,6 +535,31 @@ fn string_byte_len(call: &OwnedHostCall<'_>) -> Result<Value, VmError> {
         }
     };
     Ok(Value::Float(len as f64))
+}
+
+/// Unbound `rawlen`. Strings share [`byte_len_of`]. An issued table is a raw
+/// numeric border. A number, a Core array, and a foreign carrier are not tables.
+fn raw_len(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
+    let value = match call.args() {
+        [value] => value.clone(),
+        _ => {
+            return Err(host_fault("Lua rawlen operand is not a string or table"));
+        }
+    };
+    if let Some(len) = byte_len_of(&value) {
+        return Ok(Value::Float(len as f64));
+    }
+    let table = match classify(&mut call.vm().host_context(), &value)? {
+        heap::GuestClass::Table(table) => table,
+        _ => {
+            return Err(host_fault("Lua rawlen operand is not a string or table"));
+        }
+    };
+    let len = heap::with_heap(&mut call.vm().host_context(), |heap| {
+        heap.raw_sequence_len(table)
+    })
+    .map_err(heap_error)?;
+    Ok(Value::Float(len))
 }
 
 fn skip_parens(expr: &ast::Expr) -> &ast::Expr {
@@ -2062,6 +2105,22 @@ impl Lower<'_> {
         self.call(STRING_BYTE_LEN, vec![Expr::Var(slot)])
     }
 
+    fn rawlen_expr(&mut self, operand: &ast::Expr, span: ast::Span) -> Result<Expr, ParseError> {
+        let operand = skip_parens(operand);
+        self.reject_tail_next(operand, span)?;
+        let value = self.length_operand(operand)?;
+        let slot = self
+            .builder
+            .alloc_local_named(&format!("rawlen:{}", self.stmts.len()))?;
+        self.stmts.push(Stmt::Let {
+            index: slot,
+            declared_schema: None,
+            expr: value,
+            line: self.line(span),
+        });
+        self.call(RAW_LEN, vec![Expr::Var(slot)])
+    }
+
     fn length_operand(&mut self, expr: &ast::Expr) -> Result<Expr, ParseError> {
         match skip_parens(expr) {
             ast::Expr::String { bytes, .. } => Ok(self.string_literal(bytes)),
@@ -3256,7 +3315,7 @@ impl Lower<'_> {
                     if self.name_is_bound(name) {
                         return Err(self.unsupported(expr.span()));
                     }
-                    return self.length_expr(arg, expr.span());
+                    return self.rawlen_expr(arg, expr.span());
                 }
                 if name.is("type")
                     && let [arg] = args.exprs.as_slice()

@@ -1,8 +1,9 @@
 //! String byte length for the Lua 5.2 candidate.
 //!
-//! `#` and unbound `rawlen` share one private length operation. These tests
-//! feed real `.lua` files through the candidate source plugin, Core, and the
-//! interpreter. Table length, `__len`, and `pcall` stay out of this slice.
+//! `#` uses the private string byte-length operation. Unbound `rawlen` of a
+//! string or byte string uses the same byte-length helper and still returns
+//! one binary64. Table `rawlen` is covered by `table_rawlen`. Table `#`,
+//! `__len`, and `pcall` stay out of this slice.
 //! A sibling module keeps those fixtures out of the closure-graph tests.
 
 use std::fs;
@@ -434,7 +435,15 @@ fn bound_rawlen_keeps_unsupported_diagnostic() {
 
 #[test]
 fn non_string_length_is_rejected() {
-    assert_rejected(NUMBER_OPERAND, "Lua length operand is not a string");
+    assert_rejected(
+        NUMBER_OPERAND,
+        "Lua rawlen operand is not a string or table",
+    );
     assert_rejected(NIL_OPERAND, "Lua length operand is not a string");
-    assert_rejected(TABLE_OPERAND, "Lua length operand is not a string");
+}
+
+#[test]
+fn empty_table_rawlen_is_zero() {
+    let run = run_file(TABLE_OPERAND, &[]).expect("empty table rawlen");
+    assert_eq!(run.stack, vec![Value::Float(0.0)]);
 }

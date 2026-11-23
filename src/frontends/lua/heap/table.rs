@@ -623,6 +623,25 @@ pub struct LuaHeap {
     payload_bytes: u64,
 }
 
+/// Positive finite integer key that can sit in a 1-based prefix.
+///
+/// `cap` is the edge quota. A contiguous prefix cannot outgrow the owner's
+/// degree, and that degree cannot exceed the quota, so a larger key cannot
+/// change the border. The caller therefore does not size marks by the key.
+fn sequence_index(key: &EdgeKey, cap: u32) -> Option<u32> {
+    let EdgeKey::Number(bits) = key else {
+        return None;
+    };
+    let number = f64::from_bits(*bits);
+    if !number.is_finite() || number < 1.0 || number.trunc() != number {
+        return None;
+    }
+    if number > f64::from(cap) {
+        return None;
+    }
+    Some(number as u32)
+}
+
 impl LuaHeap {
     /// Reserved direct field id for `__mode`; ordinary field ids start at 1.
     pub const MODE_FIELD: u32 = 0;
@@ -1262,6 +1281,60 @@ impl LuaHeap {
         }
         let key = EdgeKey::number(key);
         self.stored_value(from, |stored| stored == &key)
+    }
+
+    /// First raw sequence border of this issued table.
+    ///
+    /// One walk of the owner's chain copies positive finite integer keys into
+    /// a buffer. That buffer is at most the owner's degree, and the degree
+    /// cannot exceed the edge quota, so a huge key does not size it. Strings,
+    /// object keys, private fields, and cursor gaps are ignored. The walk does
+    /// not read a metatable, use ordinary lookup, collect, or modify the chain.
+    /// The length is not cached.
+    ///
+    /// A contiguous prefix returns that length. Several legal borders resolve
+    /// to the first border of the prefix that starts at 1. No key 1 means 0.
+    /// This is not a border that depends on table capacity or insert history.
+    pub fn raw_sequence_len(&self, table: TableRef) -> Result<f64, HeapError> {
+        self.require_live(table)?;
+        Ok(f64::from(self.raw_sequence_border(table.slot())))
+    }
+
+    fn raw_sequence_border(&self, owner: u32) -> u32 {
+        let cap = self.limits.edges;
+        let mut keys = Vec::new();
+        let mut cursor = self
+            .slots
+            .get(owner as usize)
+            .and_then(|slot| slot.edge_head);
+        while let Some(index) = cursor {
+            let record = &self.edge_slots[index as usize];
+            let edge = record
+                .edge
+                .as_ref()
+                .expect("owner chain holds an occupied record");
+            cursor = record.next;
+            if edge.value.is_cursor_gap() {
+                continue;
+            }
+            let Some(key) = sequence_index(&edge.key, cap) else {
+                continue;
+            };
+            keys.push(key);
+        }
+        keys.sort_unstable();
+        let mut expect = 1u32;
+        for key in keys {
+            if key == expect {
+                if expect == cap {
+                    return expect;
+                }
+                expect += 1;
+            } else if key > expect {
+                break;
+            }
+        }
+        expect - 1
     }
 
     fn number_key(key: f64) -> Result<EdgeKey, HeapError> {

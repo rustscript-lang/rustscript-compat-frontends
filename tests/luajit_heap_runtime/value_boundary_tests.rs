@@ -23,6 +23,8 @@ mod source_closure;
 mod string_byte_length;
 #[path = "table_metatable_protection.rs"]
 mod table_metatable_protection;
+#[path = "table_rawlen.rs"]
+mod table_rawlen;
 
 use super::heap;
 use super::support;
