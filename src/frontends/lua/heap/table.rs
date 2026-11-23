@@ -329,8 +329,10 @@ pub enum CellValue {
 }
 
 /// One explicit root. Table, closure, and upvalue roots share the root vector.
+///
+/// Visible to the private host continuation. Not a public heap schema.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Rooted {
+pub(super) enum Rooted {
     Table(TableRef),
     Closure(ClosureRef),
     Upvalue(UpvalueRef),
@@ -1881,12 +1883,33 @@ impl LuaHeap {
         true
     }
 
+    /// True when a mark is already stored. Does not read slots, edges, or a batch.
+    pub(super) fn has_saved_mark(&self) -> bool {
+        self.mark.is_some()
+    }
+
     /// Marks once, then drains the pending-close enumerator. Each slot check
     /// is one scan unit. The drain finishes before this returns, so host close
     /// still sees every doomed token and the original mark snapshot. A partial
     /// pulse is not returned from here and is not given to sweep.
     pub(super) fn mark_and_doomed_tokens(&mut self) -> DoomedMark {
         let modes = self.mark_reachable();
+        self.drain_pending_close(modes)
+    }
+
+    /// Advances a saved mark with the borrowed batch. `None` means the same
+    /// state was written back and tokens were not enumerated. `Some` is the
+    /// owned close list of a finished mark; the saved state is already gone.
+    pub(super) fn take_finished_saved_mark(
+        &mut self,
+        budget: u64,
+        batch: &[Rooted],
+    ) -> Result<Option<DoomedMark>, HeapError> {
+        let (_view, snapshot) = self.advance_saved_mark_with_root_batch(budget, batch)?;
+        Ok(snapshot.map(|modes| self.drain_pending_close(modes)))
+    }
+
+    fn drain_pending_close(&mut self, modes: MarkSnapshot) -> DoomedMark {
         let mut session = PendingCloseSession::start(self, modes);
         session.drain();
         session.finish()
@@ -2378,6 +2401,9 @@ mod parked_mark;
 #[cfg(test)]
 #[path = "../../../../tests/luajit_heap_runtime/private_cycle.rs"]
 mod private_cycle;
+#[cfg(test)]
+#[path = "../../../../tests/luajit_heap_runtime/resume_cycle.rs"]
+mod resume_cycle;
 #[cfg(test)]
 #[path = "../../../../tests/luajit_heap_runtime/safepoint_roots.rs"]
 mod safepoint_roots;

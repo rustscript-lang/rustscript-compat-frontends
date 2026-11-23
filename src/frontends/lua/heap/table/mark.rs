@@ -28,6 +28,13 @@
 //! including one after park and resume, reads only the batch it was given.
 //! Zero budget only observes.
 //!
+//! `ParkedMark::advance_with_root_batch` and the host continuation share
+//! [`LuaHeap::advance_saved_mark_with_root_batch`]. That primitive checks the
+//! saved mark, Done, the root quota, and each typed handle before it takes
+//! the state, then uses this same `pulse_budget`. The host entry does not
+//! build a `ParkedMark`: dropping one would discard an unparked mark, and
+//! `complete` would sweep without closing tokens.
+//!
 //! Reset and mode pulses still spend that budget. They do not open mutation.
 //! Roots and Gray open an ordinary field delete, an ordinary field write on
 //! an owner that is not yet marked, an in-place replacement of an existing
@@ -291,24 +298,14 @@ impl<'a> ParkedMark<'a> {
         budget: u64,
         batch: &[Rooted],
     ) -> Result<MarkView, HeapError> {
-        self.saved_mark()?;
-        if self
-            .heap
-            .mark
-            .as_ref()
-            .is_some_and(|state| matches!(state.phase, MarkPhase::Done))
-        {
+        if self.done.is_some() || self.swept {
             return Err(HeapError::MarkDenied);
         }
-        validate_root_batch(self.heap, batch)?;
-        let mut state = self.heap.mark.take().expect("parked mark");
-        let view = pulse_budget(self.heap, &mut state, budget, Some(batch));
-        if matches!(state.phase, MarkPhase::Done) {
-            self.done = Some(MarkSnapshot {
-                modes: state.modes.take(),
-            });
-        } else {
-            self.heap.mark = Some(state);
+        let (view, done) = self
+            .heap
+            .advance_saved_mark_with_root_batch(budget, batch)?;
+        if let Some(snapshot) = done {
+            self.done = Some(snapshot);
         }
         Ok(view)
     }
@@ -646,6 +643,42 @@ impl Drop for ParkedMark<'_> {
     fn drop(&mut self) {
         if !self.keep {
             self.heap.mark = None;
+        }
+    }
+}
+
+impl LuaHeap {
+    /// Positive-budget step of a mark already stored on this heap.
+    ///
+    /// Order is the parked driver's order: saved state, Done, quota, then
+    /// each typed handle. Only then is `heap.mark` taken. [`pulse_budget`]
+    /// commits `batch` once, after this pulse enters Roots and before any
+    /// root or gray step. An unfinished mark is written back. A finished
+    /// mark is not stored; its modes are returned once. This does not
+    /// enumerate tokens, close them, or sweep.
+    pub(super) fn advance_saved_mark_with_root_batch(
+        &mut self,
+        budget: u64,
+        batch: &[Rooted],
+    ) -> Result<(MarkView, Option<MarkSnapshot>), HeapError> {
+        debug_assert!(budget > 0, "zero budget does not enter the shared advance");
+        let state = self.mark.as_ref().ok_or(HeapError::MarkDenied)?;
+        if matches!(state.phase, MarkPhase::Done) {
+            return Err(HeapError::MarkDenied);
+        }
+        validate_root_batch(self, batch)?;
+        let mut state = self.mark.take().expect("saved mark");
+        let view = pulse_budget(self, &mut state, budget, Some(batch));
+        if matches!(state.phase, MarkPhase::Done) {
+            Ok((
+                view,
+                Some(MarkSnapshot {
+                    modes: state.modes.take(),
+                }),
+            ))
+        } else {
+            self.mark = Some(state);
+            Ok((view, None))
         }
     }
 }

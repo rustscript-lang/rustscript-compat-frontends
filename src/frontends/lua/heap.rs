@@ -187,6 +187,71 @@ pub fn collect_observing<R>(
     observe: impl for<'a> FnOnce(&'a PublishedRead<'a>) -> R,
 ) -> Result<(table::CollectReport, Option<R>), HeapError> {
     let marked = with_heap(host, |heap| heap.begin_private_cycle())?;
+    close_then_sweep_observing(host, marked, observe)
+}
+
+/// A saved mark that this call did not finish, or the one report from the
+/// sweep that followed a finished mark.
+#[derive(Debug)]
+enum SavedMarkResume<R> {
+    /// The saved mark is still on the heap. No token was closed and nothing
+    /// was swept.
+    Paused,
+    /// Close and sweep finished in this call. The observer ran only when a
+    /// dead slot was published.
+    Completed(table::CollectReport, Option<R>),
+}
+
+/// Continues a mark this scope already saved. Does not start a mark and does
+/// not install a heap.
+///
+/// No saved mark is [`HeapError::MarkDenied`], including a missing heap.
+/// Zero budget with a saved mark returns [`SavedMarkResume::Paused`] without
+/// reading the batch or the graph. A positive budget that stops before Done
+/// may move the cursor and returns `Paused` with no enumeration, close, or
+/// sweep; a budget that runs out before Roots does not commit `batch`.
+/// Done removes the saved mark, enumerates once, and closes through the same
+/// token retirement as [`collect`]. The observer and sweep then share the
+/// private-cycle tail. Close failure drops that snapshot, keeps the closed
+/// prefix, publishes nothing, and leaves the continuation stateless.
+///
+/// `batch` is an additional safepoint slice. It is not written into a fixed
+/// root slot and is not deduped. A root already sitting in a fixed slot or a
+/// pending frame must not be passed again. This is not a guest `step`.
+///
+/// Private to this module. `Rooted` is not a public heap schema, so this
+/// signature stays inside the heap module and its tests.
+fn resume_private_cycle<R>(
+    host: &mut HostContext,
+    budget: u64,
+    batch: &[table::Rooted],
+    observe: impl for<'a> FnOnce(&'a PublishedRead<'a>) -> R,
+) -> Result<SavedMarkResume<R>, HeapError> {
+    if host.scope_state::<LuaHeap>().is_none() {
+        return Err(HeapError::MarkDenied);
+    }
+    if budget == 0 {
+        let saved = host
+            .scope_state::<LuaHeap>()
+            .is_some_and(LuaHeap::has_saved_mark);
+        if !saved {
+            return Err(HeapError::MarkDenied);
+        }
+        return Ok(SavedMarkResume::Paused);
+    }
+    let marked = with_heap(host, |heap| heap.take_finished_saved_mark(budget, batch))?;
+    let Some(marked) = marked else {
+        return Ok(SavedMarkResume::Paused);
+    };
+    let (report, seen) = close_then_sweep_observing(host, marked, observe)?;
+    Ok(SavedMarkResume::Completed(report, seen))
+}
+
+fn close_then_sweep_observing<R>(
+    host: &mut HostContext,
+    marked: table::DoomedMark,
+    observe: impl for<'a> FnOnce(&'a PublishedRead<'a>) -> R,
+) -> Result<(table::CollectReport, Option<R>), HeapError> {
     for token in marked.tokens {
         retire_doomed_token(host, token)?;
     }
