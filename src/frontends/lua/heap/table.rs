@@ -16,9 +16,12 @@ use super::handle::{ClosureRef, HandleKind, TableRef, UpvalueRef};
 
 #[path = "table/mark.rs"]
 mod mark;
+#[path = "table/pending_close.rs"]
+mod pending_close;
 #[path = "table/sweep.rs"]
 mod sweep;
 use mark::MarkSession;
+use pending_close::{PendingCloseSession, PendingCloseView};
 use sweep::SweepSession;
 
 static NEXT_DOMAIN: AtomicU64 = AtomicU64::new(1);
@@ -1846,29 +1849,15 @@ impl LuaHeap {
         true
     }
 
-    /// Marks once and returns unreachable stored tokens with their slots,
-    /// plus the weak modes sweep needs after those tokens close. Does not
-    /// release nodes. A close error drops the modes with this result; the
-    /// next collect marks and parses again. [`Self::sweep_marked`] uses this
-    /// same mark and does not build another mode index.
+    /// Marks once, then drains the pending-close enumerator. Each slot check
+    /// is one scan unit. The drain finishes before this returns, so host close
+    /// still sees every doomed token and the original mark snapshot. A partial
+    /// pulse is not returned from here and is not given to sweep.
     pub(super) fn mark_and_doomed_tokens(&mut self) -> DoomedMark {
         let modes = self.mark_reachable();
-        let tokens: Vec<DoomedToken> = self
-            .slots
-            .iter()
-            .enumerate()
-            .filter_map(|(index, slot)| match slot.state {
-                SlotState::Live { marked: false } => slot.token.map(|raw| DoomedToken {
-                    raw,
-                    slot: index as u32,
-                    generation: slot.generation,
-                }),
-                _ => None,
-            })
-            .collect();
-        self.scan.node_slot_visits += self.slots.len() as u64;
-        self.scan.scratch.pending_close_pushed += tokens.len() as u64;
-        DoomedMark { tokens, modes }
+        let mut session = PendingCloseSession::start(self, modes);
+        session.drain();
+        session.finish()
     }
 
     /// Non-moving mark from explicit roots, then one sweep of unmarked nodes.
@@ -2280,3 +2269,6 @@ mod budgeted_mark;
 #[cfg(test)]
 #[path = "../../../../tests/luajit_heap_runtime/budgeted_sweep.rs"]
 mod budgeted_sweep;
+#[cfg(test)]
+#[path = "../../../../tests/luajit_heap_runtime/budgeted_token_scan.rs"]
+mod budgeted_token_scan;
