@@ -21,6 +21,8 @@ mod pending_close;
 #[path = "table/sweep.rs"]
 mod sweep;
 use mark::MarkSession;
+#[cfg(test)]
+use mark::{ParkedMark, PausedOp, PendingScan};
 use pending_close::{PendingCloseSession, PendingCloseView};
 use sweep::SweepSession;
 
@@ -97,6 +99,10 @@ pub enum HeapError {
     /// Execution-scope or resource-table failure. `publish` rolls the reserved
     /// node back before returning this error.
     Scope(String),
+    /// A parked mark does not allow this edit. The heap is unchanged.
+    MarkDenied,
+    /// A mark is already active, so a second start or private collect cannot run.
+    MarkActive,
 }
 
 impl HeapError {
@@ -123,6 +129,8 @@ impl fmt::Display for HeapError {
             Self::NextUnsupported => write!(formatter, "next key is not a guest key"),
             Self::AlreadyInstalled => write!(formatter, "lua heap already installed"),
             Self::Scope(message) => write!(formatter, "lua heap scope error: {message}"),
+            Self::MarkDenied => write!(formatter, "lua mark denied this edit"),
+            Self::MarkActive => write!(formatter, "lua mark is already active"),
         }
     }
 }
@@ -522,6 +530,12 @@ pub struct ScanMeter {
     pub node_slot_visits: u64,
     /// Root-slot reads during root enumeration and the dead-root sweep.
     pub root_slot_visits: u64,
+    /// Ordinary field writes accepted while a mark is parked. Not a pulse unit,
+    /// and not folded into the scan budget. A full collect leaves this at zero.
+    pub parked_edge_writes: u64,
+    /// Parked gray cursors advanced inside `unlink_at` after it has read the
+    /// old successor. Not a pulse unit. A full collect leaves this at zero.
+    pub parked_cursor_repairs: u64,
     pub scratch: ScanScratch,
 }
 
@@ -621,6 +635,9 @@ pub struct LuaHeap {
     peak_roots: u32,
     peak_edges: u32,
     scan: ScanMeter,
+    /// Mark progress saved between pulses. Absent unless a session or the
+    /// parked driver is active. Done is not stored for the parked caller.
+    mark: Option<mark::MarkState>,
     /// String and byte lengths stored in edge records. Not Vec capacity, not
     /// Core locals, and not a second scan of `edges`.
     payload_bytes: u64,
@@ -671,6 +688,7 @@ impl LuaHeap {
             peak_roots: 0,
             peak_edges: 0,
             scan: ScanMeter::default(),
+            mark: None,
             payload_bytes: 0,
         }
     }
@@ -2185,6 +2203,7 @@ impl LuaHeap {
 
     fn unlink_at(&mut self, owner: u32, prev: Option<u32>, index: u32) {
         let next = self.edge_slots[index as usize].next;
+        self.repair_parked_cursor(owner, index, next);
         match prev {
             Some(prev) => self.edge_slots[prev as usize].next = next,
             None => self.slots[owner as usize].edge_head = next,
@@ -2272,3 +2291,7 @@ mod budgeted_sweep;
 #[cfg(test)]
 #[path = "../../../../tests/luajit_heap_runtime/budgeted_token_scan.rs"]
 mod budgeted_token_scan;
+
+#[cfg(test)]
+#[path = "../../../../tests/luajit_heap_runtime/parked_mark.rs"]
+mod parked_mark;

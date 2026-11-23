@@ -1,18 +1,30 @@
-//! Pausable mark. A session holds the heap borrow until it is dropped or swept.
+//! Pausable mark. Progress lives in [`MarkState`]. One stepper drains it.
+//!
+//! A long-borrow session holds the heap until it is dropped or swept. The
+//! parked driver stores that same state on the heap between pulses, so a
+//! restricted edit can run without handing out `&mut LuaHeap`. Done is not
+//! left for the caller: the driver sweeps in that same window and returns
+//! only a report. Drop and cancel clear the saved state and do not sweep.
 //!
 //! A pulse spends a caller budget on these units, each checked before it runs:
 //! one slot reset, one mode-edge open, one mode-string byte (including a NUL),
 //! one mode-cache initialization, one root slot, one reached owner's outgoing
 //! head, or one outgoing edge or gap. Target checks and the metatable check
 //! ride with the edge or the owner head. A zero budget does not read the graph.
+//!
+//! Reset and mode pulses still spend that budget. They do not open mutation.
+//! Roots and Gray open only an ordinary field delete, or an ordinary field
+//! write on an owner that is not yet marked. Allocation, rollback, metatable
+//! and `__mode` writes, root edits, and token edits stay closed. A refused
+//! edit returns before it changes the heap.
 
 use super::{
-    CollectReport, EdgeKey, EdgeValue, HandleKind, LuaHeap, MarkSnapshot, SlotState, WeakMode,
+    CollectReport, EdgeKey, EdgeValue, HandleKind, HeapError, HeapStats, LuaHeap, MarkSnapshot,
+    SlotState, TableRef, WeakMode,
 };
 use vm::Value;
 
-pub(super) struct MarkSession<'a> {
-    heap: &'a mut LuaHeap,
+pub(super) struct MarkState {
     phase: MarkPhase,
     gray: Vec<u32>,
     modes: Option<Vec<WeakMode>>,
@@ -22,8 +34,8 @@ pub(super) struct MarkSession<'a> {
     byte_at: usize,
     pending_mode: WeakMode,
     init_at: usize,
-    owner: Option<u32>,
-    cursor: Option<u32>,
+    pub(super) owner: Option<u32>,
+    pub(super) cursor: Option<u32>,
     owner_kind: HandleKind,
     owner_mode: WeakMode,
 }
@@ -44,10 +56,40 @@ pub(super) struct MarkView {
     pub(super) meter: super::ScanMeter,
 }
 
-impl<'a> MarkSession<'a> {
-    pub(super) fn start(heap: &'a mut LuaHeap) -> Self {
+/// Owner and record the gray scan will charge next. The cursor is the record
+/// index, not a field id.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PendingScan {
+    pub(super) owner: u32,
+    pub(super) cursor: u32,
+}
+
+/// Operations the pause window does not open. The driver refuses each one
+/// before calling the heap method that would apply it.
+pub(super) enum PausedOp {
+    Alloc,
+    Rollback,
+    Metatable,
+    Mode,
+    Root,
+    Token,
+}
+
+pub(super) struct MarkSession<'a> {
+    heap: &'a mut LuaHeap,
+}
+
+/// Exclusive pure-heap mark. The caller does not receive `&mut LuaHeap` until
+/// this driver is dropped, cancelled, or has swept a finished mark.
+pub(super) struct ParkedMark<'a> {
+    heap: &'a mut LuaHeap,
+    done: Option<MarkSnapshot>,
+    swept: bool,
+}
+
+impl MarkState {
+    fn new() -> Self {
         Self {
-            heap,
             phase: MarkPhase::Start,
             gray: Vec::new(),
             modes: None,
@@ -64,336 +106,606 @@ impl<'a> MarkSession<'a> {
         }
     }
 
+    fn mutation_open(&self) -> bool {
+        matches!(self.phase, MarkPhase::Roots | MarkPhase::Gray)
+    }
+
+    fn phase_name(&self) -> &'static str {
+        match self.phase {
+            MarkPhase::Start => "start",
+            MarkPhase::Reset => "reset",
+            MarkPhase::ModeOpen => "mode-open",
+            MarkPhase::ModeBytes => "mode-bytes",
+            MarkPhase::ModeInit => "mode-init",
+            MarkPhase::Roots => "roots",
+            MarkPhase::Gray => "gray",
+            MarkPhase::Done => "done",
+        }
+    }
+}
+
+impl<'a> MarkSession<'a> {
+    pub(super) fn start(heap: &'a mut LuaHeap) -> Self {
+        debug_assert!(heap.mark.is_none(), "a mark is already parked");
+        heap.mark = Some(MarkState::new());
+        Self { heap }
+    }
+
     pub(super) fn meter(&self) -> super::ScanMeter {
         self.heap.scan
     }
 
     pub(super) fn pulse(&mut self, budget: u64) -> MarkView {
-        if budget == 0 || matches!(self.phase, MarkPhase::Done) {
-            return self.view();
-        }
-        if matches!(self.phase, MarkPhase::Start) {
-            self.heap.scan.mark_passes += 1;
-            self.phase = MarkPhase::Reset;
-        }
-        let mut left = budget;
-        let mut spins = 0u32;
-        while left > 0 && !matches!(self.phase, MarkPhase::Done) {
-            if self.step() {
-                left -= 1;
-                spins = 0;
-            } else {
-                spins += 1;
-                debug_assert!(spins <= 4, "mark phase did not advance");
-            }
-        }
-        self.view()
+        let mut state = self.heap.mark.take().expect("mark state");
+        let view = pulse_state(self.heap, &mut state, budget);
+        self.heap.mark = Some(state);
+        view
     }
 
     pub(super) fn drain(&mut self) {
-        while !matches!(self.phase, MarkPhase::Done) {
+        while self
+            .heap
+            .mark
+            .as_ref()
+            .is_some_and(|state| !matches!(state.phase, MarkPhase::Done))
+        {
             self.pulse(64);
         }
     }
 
     pub(super) fn sweep(self) -> CollectReport {
-        let MarkSession {
-            heap, modes, phase, ..
-        } = self;
+        let state = self.heap.mark.take().expect("mark state");
         assert!(
-            matches!(phase, MarkPhase::Done),
+            matches!(state.phase, MarkPhase::Done),
             "sweep needs a finished mark"
         );
-        heap.sweep_marked(MarkSnapshot { modes })
+        self.heap.sweep_marked(MarkSnapshot { modes: state.modes })
     }
 
-    fn view(&self) -> MarkView {
+    pub(super) fn into_snapshot(self) -> MarkSnapshot {
+        let state = self.heap.mark.take().expect("drained mark");
+        assert!(
+            matches!(state.phase, MarkPhase::Done),
+            "drain needs a finished mark"
+        );
+        MarkSnapshot { modes: state.modes }
+    }
+}
+
+impl Drop for MarkSession<'_> {
+    fn drop(&mut self) {
+        self.heap.mark = None;
+    }
+}
+
+impl<'a> ParkedMark<'a> {
+    pub(super) fn start(heap: &'a mut LuaHeap) -> Result<Self, HeapError> {
+        if heap.mark.is_some() {
+            return Err(HeapError::MarkActive);
+        }
+        heap.mark = Some(MarkState::new());
+        Ok(Self {
+            heap,
+            done: None,
+            swept: false,
+        })
+    }
+
+    pub(super) fn meter(&self) -> super::ScanMeter {
+        self.heap.scan
+    }
+
+    pub(super) fn stats(&self) -> HeapStats {
+        self.heap.stats()
+    }
+
+    pub(super) fn logical_bytes(&self) -> u64 {
+        self.heap.logical_bytes()
+    }
+
+    pub(super) fn pulse(&mut self, budget: u64) -> MarkView {
+        if self.done.is_some() {
+            return self.finished_view();
+        }
+        let mut state = self.heap.mark.take().expect("parked mark");
+        let view = pulse_state(self.heap, &mut state, budget);
+        if matches!(state.phase, MarkPhase::Done) {
+            self.done = Some(MarkSnapshot {
+                modes: state.modes.take(),
+            });
+        } else {
+            self.heap.mark = Some(state);
+        }
+        view
+    }
+
+    pub(super) fn pending(&self) -> Option<PendingScan> {
+        let state = self.heap.mark.as_ref()?;
+        Some(PendingScan {
+            owner: state.owner?,
+            cursor: state.cursor?,
+        })
+    }
+
+    pub(super) fn marked(&self, table: TableRef) -> bool {
+        self.heap
+            .slots
+            .get(table.slot() as usize)
+            .is_some_and(|slot| {
+                slot.generation == table.generation()
+                    && slot.kind == HandleKind::Table
+                    && matches!(slot.state, SlotState::Live { marked: true })
+            })
+    }
+
+    pub(super) fn phase_name(&self) -> &'static str {
+        if self.done.is_some() {
+            return "done";
+        }
+        self.heap
+            .mark
+            .as_ref()
+            .map(MarkState::phase_name)
+            .unwrap_or("absent")
+    }
+
+    pub(super) fn mutation_open(&self) -> bool {
+        self.heap
+            .mark
+            .as_ref()
+            .is_some_and(MarkState::mutation_open)
+    }
+
+    pub(super) fn write_allowed(&self, owner: TableRef) -> bool {
+        self.mutation_open() && self.heap.alive(owner) && !self.marked(owner)
+    }
+
+    pub(super) fn field_index(&self, owner: TableRef, key: u32) -> Option<u32> {
+        self.heap.find_key(owner.slot(), &EdgeKey::Field(key))
+    }
+
+    pub(super) fn edge(&self, from: TableRef, key: u32) -> Result<Option<TableRef>, HeapError> {
+        self.heap.edge(from, key)
+    }
+
+    pub(super) fn metatable(&self, owner: TableRef) -> Result<Option<TableRef>, HeapError> {
+        self.heap.metatable(owner)
+    }
+
+    pub(super) fn field_scalar(&self, from: TableRef, key: u32) -> Result<Value, HeapError> {
+        self.heap
+            .stored_value(from, |stored| stored == &EdgeKey::Field(key))
+    }
+
+    pub(super) fn delete_field(&mut self, from: TableRef, key: u32) -> Result<(), HeapError> {
+        self.gate_field(from, key)?;
+        let key = EdgeKey::Field(key);
+        self.heap.clear_edge(from, &key);
+        Ok(())
+    }
+
+    pub(super) fn write_field(
+        &mut self,
+        from: TableRef,
+        key: u32,
+        to: TableRef,
+    ) -> Result<(), HeapError> {
+        self.gate_field(from, key)?;
+        self.heap.require_live(to)?;
+        if self.marked(from) {
+            return Err(HeapError::MarkDenied);
+        }
+        self.heap.set_edge(from, key, to)?;
+        self.heap.scan.parked_edge_writes += 1;
+        Ok(())
+    }
+
+    /// Private collect while this driver holds the heap. It does not sweep.
+    pub(super) fn ordinary_collect(&mut self) -> Result<CollectReport, HeapError> {
+        Err(HeapError::MarkActive)
+    }
+
+    /// A second start while saved progress is still on this heap.
+    pub(super) fn restart(&mut self) -> Result<(), HeapError> {
+        if self.heap.mark.is_some() || self.done.is_some() {
+            return Err(HeapError::MarkActive);
+        }
+        Err(HeapError::MarkActive)
+    }
+
+    pub(super) fn deny(&mut self, op: PausedOp) -> Result<(), HeapError> {
+        match op {
+            PausedOp::Alloc
+            | PausedOp::Rollback
+            | PausedOp::Metatable
+            | PausedOp::Mode
+            | PausedOp::Root
+            | PausedOp::Token => Err(HeapError::MarkDenied),
+        }
+    }
+
+    pub(super) fn cancel(mut self) {
+        self.heap.mark = None;
+        self.done = None;
+    }
+
+    /// Sweep a finished mark in this same window. An unfinished mark is not a
+    /// snapshot and is not swept.
+    pub(super) fn complete(&mut self) -> Result<CollectReport, HeapError> {
+        if self.swept {
+            return Err(HeapError::MarkDenied);
+        }
+        let Some(modes) = self.done.take() else {
+            return Err(HeapError::MarkDenied);
+        };
+        self.heap.mark = None;
+        self.swept = true;
+        Ok(self.heap.sweep_marked(modes))
+    }
+
+    fn finished_view(&self) -> MarkView {
         MarkView {
-            finished: matches!(self.phase, MarkPhase::Done),
+            finished: true,
             meter: self.heap.scan,
         }
     }
 
-    fn step(&mut self) -> bool {
-        match self.phase {
-            MarkPhase::Start => false,
-            MarkPhase::Reset => self.step_reset(),
-            MarkPhase::ModeOpen => self.step_mode_open(),
-            MarkPhase::ModeBytes => self.step_mode_byte(),
-            MarkPhase::ModeInit => self.step_mode_init(),
-            MarkPhase::Roots => self.step_root(),
-            MarkPhase::Gray => self.step_gray(),
-            MarkPhase::Done => false,
+    fn gate_field(&self, from: TableRef, key: u32) -> Result<(), HeapError> {
+        let state = self.heap.mark.as_ref().ok_or(HeapError::MarkDenied)?;
+        if !state.mutation_open() {
+            return Err(HeapError::MarkDenied);
         }
+        if key == LuaHeap::MODE_FIELD {
+            return Err(HeapError::MarkDenied);
+        }
+        self.heap.require_live(from)?;
+        Ok(())
     }
+}
 
-    fn step_reset(&mut self) -> bool {
-        if self.index >= self.heap.slots.len() {
-            self.phase = MarkPhase::Roots;
-            self.index = 0;
-            return false;
-        }
-        let index = self.index;
-        if let SlotState::Live { marked } = &mut self.heap.slots[index].state {
-            *marked = false;
-        }
-        self.heap.scan.node_slot_visits += 1;
-        self.heap.scan.weak_mode_slot_checks += 1;
-        let mode_edge = self.heap.slots[index].mode_edge;
-        let is_table = self.heap.slots[index].kind == HandleKind::Table;
-        if self.heap.metatable_edges > 0 && is_table && mode_edge.is_some() {
-            self.mode_edge = mode_edge;
-            self.mode_owner = index;
-            self.byte_at = 0;
-            self.pending_mode = WeakMode::default();
-            self.phase = MarkPhase::ModeOpen;
+impl Drop for ParkedMark<'_> {
+    fn drop(&mut self) {
+        self.heap.mark = None;
+    }
+}
+
+fn pulse_state(heap: &mut LuaHeap, state: &mut MarkState, budget: u64) -> MarkView {
+    if budget == 0 || matches!(state.phase, MarkPhase::Done) {
+        return view(heap, state);
+    }
+    if matches!(state.phase, MarkPhase::Start) {
+        heap.scan.mark_passes += 1;
+        state.phase = MarkPhase::Reset;
+    }
+    let mut left = budget;
+    let mut spins = 0u32;
+    while left > 0 && !matches!(state.phase, MarkPhase::Done) {
+        if step(heap, state) {
+            left -= 1;
+            spins = 0;
         } else {
-            self.index += 1;
+            spins += 1;
+            debug_assert!(spins <= 4, "mark phase did not advance");
         }
-        true
     }
+    view(heap, state)
+}
 
-    fn step_mode_open(&mut self) -> bool {
-        let edge_index = self.mode_edge.expect("mode open has an edge");
-        self.heap.scan.weak_mode_edge_checks += 1;
-        if self.mode_string_len(edge_index).is_some() {
-            self.phase = MarkPhase::ModeBytes;
-        } else {
-            self.advance_after_mode();
-        }
-        true
+fn view(heap: &LuaHeap, state: &MarkState) -> MarkView {
+    MarkView {
+        finished: matches!(state.phase, MarkPhase::Done),
+        meter: heap.scan,
     }
+}
 
-    fn step_mode_byte(&mut self) -> bool {
-        let edge_index = self.mode_edge.expect("mode byte has an edge");
-        let at = self.byte_at;
-        let Some(byte) = self.mode_string_byte(edge_index, at) else {
-            self.finish_mode_parse();
-            return false;
-        };
-        self.heap.scan.weak_mode_bytes += 1;
-        self.byte_at = at + 1;
-        match byte {
-            b'k' => self.pending_mode.keys = true,
-            b'v' => self.pending_mode.values = true,
-            0 => {
-                self.finish_mode_parse();
-                return true;
-            }
-            _ => {}
-        }
-        let len = self.mode_string_len(edge_index).unwrap_or(0);
-        if self.byte_at >= len {
-            self.finish_mode_parse();
-        }
-        true
+fn step(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
+    match state.phase {
+        MarkPhase::Start => false,
+        MarkPhase::Reset => step_reset(heap, state),
+        MarkPhase::ModeOpen => step_mode_open(heap, state),
+        MarkPhase::ModeBytes => step_mode_byte(heap, state),
+        MarkPhase::ModeInit => step_mode_init(heap, state),
+        MarkPhase::Roots => step_root(heap, state),
+        MarkPhase::Gray => step_gray(heap, state),
+        MarkPhase::Done => false,
     }
+}
 
-    fn finish_mode_parse(&mut self) {
-        let parsed = self.pending_mode;
-        if parsed.keys || parsed.values {
-            if self.modes.is_none() {
-                self.init_at = 0;
-                self.phase = MarkPhase::ModeInit;
-                return;
-            }
-            self.store_mode(parsed);
-        }
-        self.advance_after_mode();
+fn step_reset(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
+    if state.index >= heap.slots.len() {
+        state.phase = MarkPhase::Roots;
+        state.index = 0;
+        return false;
     }
-
-    fn step_mode_init(&mut self) -> bool {
-        let slot_count = self.heap.slots.len();
-        if self.modes.is_none() {
-            self.modes = Some(Vec::with_capacity(slot_count));
-        }
-        let modes = self.modes.as_mut().expect("mode init has a cache");
-        modes.push(WeakMode::default());
-        self.heap.scan.scratch.weak_modes_inited += 1;
-        self.init_at += 1;
-        if self.init_at == slot_count {
-            let parsed = self.pending_mode;
-            self.store_mode(parsed);
-            self.advance_after_mode();
-        }
-        true
+    let index = state.index;
+    if let SlotState::Live { marked } = &mut heap.slots[index].state {
+        *marked = false;
     }
-
-    fn store_mode(&mut self, parsed: WeakMode) {
-        let modes = self.modes.as_mut().expect("mode cache");
-        modes[self.mode_owner] = parsed;
+    heap.scan.node_slot_visits += 1;
+    heap.scan.weak_mode_slot_checks += 1;
+    let mode_edge = heap.slots[index].mode_edge;
+    let is_table = heap.slots[index].kind == HandleKind::Table;
+    if heap.metatable_edges > 0 && is_table && mode_edge.is_some() {
+        state.mode_edge = mode_edge;
+        state.mode_owner = index;
+        state.byte_at = 0;
+        state.pending_mode = WeakMode::default();
+        state.phase = MarkPhase::ModeOpen;
+    } else {
+        state.index += 1;
     }
+    true
+}
 
-    fn advance_after_mode(&mut self) {
-        self.mode_edge = None;
-        self.index += 1;
-        self.phase = MarkPhase::Reset;
+fn step_mode_open(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
+    let edge_index = state.mode_edge.expect("mode open has an edge");
+    heap.scan.weak_mode_edge_checks += 1;
+    if mode_string_len(heap, edge_index).is_some() {
+        state.phase = MarkPhase::ModeBytes;
+    } else {
+        advance_after_mode(state);
     }
+    true
+}
 
-    fn step_root(&mut self) -> bool {
-        if self.index >= self.heap.roots.len() {
-            self.phase = MarkPhase::Gray;
-            return false;
-        }
-        let index = self.index;
-        self.index += 1;
-        self.heap.scan.root_slot_visits += 1;
-        let Some(rooted) = self.heap.roots[index] else {
+fn step_mode_byte(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
+    let edge_index = state.mode_edge.expect("mode byte has an edge");
+    let at = state.byte_at;
+    let Some(byte) = mode_string_byte(heap, edge_index, at) else {
+        finish_mode_parse(state);
+        return false;
+    };
+    heap.scan.weak_mode_bytes += 1;
+    state.byte_at = at + 1;
+    match byte {
+        b'k' => state.pending_mode.keys = true,
+        b'v' => state.pending_mode.values = true,
+        0 => {
+            finish_mode_parse(state);
             return true;
-        };
-        self.heap.scan.node_slot_visits += 1;
-        if self.heap.rooted_alive(rooted) {
-            self.heap.scan.node_slot_visits += 1;
-            let slot = rooted.slot();
-            if self.heap.mark_new(slot) {
-                self.gray.push(slot);
-            }
         }
-        true
+        _ => {}
     }
+    let len = mode_string_len(heap, edge_index).unwrap_or(0);
+    if state.byte_at >= len {
+        finish_mode_parse(state);
+    }
+    true
+}
 
-    fn step_gray(&mut self) -> bool {
-        if self.owner.is_some() {
-            if self.cursor.is_some() {
-                return self.charge_edge();
-            }
-            self.owner = None;
-            return false;
+fn finish_mode_parse(state: &mut MarkState) {
+    let parsed = state.pending_mode;
+    if parsed.keys || parsed.values {
+        if state.modes.is_none() {
+            state.init_at = 0;
+            state.phase = MarkPhase::ModeInit;
+            return;
         }
-        self.begin_owner()
+        store_mode(state, parsed);
     }
+    advance_after_mode(state);
+}
 
-    fn begin_owner(&mut self) -> bool {
-        let Some(slot) = self.gray.pop() else {
-            self.phase = MarkPhase::Done;
-            return false;
-        };
-        let kind = self.heap.slots[slot as usize].kind;
-        let mode = if kind == HandleKind::Table && self.heap.metatable_edges > 0 {
-            self.owner_mode(slot)
-        } else {
-            WeakMode::default()
-        };
-        self.heap.scan.owner_head_checks += 1;
-        self.cursor = self.heap.slots[slot as usize].edge_head;
-        self.owner = Some(slot);
-        self.owner_kind = kind;
-        self.owner_mode = mode;
-        true
+fn step_mode_init(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
+    let slot_count = heap.slots.len();
+    if state.modes.is_none() {
+        state.modes = Some(Vec::with_capacity(slot_count));
     }
+    let modes = state.modes.as_mut().expect("mode init has a cache");
+    modes.push(WeakMode::default());
+    heap.scan.scratch.weak_modes_inited += 1;
+    state.init_at += 1;
+    if state.init_at == slot_count {
+        let parsed = state.pending_mode;
+        store_mode(state, parsed);
+        advance_after_mode(state);
+    }
+    true
+}
 
-    fn charge_edge(&mut self) -> bool {
-        let cursor = self.cursor.expect("edge unit has a cursor");
-        let next = self.heap.edge_slots[cursor as usize].next;
-        self.cursor = next;
-        let gap = self.heap.edge_slots[cursor as usize]
+fn store_mode(state: &mut MarkState, parsed: WeakMode) {
+    let modes = state.modes.as_mut().expect("mode cache");
+    modes[state.mode_owner] = parsed;
+}
+
+fn advance_after_mode(state: &mut MarkState) {
+    state.mode_edge = None;
+    state.index += 1;
+    state.phase = MarkPhase::Reset;
+}
+
+fn step_root(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
+    if state.index >= heap.roots.len() {
+        state.phase = MarkPhase::Gray;
+        return false;
+    }
+    let index = state.index;
+    state.index += 1;
+    heap.scan.root_slot_visits += 1;
+    let Some(rooted) = heap.roots[index] else {
+        return true;
+    };
+    heap.scan.node_slot_visits += 1;
+    if heap.rooted_alive(rooted) {
+        heap.scan.node_slot_visits += 1;
+        let slot = rooted.slot();
+        if heap.mark_new(slot) {
+            state.gray.push(slot);
+        }
+    }
+    true
+}
+
+fn step_gray(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
+    if state.owner.is_some() {
+        if state.cursor.is_some() {
+            return charge_edge(heap, state);
+        }
+        state.owner = None;
+        return false;
+    }
+    begin_owner(heap, state)
+}
+
+fn begin_owner(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
+    let Some(slot) = state.gray.pop() else {
+        state.phase = MarkPhase::Done;
+        return false;
+    };
+    let Some(stored) = heap.slots.get(slot as usize) else {
+        return false;
+    };
+    if !matches!(stored.state, SlotState::Live { .. }) {
+        return false;
+    }
+    let kind = stored.kind;
+    let mode = if kind == HandleKind::Table && heap.metatable_edges > 0 {
+        owner_mode(heap, state, slot)
+    } else {
+        WeakMode::default()
+    };
+    heap.scan.owner_head_checks += 1;
+    state.cursor = heap.slots[slot as usize].edge_head;
+    state.owner = Some(slot);
+    state.owner_kind = kind;
+    state.owner_mode = mode;
+    true
+}
+
+fn charge_edge(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
+    let cursor = state.cursor.expect("edge unit has a cursor");
+    let next = heap.edge_slots[cursor as usize].next;
+    state.cursor = next;
+    let gap = heap.edge_slots[cursor as usize]
+        .edge
+        .as_ref()
+        .is_some_and(|edge| edge.value.is_cursor_gap());
+    if gap {
+        heap.scan.outgoing_gap_checks += 1;
+        return true;
+    }
+    heap.scan.outgoing_edge_checks += 1;
+    follow_edge_ends(heap, state, cursor);
+    true
+}
+
+fn follow_edge_ends(heap: &mut LuaHeap, state: &mut MarkState, cursor: u32) {
+    let (object_key, value_target) = {
+        let edge = heap.edge_slots[cursor as usize]
             .edge
             .as_ref()
-            .is_some_and(|edge| edge.value.is_cursor_gap());
-        if gap {
-            self.heap.scan.outgoing_gap_checks += 1;
-            return true;
-        }
-        self.heap.scan.outgoing_edge_checks += 1;
-        self.follow_edge_ends(cursor);
-        true
-    }
-
-    fn follow_edge_ends(&mut self, cursor: u32) {
-        let (object_key, value_target) = {
-            let edge = self.heap.edge_slots[cursor as usize]
-                .edge
-                .as_ref()
-                .expect("owner chain holds an occupied record");
-            let object_key = match &edge.key {
-                EdgeKey::Object {
-                    slot,
-                    generation,
-                    kind,
-                } => Some((*slot, *generation, *kind)),
-                EdgeKey::Field(_) | EdgeKey::Utf8(_) | EdgeKey::Number(_) => None,
-            };
-            let value_target = match &edge.value {
-                EdgeValue::Table { slot, generation } => {
-                    Some((*slot, *generation, HandleKind::Table))
-                }
-                EdgeValue::Closure { slot, generation } => {
-                    Some((*slot, *generation, HandleKind::Closure))
-                }
-                EdgeValue::Upvalue { slot, generation } => {
-                    Some((*slot, *generation, HandleKind::Upvalue))
-                }
-                EdgeValue::Scalar(_) => None,
-            };
-            (object_key, value_target)
+            .expect("owner chain holds an occupied record");
+        let object_key = match &edge.key {
+            EdgeKey::Object {
+                slot,
+                generation,
+                kind,
+            } => Some((*slot, *generation, *kind)),
+            EdgeKey::Field(_) | EdgeKey::Utf8(_) | EdgeKey::Number(_) => None,
         };
-        let from_table = self.owner_kind == HandleKind::Table;
-        if from_table
-            && !self.owner_mode.keys
-            && let Some((slot, generation, kind)) = object_key
-        {
-            let _matched = self.follow_one(slot, generation, kind);
-        }
-        // A table entry follows that table's weak mode. A closure or cell
-        // link is not a table entry, so it stays strong.
-        let strong_value = !from_table || !self.owner_mode.values;
-        if strong_value && let Some((slot, generation, kind)) = value_target {
-            let _matched = self.follow_one(slot, generation, kind);
-        }
-    }
-
-    fn owner_mode(&mut self, slot: u32) -> WeakMode {
-        let Some((to_slot, to_generation)) = self.heap.slots[slot as usize].metatable else {
-            return WeakMode::default();
+        let value_target = match &edge.value {
+            EdgeValue::Table { slot, generation } => Some((*slot, *generation, HandleKind::Table)),
+            EdgeValue::Closure { slot, generation } => {
+                Some((*slot, *generation, HandleKind::Closure))
+            }
+            EdgeValue::Upvalue { slot, generation } => {
+                Some((*slot, *generation, HandleKind::Upvalue))
+            }
+            EdgeValue::Scalar(_) => None,
         };
-        self.heap.scan.metatable_edge_checks += 1;
-        if self.follow_one(to_slot, to_generation, HandleKind::Table)
-            && let Some(modes) = self.modes.as_ref()
-        {
-            self.heap.scan.weak_mode_lookups += 1;
-            return modes[to_slot as usize];
-        }
-        WeakMode::default()
+        (object_key, value_target)
+    };
+    let from_table = state.owner_kind == HandleKind::Table;
+    if from_table
+        && !state.owner_mode.keys
+        && let Some((slot, generation, kind)) = object_key
+    {
+        let _matched = follow_one(heap, state, slot, generation, kind);
     }
-
-    /// Same visits as the old target follow. True when the slot matches, even
-    /// if it was already marked. Only a newly marked slot joins the gray stack.
-    fn follow_one(&mut self, slot: u32, generation: u32, kind: HandleKind) -> bool {
-        self.heap.scan.node_slot_visits += 1;
-        if !self.heap.slot_matches(slot, generation, kind) {
-            return false;
-        }
-        self.heap.scan.node_slot_visits += 1;
-        if self.heap.mark_new(slot) {
-            self.gray.push(slot);
-        }
-        true
+    // A table entry follows that table's weak mode. A closure or cell
+    // link is not a table entry, so it stays strong.
+    let strong_value = !from_table || !state.owner_mode.values;
+    if strong_value && let Some((slot, generation, kind)) = value_target {
+        let _matched = follow_one(heap, state, slot, generation, kind);
     }
+}
 
-    fn mode_string_len(&self, edge_index: u32) -> Option<usize> {
-        let edge = self.heap.edge_slots[edge_index as usize].edge.as_ref()?;
-        match &edge.value {
-            EdgeValue::Scalar(Value::String(mode)) => Some(mode.len()),
-            _ => None,
-        }
+fn owner_mode(heap: &mut LuaHeap, state: &mut MarkState, slot: u32) -> WeakMode {
+    let Some(stored) = heap.slots.get(slot as usize) else {
+        return WeakMode::default();
+    };
+    let Some((to_slot, to_generation)) = stored.metatable else {
+        return WeakMode::default();
+    };
+    heap.scan.metatable_edge_checks += 1;
+    if follow_one(heap, state, to_slot, to_generation, HandleKind::Table)
+        && let Some(modes) = state.modes.as_ref()
+    {
+        heap.scan.weak_mode_lookups += 1;
+        return modes.get(to_slot as usize).copied().unwrap_or_default();
     }
+    WeakMode::default()
+}
 
-    fn mode_string_byte(&self, edge_index: u32, at: usize) -> Option<u8> {
-        let edge = self.heap.edge_slots[edge_index as usize].edge.as_ref()?;
-        match &edge.value {
-            EdgeValue::Scalar(Value::String(mode)) => mode.as_bytes().get(at).copied(),
-            _ => None,
-        }
+/// Same visits as the old target follow. True when the slot matches, even
+/// if it was already marked. Only a newly marked slot joins the gray stack.
+fn follow_one(
+    heap: &mut LuaHeap,
+    state: &mut MarkState,
+    slot: u32,
+    generation: u32,
+    kind: HandleKind,
+) -> bool {
+    heap.scan.node_slot_visits += 1;
+    if !heap.slot_matches(slot, generation, kind) {
+        return false;
+    }
+    heap.scan.node_slot_visits += 1;
+    if heap.mark_new(slot) {
+        state.gray.push(slot);
+    }
+    true
+}
+
+fn mode_string_len(heap: &LuaHeap, edge_index: u32) -> Option<usize> {
+    let edge = heap.edge_slots[edge_index as usize].edge.as_ref()?;
+    match &edge.value {
+        EdgeValue::Scalar(Value::String(mode)) => Some(mode.len()),
+        _ => None,
+    }
+}
+
+fn mode_string_byte(heap: &LuaHeap, edge_index: u32, at: usize) -> Option<u8> {
+    let edge = heap.edge_slots[edge_index as usize].edge.as_ref()?;
+    match &edge.value {
+        EdgeValue::Scalar(Value::String(mode)) => mode.as_bytes().get(at).copied(),
+        _ => None,
     }
 }
 
 impl LuaHeap {
+    /// Advances a parked gray cursor when `unlink_at` removes its record.
+    /// One field compare. No chain, root, or slot walk.
+    pub(super) fn repair_parked_cursor(&mut self, owner: u32, index: u32, next: Option<u32>) {
+        let Some(state) = self.mark.as_mut() else {
+            return;
+        };
+        if state.owner != Some(owner) || state.cursor != Some(index) {
+            return;
+        }
+        if next.is_some() {
+            state.cursor = next;
+        } else {
+            state.owner = None;
+            state.cursor = None;
+        }
+        self.scan.parked_cursor_repairs += 1;
+    }
+
     pub(super) fn drain_mark(&mut self) -> MarkSnapshot {
         let mut session = MarkSession::start(self);
         session.drain();
-        MarkSnapshot {
-            modes: session.modes.take(),
-        }
+        session.into_snapshot()
     }
 
     fn mark_new(&mut self, index: u32) -> bool {
