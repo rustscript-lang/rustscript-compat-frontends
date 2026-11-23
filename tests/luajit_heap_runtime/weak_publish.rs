@@ -458,16 +458,19 @@ fn assert_guest_pair(left: &Graph, right: &Graph) {
         );
         match (&left_owner.kind, &right_owner.kind) {
             (Kind::Text { .. }, Kind::Text { .. }) => {
-                assert!(left
-                    .heap
-                    .named_edge(left_owner.owner, "a")
-                    .expect("a")
-                    .is_none());
-                assert!(right
-                    .heap
-                    .named_edge(right_owner.owner, "a")
-                    .expect("a")
-                    .is_none());
+                assert!(
+                    left.heap
+                        .named_edge(left_owner.owner, "a")
+                        .expect("a")
+                        .is_none()
+                );
+                assert!(
+                    right
+                        .heap
+                        .named_edge(right_owner.owner, "a")
+                        .expect("a")
+                        .is_none()
+                );
             }
             (Kind::Number { .. }, Kind::Number { .. }) => {
                 assert_eq!(
@@ -509,11 +512,12 @@ fn assert_guest_pair(left: &Graph, right: &Graph) {
                     .expect("next");
                 assert!(left_next.is_some());
                 assert_eq!(left_next.is_some(), right_next.is_some());
-                assert!(left
-                    .heap
-                    .object_edge(left_owner.owner, keys[0])
-                    .expect("cleared")
-                    .is_none());
+                assert!(
+                    left.heap
+                        .object_edge(left_owner.owner, keys[0])
+                        .expect("cleared")
+                        .is_none()
+                );
             }
             _ => panic!("paired graphs diverged"),
         }
