@@ -16,7 +16,10 @@ use super::handle::{ClosureRef, HandleKind, TableRef, UpvalueRef};
 
 #[path = "table/mark.rs"]
 mod mark;
+#[path = "table/sweep.rs"]
+mod sweep;
 use mark::MarkSession;
+use sweep::SweepSession;
 
 static NEXT_DOMAIN: AtomicU64 = AtomicU64::new(1);
 
@@ -255,12 +258,6 @@ struct Edge {
 struct EdgeSlot {
     next: Option<u32>,
     edge: Option<Edge>,
-}
-
-enum SweepAction {
-    Keep,
-    Gap,
-    Drop,
 }
 
 enum EdgeValue {
@@ -540,9 +537,12 @@ pub struct ScanScratch {
     pub work_pushed: u64,
     /// Pending-close elements appended. Host mark only; pure collect is 0.
     pub pending_close_pushed: u64,
-    /// Dead-slot indices appended during sweep selection. 0 if sweep did not run.
+    /// Dead-slot indices appended during sweep selection, one per dead slot.
+    /// 0 if sweep did not run. The push rides with that slot's selection unit.
     pub dead_slots_pushed: u64,
-    /// Mark bitmap zero-initialized when the edge filter runs. 0 when skipped.
+    /// Snapshot slot records appended when the edge filter runs, one per slot.
+    /// Not a collective zero-fill. 0 when every live node is marked and the
+    /// filter is skipped.
     pub sweep_bitmap_inited: u64,
 }
 
@@ -1885,37 +1885,14 @@ impl LuaHeap {
 
     /// Releases nodes the current mark did not reach. Does not mark again.
     ///
-    /// Selection and the marked count share one slot pass. After that pass,
-    /// every unmarked live node is released, so remaining live nodes are the
-    /// marked count. The report uses that count instead of walking the slot
-    /// vector again.
+    /// [`SweepSession`] drains the same sweep used by [`Self::collect`] and
+    /// by [`MarkSession::sweep`]. `heap::collect` reaches it through this
+    /// function after tokens close. The report is built once, after the drain.
+    /// This function does not return a partial sweep.
     pub(super) fn sweep_marked(&mut self, modes: MarkSnapshot) -> CollectReport {
-        let mut swept = Vec::new();
-        let mut marked_nodes = 0u32;
-        self.scan.node_slot_visits += self.slots.len() as u64;
-        for (index, slot) in self.slots.iter().enumerate() {
-            match slot.state {
-                SlotState::Live { marked: false } => swept.push(index as u32),
-                SlotState::Live { marked: true } => marked_nodes += 1,
-                SlotState::Free | SlotState::Retired => {}
-            }
-        }
-        self.scan.scratch.dead_slots_pushed += swept.len() as u64;
-        if !swept.is_empty() {
-            self.sweep_edges_once(&modes);
-            for index in swept {
-                self.scan.node_slot_visits += 1;
-                self.release_slot(index);
-            }
-        }
-        let live_roots = self.clear_dead_roots();
-        self.collections = self.collections.saturating_add(1);
-        self.last_marked = marked_nodes;
-        CollectReport {
-            live_nodes: marked_nodes,
-            marked_nodes,
-            live_roots,
-        }
+        let mut session = SweepSession::start(self, modes);
+        session.drain();
+        session.report()
     }
 
     /// Reports whether `handle` names a live table in this heap.
@@ -2053,147 +2030,6 @@ impl LuaHeap {
         self.drain_mark()
     }
 
-    /// One owner-chain walk of occupied records. Skipped when every live node is
-    /// marked, so an all-live collect does not walk edges and does not build
-    /// the mark bitmap. Weak-value flags come from `modes`, already parsed
-    /// during mark. This does not scan edges to find `__mode`.
-    fn sweep_edges_once(&mut self, modes: &MarkSnapshot) {
-        struct SweepSlot {
-            marked: bool,
-            kind: HandleKind,
-            generation: u32,
-        }
-        let sweep: Vec<SweepSlot> = self
-            .slots
-            .iter()
-            .map(|slot| SweepSlot {
-                marked: matches!(slot.state, SlotState::Live { marked: true }),
-                kind: slot.kind,
-                generation: slot.generation,
-            })
-            .collect();
-        self.scan.node_slot_visits += sweep.len() as u64;
-        self.scan.scratch.sweep_bitmap_inited += sweep.len() as u64;
-        let is_marked = |slot: u32| sweep.get(slot as usize).is_some_and(|found| found.marked);
-        let typed = |slot: u32, generation: u32, kind: HandleKind| {
-            sweep.get(slot as usize).is_some_and(|found| {
-                found.marked && found.kind == kind && found.generation == generation
-            })
-        };
-        let weak_values = match modes.modes.as_ref() {
-            // No stored weak mode: every owner is strong. Do not read
-            // metatable slots or edges to rediscover that.
-            None => Vec::new(),
-            Some(stored) => sweep
-                .iter()
-                .enumerate()
-                .map(|(index, found)| {
-                    if !found.marked || found.kind != HandleKind::Table {
-                        return false;
-                    }
-                    let Some((mt_slot, mt_generation)) = self.slots[index].metatable else {
-                        return false;
-                    };
-                    let Some(mt) = sweep.get(mt_slot as usize) else {
-                        return false;
-                    };
-                    if !mt.marked || mt.kind != HandleKind::Table || mt.generation != mt_generation
-                    {
-                        return false;
-                    }
-                    // Mark already counted this lookup. Reading the stored
-                    // flag is not another parse and is not an edge scan.
-                    stored.get(mt_slot as usize).is_some_and(|mode| mode.values)
-                })
-                .collect(),
-        };
-        let guest_cursor = |key: &EdgeKey| match key {
-            EdgeKey::Utf8(_) | EdgeKey::Number(_) => true,
-            EdgeKey::Field(_) => false,
-            EdgeKey::Object {
-                slot,
-                generation,
-                kind: HandleKind::Table,
-            } => typed(*slot, *generation, HandleKind::Table),
-            EdgeKey::Object { .. } => false,
-        };
-        // One pass per owner, with the predecessor kept so a removal does not
-        // rescan. A weak-value clear leaves the key in place with no value.
-        // That record is the cursor, not a second index. A dead key, a private
-        // field, or a strong edge is still removed.
-        let occupied_before = self.occupied_edges;
-        let mut visited = 0u64;
-        for owner in 0..self.slots.len() {
-            self.scan.owner_head_checks += 1;
-            let mut prev = None;
-            let mut cursor = self.slots[owner].edge_head;
-            while let Some(index) = cursor {
-                visited += 1;
-                let next = self.edge_slots[index as usize].next;
-                let action = {
-                    let edge = self.edge_slots[index as usize]
-                        .edge
-                        .as_ref()
-                        .expect("owner chain holds an occupied record");
-                    let owner_marked = is_marked(owner as u32);
-                    let weak = weak_values.get(owner).copied().unwrap_or(false);
-                    let value_dead = match &edge.value {
-                        EdgeValue::Scalar(_) => false,
-                        EdgeValue::Table { slot, .. } => !is_marked(*slot),
-                        EdgeValue::Closure { slot, generation } => {
-                            !typed(*slot, *generation, HandleKind::Closure)
-                        }
-                        EdgeValue::Upvalue { slot, generation } => {
-                            !typed(*slot, *generation, HandleKind::Upvalue)
-                        }
-                    };
-                    let make_gap = owner_marked && weak && value_dead && guest_cursor(&edge.key);
-                    let value_ok = make_gap
-                        || match &edge.value {
-                            EdgeValue::Table { slot, .. } => is_marked(*slot),
-                            EdgeValue::Scalar(_) => true,
-                            EdgeValue::Closure { slot, generation } => {
-                                typed(*slot, *generation, HandleKind::Closure)
-                            }
-                            EdgeValue::Upvalue { slot, generation } => {
-                                typed(*slot, *generation, HandleKind::Upvalue)
-                            }
-                        };
-                    let key_ok = match &edge.key {
-                        EdgeKey::Field(_) | EdgeKey::Utf8(_) | EdgeKey::Number(_) => true,
-                        EdgeKey::Object {
-                            slot,
-                            generation,
-                            kind,
-                        } if make_gap || edge.value.is_cursor_gap() => {
-                            typed(*slot, *generation, *kind)
-                        }
-                        EdgeKey::Object { slot, .. } => is_marked(*slot),
-                    };
-                    let keep = owner_marked && value_ok && key_ok;
-                    if !keep {
-                        SweepAction::Drop
-                    } else if make_gap && !edge.value.is_cursor_gap() {
-                        SweepAction::Gap
-                    } else {
-                        SweepAction::Keep
-                    }
-                };
-                match action {
-                    SweepAction::Keep => prev = Some(index),
-                    SweepAction::Gap => {
-                        self.rewrite_gap(index);
-                        prev = Some(index);
-                    }
-                    SweepAction::Drop => self.unlink_at(owner as u32, prev, index),
-                }
-                cursor = next;
-            }
-        }
-        self.scan.sweep_edge_checks += visited;
-        debug_assert_eq!(visited, u64::from(occupied_before));
-    }
-
     fn release_slot(&mut self, index: u32) {
         debug_assert!(
             self.slots[index as usize].edge_head.is_none()
@@ -2259,24 +2095,6 @@ impl LuaHeap {
             Rooted::Closure(handle) => self.closure_alive(handle),
             Rooted::Upvalue(handle) => self.upvalue_alive(handle),
         }
-    }
-
-    fn clear_dead_roots(&mut self) -> u32 {
-        let mut live = 0u32;
-        let len = self.roots.len();
-        self.scan.root_slot_visits += len as u64;
-        for index in 0..len {
-            let Some(rooted) = self.roots[index] else {
-                continue;
-            };
-            self.scan.node_slot_visits += 1;
-            if self.rooted_alive(rooted) {
-                live += 1;
-            } else {
-                self.roots[index] = None;
-            }
-        }
-        live
     }
 
     fn frame(&self, id: RootFrameId) -> Result<&Frame, HeapError> {
@@ -2459,3 +2277,6 @@ fn edge_key_is_slot(key: &EdgeKey, slot: u32) -> bool {
 #[cfg(test)]
 #[path = "../../../../tests/luajit_heap_runtime/budgeted_mark.rs"]
 mod budgeted_mark;
+#[cfg(test)]
+#[path = "../../../../tests/luajit_heap_runtime/budgeted_sweep.rs"]
+mod budgeted_sweep;
