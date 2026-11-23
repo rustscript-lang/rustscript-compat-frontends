@@ -12,6 +12,8 @@ mod envelope_local_root;
 mod lexer;
 #[path = "../../src/frontends/lua/parser.rs"]
 mod parser;
+#[path = "rawequal.rs"]
+mod rawequal;
 #[path = "rawset.rs"]
 mod rawset;
 #[path = "../../src/frontends/lua/resolve.rs"]

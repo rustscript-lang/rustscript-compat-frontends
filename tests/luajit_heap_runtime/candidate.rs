@@ -52,6 +52,9 @@ const RELEASE_RESULT: &str = "lua_internal::release_result";
 // They are not Lua syntax and are not registered on the production entry.
 const COPY_FIELDS: &str = "lua_internal::copy_fields";
 const EXTERNAL_SHAPE: &str = "lua_internal::external_shape";
+const BYTE_TEXT: &str = "lua_internal::byte_text";
+const HOST_INT: &str = "lua_internal::host_int";
+const RAW_EQUAL: &str = "lua_internal::raw_equal";
 
 /// Lengths the IR consumer read from `next`'s return transport with Core `len`.
 ///
@@ -99,6 +102,24 @@ pub(super) fn install_schemas(builder: &mut HostApiBuilder) {
         EXTERNAL_SHAPE,
         vec![],
         HostTypeSchema::Unknown,
+    ));
+    builder.function(HostFunctionSchema::with_return(
+        BYTE_TEXT,
+        vec![],
+        HostTypeSchema::Unknown,
+    ));
+    builder.function(HostFunctionSchema::with_return(
+        HOST_INT,
+        vec![],
+        HostTypeSchema::Unknown,
+    ));
+    builder.function(HostFunctionSchema::with_return(
+        RAW_EQUAL,
+        vec![
+            HostParamSchema::value("left", HostTypeSchema::Unknown),
+            HostParamSchema::value("right", HostTypeSchema::Unknown),
+        ],
+        HostTypeSchema::Bool,
     ));
     builder.function(HostFunctionSchema::with_return(
         TYPE,
@@ -221,6 +242,9 @@ pub(super) fn register(
         Op::ReleaseResult,
         Op::CopyFields,
         Op::ExternalShape,
+        Op::ByteText,
+        Op::HostInt,
+        Op::RawEqual,
         Op::OpenCell,
         Op::ReadCell,
         Op::WriteCell,
@@ -255,6 +279,9 @@ pub(super) fn register(
             Op::ReleaseResult => RELEASE_RESULT,
             Op::CopyFields => COPY_FIELDS,
             Op::ExternalShape => EXTERNAL_SHAPE,
+            Op::ByteText => BYTE_TEXT,
+            Op::HostInt => HOST_INT,
+            Op::RawEqual => RAW_EQUAL,
             Op::OpenCell => OPEN_CELL,
             Op::ReadCell => READ_CELL,
             Op::WriteCell => WRITE_CELL,
@@ -299,6 +326,9 @@ enum Op {
     ReleaseResult,
     CopyFields,
     ExternalShape,
+    ByteText,
+    HostInt,
+    RawEqual,
     OpenCell,
     ReadCell,
     WriteCell,
@@ -503,6 +533,9 @@ impl HostOwnedFunction for Op {
                 }
             },
             Self::ExternalShape => Value::array(vec![Value::Int(0), Value::Int(1)]),
+            Self::ByteText => Value::bytes(b"ab".to_vec()),
+            Self::HostInt => Value::Int(7),
+            Self::RawEqual => raw_equal(call)?,
             Self::OpenCell => open_cell(call)?,
             Self::ReadCell => read_cell(call)?,
             Self::WriteCell => write_cell(call)?,
@@ -568,6 +601,59 @@ fn skip_parens(expr: &ast::Expr) -> &ast::Expr {
         expr = inner;
     }
     expr
+}
+
+fn raw_equal(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
+    let (left, right) = match call.args() {
+        [left, right] => (left.clone(), right.clone()),
+        _ => return Err(host_fault("Lua rawequal needs two values")),
+    };
+    let same = values_raw_equal(&mut call.vm().host_context(), &left, &right)?;
+    Ok(Value::Bool(same))
+}
+
+enum EqualKind<'a> {
+    Nil,
+    Bool(bool),
+    Number(f64),
+    Bytes(&'a [u8]),
+    Table(heap::TableRef),
+}
+
+fn equal_kind<'a>(
+    host: &mut vm::HostContext<'_>,
+    value: &'a Value,
+) -> Result<EqualKind<'a>, VmError> {
+    match value {
+        Value::Null => Ok(EqualKind::Nil),
+        Value::Bool(bit) => Ok(EqualKind::Bool(*bit)),
+        Value::Float(number) => Ok(EqualKind::Number(*number)),
+        Value::Int(_) => Err(host_fault("host integer is not a Lua number")),
+        Value::String(text) => Ok(EqualKind::Bytes(text.as_bytes())),
+        Value::Bytes(bytes) => Ok(EqualKind::Bytes(bytes.as_ref())),
+        Value::Array(_) => match classify(host, value)? {
+            heap::GuestClass::Table(table) => Ok(EqualKind::Table(table)),
+            _ => Err(host_fault("Lua rawequal operand is not an issued table")),
+        },
+        _ => Err(host_fault("Lua rawequal operand is not a supported value")),
+    }
+}
+
+fn values_raw_equal(
+    host: &mut vm::HostContext<'_>,
+    left: &Value,
+    right: &Value,
+) -> Result<bool, VmError> {
+    let left = equal_kind(host, left)?;
+    let right = equal_kind(host, right)?;
+    Ok(match (left, right) {
+        (EqualKind::Nil, EqualKind::Nil) => true,
+        (EqualKind::Bool(left), EqualKind::Bool(right)) => left == right,
+        (EqualKind::Number(left), EqualKind::Number(right)) => left == right,
+        (EqualKind::Bytes(left), EqualKind::Bytes(right)) => left == right,
+        (EqualKind::Table(left), EqualKind::Table(right)) => left == right,
+        _ => false,
+    })
 }
 
 fn host_fault(message: &str) -> VmError {
@@ -3391,6 +3477,26 @@ impl Lower<'_> {
                     self.reject_tail_next(value, expr.span())?;
                     return self.rawset_expr(table, key, value, expr.span());
                 }
+                if name.is("rawequal") {
+                    // Same binding rule as rawset: a shadowed or upvalue name
+                    // is not this builtin, and must not fall through to it.
+                    if self.name_is_bound(name) {
+                        return Err(self.unsupported(expr.span()));
+                    }
+                    return self.rawequal_expr(&args.exprs, expr.span());
+                }
+                if name.is("byte_text") && args.exprs.is_empty() {
+                    if self.name_is_bound(name) {
+                        return Err(self.unsupported(expr.span()));
+                    }
+                    return self.call(BYTE_TEXT, vec![]);
+                }
+                if name.is("host_int") && args.exprs.is_empty() {
+                    if self.name_is_bound(name) {
+                        return Err(self.unsupported(expr.span()));
+                    }
+                    return self.call(HOST_INT, vec![]);
+                }
                 if name.is("external_shape") && args.exprs.is_empty() {
                     return self.call(EXTERNAL_SHAPE, vec![]);
                 }
@@ -3460,6 +3566,32 @@ impl Lower<'_> {
         }
         self.active_temps.truncate(temp_base);
         self.call(name, checked)
+    }
+
+    /// Evaluate every static argument on the same temporary-root path as an
+    /// index operand, then compare only the first two. Extra arguments are
+    /// evaluated and ignored. Fewer than two is a refusal, not an implicit nil.
+    fn rawequal_expr(&mut self, args: &[ast::Expr], span: ast::Span) -> Result<Expr, ParseError> {
+        if args.len() < 2 || args.last().is_some_and(|arg| self.is_next_call(arg)) {
+            return Err(self.unsupported(span));
+        }
+        let temp_base = self.active_temps.len();
+        let mut slots = Vec::with_capacity(args.len());
+        for arg in args {
+            let value = self.equal_operand(arg)?;
+            slots.push(self.index_operand_slot(value, span)?);
+        }
+        self.active_temps.truncate(temp_base);
+        self.call(RAW_EQUAL, vec![Expr::Var(slots[0]), Expr::Var(slots[1])])
+    }
+
+    /// String literals keep their raw bytes. Other operands use the existing
+    /// expression lowerer, including calls that already return one value.
+    fn equal_operand(&mut self, expr: &ast::Expr) -> Result<Expr, ParseError> {
+        match skip_parens(expr) {
+            ast::Expr::String { bytes, .. } => Ok(self.string_literal(bytes)),
+            other => self.expr(other),
+        }
     }
 
     fn collect_expr(&mut self, span: ast::Span) -> Result<Expr, ParseError> {
