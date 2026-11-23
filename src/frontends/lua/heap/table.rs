@@ -2041,7 +2041,11 @@ impl LuaHeap {
         })
     }
 
+    /// Drops any parked mark, then marks from the current roots.
+    /// A later close failure does not put that mark back.
     fn mark_reachable(&mut self) -> MarkSnapshot {
+        let abandoned = self.mark.take();
+        drop(abandoned);
         self.drain_mark()
     }
 
@@ -2333,6 +2337,9 @@ mod budgeted_sweep;
 #[path = "../../../../tests/luajit_heap_runtime/budgeted_token_scan.rs"]
 mod budgeted_token_scan;
 
+#[cfg(test)]
+#[path = "../../../../tests/luajit_heap_runtime/parked_lifecycle.rs"]
+mod parked_lifecycle;
 #[cfg(test)]
 #[path = "../../../../tests/luajit_heap_runtime/parked_mark.rs"]
 mod parked_mark;

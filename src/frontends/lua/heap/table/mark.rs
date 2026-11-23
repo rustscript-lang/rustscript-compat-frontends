@@ -1,10 +1,12 @@
 //! Pausable mark. Progress lives in [`MarkState`]. One stepper drains it.
 //!
 //! A long-borrow session holds the heap until it is dropped or swept. The
-//! parked driver stores that same state on the heap between pulses, so a
-//! restricted edit can run without handing out `&mut LuaHeap`. Done is not
-//! left for the caller: the driver sweeps in that same window and returns
-//! only a report. Drop and cancel clear the saved state and do not sweep.
+//! parked driver stores that same state on the heap between pulses. `park`
+//! consumes the driver and leaves an incomplete mark there; `resume` borrows
+//! it and does not create another. Drop and cancel still clear the saved
+//! state and do not sweep. Done is not left for the caller: the driver sweeps
+//! in that same window and returns only a report. A full collect drops any
+//! saved mark and starts again from reset.
 //!
 //! A pulse spends a caller budget on these units, each checked before it runs:
 //! one slot reset, one mode-edge open, one mode-string byte (including a NUL),
@@ -84,12 +86,15 @@ pub(super) struct MarkSession<'a> {
     heap: &'a mut LuaHeap,
 }
 
-/// Exclusive pure-heap mark. The caller does not receive `&mut LuaHeap` until
-/// this driver is dropped, cancelled, or has swept a finished mark.
+/// Exclusive pure-heap mark. `park` consumes the driver and can leave an
+/// incomplete mark on the heap for `resume`. Drop and cancel still clear it.
+/// Done is swept in this window and is not parked.
 pub(super) struct ParkedMark<'a> {
     heap: &'a mut LuaHeap,
     done: Option<MarkSnapshot>,
     swept: bool,
+    /// Set only by a successful `park`, so Drop does not clear that mark.
+    keep: bool,
 }
 
 impl MarkState {
@@ -193,7 +198,31 @@ impl<'a> ParkedMark<'a> {
             heap,
             done: None,
             swept: false,
+            keep: false,
         })
+    }
+
+    /// Borrows a mark this heap already holds. Absent is `None`.
+    /// This does not create, reset, write, or replace that mark.
+    pub(super) fn resume(heap: &'a mut LuaHeap) -> Option<Self> {
+        heap.mark.as_ref()?;
+        Some(Self {
+            heap,
+            done: None,
+            swept: false,
+            keep: false,
+        })
+    }
+
+    /// Leaves an incomplete mark on the heap and ends this borrow.
+    /// Done, or a heap with no mark, is refused. Refusal does not sweep and
+    /// does not return a collection report.
+    pub(super) fn park(mut self) -> Result<(), HeapError> {
+        if self.heap.mark.is_none() || self.done.is_some() || self.swept {
+            return Err(HeapError::MarkDenied);
+        }
+        self.keep = true;
+        Ok(())
     }
 
     pub(super) fn meter(&self) -> super::ScanMeter {
@@ -512,7 +541,9 @@ impl<'a> ParkedMark<'a> {
 
 impl Drop for ParkedMark<'_> {
     fn drop(&mut self) {
-        self.heap.mark = None;
+        if !self.keep {
+            self.heap.mark = None;
+        }
     }
 }
 
