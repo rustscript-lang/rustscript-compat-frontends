@@ -12,6 +12,8 @@ mod envelope_local_root;
 mod lexer;
 #[path = "../../src/frontends/lua/parser.rs"]
 mod parser;
+#[path = "pending_argument.rs"]
+mod pending_argument;
 #[path = "rawequal.rs"]
 mod rawequal;
 #[path = "rawset.rs"]

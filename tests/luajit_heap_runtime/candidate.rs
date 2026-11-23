@@ -32,6 +32,9 @@ const WRITE_CELL: &str = "lua_internal::write_cell";
 const TRACK_CLOSURE: &str = "lua_internal::track_closure";
 const ENTER_RESULT: &str = "lua_internal::enter_result_frame";
 const ENTER_CALLEE: &str = "lua_internal::enter_callee_frame";
+const ENTER_PENDING: &str = "lua_internal::enter_pending_frame";
+const WRITE_PENDING: &str = "lua_internal::write_pending_root";
+const LEAVE_PENDING: &str = "lua_internal::leave_pending_frame";
 const ROOT_ISSUED: &str = "lua_internal::root_issued";
 const SET_EDGE: &str = "lua_internal::set_edge";
 const GET_EDGE: &str = "lua_internal::get_edge";
@@ -165,6 +168,13 @@ pub(super) fn install_schemas(builder: &mut HostApiBuilder) {
     for (name, params, result) in [
         (ENTER_RESULT, vec!["width"], HostTypeSchema::Unknown),
         (ENTER_CALLEE, vec!["width"], HostTypeSchema::Float),
+        (ENTER_PENDING, vec!["width"], HostTypeSchema::Unknown),
+        (
+            WRITE_PENDING,
+            vec!["frame", "slot", "value"],
+            HostTypeSchema::Float,
+        ),
+        (LEAVE_PENDING, vec!["frame"], HostTypeSchema::Float),
         (
             ROOT_ISSUED,
             vec!["value", "slot", "role"],
@@ -229,6 +239,9 @@ pub(super) fn register(
         Op::Count,
         Op::EnterResult,
         Op::EnterCallee,
+        Op::EnterPending,
+        Op::WritePending,
+        Op::LeavePending,
         Op::RootIssued,
         Op::SetEdge,
         Op::GetEdge,
@@ -266,6 +279,9 @@ pub(super) fn register(
             Op::Count => COUNT,
             Op::EnterResult => ENTER_RESULT,
             Op::EnterCallee => ENTER_CALLEE,
+            Op::EnterPending => ENTER_PENDING,
+            Op::WritePending => WRITE_PENDING,
+            Op::LeavePending => LEAVE_PENDING,
             Op::RootIssued => ROOT_ISSUED,
             Op::SetEdge => SET_EDGE,
             Op::GetEdge => GET_EDGE,
@@ -313,6 +329,9 @@ enum Op {
     Count,
     EnterResult,
     EnterCallee,
+    EnterPending,
+    WritePending,
+    LeavePending,
     RootIssued,
     SetEdge,
     GetEdge,
@@ -520,6 +539,9 @@ impl HostOwnedFunction for Op {
             }
             Self::EnterResult => enter_result(call)?,
             Self::EnterCallee => enter_callee(call)?,
+            Self::EnterPending => enter_pending(call)?,
+            Self::WritePending => write_pending(call)?,
+            Self::LeavePending => leave_pending(call)?,
             Self::RootIssued => root_issued(call)?,
             Self::SetEdge => set_edge(call)?,
             Self::GetEdge => get_edge(call)?,
@@ -769,6 +791,66 @@ fn enter_callee(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
     with_witness(call.vm(), |witness| {
         witness.callee_depth = Some(depth);
     })?;
+    Ok(Value::Float(0.0))
+}
+
+fn enter_pending(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
+    let width = match call.args() {
+        [value] => float_u32(value)?,
+        _ => return Err(host_fault("invalid pending frame")),
+    };
+    let frame = heap::with_heap(&mut call.vm().host_context(), |heap| {
+        heap.enter_roots(width)
+    })
+    .map_err(heap_error)?;
+    Ok(frame_token(frame))
+}
+
+fn write_pending(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
+    let (frame_token, slot, value) = match call.args() {
+        [frame, slot, value] => (frame.clone(), float_u32(slot)?, value.clone()),
+        _ => return Err(host_fault("invalid pending root")),
+    };
+    let table = match classify(&mut call.vm().host_context(), &value)? {
+        heap::GuestClass::Table(table) => table,
+        _ => {
+            if let Ok(frame) = decode_frame(call, &frame_token) {
+                let _ = heap::with_heap(&mut call.vm().host_context(), |heap| {
+                    heap.leave_roots(frame)
+                });
+            }
+            return Err(host_fault("pending root is not a table"));
+        }
+    };
+    let frame = decode_frame(call, &frame_token)?;
+    if let Err(error) = heap::with_heap(&mut call.vm().host_context(), |heap| {
+        heap.write_root(frame, slot, table)
+    }) {
+        let _ = heap::with_heap(&mut call.vm().host_context(), |heap| {
+            heap.leave_roots(frame)
+        });
+        return Err(heap_error(error));
+    }
+    Ok(Value::Float(0.0))
+}
+
+fn leave_pending(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
+    let frame_token = match call.args() {
+        [frame] => frame.clone(),
+        _ => return Err(host_fault("invalid pending release")),
+    };
+    let frame = decode_frame(call, &frame_token)?;
+    let current = heap::with_heap(&mut call.vm().host_context(), |heap| {
+        Ok(heap.current_frame())
+    })
+    .map_err(heap_error)?;
+    if current != Some(frame) {
+        return Err(host_fault("pending release is not the current frame"));
+    }
+    heap::with_heap(&mut call.vm().host_context(), |heap| {
+        heap.leave_roots(frame)
+    })
+    .map_err(heap_error)?;
     Ok(Value::Float(0.0))
 }
 
@@ -1286,6 +1368,9 @@ fn note_collect(
         })
         .map_err(heap_error)?;
     let meter = heap::take_scan_meter(host).map_err(heap_error)?;
+    if let Some(samples) = host.scope_state_mut::<VisitSamples>() {
+        samples.visits.push(meter.root_slot_visits);
+    }
     let witness = host
         .scope_state_mut::<ReturnWitness>()
         .ok_or_else(|| host_fault("return witness disappeared"))?;
@@ -3260,6 +3345,76 @@ impl Lower<'_> {
         Ok(())
     }
 
+    /// Value-position direct call. The result is a real Get, not a swallowed
+    /// null. No root is published here; a later argument still has to root
+    /// an earlier table before this call can collect.
+    fn lower_direct_value(&mut self, call: &ast::Expr) -> Result<Expr, ParseError> {
+        let span = call.span();
+        if self.in_function {
+            return Err(self.unsupported(span));
+        }
+        let callee = self
+            .direct_function_call(call)
+            .ok_or_else(|| self.unsupported(span))?;
+        let info = self
+            .functions
+            .get(&callee.bytes)
+            .copied()
+            .ok_or_else(|| self.unsupported(span))?;
+        let line = self.line(span);
+        let transport = self
+            .builder
+            .alloc_local_named(&format!("#ret:{}", span.start))?;
+        let call_expr = Expr::Call(info.index, vec![], vec![], None, None);
+        let frame_expr = self.caller_frame.map(Expr::Var).unwrap_or(Expr::Null);
+        let finish = self.call(
+            FINISH_RETURN,
+            vec![
+                call_expr,
+                frame_expr.clone(),
+                Expr::Float(0.0),
+                Expr::Null,
+                Expr::Float(if info.callee_width > 0 { 1.0 } else { 0.0 }),
+            ],
+        )?;
+        self.stmts.push(Stmt::Let {
+            index: transport,
+            declared_schema: None,
+            expr: finish,
+            line,
+        });
+        let result = self
+            .builder
+            .alloc_local_named(&format!("#value:{}", span.start))?;
+        let value = if info.return_count > 0 {
+            let get = vm::BuiltinFunction::Get.call_index();
+            Expr::Call(
+                get,
+                vec![],
+                vec![Expr::Var(transport), Expr::Int(0)],
+                None,
+                None,
+            )
+        } else {
+            Expr::Null
+        };
+        self.stmts.push(Stmt::Let {
+            index: result,
+            declared_schema: None,
+            expr: value,
+            line,
+        });
+        let retire = self.call(
+            RETIRE_CALLEE,
+            vec![
+                Expr::Float(if info.callee_width > 0 { 1.0 } else { 0.0 }),
+                frame_expr,
+            ],
+        )?;
+        self.emit_ignored(retire, line)?;
+        Ok(Expr::Var(result))
+    }
+
     fn field_read(
         &mut self,
         base: &ast::Expr,
@@ -3399,8 +3554,7 @@ impl Lower<'_> {
                     if !args.exprs.is_empty() {
                         return Err(self.unsupported(expr.span()));
                     }
-                    self.lower_call_local(expr.span(), &[], expr)?;
-                    return Ok(Expr::Null);
+                    return self.lower_direct_value(expr);
                 }
                 if name.is("rawlen")
                     && let [arg] = args.exprs.as_slice()
@@ -3520,6 +3674,14 @@ impl Lower<'_> {
         }
     }
 
+    fn param_is_table(param: &HostParamSchema) -> bool {
+        matches!(
+            (&param.ty, param.passing),
+            (HostTypeSchema::Resource(key), vm::HostParamPassing::Borrow)
+                if *key == heap::LuaTableResource::key()
+        )
+    }
+
     fn host_call(
         &mut self,
         name: &str,
@@ -3542,7 +3704,13 @@ impl Lower<'_> {
         }
         let mut checked = Vec::new();
         let temp_base = self.active_temps.len();
+        let mut pending_slots = Vec::new();
+        let mut pending_frames = Vec::new();
         for (arg, param) in args.iter().zip(&function.params) {
+            if self.direct_function_call(arg).is_some() && !pending_slots.is_empty() {
+                pending_frames.push(self.open_pending_frame(&pending_slots, span)?);
+                pending_slots.clear();
+            }
             let value = self.expr(arg)?;
             let slot = self
                 .builder
@@ -3554,6 +3722,9 @@ impl Lower<'_> {
                 line: self.line(span),
             });
             self.active_temps.push(slot);
+            if Self::param_is_table(param) {
+                pending_slots.push(slot);
+            }
             let forwarded = match (&param.ty, param.passing) {
                 (HostTypeSchema::Float, vm::HostParamPassing::Value) => NUMBER_ARG,
                 (HostTypeSchema::Bool, vm::HostParamPassing::Value) => BOOL_ARG,
@@ -3572,7 +3743,55 @@ impl Lower<'_> {
             checked.push(self.call(forwarded, vec![Expr::Var(slot)])?);
         }
         self.active_temps.truncate(temp_base);
-        self.call(name, checked)
+        let call_expr = self.call(name, checked)?;
+        if pending_frames.is_empty() {
+            return Ok(call_expr);
+        }
+        let result = self
+            .builder
+            .alloc_local_named(&format!("#host:{}", span.start))?;
+        self.stmts.push(Stmt::Let {
+            index: result,
+            declared_schema: None,
+            expr: call_expr,
+            line: self.line(span),
+        });
+        for frame in pending_frames.into_iter().rev() {
+            let leave = self.call(LEAVE_PENDING, vec![Expr::Var(frame)])?;
+            self.emit_ignored(leave, self.line(span))?;
+        }
+        Ok(Expr::Var(result))
+    }
+
+    fn open_pending_frame(
+        &mut self,
+        slots: &[vm::LocalSlot],
+        span: ast::Span,
+    ) -> Result<vm::LocalSlot, ParseError> {
+        let line = self.line(span);
+        let width = u32::try_from(slots.len()).map_err(|_| self.unsupported(span))?;
+        let entered = self.call(ENTER_PENDING, vec![Expr::Float(width as f64)])?;
+        let frame = self
+            .builder
+            .alloc_local_named(&format!("#pending:{}", span.start))?;
+        self.stmts.push(Stmt::Let {
+            index: frame,
+            declared_schema: None,
+            expr: entered,
+            line,
+        });
+        for (index, slot) in slots.iter().enumerate() {
+            let wrote = self.call(
+                WRITE_PENDING,
+                vec![
+                    Expr::Var(frame),
+                    Expr::Float(index as f64),
+                    Expr::Var(*slot),
+                ],
+            )?;
+            self.emit_ignored(wrote, line)?;
+        }
+        Ok(frame)
     }
 
     /// Evaluate every static argument on the same temporary-root path as an
@@ -3787,6 +4006,11 @@ fn pack_array(values: Vec<Expr>) -> Expr {
         Expr::Call(new_array, vec![], vec![], None, None),
         |array, value| Expr::Call(push, vec![], vec![array, value], None, None),
     )
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct VisitSamples {
+    pub visits: Vec<u64>,
 }
 
 #[derive(Clone, Debug, Default)]
