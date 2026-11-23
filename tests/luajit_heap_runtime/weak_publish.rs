@@ -12,6 +12,7 @@ use vm::Value;
 const TABLES: u32 = 32;
 const TEXT_TABLES: u32 = 16;
 const NUMBER_TABLES: u32 = 8;
+const MIXED_OWNERS: u32 = 4;
 
 fn limits(nodes: u32, roots: u32, edges: u32) -> HeapLimits {
     HeapLimits {
@@ -561,4 +562,437 @@ fn marked_graph_does_not_open_a_publish_window() {
     }
     assert_eq!(session.meter().sweep_edge_checks, 0);
     let _ = session.report();
+}
+
+/// One sweep, owners interleaved as `k`, `v`, `kv`, `kv`.
+///
+/// The two `kv` rows are a dead object key with a rooted value, and a rooted
+/// object key with a dead value. Each owner also keeps a separate strong key
+/// and value. Dead carriers exist so `next` can name those objects; they are
+/// not written into root slots, and a judged-dead handle is never a lookup
+/// key or a `next` cursor. Group counts stay separate. The owners window
+/// reports the heads and edges that walk visited. `pulse(1)` is one unit and
+/// does not describe that window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Group {
+    Keys,
+    Values,
+    KvDeadKey,
+    KvDeadValue,
+}
+
+impl Group {
+    fn mode(self) -> &'static str {
+        match self {
+            Group::Keys => "k",
+            Group::Values => "v",
+            Group::KvDeadKey | Group::KvDeadValue => "kv",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Group::Keys => 0,
+            Group::Values => 1,
+            Group::KvDeadKey => 2,
+            Group::KvDeadValue => 3,
+        }
+    }
+
+    fn metatable_slot(self) -> usize {
+        match self {
+            Group::Keys => 0,
+            Group::Values => 1,
+            Group::KvDeadKey | Group::KvDeadValue => 2,
+        }
+    }
+}
+
+enum WeakEdge {
+    DeadKey {
+        carrier: Value,
+    },
+    NamedDead {
+        value: super::super::TableRef,
+        carrier: Value,
+    },
+    RootedKeyDeadValue {
+        key: super::super::TableRef,
+        key_carrier: Value,
+        value: super::super::TableRef,
+        value_carrier: Value,
+    },
+}
+
+struct MixedOwner {
+    owner: super::super::TableRef,
+    keep_key: super::super::TableRef,
+    keep_key_carrier: Value,
+    keep_value: super::super::TableRef,
+    keep_value_carrier: Value,
+    group: Group,
+    weak: WeakEdge,
+}
+
+struct Mixed {
+    heap: LuaHeap,
+    owners: Vec<MixedOwner>,
+    dead: Vec<super::super::TableRef>,
+    nodes: u32,
+    edges: u32,
+}
+
+fn build_mixed(shared_metatable: bool) -> Mixed {
+    let owners_n = MIXED_OWNERS * 4;
+    let metatables = if shared_metatable { 3 } else { owners_n };
+    let nodes = metatables + owners_n * 4 + MIXED_OWNERS;
+    let roots = metatables + owners_n * 3 + MIXED_OWNERS;
+    let edges = metatables + owners_n * 3;
+    let mut heap = LuaHeap::new(limits(nodes, roots, edges));
+    let mut rooted = Vec::new();
+    let mut shared = [None, None, None];
+    let mut owners = Vec::new();
+    let mut dead = Vec::new();
+    let order = [
+        Group::Keys,
+        Group::Values,
+        Group::KvDeadKey,
+        Group::KvDeadValue,
+    ];
+    for _ in 0..MIXED_OWNERS {
+        for group in order {
+            let metatable = if let Some(existing) = shared[group.metatable_slot()]
+                && shared_metatable
+            {
+                existing
+            } else {
+                let table = heap.alloc().expect("metatable");
+                heap.set_mode_scalar(table, Value::string(group.mode()))
+                    .expect("mode");
+                rooted.push(table);
+                if shared_metatable {
+                    shared[group.metatable_slot()] = Some(table);
+                }
+                table
+            };
+            let owner = heap.alloc().expect("owner");
+            let keep_key = heap.alloc().expect("keep key");
+            let keep_value = heap.alloc().expect("keep value");
+            let dead_table = heap.alloc().expect("dead");
+            let keep_key_carrier = heap.issue_carrier(keep_key).expect("keep key carrier");
+            let keep_value_carrier = heap.issue_carrier(keep_value).expect("keep value carrier");
+            let dead_carrier = heap.issue_carrier(dead_table).expect("dead carrier");
+            assert_ne!(keep_key, dead_table);
+            assert_ne!(keep_value, dead_table);
+            heap.set_metatable(owner, Some(metatable))
+                .expect("metatable");
+            heap.set_object_edge(owner, keep_key, keep_value)
+                .expect("keep");
+            heap.set_named_edge(dead_table, "self", dead_table)
+                .expect("cycle");
+            let weak = match group {
+                Group::Keys | Group::KvDeadKey => {
+                    heap.set_object_edge(owner, dead_table, keep_value)
+                        .expect("dead key");
+                    WeakEdge::DeadKey {
+                        carrier: dead_carrier,
+                    }
+                }
+                Group::Values => {
+                    heap.set_named_edge(owner, "orphan", dead_table)
+                        .expect("orphan");
+                    WeakEdge::NamedDead {
+                        value: dead_table,
+                        carrier: dead_carrier,
+                    }
+                }
+                Group::KvDeadValue => {
+                    let held = heap.alloc().expect("held key");
+                    let held_carrier = heap.issue_carrier(held).expect("held carrier");
+                    assert_ne!(held, dead_table);
+                    assert_ne!(held, keep_key);
+                    heap.set_object_edge(owner, held, dead_table)
+                        .expect("dead value");
+                    rooted.push(held);
+                    WeakEdge::RootedKeyDeadValue {
+                        key: held,
+                        key_carrier: held_carrier,
+                        value: dead_table,
+                        value_carrier: dead_carrier,
+                    }
+                }
+            };
+            rooted.push(owner);
+            rooted.push(keep_key);
+            rooted.push(keep_value);
+            dead.push(dead_table);
+            owners.push(MixedOwner {
+                owner,
+                keep_key,
+                keep_key_carrier,
+                keep_value,
+                keep_value_carrier,
+                group,
+                weak,
+            });
+        }
+    }
+    assert_eq!(owners.len() as u32, owners_n);
+    assert_eq!(dead.len() as u32, owners_n);
+    root_all(&mut heap, &rooted);
+    let stats = heap.stats();
+    assert_eq!(stats.node_slots, nodes, "node accounting");
+    assert_eq!(stats.edge_slots, edges, "edge accounting");
+    assert_eq!(rooted.len() as u32, roots, "root accounting");
+    Mixed {
+        heap,
+        owners,
+        dead,
+        nodes,
+        edges,
+    }
+}
+
+fn finish_snapshot(session: &mut SweepSession<'_>, nodes: u32) {
+    let one = session.pulse(1);
+    assert_eq!(one.spent.total(), 1, "one pulse is one unit");
+    assert_eq!(one.spent.selection, 1);
+    let rest = session.pulse(u64::from(nodes) - 1);
+    assert_eq!(rest.spent.selection, u64::from(nodes) - 1);
+    let snapshot = session.pulse(u64::from(nodes));
+    assert_eq!(snapshot.spent.snapshot, u64::from(nodes));
+    assert_eq!(snapshot.spent.heads, 0);
+    assert_eq!(snapshot.spent.edges, 0);
+    let held = session.pulse(0);
+    assert_eq!(held.spent.total(), 0);
+    assert!(!held.finished);
+}
+
+fn assert_keep(view: &super::WeakView<'_>, owner: &MixedOwner) {
+    assert_eq!(
+        view.object(owner.owner, owner.keep_key).expect("keep"),
+        Some(owner.keep_value),
+        "kept key and value"
+    );
+    assert!(view.alive(owner.keep_key).expect("keep key"));
+    assert!(view.alive(owner.keep_value).expect("keep value"));
+    let started = view.next(owner.owner, &Value::Null).expect("keep next");
+    let (key, value) = started.expect("keep pair");
+    assert_eq!(key, owner.keep_key_carrier);
+    assert_eq!(value, owner.keep_value_carrier);
+}
+
+fn weak_visible(view: &super::WeakView<'_>, owner: &MixedOwner) -> bool {
+    match &owner.weak {
+        WeakEdge::DeadKey { carrier } => {
+            let found = view
+                .next(owner.owner, &owner.keep_key_carrier)
+                .expect("dead key next");
+            match found {
+                Some((key, value)) => {
+                    assert_eq!(key, *carrier);
+                    assert_eq!(value, owner.keep_value_carrier);
+                    true
+                }
+                None => false,
+            }
+        }
+        WeakEdge::NamedDead { value, carrier } => {
+            let named = view.named(owner.owner, "orphan").expect("orphan");
+            let found = view
+                .next(owner.owner, &owner.keep_key_carrier)
+                .expect("orphan next");
+            match (named, found) {
+                (Some(found_value), Some((key, got))) => {
+                    assert_eq!(found_value, *value);
+                    assert_eq!(key, Value::string("orphan"));
+                    assert_eq!(got, *carrier);
+                    true
+                }
+                (None, None) => false,
+                _ => panic!("orphan lookup and next diverged"),
+            }
+        }
+        WeakEdge::RootedKeyDeadValue {
+            key,
+            key_carrier,
+            value,
+            value_carrier,
+        } => {
+            assert!(view.alive(*key).expect("rooted key"));
+            let got = view.object(owner.owner, *key).expect("rooted key lookup");
+            let found = view
+                .next(owner.owner, &owner.keep_key_carrier)
+                .expect("dead value next");
+            match (got, found) {
+                (Some(found_value), Some((next_key, next_value))) => {
+                    assert_eq!(found_value, *value);
+                    assert_eq!(next_key, *key_carrier);
+                    assert_eq!(next_value, *value_carrier);
+                    true
+                }
+                (None, None) => false,
+                _ => panic!("object lookup and next diverged"),
+            }
+        }
+    }
+}
+
+fn group_counts(view: &super::WeakView<'_>, owners: &[MixedOwner]) -> [u32; 4] {
+    let mut counts = [0u32; 4];
+    for owner in owners {
+        assert_keep(view, owner);
+        if weak_visible(view, owner) {
+            counts[owner.group.index()] += 1;
+        }
+    }
+    counts
+}
+
+fn reject_dead(view: &super::WeakView<'_>, dead: &[super::super::TableRef]) {
+    for table in dead {
+        assert!(matches!(view.alive(*table), Err(ObserveError::JudgedDead)));
+        assert!(matches!(
+            view.named(*table, "self"),
+            Err(ObserveError::JudgedDead)
+        ));
+    }
+}
+
+fn publish_mixed(shared_metatable: bool) {
+    let mut graph = build_mixed(shared_metatable);
+    let modes = graph.heap.drain_mark();
+    let mut session = SweepSession::start(&mut graph.heap, modes);
+    let before = session.meter();
+    finish_snapshot(&mut session, graph.nodes);
+    {
+        let original = session.weak_view().expect("original");
+        assert_eq!(original.publish(), WeakPublish::Original);
+        assert!(!original.finished());
+        assert!(!original.release_started());
+        assert_eq!(group_counts(&original, &graph.owners), [MIXED_OWNERS; 4]);
+        reject_dead(&original, &graph.dead);
+    }
+
+    let (window_heads, window_edges) = {
+        let window = session.publish_owners().expect("published");
+        assert_eq!(window.view.publish(), WeakPublish::Published);
+        assert!(!window.view.finished());
+        assert!(!window.view.release_started());
+        assert_eq!(window.spent.heads, u64::from(graph.nodes));
+        assert_eq!(window.spent.edges, u64::from(graph.edges));
+        assert_eq!(window.spent.selection, 0);
+        assert_eq!(window.spent.snapshot, 0);
+        assert_eq!(window.spent.releases, 0);
+        assert_eq!(window.spent.roots, 0);
+        assert_eq!(
+            window.spent.heads + window.spent.edges,
+            window.spent.total()
+        );
+        assert_ne!(window.spent.total(), 1, "owners window is not one pulse");
+        assert_eq!(group_counts(&window.view, &graph.owners), [0; 4]);
+        assert_eq!(window.view.occupying_dead(), graph.dead.len() as u32);
+        assert_eq!(window.view.dead_still_physical(), graph.dead.len() as u32);
+        reject_dead(&window.view, &graph.dead);
+        (window.spent.heads, window.spent.edges)
+    };
+
+    let held = session.pulse(0);
+    assert_eq!(held.spent.total(), 0);
+    assert!(!held.finished);
+    {
+        let published = session.weak_view().expect("still published");
+        assert_eq!(published.publish(), WeakPublish::Published);
+        assert!(!published.release_started());
+        assert_eq!(group_counts(&published, &graph.owners), [0; 4]);
+        assert_eq!(published.dead_still_physical(), graph.dead.len() as u32);
+    }
+    assert_eq!(session.stats().collections, 0);
+
+    let first = graph
+        .dead
+        .iter()
+        .copied()
+        .min_by_key(|table| table.slot())
+        .expect("dead");
+    let release = session.pulse(1);
+    assert_eq!(release.spent.total(), 1);
+    assert_eq!(release.spent.releases, 1);
+    assert!(!release.finished);
+    assert!(
+        session.weak_view().is_none(),
+        "release is not a publish boundary"
+    );
+    assert_eq!(
+        session.slot_physical(first.slot()),
+        Some((false, first.generation().saturating_add(1)))
+    );
+    let mut still_physical = 0u32;
+    for table in &graph.dead {
+        if table.slot() == first.slot() {
+            continue;
+        }
+        assert_eq!(
+            session.slot_physical(table.slot()),
+            Some((true, table.generation()))
+        );
+        still_physical += 1;
+    }
+    assert_eq!(still_physical, graph.dead.len() as u32 - 1);
+    finish_release(&mut session);
+    let after = session.meter();
+    assert_eq!(
+        sweep_delta(&before, &after),
+        (window_heads, window_edges, 0, 0)
+    );
+    assert_eq!(session.stats().collections, 1);
+    let _ = session.report();
+}
+
+#[test]
+fn shared_modes_publish_interleaved_weak_groups_at_one_boundary() {
+    publish_mixed(true);
+}
+
+#[test]
+fn separate_modes_publish_interleaved_weak_groups_at_one_boundary() {
+    publish_mixed(false);
+}
+
+#[test]
+fn mixed_weak_observer_counts_one_deleted_entry() {
+    let mut graph = build_mixed(true);
+    let deleted = graph
+        .owners
+        .iter()
+        .find(|owner| owner.group == Group::Values)
+        .expect("value owner")
+        .owner;
+    graph
+        .heap
+        .set_named_scalar(deleted, "orphan", Value::Null)
+        .expect("delete one entry");
+    let modes = graph.heap.drain_mark();
+    let mut session = SweepSession::start(&mut graph.heap, modes);
+    finish_snapshot(&mut session, graph.nodes);
+    let original = session.weak_view().expect("original");
+    assert_eq!(original.publish(), WeakPublish::Original);
+    assert_eq!(
+        group_counts(&original, &graph.owners),
+        [MIXED_OWNERS, MIXED_OWNERS - 1, MIXED_OWNERS, MIXED_OWNERS]
+    );
+    let mut hidden = 0u32;
+    for owner in &graph.owners {
+        if owner.group != Group::Values {
+            continue;
+        }
+        let visible = weak_visible(&original, owner);
+        if owner.owner == deleted {
+            assert!(!visible);
+            hidden += 1;
+        } else {
+            assert!(visible);
+        }
+    }
+    assert_eq!(hidden, 1);
 }
