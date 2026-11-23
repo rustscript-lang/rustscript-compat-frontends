@@ -1055,7 +1055,8 @@ fn barrier_black_owner_keeps_the_cycle_until_release() {
     assert_eq!(view.mark_passes, 1);
     assert_eq!(heap.scan.mark_passes, 1);
 
-    heap.clear_edge(graph.owner, &super::EdgeKey::Field(KEY_REPLACED));
+    heap.clear_edge(graph.owner, &super::EdgeKey::Field(KEY_REPLACED))
+        .expect("clear");
     heap.collect();
     assert!(
         !heap.alive(graph.cycle.p) && !heap.alive(graph.cycle.q) && !heap.alive(graph.cycle.r),
@@ -1704,7 +1705,8 @@ fn raw_set_edge_on_scanned_owner_keeps_the_strong_cycle() {
     assert_eq!(view.mark_passes, 1);
     assert_eq!(heap.scan.mark_passes, 1);
     assert!(heap.alive(graph.owner) && heap.alive(graph.kept) && heap.alive(graph.child));
-    heap.clear_edge(graph.owner, &super::EdgeKey::Field(KEY_REPLACED));
+    heap.clear_edge(graph.owner, &super::EdgeKey::Field(KEY_REPLACED))
+        .expect("clear");
     heap.collect();
     assert!(
         !heap.alive(graph.cycle.p) && !heap.alive(graph.cycle.q) && !heap.alive(graph.cycle.r),

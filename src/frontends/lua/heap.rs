@@ -171,11 +171,97 @@ pub fn with_heap<T>(
 /// A Pending result is an error. This type has no path that starts an
 /// asynchronous close, and this collector does not add one.
 pub fn collect(host: &mut HostContext) -> Result<table::CollectReport, HeapError> {
+    if host
+        .scope_state::<LuaHeap>()
+        .is_some_and(LuaHeap::has_sweep_tail)
+    {
+        return Err(HeapError::SweepPending);
+    }
     let marked = with_heap(host, |heap| Ok(heap.mark_and_doomed_tokens()))?;
     for token in marked.tokens {
         retire_doomed_token(host, token)?;
     }
     with_heap(host, |heap| Ok(heap.sweep_marked(marked.modes)))
+}
+
+/// Publish stopped before release, or the heap had no dead slot to publish.
+#[derive(Debug)]
+enum PublishedBoundary {
+    /// No dead slot. Sweep finished and recorded the one report.
+    Completed(table::CollectReport),
+    /// Weak edges are published. Dead slots are still physical. No report.
+    Published {
+        window_heads: u64,
+        window_edges: u64,
+    },
+}
+
+/// A saved published sweep that this call did not finish, or the one report
+/// from the tail that did finish.
+#[derive(Debug)]
+enum PublishedResume {
+    /// The tail is still saved. This call did not finish the sweep.
+    Paused,
+    /// The tail finished in this call. The report was recorded once.
+    Completed(table::CollectReport),
+}
+
+/// Marks, closes doomed tokens, publishes weak edges, and saves the release tail.
+///
+/// Does not take an observer. A parked mark is refused and left in place.
+/// Close failure publishes nothing and saves no tail.
+fn collect_until_published(host: &mut HostContext) -> Result<PublishedBoundary, HeapError> {
+    let Some(heap) = host.scope_state::<LuaHeap>() else {
+        return Err(HeapError::SweepDenied);
+    };
+    if heap.has_sweep_tail() {
+        return Err(HeapError::SweepPending);
+    }
+    if heap.has_saved_mark() {
+        return Err(HeapError::MarkActive);
+    }
+    let marked = with_heap(host, |heap| Ok(heap.mark_and_doomed_tokens()))?;
+    for token in marked.tokens {
+        retire_doomed_token(host, token)?;
+    }
+    let halt = with_heap(host, |heap| Ok(heap.halt_at_publish(marked.modes)))?;
+    Ok(match halt {
+        table::PublishHalt::Completed(report) => PublishedBoundary::Completed(report),
+        table::PublishHalt::Published { heads, edges } => PublishedBoundary::Published {
+            window_heads: heads,
+            window_edges: edges,
+        },
+    })
+}
+
+/// Continues a published sweep this scope already saved. Does not install a
+/// heap and does not start a sweep. No saved tail is [`HeapError::SweepDenied`].
+///
+/// Zero budget with a saved tail returns [`PublishedResume::Paused`] without
+/// reading the graph. A positive budget spends that many release or root units
+/// on the same machine as a full sweep. The one report is returned only when
+/// the tail finishes, and that tail is then gone.
+fn resume_published_sweep(
+    host: &mut HostContext,
+    budget: u64,
+) -> Result<PublishedResume, HeapError> {
+    if host.scope_state::<LuaHeap>().is_none() {
+        return Err(HeapError::SweepDenied);
+    }
+    if budget == 0 {
+        let saved = host
+            .scope_state::<LuaHeap>()
+            .is_some_and(LuaHeap::has_sweep_tail);
+        if !saved {
+            return Err(HeapError::SweepDenied);
+        }
+        return Ok(PublishedResume::Paused);
+    }
+    match with_heap(host, |heap| Ok(heap.resume_sweep_tail(budget)))? {
+        table::TailResume::Denied => Err(HeapError::SweepDenied),
+        table::TailResume::Paused => Ok(PublishedResume::Paused),
+        table::TailResume::Completed(report) => Ok(PublishedResume::Completed(report)),
+    }
 }
 
 /// One host call: a fresh mark, the existing synchronous token close, then
@@ -186,6 +272,12 @@ pub fn collect_observing<R>(
     host: &mut HostContext,
     observe: impl for<'a> FnOnce(&'a PublishedRead<'a>) -> R,
 ) -> Result<(table::CollectReport, Option<R>), HeapError> {
+    if host
+        .scope_state::<LuaHeap>()
+        .is_some_and(LuaHeap::has_sweep_tail)
+    {
+        return Err(HeapError::SweepPending);
+    }
     let marked = with_heap(host, |heap| heap.begin_private_cycle())?;
     close_then_sweep_observing(host, marked, observe)
 }
@@ -229,6 +321,12 @@ fn resume_private_cycle<R>(
 ) -> Result<SavedMarkResume<R>, HeapError> {
     if host.scope_state::<LuaHeap>().is_none() {
         return Err(HeapError::MarkDenied);
+    }
+    if host
+        .scope_state::<LuaHeap>()
+        .is_some_and(LuaHeap::has_sweep_tail)
+    {
+        return Err(HeapError::SweepPending);
     }
     if budget == 0 {
         let saved = host

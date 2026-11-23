@@ -104,6 +104,10 @@ pub enum HeapError {
     MarkDenied,
     /// A mark is already active, so a second start or private collect cannot run.
     MarkActive,
+    /// A published sweep tail is still stored, so this mutation or collect cannot run.
+    SweepPending,
+    /// No heap is installed, or no published sweep tail can accept this resume.
+    SweepDenied,
 }
 
 impl HeapError {
@@ -132,6 +136,8 @@ impl fmt::Display for HeapError {
             Self::Scope(message) => write!(formatter, "lua heap scope error: {message}"),
             Self::MarkDenied => write!(formatter, "lua mark denied this edit"),
             Self::MarkActive => write!(formatter, "lua mark is already active"),
+            Self::SweepPending => write!(formatter, "lua sweep is still pending"),
+            Self::SweepDenied => write!(formatter, "lua sweep denied this resume"),
         }
     }
 }
@@ -653,6 +659,9 @@ pub struct LuaHeap {
     /// Mark progress saved between pulses. Absent unless a session or the
     /// parked driver is active. Done is not stored for the parked caller.
     mark: Option<mark::MarkState>,
+    /// Release/root continuation after a published sweep. Absent unless publish
+    /// stopped with a dead slot. Done is not stored.
+    sweep_tail: Option<sweep::SweepTail>,
     /// String and byte lengths stored in edge records. Not Vec capacity, not
     /// Core locals, and not a second scan of `edges`.
     payload_bytes: u64,
@@ -675,6 +684,20 @@ fn sequence_index(key: &EdgeKey, cap: u32) -> Option<u32> {
         return None;
     }
     Some(number as u32)
+}
+
+/// Where a publish-only sweep stopped. A completion means no dead slot was
+/// published. `Published` has rewritten weak edges and has not released.
+pub(super) enum PublishHalt {
+    Completed(CollectReport),
+    Published { heads: u64, edges: u64 },
+}
+
+/// Host-facing result of spending budget on a saved sweep tail.
+pub(super) enum TailResume {
+    Denied,
+    Paused,
+    Completed(CollectReport),
 }
 
 impl LuaHeap {
@@ -704,6 +727,7 @@ impl LuaHeap {
             peak_edges: 0,
             scan: ScanMeter::default(),
             mark: None,
+            sweep_tail: None,
             payload_bytes: 0,
         }
     }
@@ -737,7 +761,9 @@ impl LuaHeap {
     }
 
     fn alloc_slot(&mut self, kind: HandleKind) -> Result<(u32, u32), HeapError> {
-        if let Some(index) = self.free_list.pop() {
+        if !self.free_list.is_empty() {
+            self.ensure_sweep_open()?;
+            let index = self.free_list.pop().expect("free list was not empty");
             let slot = &mut self.slots[index as usize];
             if !matches!(slot.state, SlotState::Free) {
                 return Err(HeapError::StaleHandle);
@@ -758,6 +784,7 @@ impl LuaHeap {
         if self.limits.max_generation == 0 {
             return Err(HeapError::GenerationExhausted);
         }
+        self.ensure_sweep_open()?;
         let index = u32::try_from(self.slots.len()).map_err(|_| HeapError::NodeCapacity)?;
         self.slots.push(Slot {
             generation: 1,
@@ -779,6 +806,7 @@ impl LuaHeap {
     /// cannot be reissued as 1.
     pub fn rollback(&mut self, handle: TableRef) -> Result<(), HeapError> {
         self.require_live(handle)?;
+        self.ensure_sweep_open()?;
         self.clear_roots_to(handle);
         self.remove_edges_touching(handle.slot());
         self.release_slot(handle.slot());
@@ -795,6 +823,7 @@ impl LuaHeap {
         if self.slots[index].carrier.is_some() {
             return Err(HeapError::StaleHandle);
         }
+        self.ensure_sweep_open()?;
         let value = Value::array(vec![
             Value::Int(i64::from(table.slot())),
             Value::Int(i64::from(table.generation())),
@@ -957,8 +986,7 @@ impl LuaHeap {
     pub fn clear_upvalue(&mut self, cell: UpvalueRef) -> Result<(), HeapError> {
         self.require_upvalue(cell)?;
         let key = EdgeKey::Field(CURRENT_EDGE);
-        self.unlink_key(cell.slot(), &key);
-        Ok(())
+        self.unlink_key(cell.slot(), &key)
     }
 
     /// Reads the current edge through a closure.
@@ -1109,7 +1137,7 @@ impl LuaHeap {
         self.require_live(from)?;
         let key = EdgeKey::Field(key);
         if matches!(value, Value::Null) {
-            self.clear_edge(from, &key);
+            self.clear_edge(from, &key)?;
             Ok(())
         } else {
             self.write_edge(from, key, EdgeValue::Scalar(value))
@@ -1148,7 +1176,7 @@ impl LuaHeap {
         );
         self.require_live(from)?;
         if matches!(value, Value::Null) {
-            self.clear_edge(from, &key);
+            self.clear_edge(from, &key)?;
             Ok(())
         } else {
             self.write_edge(from, key, EdgeValue::Scalar(value))
@@ -1206,8 +1234,7 @@ impl LuaHeap {
         self.require_live(from)?;
         self.require_live(key)?;
         let key = EdgeKey::object(key);
-        self.clear_edge(from, &key);
-        Ok(())
+        self.clear_edge(from, &key)
     }
 
     /// Writes one table under a closure identity key.
@@ -1247,8 +1274,7 @@ impl LuaHeap {
         self.require_live(from)?;
         self.require_closure(key)?;
         let key = EdgeKey::closure_key(key);
-        self.clear_edge(from, &key);
-        Ok(())
+        self.clear_edge(from, &key)
     }
 
     /// Reads a closure-key edge. The key domain, kind, and generation must
@@ -1304,8 +1330,7 @@ impl LuaHeap {
     pub fn clear_number_edge(&mut self, from: TableRef, key: f64) -> Result<(), HeapError> {
         let key = Self::number_key(key)?;
         self.require_live(from)?;
-        self.clear_edge(from, &key);
-        Ok(())
+        self.clear_edge(from, &key)
     }
 
     /// Reads a binary64 key. NaN reads nil after the table is confirmed live.
@@ -1380,8 +1405,8 @@ impl LuaHeap {
         Ok(EdgeKey::number(key))
     }
 
-    fn clear_edge(&mut self, from: TableRef, key: &EdgeKey) {
-        self.unlink_key(from.slot(), key);
+    fn clear_edge(&mut self, from: TableRef, key: &EdgeKey) -> Result<(), HeapError> {
+        self.unlink_key(from.slot(), key)
     }
 
     fn write_table_edge(
@@ -1417,6 +1442,7 @@ impl LuaHeap {
         key: EdgeKey,
         value: EdgeValue,
     ) -> Result<(), HeapError> {
+        self.ensure_sweep_open()?;
         if let Some(index) = self.find_key(from_slot, &key) {
             self.replace_edge_value(from_slot, index, value);
             return Ok(());
@@ -1688,6 +1714,7 @@ impl LuaHeap {
         if let Some(target) = mt {
             self.require_live(target)?;
         }
+        self.ensure_sweep_open()?;
         let had = self.slots[owner.slot() as usize].metatable.is_some();
         let next = mt.map(|target| (target.slot(), target.generation()));
         if had != next.is_some() {
@@ -1729,6 +1756,7 @@ impl LuaHeap {
         if end > self.limits.roots {
             return Err(HeapError::RootCapacity);
         }
+        self.ensure_sweep_open()?;
         self.roots.resize(end as usize, None);
         let generation = self.next_frame_generation;
         self.next_frame_generation = self.next_frame_generation.saturating_add(1);
@@ -1802,6 +1830,7 @@ impl LuaHeap {
         if slot >= found.width {
             return Err(HeapError::StaleFrame);
         }
+        self.ensure_sweep_open()?;
         let index = found.start as usize + slot as usize;
         self.roots[index] = Some(rooted);
         self.note_parked_root_store(rooted);
@@ -1817,6 +1846,7 @@ impl LuaHeap {
         if slot >= found.width {
             return Err(HeapError::StaleFrame);
         }
+        self.ensure_sweep_open()?;
         let index = found.start as usize + slot as usize;
         self.roots[index] = None;
         Ok(())
@@ -1828,6 +1858,7 @@ impl LuaHeap {
         if top.index != frame.index || top.generation != frame.generation {
             return Err(HeapError::StaleFrame);
         }
+        self.ensure_sweep_open()?;
         let start = top.start as usize;
         self.roots.truncate(start);
         self.frames.pop();
@@ -1838,11 +1869,11 @@ impl LuaHeap {
     /// as a root.
     pub fn bind_token(&mut self, table: TableRef, raw: u64) -> Result<(), HeapError> {
         self.require_live(table)?;
-        let slot = &mut self.slots[table.slot() as usize];
-        if slot.token.is_some() {
+        if self.slots[table.slot() as usize].token.is_some() {
             return Err(HeapError::StaleHandle);
         }
-        slot.token = Some(raw);
+        self.ensure_sweep_open()?;
+        self.slots[table.slot() as usize].token = Some(raw);
         Ok(())
     }
 
@@ -1858,6 +1889,7 @@ impl LuaHeap {
     /// [`Self::clear_exact_token`] instead.
     pub fn unbind_token(&mut self, table: TableRef) -> Result<(), HeapError> {
         self.require_live(table)?;
+        self.ensure_sweep_open()?;
         self.slots[table.slot() as usize].token = None;
         Ok(())
     }
@@ -1886,6 +1918,49 @@ impl LuaHeap {
     /// True when a mark is already stored. Does not read slots, edges, or a batch.
     pub(super) fn has_saved_mark(&self) -> bool {
         self.mark.is_some()
+    }
+
+    /// True when a published sweep tail is stored. Does not read slots or edges.
+    pub(super) fn has_sweep_tail(&self) -> bool {
+        self.sweep_tail.is_some()
+    }
+
+    /// A saved tail owns the graph. Checked after handle and capacity validation,
+    /// and before the first write or chain walk of a commit.
+    fn ensure_sweep_open(&self) -> Result<(), HeapError> {
+        if self.sweep_tail.is_some() {
+            Err(HeapError::SweepPending)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Spends `budget` on the saved tail. Zero restores it without a scan.
+    pub(super) fn resume_sweep_tail(&mut self, budget: u64) -> TailResume {
+        let Some(tail) = self.sweep_tail.take() else {
+            return TailResume::Denied;
+        };
+        match tail.drive(self, budget) {
+            sweep::TailStep::Paused(tail) => {
+                self.sweep_tail = Some(tail);
+                TailResume::Paused
+            }
+            sweep::TailStep::Completed(report) => TailResume::Completed(report),
+        }
+    }
+
+    /// Finishes a saved tail before a fresh pure-heap cycle. No tail is a no-op.
+    fn drain_sweep_tail(&mut self) {
+        let Some(tail) = self.sweep_tail.take() else {
+            return;
+        };
+        match tail.drive(self, u64::MAX) {
+            sweep::TailStep::Completed(_) => {}
+            sweep::TailStep::Paused(tail) => {
+                self.sweep_tail = Some(tail);
+                debug_assert!(false, "a full budget must finish a saved sweep tail");
+            }
+        }
     }
 
     /// Marks once, then drains the pending-close enumerator. Each slot check
@@ -1919,10 +1994,12 @@ impl LuaHeap {
     /// Freed slots are reused with a bumped generation. A slot whose next
     /// generation would pass `max_generation` is retired instead.
     ///
+    /// A saved published tail is drained first, then this starts a fresh cycle.
     /// This is the pure-heap collector. A host heap must use `heap::collect`,
     /// which closes tokens before [`Self::sweep_marked`]. Calling this on a
     /// host heap would skip that close.
     pub fn collect(&mut self) -> CollectReport {
+        self.drain_sweep_tail();
         let modes = self.mark_reachable();
         self.sweep_marked(modes)
     }
@@ -1945,6 +2022,9 @@ impl LuaHeap {
         if self.mark.is_some() {
             return Err(HeapError::MarkActive);
         }
+        if self.sweep_tail.is_some() {
+            return Err(HeapError::SweepPending);
+        }
         Ok(self.mark_and_doomed_tokens())
     }
 
@@ -1959,6 +2039,23 @@ impl LuaHeap {
         let seen = session.observe_before_release(observe);
         session.drain();
         (session.report(), seen)
+    }
+
+    /// Publishes weak edges and stores the release tail. No dead slot finishes
+    /// the sweep and records the one report.
+    pub(super) fn halt_at_publish(&mut self, modes: MarkSnapshot) -> PublishHalt {
+        debug_assert!(self.sweep_tail.is_none(), "publish must not stack a tail");
+        let mut session = SweepSession::start(self, modes);
+        if !session.reach_before_owners() {
+            session.drain();
+            return PublishHalt::Completed(session.report());
+        }
+        let (heads, edges) = session
+            .publish_counts()
+            .expect("the owner boundary publishes once");
+        let tail = session.into_release_tail();
+        self.sweep_tail = Some(tail);
+        PublishHalt::Published { heads, edges }
     }
 
     /// Reports whether `handle` names a live table in this heap.
@@ -2243,7 +2340,8 @@ impl LuaHeap {
         self.slots[owner as usize].edge_tail = Some(index);
     }
 
-    fn unlink_key(&mut self, owner: u32, key: &EdgeKey) {
+    fn unlink_key(&mut self, owner: u32, key: &EdgeKey) -> Result<(), HeapError> {
+        self.ensure_sweep_open()?;
         let mut prev = None;
         let mut cursor = self
             .slots
@@ -2257,11 +2355,12 @@ impl LuaHeap {
                 .is_some_and(|edge| edge.key == *key);
             if matched {
                 self.unlink_at(owner, prev, index);
-                return;
+                return Ok(());
             }
             prev = Some(index);
             cursor = next;
         }
+        Ok(())
     }
 
     fn unlink_at(&mut self, owner: u32, prev: Option<u32>, index: u32) {
@@ -2401,6 +2500,9 @@ mod parked_mark;
 #[cfg(test)]
 #[path = "../../../../tests/luajit_heap_runtime/private_cycle.rs"]
 mod private_cycle;
+#[cfg(test)]
+#[path = "../../../../tests/luajit_heap_runtime/published_sweep.rs"]
+mod published_sweep;
 #[cfg(test)]
 #[path = "../../../../tests/luajit_heap_runtime/resume_cycle.rs"]
 mod resume_cycle;

@@ -60,6 +60,134 @@ enum SweepPhase {
     Done,
 }
 
+/// Release or root scan saved after publish. No snapshot, modes, or owner cursor.
+#[derive(Debug)]
+pub(super) enum TailPhase {
+    Release,
+    Roots,
+    Done,
+}
+
+/// Owned continuation of one published sweep. Only the fields Release and Roots need.
+#[derive(Debug)]
+pub(super) struct SweepTail {
+    phase: TailPhase,
+    index: usize,
+    dead: Vec<u32>,
+    marked_nodes: u32,
+    live_roots: u32,
+}
+
+pub(super) enum TailStep {
+    Paused(SweepTail),
+    Completed(CollectReport),
+}
+
+impl SweepTail {
+    /// Spends `budget` on the shared release/root machine. Zero does not read the heap.
+    pub(super) fn drive(self, heap: &mut LuaHeap, budget: u64) -> TailStep {
+        let mut phase = self.phase;
+        let mut index = self.index;
+        let dead = self.dead;
+        let marked_nodes = self.marked_nodes;
+        let mut live_roots = self.live_roots;
+        let mut report = None;
+        let mut releases = 0u64;
+        let mut roots = 0u64;
+        let mut left = budget;
+        let mut spins = 0u32;
+        while left > 0 && !matches!(phase, TailPhase::Done) {
+            let mut cursor = TailCursor {
+                phase: &mut phase,
+                index: &mut index,
+                dead: &dead,
+                marked_nodes,
+                live_roots: &mut live_roots,
+                report: &mut report,
+                releases: &mut releases,
+                roots: &mut roots,
+            };
+            if step_tail(heap, &mut cursor) {
+                left -= 1;
+                spins = 0;
+            } else {
+                spins += 1;
+                debug_assert!(spins <= 4, "uncharged tail transition did not settle");
+            }
+        }
+        if matches!(phase, TailPhase::Done) {
+            return TailStep::Completed(report.take().expect("a finished tail records one report"));
+        }
+        TailStep::Paused(SweepTail {
+            phase,
+            index,
+            dead,
+            marked_nodes,
+            live_roots,
+        })
+    }
+}
+
+/// One release, root, or uncharged transition. Callers share this with [`SweepSession`].
+struct TailCursor<'a> {
+    phase: &'a mut TailPhase,
+    index: &'a mut usize,
+    dead: &'a [u32],
+    marked_nodes: u32,
+    live_roots: &'a mut u32,
+    report: &'a mut Option<CollectReport>,
+    releases: &'a mut u64,
+    roots: &'a mut u64,
+}
+
+fn step_tail(heap: &mut LuaHeap, cursor: &mut TailCursor<'_>) -> bool {
+    match *cursor.phase {
+        TailPhase::Release => {
+            if *cursor.index >= cursor.dead.len() {
+                *cursor.index = 0;
+                *cursor.phase = TailPhase::Roots;
+                return false;
+            }
+            let slot = cursor.dead[*cursor.index];
+            *cursor.index += 1;
+            heap.scan.node_slot_visits += 1;
+            heap.release_slot(slot);
+            *cursor.releases += 1;
+            true
+        }
+        TailPhase::Roots => {
+            if *cursor.index >= heap.roots.len() {
+                if cursor.report.is_none() {
+                    heap.collections = heap.collections.saturating_add(1);
+                    heap.last_marked = cursor.marked_nodes;
+                    *cursor.report = Some(CollectReport {
+                        live_nodes: cursor.marked_nodes,
+                        marked_nodes: cursor.marked_nodes,
+                        live_roots: *cursor.live_roots,
+                    });
+                }
+                *cursor.phase = TailPhase::Done;
+                return false;
+            }
+            let root_index = *cursor.index;
+            *cursor.index += 1;
+            heap.scan.root_slot_visits += 1;
+            *cursor.roots += 1;
+            let Some(rooted) = heap.roots[root_index] else {
+                return true;
+            };
+            heap.scan.node_slot_visits += 1;
+            if heap.rooted_alive(rooted) {
+                *cursor.live_roots += 1;
+            } else {
+                heap.roots[root_index] = None;
+            }
+            true
+        }
+        TailPhase::Done => false,
+    }
+}
+
 enum SweepAction {
     Keep,
     Gap,
@@ -93,6 +221,10 @@ impl SweepUnits {
 
 impl<'a> SweepSession<'a> {
     pub(super) fn start(heap: &'a mut LuaHeap, modes: MarkSnapshot) -> Self {
+        debug_assert!(
+            heap.sweep_tail.is_none(),
+            "a saved sweep tail and a new sweep cannot coexist"
+        );
         Self {
             heap,
             modes,
@@ -205,10 +337,36 @@ impl<'a> SweepSession<'a> {
             SweepPhase::Select => self.step_select(),
             SweepPhase::Snapshot => self.step_snapshot(),
             SweepPhase::Owners => self.step_owners(),
-            SweepPhase::Release => self.step_release(),
-            SweepPhase::Roots => self.step_root(),
-            SweepPhase::Done => false,
+            SweepPhase::Release | SweepPhase::Roots | SweepPhase::Done => self.step_saved_tail(),
         }
+    }
+
+    fn step_saved_tail(&mut self) -> bool {
+        let mut phase = match self.phase {
+            SweepPhase::Release => TailPhase::Release,
+            SweepPhase::Roots => TailPhase::Roots,
+            SweepPhase::Done => TailPhase::Done,
+            SweepPhase::Select | SweepPhase::Snapshot | SweepPhase::Owners => {
+                unreachable!("saved tail phases only")
+            }
+        };
+        let mut cursor = TailCursor {
+            phase: &mut phase,
+            index: &mut self.index,
+            dead: &self.dead,
+            marked_nodes: self.marked_nodes,
+            live_roots: &mut self.live_roots,
+            report: &mut self.report,
+            releases: &mut self.pulse_spent.releases,
+            roots: &mut self.pulse_spent.roots,
+        };
+        let charged = step_tail(self.heap, &mut cursor);
+        self.phase = match phase {
+            TailPhase::Release => SweepPhase::Release,
+            TailPhase::Roots => SweepPhase::Roots,
+            TailPhase::Done => SweepPhase::Done,
+        };
+        charged
     }
 
     fn step_select(&mut self) -> bool {
@@ -372,56 +530,6 @@ impl<'a> SweepSession<'a> {
         }
     }
 
-    fn step_release(&mut self) -> bool {
-        if self.index >= self.dead.len() {
-            self.index = 0;
-            self.phase = SweepPhase::Roots;
-            return false;
-        }
-        let slot = self.dead[self.index];
-        self.index += 1;
-        self.heap.scan.node_slot_visits += 1;
-        self.heap.release_slot(slot);
-        self.pulse_spent.releases += 1;
-        true
-    }
-
-    fn step_root(&mut self) -> bool {
-        if self.index >= self.heap.roots.len() {
-            self.finish();
-            return false;
-        }
-        let index = self.index;
-        self.index += 1;
-        self.heap.scan.root_slot_visits += 1;
-        self.pulse_spent.roots += 1;
-        let Some(rooted) = self.heap.roots[index] else {
-            return true;
-        };
-        self.heap.scan.node_slot_visits += 1;
-        if self.heap.rooted_alive(rooted) {
-            self.live_roots += 1;
-        } else {
-            self.heap.roots[index] = None;
-        }
-        true
-    }
-
-    fn finish(&mut self) {
-        if self.report.is_some() {
-            self.phase = SweepPhase::Done;
-            return;
-        }
-        self.heap.collections = self.heap.collections.saturating_add(1);
-        self.heap.last_marked = self.marked_nodes;
-        self.report = Some(CollectReport {
-            live_nodes: self.marked_nodes,
-            marked_nodes: self.marked_nodes,
-            live_roots: self.live_roots,
-        });
-        self.phase = SweepPhase::Done;
-    }
-
     fn is_marked(&self, slot: u32) -> bool {
         self.snapshot
             .get(slot as usize)
@@ -488,6 +596,27 @@ impl<'a> SweepSession<'a> {
             spent,
             view: self.boundary(WeakPublish::Published),
         })
+    }
+
+    /// Same owner walk as [`Self::publish_owners`], returning only the charged
+    /// head and edge counts. The window borrow ends before this returns.
+    pub(super) fn publish_counts(&mut self) -> Option<(u64, u64)> {
+        let window = self.publish_owners()?;
+        Some((window.spent.heads, window.spent.edges))
+    }
+
+    /// Drops the snapshot, modes, and owner cursor. The caller stores this tail.
+    pub(super) fn into_release_tail(self) -> SweepTail {
+        debug_assert!(matches!(self.phase, SweepPhase::Release));
+        debug_assert_eq!(self.index, 0);
+        debug_assert!(self.report.is_none());
+        SweepTail {
+            phase: TailPhase::Release,
+            index: 0,
+            dead: self.dead,
+            marked_nodes: self.marked_nodes,
+            live_roots: self.live_roots,
+        }
     }
 
     fn at_owner_start(&self) -> bool {

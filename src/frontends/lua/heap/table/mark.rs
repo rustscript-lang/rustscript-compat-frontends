@@ -158,6 +158,10 @@ impl MarkState {
 impl<'a> MarkSession<'a> {
     pub(super) fn start(heap: &'a mut LuaHeap) -> Self {
         debug_assert!(heap.mark.is_none(), "a mark is already parked");
+        debug_assert!(
+            !heap.has_sweep_tail(),
+            "a published sweep tail and a mark session cannot coexist"
+        );
         heap.mark = Some(MarkState::new());
         Self { heap }
     }
@@ -213,6 +217,9 @@ impl<'a> ParkedMark<'a> {
     pub(super) fn start(heap: &'a mut LuaHeap) -> Result<Self, HeapError> {
         if heap.mark.is_some() {
             return Err(HeapError::MarkActive);
+        }
+        if heap.has_sweep_tail() {
+            return Err(HeapError::SweepPending);
         }
         heap.mark = Some(MarkState::new());
         Ok(Self {
@@ -378,7 +385,7 @@ impl<'a> ParkedMark<'a> {
     pub(super) fn delete_field(&mut self, from: TableRef, key: u32) -> Result<(), HeapError> {
         self.gate_field(from, key)?;
         let key = EdgeKey::Field(key);
-        self.heap.clear_edge(from, &key);
+        self.heap.clear_edge(from, &key)?;
         Ok(())
     }
 
