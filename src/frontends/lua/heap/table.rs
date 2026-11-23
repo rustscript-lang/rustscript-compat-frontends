@@ -14,6 +14,10 @@ use vm::{HostContextError, Value};
 
 use super::handle::{ClosureRef, HandleKind, TableRef, UpvalueRef};
 
+#[path = "table/mark.rs"]
+mod mark;
+use mark::MarkSession;
+
 static NEXT_DOMAIN: AtomicU64 = AtomicU64::new(1);
 
 /// Closure-to-cell field. It is keyed only on a closure node. Field id 0 on a
@@ -569,22 +573,6 @@ pub(super) struct DoomedMark {
 struct WeakMode {
     keys: bool,
     values: bool,
-}
-
-impl WeakMode {
-    fn parse(mode: &str, bytes: &mut u64) -> Self {
-        let mut weak = Self::default();
-        for byte in mode.bytes() {
-            *bytes += 1;
-            match byte {
-                b'k' => weak.keys = true,
-                b'v' => weak.values = true,
-                0 => break, // LuaJIT scans the NUL-terminated mode string.
-                _ => {}
-            }
-        }
-        weak
-    }
 }
 
 /// Category of one guest value on this heap.
@@ -1989,136 +1977,7 @@ impl LuaHeap {
     }
 
     fn mark_reachable(&mut self) -> MarkSnapshot {
-        self.scan.mark_passes += 1;
-        self.scan.node_slot_visits += self.slots.len() as u64;
-        self.scan.weak_mode_slot_checks += self.slots.len() as u64;
-        let parse_modes = self.metatable_edges > 0;
-        let mut modes = None;
-        for index in 0..self.slots.len() {
-            if let SlotState::Live { marked } = &mut self.slots[index].state {
-                *marked = false;
-            }
-            let mode_edge = self.slots[index].mode_edge;
-            let is_table = self.slots[index].kind == HandleKind::Table;
-            if parse_modes
-                && is_table
-                && let Some(edge_index) = mode_edge
-            {
-                self.record_mode(index, edge_index, &mut modes);
-            }
-        }
-        let mut work = Vec::new();
-        self.scan.root_slot_visits += self.roots.len() as u64;
-        let rooted: Vec<Rooted> = self.roots.iter().copied().flatten().collect();
-        for rooted in rooted {
-            self.scan.node_slot_visits += 1;
-            if self.rooted_alive(rooted) {
-                self.scan.node_slot_visits += 1;
-                self.mark_slot(rooted.slot(), &mut work);
-            }
-        }
-        let follow_metatables = self.metatable_edges > 0;
-        while let Some(slot) = work.pop() {
-            let from_table = self.slots[slot as usize].kind == HandleKind::Table;
-            let mode = if from_table && follow_metatables {
-                self.follow_metatable(slot, modes.as_ref(), &mut work)
-            } else {
-                WeakMode::default()
-            };
-            self.scan.owner_head_checks += 1;
-            let mut cursor = self.slots[slot as usize].edge_head;
-            while let Some(index) = cursor {
-                let next = self.edge_slots[index as usize].next;
-                let gap = self.edge_slots[index as usize]
-                    .edge
-                    .as_ref()
-                    .is_some_and(|edge| edge.value.is_cursor_gap());
-                if gap {
-                    self.scan.outgoing_gap_checks += 1;
-                    cursor = next;
-                    continue;
-                }
-                self.scan.outgoing_edge_checks += 1;
-                let (object_key, value_target) = {
-                    let edge = self.edge_slots[index as usize]
-                        .edge
-                        .as_ref()
-                        .expect("owner chain holds an occupied record");
-                    let object_key = match &edge.key {
-                        EdgeKey::Object {
-                            slot,
-                            generation,
-                            kind,
-                        } => Some((*slot, *generation, *kind)),
-                        EdgeKey::Field(_) | EdgeKey::Utf8(_) | EdgeKey::Number(_) => None,
-                    };
-                    let value_target = match &edge.value {
-                        EdgeValue::Table { slot, generation } => {
-                            Some((*slot, *generation, HandleKind::Table))
-                        }
-                        EdgeValue::Closure { slot, generation } => {
-                            Some((*slot, *generation, HandleKind::Closure))
-                        }
-                        EdgeValue::Upvalue { slot, generation } => {
-                            Some((*slot, *generation, HandleKind::Upvalue))
-                        }
-                        EdgeValue::Scalar(_) => None,
-                    };
-                    (object_key, value_target)
-                };
-                cursor = next;
-                if from_table
-                    && !mode.keys
-                    && let Some((slot, generation, kind)) = object_key
-                {
-                    self.follow_target(slot, generation, kind, &mut work);
-                }
-                // A table entry follows that table's weak mode. A closure or
-                // cell link is not a table entry, so it stays strong.
-                let strong_value = !from_table || !mode.values;
-                if strong_value && let Some((slot, generation, kind)) = value_target {
-                    self.follow_target(slot, generation, kind, &mut work);
-                }
-            }
-        }
-        MarkSnapshot { modes }
-    }
-
-    /// Follows one stored metatable ref. Absent refs are not edges and are
-    /// not counted. The caller skips this entirely when no ref is stored.
-    fn follow_metatable(
-        &mut self,
-        slot: u32,
-        modes: Option<&Vec<WeakMode>>,
-        work: &mut Vec<u32>,
-    ) -> WeakMode {
-        let Some((to_slot, to_generation)) = self.slots[slot as usize].metatable else {
-            return WeakMode::default();
-        };
-        self.scan.metatable_edge_checks += 1;
-        if self.follow_target(to_slot, to_generation, HandleKind::Table, work)
-            && let Some(modes) = modes
-        {
-            self.scan.weak_mode_lookups += 1;
-            return modes[to_slot as usize];
-        }
-        WeakMode::default()
-    }
-
-    fn follow_target(
-        &mut self,
-        to_slot: u32,
-        to_generation: u32,
-        kind: HandleKind,
-        work: &mut Vec<u32>,
-    ) -> bool {
-        self.scan.node_slot_visits += 1;
-        if !self.slot_matches(to_slot, to_generation, kind) {
-            return false;
-        }
-        self.scan.node_slot_visits += 1;
-        self.mark_slot(to_slot, work);
-        true
+        self.drain_mark()
     }
 
     /// One owner-chain walk of occupied records. Skipped when every live node is
@@ -2260,16 +2119,6 @@ impl LuaHeap {
         }
         self.scan.sweep_edge_checks += visited;
         debug_assert_eq!(visited, u64::from(occupied_before));
-    }
-
-    fn mark_slot(&mut self, index: u32, work: &mut Vec<u32>) {
-        if let SlotState::Live { marked } = &mut self.slots[index as usize].state
-            && !*marked
-        {
-            *marked = true;
-            work.push(index);
-            self.scan.scratch.work_pushed += 1;
-        }
     }
 
     fn release_slot(&mut self, index: u32) {
@@ -2528,27 +2377,12 @@ impl LuaHeap {
             self.slots[owner as usize].mode_edge = Some(index);
         }
     }
-
-    fn record_mode(&mut self, owner: usize, edge_index: u32, modes: &mut Option<Vec<WeakMode>>) {
-        self.scan.weak_mode_edge_checks += 1;
-        let Some(edge) = self.edge_slots[edge_index as usize].edge.as_ref() else {
-            return;
-        };
-        let EdgeValue::Scalar(Value::String(mode)) = &edge.value else {
-            return;
-        };
-        let parsed = WeakMode::parse(mode, &mut self.scan.weak_mode_bytes);
-        if parsed.keys || parsed.values {
-            let slot_count = self.slots.len();
-            let cache = modes.get_or_insert_with(|| {
-                self.scan.scratch.weak_modes_inited += slot_count as u64;
-                vec![WeakMode::default(); slot_count]
-            });
-            cache[owner] = parsed;
-        }
-    }
 }
 
 fn edge_key_is_slot(key: &EdgeKey, slot: u32) -> bool {
     matches!(key, EdgeKey::Object { slot: key_slot, .. } if *key_slot == slot)
 }
+
+#[cfg(test)]
+#[path = "../../../../tests/luajit_heap_runtime/budgeted_mark.rs"]
+mod budgeted_mark;
