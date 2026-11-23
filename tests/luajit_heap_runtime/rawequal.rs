@@ -7,6 +7,9 @@
 //! refusal, not an implicit nil: this candidate has no argument frame that
 //! can raise LuaJIT's runtime "value expected".
 //!
+//! Nil and a raw byte string are legal arguments. Neither has a Lua heap
+//! node, so a later explicit collect skips them in the shared root gather.
+//!
 //! String-call syntax, a trailing `next` adjustment, method calls, and a
 //! nested function that reads a chunk local are not lowered. Closures cannot
 //! return `type` of a weak field, so the collection witness uses
@@ -135,6 +138,39 @@ fn notes_of(ran: &mut Attempt) -> Vec<(f64, bool)> {
 
 fn alive(ran: &mut Attempt, table: heap::TableRef) -> bool {
     heap::with_heap(&mut ran.vm.host_context(), |heap| Ok(heap.alive(table))).expect("alive")
+}
+
+fn scalar_collect_is_false_and_reclaims_the_orphan(source: &str) {
+    let mut ran = halted(&weak_source(source));
+    assert_eq!(
+        ran.stack.as_deref(),
+        Some(&[Value::Bool(false)][..]),
+        "the scalar is not equal to the collect result"
+    );
+    let stats =
+        heap::with_heap(&mut ran.vm.host_context(), |heap| Ok(heap.stats())).expect("stats");
+    assert_eq!(
+        stats.collections, 1,
+        "the later argument performs one real collection"
+    );
+    assert_eq!(
+        stats.last_marked, 2,
+        "metatable and weak table are marked; the scalar is not a heap root"
+    );
+    assert_eq!(
+        stats.live_nodes, 2,
+        "the scalar adds no heap node, and the orphan is swept"
+    );
+    let seen = super::observed_tables(&mut ran.vm);
+    assert_eq!(
+        seen.len(),
+        1,
+        "the weak orphan was observed before collection"
+    );
+    assert!(
+        !alive(&mut ran, seen[0].table),
+        "the independent weak orphan must actually be collected"
+    );
 }
 
 const ALIAS: &str = "\
@@ -289,6 +325,16 @@ return eq
 const COLLECT_THEN_RELEASE: &str = "\
 local eq = rawequal({}, (collectgarbage(\"collect\")))
 collectgarbage(\"collect\")
+return eq
+";
+
+const NIL_THEN_COLLECT: &str = "\
+local eq = rawequal(nil, (collectgarbage(\"collect\")))
+return eq
+";
+
+const BYTES_THEN_COLLECT: &str = "\
+local eq = rawequal(\"\\255\\0a\", (collectgarbage(\"collect\")))
 return eq
 ";
 
@@ -508,6 +554,16 @@ fn lua_file_rawequal_roots_the_first_table_only_until_the_call_returns() {
         !alive(&mut reversed, reversed_seen[0].table),
         "the weak orphan is collected when the collect runs first"
     );
+}
+
+#[test]
+fn lua_file_rawequal_compares_nil_against_a_later_collect() {
+    scalar_collect_is_false_and_reclaims_the_orphan(NIL_THEN_COLLECT);
+}
+
+#[test]
+fn lua_file_rawequal_compares_raw_bytes_against_a_later_collect() {
+    scalar_collect_is_false_and_reclaims_the_orphan(BYTES_THEN_COLLECT);
 }
 
 #[test]

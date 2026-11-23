@@ -445,20 +445,27 @@ impl HostOwnedFunction for Op {
                         ));
                     }
                 };
-                let included = match classify(&mut call.vm().host_context(), &value)? {
-                    heap::GuestClass::Table(_) => Some(value),
-                    heap::GuestClass::Number
-                    | heap::GuestClass::Boolean
-                    | heap::GuestClass::String => None,
-                    heap::GuestClass::Unissued => {
-                        // A callable is not a table root. Its shadow envelope,
-                        // when still assigned, is the issued table gather sees.
-                        if matches!(value, Value::Callable(_)) {
-                            None
-                        } else {
-                            return Err(VmError::HostError(
-                                "invalid private Lua root candidate".to_string(),
-                            ));
+                let included = if matches!(value, Value::Null | Value::Bytes(_)) {
+                    // These scalars are legal Lua values and have no heap node.
+                    // Host integers, forged arrays, and expired carriers still
+                    // fall through to classification and stay rejected.
+                    None
+                } else {
+                    match classify(&mut call.vm().host_context(), &value)? {
+                        heap::GuestClass::Table(_) => Some(value),
+                        heap::GuestClass::Number
+                        | heap::GuestClass::Boolean
+                        | heap::GuestClass::String => None,
+                        heap::GuestClass::Unissued => {
+                            // A callable is not a table root. Its shadow envelope,
+                            // when still assigned, is the issued table gather sees.
+                            if matches!(value, Value::Callable(_)) {
+                                None
+                            } else {
+                                return Err(VmError::HostError(
+                                    "invalid private Lua root candidate".to_string(),
+                                ));
+                            }
                         }
                     }
                 };
