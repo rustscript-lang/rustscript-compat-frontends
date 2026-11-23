@@ -14,11 +14,19 @@
 //! head, or one outgoing edge or gap. Target checks and the metatable check
 //! ride with the edge or the owner head. A zero budget does not read the graph.
 //!
-//! A safepoint root batch is not one of those units. While Roots or Gray is
-//! open, the batch checks the phase, the root quota, and every typed handle
-//! before it marks anything. Those prechecks do not increment the scan meter.
-//! Success then hands each entry to the existing gray queue. It does not write
-//! a root slot, open a frame, copy the batch, or spend pulse budget.
+//! A safepoint root batch is not one of those units. `accept_root_batch` is
+//! open only in Roots or Gray: phase, then root quota, then every typed
+//! handle, before any mark. Those prechecks do not increment the scan meter.
+//! Success hands each entry to the existing gray queue. It does not write a
+//! root slot, open a frame, copy the batch, or spend pulse budget.
+//!
+//! A positive `pulse_with_root_batch` refuses Done or a missing mark before
+//! it reads the batch. It then uses that same quota and handle check and
+//! advances with the ordinary stepper. Roots or Gray, including a same-pulse
+//! entry from Start, Reset, or Mode, commit once before any root or gray
+//! step. A budget that runs out before Roots does not commit. The next call,
+//! including one after park and resume, reads only the batch it was given.
+//! Zero budget only observes.
 //!
 //! Reset and mode pulses still spend that budget. They do not open mutation.
 //! Roots and Gray open an ordinary field delete, an ordinary field write on
@@ -259,6 +267,59 @@ impl<'a> ParkedMark<'a> {
         view
     }
 
+    /// Hands the current safepoint batch across the first Roots boundary.
+    ///
+    /// Zero budget only observes: it does not check the batch or read the
+    /// graph. A positive budget refuses Done or a missing mark before any
+    /// batch read, then checks quota and handles before the stepper moves.
+    /// Refusal does not scan or write. An open Roots or Gray phase commits
+    /// first. A closed phase commits once in this pulse, after the stepper
+    /// enters Roots and before any root or gray step. The slice is not stored.
+    pub(super) fn pulse_with_root_batch(
+        &mut self,
+        budget: u64,
+        batch: &[Rooted],
+    ) -> Result<MarkView, HeapError> {
+        if budget == 0 {
+            return Ok(self.pulse(budget));
+        }
+        self.advance_with_root_batch(budget, batch)
+    }
+
+    fn advance_with_root_batch(
+        &mut self,
+        budget: u64,
+        batch: &[Rooted],
+    ) -> Result<MarkView, HeapError> {
+        self.saved_mark()?;
+        if self
+            .heap
+            .mark
+            .as_ref()
+            .is_some_and(|state| matches!(state.phase, MarkPhase::Done))
+        {
+            return Err(HeapError::MarkDenied);
+        }
+        validate_root_batch(self.heap, batch)?;
+        let mut state = self.heap.mark.take().expect("parked mark");
+        let view = pulse_budget(self.heap, &mut state, budget, Some(batch));
+        if matches!(state.phase, MarkPhase::Done) {
+            self.done = Some(MarkSnapshot {
+                modes: state.modes.take(),
+            });
+        } else {
+            self.heap.mark = Some(state);
+        }
+        Ok(view)
+    }
+
+    fn saved_mark(&self) -> Result<&MarkState, HeapError> {
+        if self.done.is_some() || self.swept {
+            return Err(HeapError::MarkDenied);
+        }
+        self.heap.mark.as_ref().ok_or(HeapError::MarkDenied)
+    }
+
     pub(super) fn pending(&self) -> Option<PendingScan> {
         let state = self.heap.mark.as_ref()?;
         Some(PendingScan {
@@ -397,38 +458,16 @@ impl<'a> ParkedMark<'a> {
             return Ok(());
         }
         let mut state = self.heap.mark.take().expect("open mark");
-        for rooted in batch {
-            let (slot, generation, kind) = rooted_identity(*rooted);
-            enqueue_barrier_target(self.heap, &mut state, slot, generation, kind);
-        }
+        commit_root_batch(self.heap, &mut state, batch);
         self.heap.mark = Some(state);
-        self.heap.scan.parked_root_batch_accepts +=
-            u64::try_from(batch.len()).expect("quota already checked the length");
         Ok(())
     }
 
     fn gate_root_batch(&self, batch: &[Rooted]) -> Result<(), HeapError> {
-        if self.done.is_some() || self.swept {
+        if !self.saved_mark()?.mutation_open() {
             return Err(HeapError::MarkDenied);
         }
-        let state = self.heap.mark.as_ref().ok_or(HeapError::MarkDenied)?;
-        if !state.mutation_open() {
-            return Err(HeapError::MarkDenied);
-        }
-        let occupied = u32::try_from(self.heap.roots.len()).map_err(|_| HeapError::RootCapacity)?;
-        let extra = u32::try_from(batch.len()).map_err(|_| HeapError::RootCapacity)?;
-        let end = occupied.checked_add(extra).ok_or(HeapError::RootCapacity)?;
-        if end > self.heap.limits.roots {
-            return Err(HeapError::RootCapacity);
-        }
-        for rooted in batch {
-            match *rooted {
-                Rooted::Table(handle) => self.heap.require_live(handle)?,
-                Rooted::Closure(handle) => self.heap.require_closure(handle)?,
-                Rooted::Upvalue(handle) => self.heap.require_upvalue(handle)?,
-            }
-        }
-        Ok(())
+        validate_root_batch(self.heap, batch)
     }
 
     pub(super) fn write_table_root(
@@ -611,7 +650,47 @@ impl Drop for ParkedMark<'_> {
     }
 }
 
+fn validate_root_batch(heap: &LuaHeap, batch: &[Rooted]) -> Result<(), HeapError> {
+    let occupied = u32::try_from(heap.roots.len()).map_err(|_| HeapError::RootCapacity)?;
+    let extra = u32::try_from(batch.len()).map_err(|_| HeapError::RootCapacity)?;
+    let end = occupied.checked_add(extra).ok_or(HeapError::RootCapacity)?;
+    if end > heap.limits.roots {
+        return Err(HeapError::RootCapacity);
+    }
+    for rooted in batch {
+        match *rooted {
+            Rooted::Table(handle) => heap.require_live(handle)?,
+            Rooted::Closure(handle) => heap.require_closure(handle)?,
+            Rooted::Upvalue(handle) => heap.require_upvalue(handle)?,
+        }
+    }
+    Ok(())
+}
+
+fn commit_root_batch(heap: &mut LuaHeap, state: &mut MarkState, batch: &[Rooted]) {
+    if batch.is_empty() {
+        return;
+    }
+    for rooted in batch {
+        let (slot, generation, kind) = rooted_identity(*rooted);
+        enqueue_barrier_target(heap, state, slot, generation, kind);
+    }
+    heap.scan.parked_root_batch_accepts +=
+        u64::try_from(batch.len()).expect("quota already checked the length");
+}
+
 fn pulse_state(heap: &mut LuaHeap, state: &mut MarkState, budget: u64) -> MarkView {
+    pulse_budget(heap, state, budget, None)
+}
+
+/// Same units, gray queue, and meters as [`pulse_state`]. A batch, when
+/// present, is committed once before any Roots or Gray step. It is not stored.
+fn pulse_budget(
+    heap: &mut LuaHeap,
+    state: &mut MarkState,
+    budget: u64,
+    batch: Option<&[Rooted]>,
+) -> MarkView {
     if budget == 0 || matches!(state.phase, MarkPhase::Done) {
         return view(heap, state);
     }
@@ -619,9 +698,16 @@ fn pulse_state(heap: &mut LuaHeap, state: &mut MarkState, budget: u64) -> MarkVi
         heap.scan.mark_passes += 1;
         state.phase = MarkPhase::Reset;
     }
+    let mut handed = false;
     let mut left = budget;
     let mut spins = 0u32;
     while left > 0 && !matches!(state.phase, MarkPhase::Done) {
+        if !handed && matches!(state.phase, MarkPhase::Roots | MarkPhase::Gray) {
+            if let Some(batch) = batch {
+                commit_root_batch(heap, state, batch);
+            }
+            handed = true;
+        }
         if step(heap, state) {
             left -= 1;
             spins = 0;

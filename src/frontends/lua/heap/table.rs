@@ -2343,6 +2343,10 @@ mod budgeted_sweep;
 mod budgeted_token_scan;
 
 #[cfg(test)]
+#[path = "../../../../tests/luajit_heap_runtime/first_roots_handoff.rs"]
+mod first_roots_handoff;
+
+#[cfg(test)]
 #[path = "../../../../tests/luajit_heap_runtime/parked_lifecycle.rs"]
 mod parked_lifecycle;
 #[cfg(test)]
