@@ -700,6 +700,14 @@ pub(super) enum TailResume {
     Completed(CollectReport),
 }
 
+/// Classification of one located named record. Not a heap error.
+enum PublishedName {
+    Gap,
+    Internal,
+    Scalar,
+    Table(u32, u32),
+}
+
 impl LuaHeap {
     /// Reserved direct field id for `__mode`; ordinary field ids start at 1.
     pub const MODE_FIELD: u32 = 0;
@@ -1180,6 +1188,96 @@ impl LuaHeap {
             Ok(())
         } else {
             self.write_edge(from, key, EdgeValue::Scalar(value))
+        }
+    }
+
+    /// Removes one ordinary UTF-8 field while a sweep tail is saved.
+    ///
+    /// [`Self::require_live`] runs before the tail check, so a stale or
+    /// wrong-kind receiver is not reported as a missing tail. An unmarked live
+    /// owner, a `__mode` name, a cursor gap, an internal closure or upvalue
+    /// value, and an unmarked live table target are [`HeapError::SweepPending`].
+    /// A table target is checked with the same generation, kind, and mark rule
+    /// as the owner. Nothing is unlinked on those errors. One owner-chain walk
+    /// borrows `name`; it does not construct a key. [`Self::unlink_key`] is not
+    /// used, so its write gate stays on the ordinary delete path. A missing
+    /// ordinary field is `Ok(false)`. One removed record is `Ok(true)`. This
+    /// does not mark, resume the tail, or add a sweep count.
+    pub(super) fn delete_published_named(
+        &mut self,
+        from: TableRef,
+        name: &str,
+    ) -> Result<bool, HeapError> {
+        self.require_live(from)?;
+        if self.sweep_tail.is_none() {
+            return Err(HeapError::SweepDenied);
+        }
+        if !Self::slot_marked(&self.slots[from.slot() as usize].state) {
+            return Err(HeapError::SweepPending);
+        }
+        if EdgeKey::is_mode_name(name) {
+            return Err(HeapError::SweepPending);
+        }
+        let Some((prev, index)) = self.locate_named(from.slot(), name) else {
+            return Ok(false);
+        };
+        if !self.published_name_unlinks(index)? {
+            return Err(HeapError::SweepPending);
+        }
+        self.unlink_at(from.slot(), prev, index);
+        Ok(true)
+    }
+
+    fn slot_marked(state: &SlotState) -> bool {
+        matches!(state, SlotState::Live { marked: true })
+    }
+
+    /// One borrowed-name walk. The predecessor is the argument `unlink_at` needs.
+    fn locate_named(&self, owner: u32, name: &str) -> Option<(Option<u32>, u32)> {
+        let mut prev = None;
+        let mut cursor = self.slots.get(owner as usize)?.edge_head;
+        while let Some(index) = cursor {
+            let record = &self.edge_slots[index as usize];
+            if record
+                .edge
+                .as_ref()
+                .is_some_and(|edge| edge.key.matches_name(name))
+            {
+                return Some((prev, index));
+            }
+            prev = Some(index);
+            cursor = record.next;
+        }
+        None
+    }
+
+    /// Whether the located record may be unlinked. A table target uses the
+    /// existing handle check before the mark bit. Other refusals are `Ok(false)`.
+    fn published_name_unlinks(&self, index: u32) -> Result<bool, HeapError> {
+        let (utf8, value) = {
+            let edge = self.edge_slots[index as usize]
+                .edge
+                .as_ref()
+                .expect("owner chain holds an occupied record");
+            let utf8 = matches!(edge.key, EdgeKey::Utf8(_));
+            let value = match &edge.value {
+                EdgeValue::Scalar(Value::Null) => PublishedName::Gap,
+                EdgeValue::Closure { .. } | EdgeValue::Upvalue { .. } => PublishedName::Internal,
+                EdgeValue::Table { slot, generation } => PublishedName::Table(*slot, *generation),
+                EdgeValue::Scalar(_) => PublishedName::Scalar,
+            };
+            (utf8, value)
+        };
+        if !utf8 {
+            return Ok(false);
+        }
+        match value {
+            PublishedName::Gap | PublishedName::Internal => Ok(false),
+            PublishedName::Scalar => Ok(true),
+            PublishedName::Table(slot, generation) => {
+                self.require_kind(self.domain, slot, generation, HandleKind::Table)?;
+                Ok(Self::slot_marked(&self.slots[slot as usize].state))
+            }
         }
     }
 
@@ -1925,6 +2023,11 @@ impl LuaHeap {
         self.sweep_tail.is_some()
     }
 
+    /// Domain that issued handles for this heap. Does not read slots.
+    pub(super) fn domain(&self) -> u64 {
+        self.domain
+    }
+
     /// A saved tail owns the graph. Checked after handle and capacity validation,
     /// and before the first write or chain walk of a commit.
     fn ensure_sweep_open(&self) -> Result<(), HeapError> {
@@ -2500,6 +2603,9 @@ mod parked_mark;
 #[cfg(test)]
 #[path = "../../../../tests/luajit_heap_runtime/private_cycle.rs"]
 mod private_cycle;
+#[cfg(test)]
+#[path = "../../../../tests/luajit_heap_runtime/published_delete.rs"]
+mod published_delete;
 #[cfg(test)]
 #[path = "../../../../tests/luajit_heap_runtime/published_sweep.rs"]
 mod published_sweep;

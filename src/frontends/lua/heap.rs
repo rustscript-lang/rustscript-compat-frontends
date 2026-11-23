@@ -264,6 +264,29 @@ fn resume_published_sweep(
     }
 }
 
+/// Deletes one ordinary UTF-8 named field while this scope's published sweep
+/// tail is saved. Does not install a heap and does not resume the tail.
+///
+/// No installed heap is [`HeapError::SweepDenied`]. The installed domain is
+/// checked before any other handle or tail result, so a foreign receiver is
+/// [`HeapError::WrongDomain`] even when no tail is saved. A same-domain stale
+/// or wrong-kind receiver still uses that handle error. No saved tail, after
+/// those checks, is [`HeapError::SweepDenied`]. This is not a guest
+/// `collectgarbage` step.
+fn delete_published_named(
+    host: &mut HostContext,
+    table: TableRef,
+    name: &str,
+) -> Result<bool, HeapError> {
+    let Some(heap) = host.scope_state::<LuaHeap>() else {
+        return Err(HeapError::SweepDenied);
+    };
+    if table.domain() != heap.domain() {
+        return Err(HeapError::WrongDomain);
+    }
+    with_heap(host, |heap| heap.delete_published_named(table, name))
+}
+
 /// One host call: a fresh mark, the existing synchronous token close, then
 /// one sweep. The observer is lent only at the published boundary and does
 /// not receive the host. A parked mark is refused and left in place. This is
