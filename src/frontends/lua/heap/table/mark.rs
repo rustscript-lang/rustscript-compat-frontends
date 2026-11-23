@@ -18,8 +18,8 @@
 //! non-gap ordinary field on an already marked owner, and a fixed root-slot
 //! update through the typed root writers. New keys, gap resurrection,
 //! allocation, rollback, metatable and `__mode` writes, root-frame changes,
-//! internal closure edges, and token edits stay closed. A refused edit
-//! returns before it changes the heap.
+//! internal closure edges, the private cell edge, and token edits stay closed.
+//! A refused edit returns before it changes the heap.
 
 use super::{
     ClosureRef, CollectReport, EdgeKey, EdgeValue, HandleKind, HeapError, HeapStats, LuaHeap,
@@ -483,7 +483,8 @@ impl<'a> ParkedMark<'a> {
 
     fn gate_field(&self, from: TableRef, key: u32) -> Result<(), HeapError> {
         self.gate_mutation()?;
-        if key == LuaHeap::MODE_FIELD {
+        // Field 0 is `__mode`. The private cell id is not a Lua key either.
+        if key == LuaHeap::MODE_FIELD || key == super::CELL_EDGE {
             return Err(HeapError::MarkDenied);
         }
         self.heap.require_live(from)?;

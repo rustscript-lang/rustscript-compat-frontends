@@ -5,12 +5,13 @@
 
 use super::{
     HeapError, HeapLimits, HeapStats, LuaHeap, ParkedMark, PausedOp, PendingScan, RootFrameId,
-    ScanMeter, TableRef,
+    ScanMeter, TableRef, UpvalueRef,
 };
 use vm::Value;
 
 const KEY_X: u32 = 1;
-const KEY_Y: u32 = 2;
+/// Ordinary field. Not the private cell field stored by `set_cell_edge`.
+const KEY_Y: u32 = 5;
 const KEY_Z: u32 = 3;
 const KEY_W: u32 = 1;
 const HARNESS_BOUND: u32 = 64;
@@ -419,6 +420,225 @@ fn open_phase_refuses_marked_owner_and_forbidden_ops() {
     assert!(heap.alive(chain.a));
     assert!(heap.alive(chain.y));
     assert!(heap.alive(extra));
+}
+
+/// Mark bits and gray pushes the refusal must not change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GraphGuards {
+    owner_marked: bool,
+    successor_marked: bool,
+    intruder_marked: bool,
+    work_pushed: u64,
+    barrier_marks: u64,
+    scanning: Option<u32>,
+}
+
+struct CellRefusal {
+    phase_open: bool,
+    owner_marked: bool,
+    result: Result<(), HeapError>,
+    edge: Result<Option<TableRef>, HeapError>,
+    index_before: Option<u32>,
+    index_after: Option<u32>,
+    pending_before: (u32, u32),
+    pending_after: Option<(u32, u32)>,
+    guards_before: GraphGuards,
+    guards_after: GraphGuards,
+    meter_before: ScanMeter,
+    meter_after: ScanMeter,
+    stats_before: HeapStats,
+    stats_after: HeapStats,
+    bytes_before: u64,
+    bytes_after: u64,
+    cell: UpvalueRef,
+    successor: TableRef,
+    kept: Option<KeptCell>,
+}
+
+struct KeptCell {
+    cell_edge: Result<UpvalueRef, HeapError>,
+    current: Result<Option<TableRef>, HeapError>,
+    owner_alive: bool,
+    cell_alive: bool,
+    successor_alive: bool,
+    intruder_alive: bool,
+    orphan_alive: bool,
+}
+
+fn graph_guards(
+    parked: &ParkedMark<'_>,
+    owner: TableRef,
+    successor: TableRef,
+    intruder: TableRef,
+) -> GraphGuards {
+    GraphGuards {
+        owner_marked: parked.marked(owner),
+        successor_marked: parked.marked(successor),
+        intruder_marked: parked.marked(intruder),
+        work_pushed: parked.meter().scratch.work_pushed,
+        barrier_marks: parked.meter().parked_barrier_marks,
+        scanning: parked.scanning_owner(),
+    }
+}
+
+/// One fresh heap. A write on this heap cannot change the delete heap.
+fn cell_edge_refusal(write: bool) -> CellRefusal {
+    let mut heap = LuaHeap::new(limits(8, 2, 8));
+    let owner = heap.alloc().expect("owner");
+    let successor = heap.alloc().expect("successor");
+    let intruder = heap.alloc().expect("intruder");
+    let orphan = heap.alloc().expect("orphan");
+    let cell = heap.alloc_upvalue().expect("cell");
+    heap.write_upvalue(cell, successor).expect("current");
+    heap.set_cell_edge(owner, cell).expect("cell edge");
+    assert_eq!(heap.cell_edge(owner).expect("stored cell"), cell);
+    let frame = heap.enter_roots(1).expect("frame");
+    heap.write_root(frame, 0, owner).expect("root owner");
+    let mut parked = ParkedMark::start(&mut heap).expect("park");
+    let index = parked
+        .field_index(owner, super::CELL_EDGE)
+        .expect("cell record");
+    let pending = pause_at(&mut parked, owner.slot(), index);
+    let phase_open = parked.mutation_open() && parked.phase_name() == "gray";
+    let owner_marked = parked.marked(owner);
+    assert!(
+        phase_open,
+        "cell edge refusal must run while mutation is open"
+    );
+    assert!(owner_marked, "the owner is already marked");
+    assert!(
+        !parked.marked(successor),
+        "the cell edge has not been charged"
+    );
+    assert_eq!(
+        parked
+            .edge(owner, super::CELL_EDGE)
+            .expect_err("cell edge is an upvalue"),
+        HeapError::WrongKind
+    );
+    let guards_before = graph_guards(&parked, owner, successor, intruder);
+    let before = picture(&parked);
+    let result = if write {
+        parked.write_field(owner, super::CELL_EDGE, intruder)
+    } else {
+        parked.delete_field(owner, super::CELL_EDGE)
+    };
+    let edge = parked.edge(owner, super::CELL_EDGE);
+    let index_after = parked.field_index(owner, super::CELL_EDGE);
+    let guards_after = graph_guards(&parked, owner, successor, intruder);
+    let pending_after = parked.pending().map(|scan| (scan.owner, scan.cursor));
+    let after = picture(&parked);
+    let kept = if result.is_err() {
+        finish(&mut parked);
+        parked.complete().expect("sweep");
+        drop(parked);
+        Some(KeptCell {
+            cell_edge: heap.cell_edge(owner),
+            current: heap.current_table(cell),
+            owner_alive: heap.alive(owner),
+            cell_alive: heap.upvalue_alive(cell),
+            successor_alive: heap.alive(successor),
+            intruder_alive: heap.alive(intruder),
+            orphan_alive: heap.alive(orphan),
+        })
+    } else {
+        drop(parked);
+        None
+    };
+    CellRefusal {
+        phase_open,
+        owner_marked,
+        result,
+        edge,
+        index_before: Some(index),
+        index_after,
+        pending_before: (pending.owner, pending.cursor),
+        pending_after,
+        guards_before,
+        guards_after,
+        meter_before: before.meter,
+        meter_after: after.meter,
+        stats_before: before.stats,
+        stats_after: after.stats,
+        bytes_before: before.bytes,
+        bytes_after: after.bytes,
+        cell,
+        successor,
+        kept,
+    }
+}
+
+#[test]
+fn open_phase_refuses_marked_owner_cell_edge() {
+    let write = cell_edge_refusal(true);
+    let delete = cell_edge_refusal(false);
+    assert!(
+        write.phase_open && write.owner_marked && delete.phase_open && delete.owner_marked,
+        "both refusals run on a marked owner in an open phase"
+    );
+    assert_eq!(
+        (&write.result, &delete.result),
+        (&Err(HeapError::MarkDenied), &Err(HeapError::MarkDenied)),
+        "write edge {:?} index {:?} -> {:?}; delete edge {:?} index {:?} -> {:?}",
+        write.edge,
+        write.index_before,
+        write.index_after,
+        delete.edge,
+        delete.index_before,
+        delete.index_after,
+    );
+    assert_eq!(
+        write.guards_before, write.guards_after,
+        "write graph guards"
+    );
+    assert_eq!(
+        delete.guards_before, delete.guards_after,
+        "delete graph guards"
+    );
+    assert_eq!(
+        write.pending_after,
+        Some(write.pending_before),
+        "write pending cursor"
+    );
+    assert_eq!(
+        delete.pending_after,
+        Some(delete.pending_before),
+        "delete pending cursor"
+    );
+    assert_eq!(write.index_after, write.index_before, "write record");
+    assert_eq!(delete.index_after, delete.index_before, "delete record");
+    assert_eq!(write.meter_before, write.meter_after, "write meter");
+    assert_eq!(delete.meter_before, delete.meter_after, "delete meter");
+    assert_eq!(write.stats_before, write.stats_after, "write stats");
+    assert_eq!(delete.stats_before, delete.stats_after, "delete stats");
+    assert_eq!(write.bytes_before, write.bytes_after, "write bytes");
+    assert_eq!(delete.bytes_before, delete.bytes_after, "delete bytes");
+    let write_kept = write.kept.expect("write swept after refusal");
+    let delete_kept = delete.kept.expect("delete swept after refusal");
+    assert_eq!(
+        write_kept.cell_edge,
+        Ok(write.cell),
+        "write kept the upvalue"
+    );
+    assert_eq!(
+        delete_kept.cell_edge,
+        Ok(delete.cell),
+        "delete kept the upvalue"
+    );
+    assert_eq!(
+        write_kept.current,
+        Ok(Some(write.successor)),
+        "write kept the cell current"
+    );
+    assert_eq!(
+        delete_kept.current,
+        Ok(Some(delete.successor)),
+        "delete kept the cell current"
+    );
+    assert!(write_kept.owner_alive && write_kept.cell_alive && write_kept.successor_alive);
+    assert!(delete_kept.owner_alive && delete_kept.cell_alive && delete_kept.successor_alive);
+    assert!(!write_kept.intruder_alive && !write_kept.orphan_alive);
+    assert!(!delete_kept.intruder_alive && !delete_kept.orphan_alive);
 }
 
 #[test]
