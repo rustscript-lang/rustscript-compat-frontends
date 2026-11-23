@@ -151,6 +151,47 @@ impl<'a> SweepSession<'a> {
         self.report.take().expect("sweep report is issued once")
     }
 
+    /// Walk Select and Snapshot by their real units, then stop before the
+    /// first owner unit. An empty dead set is already Roots. This does not
+    /// call `pulse`.
+    pub(super) fn reach_before_owners(&mut self) -> bool {
+        loop {
+            match self.phase {
+                SweepPhase::Select | SweepPhase::Snapshot => {
+                    let _ = self.step();
+                }
+                SweepPhase::Owners => {
+                    debug_assert!(self.at_owner_start());
+                    return true;
+                }
+                SweepPhase::Roots => return false,
+                SweepPhase::Release | SweepPhase::Done => {
+                    debug_assert!(false, "release started before the owner boundary");
+                    return false;
+                }
+            }
+        }
+    }
+
+    /// Publish every owner in this same session, lend one read-only view, and
+    /// return before Release. No dead slot means no view and no callback.
+    pub(super) fn observe_before_release<R>(
+        &mut self,
+        observe: impl for<'b> FnOnce(&'b PublishedRead<'b>) -> R,
+    ) -> Option<R> {
+        if !self.reach_before_owners() {
+            return None;
+        }
+        let seen = {
+            let window = self
+                .publish_owners()
+                .expect("the owner boundary is the first owner unit");
+            let read = window.published();
+            observe(&read)
+        };
+        Some(seen)
+    }
+
     fn view(&self, spent: SweepUnits) -> SweepView {
         SweepView {
             finished: matches!(self.phase, SweepPhase::Done),
@@ -501,6 +542,23 @@ struct PublishWindow<'a> {
     view: WeakView<'a>,
 }
 
+impl PublishWindow<'_> {
+    fn published(&self) -> PublishedRead<'_> {
+        PublishedRead {
+            view: WeakView {
+                publish: self.view.publish,
+                finished: self.view.finished,
+                release_started: self.view.release_started,
+                heap: self.view.heap,
+                dead: self.view.dead,
+                snapshot: self.view.snapshot,
+            },
+            heads: self.spent.heads,
+            edges: self.spent.edges,
+        }
+    }
+}
+
 /// Read-only graph at one boundary. A judged-dead handle is not a target.
 struct WeakView<'a> {
     publish: WeakPublish,
@@ -609,6 +667,93 @@ impl WeakView<'_> {
             return false;
         };
         matches!(stored.state, SlotState::Live { .. }) && stored.generation == snap.generation
+    }
+}
+
+/// Why a published-boundary read was refused. A judged-dead handle is not a
+/// lookup target. This error does not carry a slot index.
+#[derive(Debug)]
+pub enum ObserveFault {
+    JudgedDead,
+    Heap(HeapError),
+}
+
+/// Values at the published boundary. The dead-slot list, snapshot, and heap
+/// stay behind this view.
+pub struct PublishedRead<'a> {
+    view: WeakView<'a>,
+    heads: u64,
+    edges: u64,
+}
+
+impl PublishedRead<'_> {
+    pub fn named(&self, table: TableRef, name: &str) -> Result<Option<TableRef>, ObserveFault> {
+        self.view.named(table, name).map_err(Self::fault)
+    }
+
+    pub fn number(&self, table: TableRef, key: f64) -> Result<Value, ObserveFault> {
+        self.view.number(table, key).map_err(Self::fault)
+    }
+
+    pub fn object(&self, table: TableRef, key: TableRef) -> Result<Option<TableRef>, ObserveFault> {
+        self.view.object(table, key).map_err(Self::fault)
+    }
+
+    pub fn raw_sequence_len(&self, table: TableRef) -> Result<f64, ObserveFault> {
+        self.view.raw_sequence_len(table).map_err(Self::fault)
+    }
+
+    pub fn next(
+        &self,
+        table: TableRef,
+        cursor: &Value,
+    ) -> Result<Option<(Value, Value)>, ObserveFault> {
+        self.view.next(table, cursor).map_err(Self::fault)
+    }
+
+    pub fn alive(&self, table: TableRef) -> Result<bool, ObserveFault> {
+        self.view.alive(table).map_err(Self::fault)
+    }
+
+    pub fn still_physical(&self, table: TableRef) -> bool {
+        let slot = table.slot();
+        self.view.still_physical(slot)
+            && self
+                .view
+                .snapshot
+                .get(slot as usize)
+                .is_some_and(|snap| snap.generation == table.generation())
+    }
+
+    pub fn dead_still_physical(&self) -> u32 {
+        self.view.dead_still_physical()
+    }
+
+    pub fn occupying_dead(&self) -> u32 {
+        self.view.occupying_dead()
+    }
+
+    pub fn finished(&self) -> bool {
+        self.view.finished()
+    }
+
+    pub fn release_started(&self) -> bool {
+        self.view.release_started()
+    }
+
+    pub fn window_heads(&self) -> u64 {
+        self.heads
+    }
+
+    pub fn window_edges(&self) -> u64 {
+        self.edges
+    }
+
+    fn fault(error: ObserveError) -> ObserveFault {
+        match error {
+            ObserveError::JudgedDead => ObserveFault::JudgedDead,
+            ObserveError::Heap(error) => ObserveFault::Heap(error),
+        }
     }
 }
 

@@ -52,8 +52,8 @@ mod table;
 pub use handle::{ClosureRef, HandleKind, TableRef, UpvalueRef};
 pub use resource::LuaTableResource;
 pub use table::{
-    CellValue, CollectReport, GuestClass, HeapError, HeapLimits, HeapStats, LuaHeap, RootFrameId,
-    ScanMeter,
+    CellValue, CollectReport, GuestClass, HeapError, HeapLimits, HeapStats, LuaHeap, ObserveFault,
+    PublishedRead, RootFrameId, ScanMeter,
 };
 
 use vm::{HostContext, Value};
@@ -176,6 +176,21 @@ pub fn collect(host: &mut HostContext) -> Result<table::CollectReport, HeapError
         retire_doomed_token(host, token)?;
     }
     with_heap(host, |heap| Ok(heap.sweep_marked(marked.modes)))
+}
+
+/// One host call: a fresh mark, the existing synchronous token close, then
+/// one sweep. The observer is lent only at the published boundary and does
+/// not receive the host. A parked mark is refused and left in place. This is
+/// not a guest `collectgarbage` step.
+pub fn collect_observing<R>(
+    host: &mut HostContext,
+    observe: impl for<'a> FnOnce(&'a PublishedRead<'a>) -> R,
+) -> Result<(table::CollectReport, Option<R>), HeapError> {
+    let marked = with_heap(host, |heap| heap.begin_private_cycle())?;
+    for token in marked.tokens {
+        retire_doomed_token(host, token)?;
+    }
+    with_heap(host, |heap| Ok(heap.sweep_observing(marked.modes, observe)))
 }
 
 fn retire_doomed_token(host: &mut HostContext, token: table::DoomedToken) -> Result<(), HeapError> {

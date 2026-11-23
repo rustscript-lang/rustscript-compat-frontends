@@ -25,6 +25,7 @@ use mark::MarkSession;
 use mark::{ParkedMark, PausedOp, PendingScan};
 use pending_close::{PendingCloseSession, PendingCloseView};
 use sweep::SweepSession;
+pub use sweep::{ObserveFault, PublishedRead};
 
 static NEXT_DOMAIN: AtomicU64 = AtomicU64::new(1);
 
@@ -1915,6 +1916,28 @@ impl LuaHeap {
         session.report()
     }
 
+    /// Refuses a parked mark without clearing it. Otherwise the same fresh
+    /// mark and pending-close enumeration as [`Self::mark_and_doomed_tokens`].
+    pub(super) fn begin_private_cycle(&mut self) -> Result<DoomedMark, HeapError> {
+        if self.mark.is_some() {
+            return Err(HeapError::MarkActive);
+        }
+        Ok(self.mark_and_doomed_tokens())
+    }
+
+    /// Same sweep session from selection through release. The callback runs
+    /// once, after Owners and before Release, and only when a dead slot exists.
+    pub(super) fn sweep_observing<R>(
+        &mut self,
+        modes: MarkSnapshot,
+        observe: impl for<'a> FnOnce(&'a PublishedRead<'a>) -> R,
+    ) -> (CollectReport, Option<R>) {
+        let mut session = SweepSession::start(self, modes);
+        let seen = session.observe_before_release(observe);
+        session.drain();
+        (session.report(), seen)
+    }
+
     /// Reports whether `handle` names a live table in this heap.
     pub fn alive(&self, handle: TableRef) -> bool {
         self.require_live(handle).is_ok()
@@ -2352,6 +2375,9 @@ mod parked_lifecycle;
 #[cfg(test)]
 #[path = "../../../../tests/luajit_heap_runtime/parked_mark.rs"]
 mod parked_mark;
+#[cfg(test)]
+#[path = "../../../../tests/luajit_heap_runtime/private_cycle.rs"]
+mod private_cycle;
 #[cfg(test)]
 #[path = "../../../../tests/luajit_heap_runtime/safepoint_roots.rs"]
 mod safepoint_roots;
