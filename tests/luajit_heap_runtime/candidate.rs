@@ -3707,7 +3707,9 @@ impl Lower<'_> {
         let mut pending_slots = Vec::new();
         let mut pending_frames = Vec::new();
         for (arg, param) in args.iter().zip(&function.params) {
-            if self.direct_function_call(arg).is_some() && !pending_slots.is_empty() {
+            // Value parentheses still execute this direct call. Recognize
+            // them only here; other direct_function_call sites keep spelling.
+            if self.direct_function_call(skip_parens(arg)).is_some() && !pending_slots.is_empty() {
                 pending_frames.push(self.open_pending_frame(&pending_slots, span)?);
                 pending_slots.clear();
             }

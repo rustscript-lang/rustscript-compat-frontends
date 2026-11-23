@@ -539,6 +539,142 @@ fn pending_argument_keeps_the_earlier_table_across_the_later_lua_collect() {
     assert_ne!(ran.discarded, Some(target.table));
 }
 
+fn seeded_with_later_call(later: &str) -> String {
+    const CALL: &str = "consume(rawget(weak, (mark(1))), sweep())";
+    assert_eq!(
+        SEEDED.matches(CALL).count(),
+        1,
+        "later sweep() call is not unique"
+    );
+    SEEDED.replacen(
+        CALL,
+        &format!("consume(rawget(weak, (mark(1))), {later})"),
+        1,
+    )
+}
+
+#[test]
+fn pending_argument_parenthesized_later_call_keeps_the_earlier_table() {
+    for later in ["(sweep())", "((sweep()))"] {
+        let source = seeded_with_later_call(later);
+        assert!(
+            source.contains(&format!(", {later})")),
+            "arm {later} did not replace the later call"
+        );
+        assert!(
+            !source.contains(", sweep()"),
+            "arm {later} still has the bare later call"
+        );
+        let ran = run_source(&source);
+        assert_eq!(
+            ran.status,
+            Ok(VmStatus::Halted),
+            "arm {later} status={:?} stack={:?} order={:?} snaps={:?} notes={:?} consumed={:?} collections={} roots={}/{} visits={:?}",
+            ran.status,
+            ran.stack,
+            ran.obs.order,
+            ran.obs.snaps,
+            ran.obs.notes,
+            ran.obs.consumed,
+            ran.collections,
+            ran.live_roots,
+            ran.root_slots,
+            ran.visits,
+        );
+        assert_eq!(ran.stack, vec![Value::Float(41.0)], "arm {later}");
+        assert_eq!(
+            ran.obs.order,
+            vec![
+                Event::Peek,
+                Event::Peek,
+                Event::Mark(1.0),
+                Event::Mark(2.0),
+                Event::Snap(2.0),
+                Event::Mark(41.0),
+                Event::Consume,
+                Event::Snap(4.0),
+                Event::Note(6.0),
+                Event::Note(7.0),
+                Event::Snap(5.0),
+                Event::Note(8.0),
+            ],
+            "arm {later}"
+        );
+        let target = ran.obs.peeked[0];
+        let orphan = ran.obs.peeked[1];
+        assert_ne!(target.table, orphan.table, "arm {later}");
+        let consumed = ran
+            .obs
+            .consumed
+            .first()
+            .expect("consumer stored the identity");
+        assert_eq!(consumed.table, target.table, "arm {later}");
+        assert_eq!(consumed.token, target.token, "arm {later}");
+        assert_eq!(consumed.marker, 41.0, "arm {later}");
+        assert_eq!(
+            consumed.root_slots, 2,
+            "arm {later} caller frame plus the pending frame"
+        );
+        assert_eq!(
+            consumed.live_roots, 2,
+            "arm {later} weak table and the pending table"
+        );
+        let nested = snap(&ran, 2.0);
+        let released = snap(&ran, 4.0);
+        let later_collect = snap(&ran, 5.0);
+        assert_eq!(nested.peeked_alive, vec![true, false], "arm {later}");
+        assert_eq!(nested.root_slots, 2, "arm {later}");
+        assert_eq!(nested.live_roots, 2, "arm {later}");
+        assert_eq!(nested.collections, 1, "arm {later}");
+        assert_eq!(
+            nested.root_slot_visits, 0,
+            "arm {later} return witness already took this meter"
+        );
+        assert_eq!(
+            ran.visits,
+            vec![4, 2],
+            "arm {later} nested and later collects stay separate"
+        );
+        assert_ne!(ran.visits[0], nested.root_slots as u64, "arm {later}");
+        assert_ne!(ran.visits[0], nested.live_roots as u64, "arm {later}");
+        assert_eq!(
+            released.root_slots, 1,
+            "arm {later} pending frame left before the next snap"
+        );
+        assert_eq!(released.live_roots, 1, "arm {later}");
+        assert_eq!(released.peeked_alive, vec![true, false], "arm {later}");
+        assert_eq!(
+            later_collect.peeked_alive,
+            vec![false, false],
+            "arm {later}"
+        );
+        assert_eq!(later_collect.collections, 2, "arm {later}");
+        assert_eq!(later_collect.root_slots, 1, "arm {later}");
+        assert_eq!(later_collect.root_slot_visits, 0, "arm {later}");
+        assert_ne!(ran.visits[0], ran.visits[1], "arm {later}");
+        assert_eq!(
+            ran.obs.notes,
+            vec![
+                (6.0, "table".to_string()),
+                (7.0, "nil".to_string()),
+                (8.0, "nil".to_string()),
+            ],
+            "arm {later}"
+        );
+        assert_eq!(
+            ran.live_roots, 0,
+            "arm {later} chunk retire returned the caller frame"
+        );
+        assert_eq!(ran.root_slots, 0, "arm {later}");
+        assert_eq!(
+            ran.issued, 4,
+            "arm {later} pending publish did not issue another witness root"
+        );
+        assert_ne!(ran.returned, Some(target.table), "arm {later}");
+        assert_ne!(ran.discarded, Some(target.table), "arm {later}");
+    }
+}
+
 #[test]
 fn pending_argument_repeat_reuses_the_returned_frame() {
     let ran = run_source(
