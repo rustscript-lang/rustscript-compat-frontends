@@ -34,6 +34,7 @@ const ENTER_RESULT: &str = "lua_internal::enter_result_frame";
 const ENTER_CALLEE: &str = "lua_internal::enter_callee_frame";
 const ENTER_PENDING: &str = "lua_internal::enter_pending_frame";
 const WRITE_PENDING: &str = "lua_internal::write_pending_root";
+const WRITE_OPTIONAL_PENDING: &str = "lua_internal::write_optional_pending_root";
 const LEAVE_PENDING: &str = "lua_internal::leave_pending_frame";
 const ROOT_ISSUED: &str = "lua_internal::root_issued";
 const SET_EDGE: &str = "lua_internal::set_edge";
@@ -174,6 +175,11 @@ pub(super) fn install_schemas(builder: &mut HostApiBuilder) {
             vec!["frame", "slot", "value"],
             HostTypeSchema::Float,
         ),
+        (
+            WRITE_OPTIONAL_PENDING,
+            vec!["frame", "slot", "value"],
+            HostTypeSchema::Float,
+        ),
         (LEAVE_PENDING, vec!["frame"], HostTypeSchema::Float),
         (
             ROOT_ISSUED,
@@ -241,6 +247,7 @@ pub(super) fn register(
         Op::EnterCallee,
         Op::EnterPending,
         Op::WritePending,
+        Op::WriteOptionalPending,
         Op::LeavePending,
         Op::RootIssued,
         Op::SetEdge,
@@ -281,6 +288,7 @@ pub(super) fn register(
             Op::EnterCallee => ENTER_CALLEE,
             Op::EnterPending => ENTER_PENDING,
             Op::WritePending => WRITE_PENDING,
+            Op::WriteOptionalPending => WRITE_OPTIONAL_PENDING,
             Op::LeavePending => LEAVE_PENDING,
             Op::RootIssued => ROOT_ISSUED,
             Op::SetEdge => SET_EDGE,
@@ -331,6 +339,7 @@ enum Op {
     EnterCallee,
     EnterPending,
     WritePending,
+    WriteOptionalPending,
     LeavePending,
     RootIssued,
     SetEdge,
@@ -541,6 +550,7 @@ impl HostOwnedFunction for Op {
             Self::EnterCallee => enter_callee(call)?,
             Self::EnterPending => enter_pending(call)?,
             Self::WritePending => write_pending(call)?,
+            Self::WriteOptionalPending => write_optional_pending(call)?,
             Self::LeavePending => leave_pending(call)?,
             Self::RootIssued => root_issued(call)?,
             Self::SetEdge => set_edge(call)?,
@@ -832,6 +842,63 @@ fn write_pending(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
         return Err(heap_error(error));
     }
     Ok(Value::Float(0.0))
+}
+
+/// Candidate-private root write. Tables use the same frame check and
+/// `write_root` as `WRITE_PENDING`. Legal scalars, nil, bytes, and callables
+/// leave the slot empty and do not abort the later call. Forged, stale, and
+/// other unissued values still reject, and that rejection drops the frame.
+fn write_optional_pending(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
+    let (frame_token, slot, value) = match call.args() {
+        [frame, slot, value] => (frame.clone(), float_u32(slot)?, value.clone()),
+        _ => return Err(host_fault("invalid pending root")),
+    };
+    let table = match optional_pending_table(call, &value) {
+        Ok(Some(table)) => table,
+        Ok(None) => return Ok(Value::Float(0.0)),
+        Err(error) => {
+            abandon_pending(call, &frame_token);
+            return Err(error);
+        }
+    };
+    let frame = decode_frame(call, &frame_token)?;
+    if let Err(error) = heap::with_heap(&mut call.vm().host_context(), |heap| {
+        heap.write_root(frame, slot, table)
+    }) {
+        let _ = heap::with_heap(&mut call.vm().host_context(), |heap| {
+            heap.leave_roots(frame)
+        });
+        return Err(heap_error(error));
+    }
+    Ok(Value::Float(0.0))
+}
+
+fn optional_pending_table(
+    call: &mut OwnedHostCall<'_>,
+    value: &Value,
+) -> Result<Option<heap::TableRef>, VmError> {
+    if matches!(value, Value::Null | Value::Bytes(_)) {
+        return Ok(None);
+    }
+    match classify(&mut call.vm().host_context(), value)? {
+        heap::GuestClass::Table(table) => Ok(Some(table)),
+        heap::GuestClass::Number | heap::GuestClass::Boolean | heap::GuestClass::String => Ok(None),
+        heap::GuestClass::Unissued => {
+            if matches!(value, Value::Callable(_)) {
+                Ok(None)
+            } else {
+                Err(host_fault("invalid private Lua root candidate"))
+            }
+        }
+    }
+}
+
+fn abandon_pending(call: &mut OwnedHostCall<'_>, token: &Value) {
+    if let Ok(frame) = decode_frame(call, token) {
+        let _ = heap::with_heap(&mut call.vm().host_context(), |heap| {
+            heap.leave_roots(frame)
+        });
+    }
 }
 
 fn leave_pending(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
@@ -2905,12 +2972,21 @@ impl Lower<'_> {
     /// private slot, then write those slots from right to left through the
     /// same named-field edge. One target stays on `lower_assign`. The slots
     /// are not guest bindings.
+    ///
+    /// The only call accepted here is a last value wrapped in at least one
+    /// pair of parentheses and naming a no-argument static Lua function.
+    /// That shape copies every receiver before the call, then keeps those
+    /// copies and the already-evaluated values in one pending frame until
+    /// the right-to-left writes finish. Scalars and nil are not roots.
     fn lower_parallel_named_fields(
         &mut self,
         span: ast::Span,
         targets: &[ast::AssignTarget],
         values: &[ast::Expr],
     ) -> Result<(), ParseError> {
+        if self.trailing_parenthesized_direct_call(values) {
+            return self.lower_parallel_named_call(span, targets, values);
+        }
         let temp_base = self.active_temps.len();
         let mut receivers = Vec::with_capacity(targets.len());
         for target in targets {
@@ -2963,6 +3039,139 @@ impl Lower<'_> {
             self.emit_ignored(written, self.line(span))?;
         }
         Ok(())
+    }
+
+    fn trailing_parenthesized_direct_call(&self, values: &[ast::Expr]) -> bool {
+        let Some(last) = values.last() else {
+            return false;
+        };
+        matches!(last, ast::Expr::Paren { .. })
+            && self.direct_function_call(skip_parens(last)).is_some()
+    }
+
+    /// Receivers are copied before any right-hand value. The pending frame
+    /// stays open across the call and the reverse writes, then leaves once.
+    fn lower_parallel_named_call(
+        &mut self,
+        span: ast::Span,
+        targets: &[ast::AssignTarget],
+        values: &[ast::Expr],
+    ) -> Result<(), ParseError> {
+        let Some(last) = values.last() else {
+            return Err(self.statement_unsupported(span));
+        };
+        if self.in_function {
+            return Err(self.unsupported(last.span()));
+        }
+        let temp_base = self.active_temps.len();
+        let mut receivers = Vec::with_capacity(targets.len());
+        for target in targets {
+            let ast::AssignTarget::Field {
+                table,
+                name,
+                nav: false,
+                ..
+            } = target
+            else {
+                return Err(self.statement_unsupported(span));
+            };
+            let key = utf8_field(&name.bytes).map_err(|_| self.unsupported(target.span()))?;
+            let from = self.expr(table)?;
+            let from = self.snapshot_private(from, target.span(), "parallel-recv")?;
+            receivers.push((from, key));
+        }
+        let mut saved = Vec::with_capacity(values.len());
+        for value in values.iter().take(values.len() - 1) {
+            if !parallel_rhs_allowed(value) {
+                return Err(self.unsupported(value.span()));
+            }
+            let expr = if matches!(value, ast::Expr::Nil { .. }) {
+                Expr::Null
+            } else {
+                self.expr(value)?
+            };
+            saved.push(self.snapshot_private(expr, value.span(), "parallel-rhs")?);
+        }
+        self.active_temps.truncate(temp_base);
+        let mut rooted = Vec::with_capacity(receivers.len() + saved.len());
+        for (slot, _) in &receivers {
+            rooted.push(*slot);
+        }
+        rooted.extend(saved.iter().copied());
+        let frame = self.open_optional_pending(&rooted, span)?;
+        let call = self.lower_direct_value(skip_parens(last))?;
+        let call_slot = match call {
+            Expr::Var(slot) => slot,
+            other => self.snapshot_private(other, last.span(), "parallel-rhs")?,
+        };
+        saved.push(call_slot);
+        if saved.len() != receivers.len() {
+            return Err(self.statement_unsupported(span));
+        }
+        for (slot, (from, key)) in saved.iter().rev().zip(receivers.iter().rev()) {
+            let written = self.call(
+                SET_EDGE,
+                vec![
+                    Expr::Var(*from),
+                    Expr::String(key.clone()),
+                    Expr::Var(*slot),
+                ],
+            )?;
+            self.emit_ignored(written, self.line(span))?;
+        }
+        let leave = self.call(LEAVE_PENDING, vec![Expr::Var(frame)])?;
+        self.emit_ignored(leave, self.line(span))?;
+        Ok(())
+    }
+
+    fn snapshot_private(
+        &mut self,
+        expr: Expr,
+        span: ast::Span,
+        label: &str,
+    ) -> Result<LocalSlot, ParseError> {
+        let slot = self
+            .builder
+            .alloc_local_named(&format!("#{label}:{}", self.stmts.len()))?;
+        self.stmts.push(Stmt::Let {
+            index: slot,
+            declared_schema: None,
+            expr,
+            line: self.line(span),
+        });
+        Ok(slot)
+    }
+
+    fn open_optional_pending(
+        &mut self,
+        slots: &[LocalSlot],
+        span: ast::Span,
+    ) -> Result<LocalSlot, ParseError> {
+        if slots.is_empty() {
+            return Err(self.statement_unsupported(span));
+        }
+        let frame = self
+            .builder
+            .alloc_local_named(&format!("#optional-pending:{}", self.stmts.len()))?;
+        let entered = self.call(ENTER_PENDING, vec![Expr::Float(slots.len() as f64)])?;
+        self.stmts.push(Stmt::Let {
+            index: frame,
+            declared_schema: None,
+            expr: entered,
+            line: self.line(span),
+        });
+        for (slot, source) in slots.iter().enumerate() {
+            let written = self.call(
+                WRITE_OPTIONAL_PENDING,
+                vec![
+                    Expr::Var(frame),
+                    Expr::Float(slot as f64),
+                    Expr::Var(*source),
+                ],
+            )?;
+            self.emit_ignored(written, self.line(span))?;
+        }
+        Ok(frame)
     }
 
     fn lower_assign(

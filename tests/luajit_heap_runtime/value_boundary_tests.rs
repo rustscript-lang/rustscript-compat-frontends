@@ -10,6 +10,8 @@ mod envelope_local_root;
 #[path = "../../src/frontends/lua/lexer.rs"]
 #[allow(dead_code)]
 mod lexer;
+#[path = "parallel_assignment_roots.rs"]
+mod parallel_assignment_roots;
 #[path = "parallel_field_assign.rs"]
 mod parallel_field_assign;
 #[path = "../../src/frontends/lua/parser.rs"]
