@@ -13,14 +13,17 @@
 //! ride with the edge or the owner head. A zero budget does not read the graph.
 //!
 //! Reset and mode pulses still spend that budget. They do not open mutation.
-//! Roots and Gray open only an ordinary field delete, or an ordinary field
-//! write on an owner that is not yet marked. Allocation, rollback, metatable
-//! and `__mode` writes, root edits, and token edits stay closed. A refused
-//! edit returns before it changes the heap.
+//! Roots and Gray open an ordinary field delete, an ordinary field write on
+//! an owner that is not yet marked, an in-place replacement of an existing
+//! non-gap ordinary field on an already marked owner, and a fixed root-slot
+//! update through the typed root writers. New keys, gap resurrection,
+//! allocation, rollback, metatable and `__mode` writes, root-frame changes,
+//! internal closure edges, and token edits stay closed. A refused edit
+//! returns before it changes the heap.
 
 use super::{
-    CollectReport, EdgeKey, EdgeValue, HandleKind, HeapError, HeapStats, LuaHeap, MarkSnapshot,
-    SlotState, TableRef, WeakMode,
+    ClosureRef, CollectReport, EdgeKey, EdgeValue, HandleKind, HeapError, HeapStats, LuaHeap,
+    MarkSnapshot, RootFrameId, Rooted, SlotState, TableRef, UpvalueRef, WeakMode,
 };
 use vm::Value;
 
@@ -293,11 +296,139 @@ impl<'a> ParkedMark<'a> {
         self.gate_field(from, key)?;
         self.heap.require_live(to)?;
         if self.marked(from) {
-            return Err(HeapError::MarkDenied);
+            return self.replace_discovered_field(from, key, to);
         }
         self.heap.set_edge(from, key, to)?;
         self.heap.scan.parked_edge_writes += 1;
         Ok(())
+    }
+
+    /// In-place replacement of one existing non-gap field. One key lookup.
+    /// A missing key or a cursor gap is refused before any record changes.
+    /// This does not insert, append, or reclaim another owner's gap.
+    fn replace_discovered_field(
+        &mut self,
+        from: TableRef,
+        key: u32,
+        to: TableRef,
+    ) -> Result<(), HeapError> {
+        let edge_key = EdgeKey::Field(key);
+        let Some(index) = self.heap.find_key(from.slot(), &edge_key) else {
+            return Err(HeapError::MarkDenied);
+        };
+        let gap = self.heap.edge_slots[index as usize]
+            .edge
+            .as_ref()
+            .is_some_and(|edge| edge.value.is_cursor_gap());
+        if gap {
+            return Err(HeapError::MarkDenied);
+        }
+        self.heap.replace_edge_value(
+            from.slot(),
+            index,
+            EdgeValue::Table {
+                slot: to.slot(),
+                generation: to.generation(),
+            },
+        );
+        self.heap.scan.parked_edge_writes += 1;
+        self.heap
+            .barrier_strong_field(from.slot(), to.slot(), to.generation());
+        Ok(())
+    }
+
+    pub(super) fn write_table_root(
+        &mut self,
+        frame: RootFrameId,
+        slot: u32,
+        handle: TableRef,
+    ) -> Result<(), HeapError> {
+        self.gate_mutation()?;
+        self.heap.write_root(frame, slot, handle)
+    }
+
+    pub(super) fn write_closure_root(
+        &mut self,
+        frame: RootFrameId,
+        slot: u32,
+        handle: ClosureRef,
+    ) -> Result<(), HeapError> {
+        self.gate_mutation()?;
+        self.heap.write_closure_root(frame, slot, handle)
+    }
+
+    pub(super) fn write_upvalue_root(
+        &mut self,
+        frame: RootFrameId,
+        slot: u32,
+        handle: UpvalueRef,
+    ) -> Result<(), HeapError> {
+        self.gate_mutation()?;
+        self.heap.write_upvalue_root(frame, slot, handle)
+    }
+
+    pub(super) fn scanning_owner(&self) -> Option<u32> {
+        self.heap.mark.as_ref().and_then(|state| state.owner)
+    }
+
+    pub(super) fn object_index(&self, owner: TableRef, key: TableRef) -> Option<u32> {
+        self.heap.find_key(owner.slot(), &EdgeKey::object(key))
+    }
+
+    pub(super) fn record_is_gap(&self, index: u32) -> bool {
+        self.heap
+            .edge_slots
+            .get(index as usize)
+            .and_then(|record| record.edge.as_ref())
+            .is_some_and(|edge| edge.value.is_cursor_gap())
+    }
+
+    pub(super) fn root_table(
+        &self,
+        frame: RootFrameId,
+        slot: u32,
+    ) -> Result<Option<TableRef>, HeapError> {
+        let found = self.heap.frame(frame)?;
+        if slot >= found.width {
+            return Err(HeapError::StaleFrame);
+        }
+        match self.heap.roots[found.start as usize + slot as usize] {
+            Some(Rooted::Table(handle)) => Ok(Some(handle)),
+            Some(_) => Err(HeapError::WrongKind),
+            None => Ok(None),
+        }
+    }
+
+    pub(super) fn root_closure(
+        &self,
+        frame: RootFrameId,
+        slot: u32,
+    ) -> Result<Option<ClosureRef>, HeapError> {
+        let found = self.heap.frame(frame)?;
+        if slot >= found.width {
+            return Err(HeapError::StaleFrame);
+        }
+        match self.heap.roots[found.start as usize + slot as usize] {
+            Some(Rooted::Closure(handle)) => Ok(Some(handle)),
+            Some(_) => Err(HeapError::WrongKind),
+            None => Ok(None),
+        }
+    }
+
+    pub(super) fn root_upvalue(
+        &self,
+        frame: RootFrameId,
+        slot: u32,
+    ) -> Result<Option<UpvalueRef>, HeapError> {
+        let found = self.heap.frame(frame)?;
+        if slot >= found.width {
+            return Err(HeapError::StaleFrame);
+        }
+        match self.heap.roots[found.start as usize + slot as usize] {
+            Some(Rooted::Upvalue(handle)) => Ok(Some(handle)),
+            Some(_) => Err(HeapError::WrongKind),
+            None => Ok(None),
+        }
     }
 
     /// Private collect while this driver holds the heap. It does not sweep.
@@ -351,14 +482,19 @@ impl<'a> ParkedMark<'a> {
     }
 
     fn gate_field(&self, from: TableRef, key: u32) -> Result<(), HeapError> {
-        let state = self.heap.mark.as_ref().ok_or(HeapError::MarkDenied)?;
-        if !state.mutation_open() {
-            return Err(HeapError::MarkDenied);
-        }
+        self.gate_mutation()?;
         if key == LuaHeap::MODE_FIELD {
             return Err(HeapError::MarkDenied);
         }
         self.heap.require_live(from)?;
+        Ok(())
+    }
+
+    fn gate_mutation(&self) -> Result<(), HeapError> {
+        let state = self.heap.mark.as_ref().ok_or(HeapError::MarkDenied)?;
+        if !state.mutation_open() {
+            return Err(HeapError::MarkDenied);
+        }
         Ok(())
     }
 }
@@ -647,6 +783,42 @@ fn owner_mode(heap: &mut LuaHeap, state: &mut MarkState, slot: u32) -> WeakMode 
     WeakMode::default()
 }
 
+/// Counts a newly gray target. An already-marked slot does not increment.
+fn enqueue_barrier_target(
+    heap: &mut LuaHeap,
+    state: &mut MarkState,
+    slot: u32,
+    generation: u32,
+    kind: HandleKind,
+) {
+    let before = heap.scan.scratch.work_pushed;
+    let matched = follow_one(heap, state, slot, generation, kind);
+    if matched && heap.scan.scratch.work_pushed > before {
+        heap.scan.parked_barrier_marks += 1;
+    }
+}
+
+/// Reads the reset-time mode cache. No metatable follow and no scan counter.
+fn cached_values_weak(heap: &LuaHeap, state: &MarkState, owner: u32) -> bool {
+    if heap.metatable_edges == 0 {
+        return false;
+    }
+    let Some(stored) = heap.slots.get(owner as usize) else {
+        return false;
+    };
+    if stored.kind != HandleKind::Table {
+        return false;
+    }
+    let Some((meta_slot, _)) = stored.metatable else {
+        return false;
+    };
+    state
+        .modes
+        .as_ref()
+        .and_then(|modes| modes.get(meta_slot as usize))
+        .is_some_and(|mode| mode.values)
+}
+
 /// Same visits as the old target follow. True when the slot matches, even
 /// if it was already marked. Only a newly marked slot joins the gray stack.
 fn follow_one(
@@ -684,6 +856,40 @@ fn mode_string_byte(heap: &LuaHeap, edge_index: u32, at: usize) -> Option<u8> {
 }
 
 impl LuaHeap {
+    /// Counts a fixed root store and marks its target while mutation is open.
+    /// The enqueue uses the same `follow_one` path as a root visit. It does
+    /// not move the root cursor or the current owner cursor.
+    pub(super) fn note_parked_root_store(&mut self, rooted: Rooted) {
+        let Some(mut state) = self.mark.take() else {
+            return;
+        };
+        if !state.mutation_open() {
+            self.mark = Some(state);
+            return;
+        }
+        self.scan.parked_root_writes += 1;
+        let (slot, generation, kind) = match rooted {
+            Rooted::Table(handle) => (handle.slot(), handle.generation(), HandleKind::Table),
+            Rooted::Closure(handle) => (handle.slot(), handle.generation(), HandleKind::Closure),
+            Rooted::Upvalue(handle) => (handle.slot(), handle.generation(), HandleKind::Upvalue),
+        };
+        enqueue_barrier_target(self, &mut state, slot, generation, kind);
+        self.mark = Some(state);
+    }
+
+    /// Marks a strong table value written into an already discovered field.
+    /// Weak values stay on the cached mode and are not followed. This does
+    /// not call `owner_mode` and does not move either cursor.
+    pub(super) fn barrier_strong_field(&mut self, owner: u32, slot: u32, generation: u32) {
+        let Some(mut state) = self.mark.take() else {
+            return;
+        };
+        if state.mutation_open() && !cached_values_weak(self, &state, owner) {
+            enqueue_barrier_target(self, &mut state, slot, generation, HandleKind::Table);
+        }
+        self.mark = Some(state);
+    }
+
     /// Advances a parked gray cursor when `unlink_at` removes its record.
     /// One field compare. No chain, root, or slot walk.
     pub(super) fn repair_parked_cursor(&mut self, owner: u32, index: u32, next: Option<u32>) {

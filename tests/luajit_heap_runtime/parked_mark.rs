@@ -4,8 +4,8 @@
 //! The bound below is only a harness limit. Sweep stays outside the pulse.
 
 use super::{
-    HeapError, HeapLimits, HeapStats, LuaHeap, ParkedMark, PausedOp, PendingScan, ScanMeter,
-    TableRef,
+    HeapError, HeapLimits, HeapStats, LuaHeap, ParkedMark, PausedOp, PendingScan, RootFrameId,
+    ScanMeter, TableRef,
 };
 use vm::Value;
 
@@ -574,4 +574,824 @@ fn weak_graph_budget_one_matches_full_collect() {
     assert_eq!(parked_meter.parked_cursor_repairs, 0);
     assert_eq!(parked_meter.parked_edge_writes, 0);
     assert_eq!(parked_meter.mark_passes, 1);
+}
+
+const KEY_KEPT: u32 = 1;
+const KEY_REPLACED: u32 = 3;
+const KEY_SUCCESSOR: u32 = 4;
+const PASSED_SLOT: u32 = 1;
+
+#[derive(Clone, Copy)]
+struct Cycle {
+    mt: TableRef,
+    watch: TableRef,
+    p: TableRef,
+    q: TableRef,
+    r: TableRef,
+    orphan: TableRef,
+}
+
+fn plant_cycle(heap: &mut LuaHeap) -> Cycle {
+    let mt = heap.alloc().expect("metatable");
+    let watch = heap.alloc().expect("weak watch");
+    let p = heap.alloc().expect("P");
+    let q = heap.alloc().expect("Q");
+    let r = heap.alloc().expect("R");
+    let orphan = heap.alloc().expect("orphan");
+    heap.set_mode_scalar(mt, Value::string("v\0"))
+        .expect("weak values");
+    heap.set_metatable(watch, Some(mt))
+        .expect("watch metatable");
+    heap.set_edge(watch, KEY_KEPT, p).expect("weak P");
+    heap.set_edge(watch, KEY_REPLACED, orphan)
+        .expect("weak orphan");
+    heap.set_edge(p, KEY_KEPT, q).expect("P to Q");
+    heap.set_edge(q, KEY_KEPT, r).expect("Q to R");
+    heap.set_edge(r, KEY_KEPT, p).expect("R to P");
+    Cycle {
+        mt,
+        watch,
+        p,
+        q,
+        r,
+        orphan,
+    }
+}
+
+fn pause_after_root_visits(parked: &mut ParkedMark<'_>, visits: u64) {
+    for _ in 0..HARNESS_BOUND {
+        let view = parked.pulse(1);
+        assert!(!view.finished, "mark finished before {visits} root visits");
+        assert_eq!(view.meter.mark_passes, 1);
+        if parked.phase_name() == "roots" && parked.meter().root_slot_visits == visits {
+            return;
+        }
+    }
+    panic!(
+        "did not stop after {visits} root visits, phase {}",
+        parked.phase_name()
+    );
+}
+
+fn pulse_until_gray(parked: &mut ParkedMark<'_>) {
+    for _ in 0..HARNESS_BOUND {
+        if parked.phase_name() == "gray" {
+            return;
+        }
+        let view = parked.pulse(1);
+        assert!(!view.finished, "mark finished before gray");
+        assert_eq!(view.meter.mark_passes, 1);
+    }
+    panic!("did not enter gray, phase {}", parked.phase_name());
+}
+
+fn charge_pending(parked: &mut ParkedMark<'_>) -> u32 {
+    let owner = parked.pending().expect("edge still pending").owner;
+    let view = parked.pulse(1);
+    assert!(
+        !view.finished,
+        "charging the last pending edge finished the mark"
+    );
+    assert_eq!(view.meter.mark_passes, 1);
+    assert!(parked.pending().is_none(), "owner still has a pending edge");
+    assert_eq!(parked.scanning_owner(), Some(owner));
+    assert_eq!(parked.phase_name(), "gray");
+    owner
+}
+
+fn same_pending(left: Option<PendingScan>, right: Option<PendingScan>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => left.owner == right.owner && left.cursor == right.cursor,
+        _ => false,
+    }
+}
+
+fn assert_write_did_not_scan(before: &ScanMeter, after: &ScanMeter) {
+    assert_eq!(after.mark_passes, 1);
+    assert_eq!(after.mark_passes, before.mark_passes);
+    assert_eq!(after.outgoing_edge_checks, before.outgoing_edge_checks);
+    assert_eq!(after.outgoing_gap_checks, before.outgoing_gap_checks);
+    assert_eq!(after.owner_head_checks, before.owner_head_checks);
+    assert_eq!(after.root_slot_visits, before.root_slot_visits);
+    assert_eq!(after.parked_cursor_repairs, before.parked_cursor_repairs);
+}
+
+fn assert_one_more_pulse_unit(parked: &mut ParkedMark<'_>) {
+    let before = parked.meter();
+    let view = parked.pulse(1);
+    assert!(!view.finished);
+    assert_eq!(view.meter.mark_passes, 1);
+    let edges = (view.meter.outgoing_edge_checks + view.meter.outgoing_gap_checks)
+        - (before.outgoing_edge_checks + before.outgoing_gap_checks);
+    let roots = view.meter.root_slot_visits - before.root_slot_visits;
+    let heads = view.meter.owner_head_checks - before.owner_head_checks;
+    assert!(
+        edges + roots + heads <= 1,
+        "pulse(1) charged edges {edges} roots {roots} heads {heads}"
+    );
+}
+
+fn cycle_kept(heap: &LuaHeap, cycle: &Cycle) -> bool {
+    heap.alive(cycle.p) && heap.alive(cycle.q) && heap.alive(cycle.r)
+}
+
+fn cycle_lost_message(heap: &LuaHeap, cycle: &Cycle, index: u32) -> String {
+    format!(
+        "record {index} stores P but the cycle was collected; P {} Q {} R {} orphan {} barrier_marks {} edge_writes {}",
+        heap.alive(cycle.p),
+        heap.alive(cycle.q),
+        heap.alive(cycle.r),
+        heap.alive(cycle.orphan),
+        heap.scan.parked_barrier_marks,
+        heap.scan.parked_edge_writes,
+    )
+}
+
+fn assert_cycle_identity(heap: &LuaHeap, cycle: &Cycle) {
+    assert_eq!(heap.edge(cycle.p, KEY_KEPT).expect("P to Q"), Some(cycle.q));
+    assert_eq!(heap.edge(cycle.q, KEY_KEPT).expect("Q to R"), Some(cycle.r));
+    assert_eq!(heap.edge(cycle.r, KEY_KEPT).expect("R to P"), Some(cycle.p));
+    assert!(
+        !heap.alive(cycle.orphan),
+        "independent weak orphan is collected"
+    );
+}
+
+struct StrongOwner {
+    later: TableRef,
+    child: TableRef,
+    owner: TableRef,
+    kept: TableRef,
+    successor: Option<TableRef>,
+    cycle: Cycle,
+}
+
+fn plant_strong_owner(heap: &mut LuaHeap, with_successor: bool) -> StrongOwner {
+    let later = heap.alloc().expect("unprocessed owner");
+    let child = heap.alloc().expect("unprocessed child");
+    heap.set_edge(later, KEY_KEPT, child)
+        .expect("unprocessed edge");
+    let owner = heap.alloc().expect("owner");
+    let kept = heap.alloc().expect("kept successor");
+    let old = heap.alloc().expect("old value");
+    heap.set_edge(owner, KEY_KEPT, kept).expect("kept field");
+    heap.set_edge(owner, KEY_REPLACED, old)
+        .expect("field to replace");
+    let successor = if with_successor {
+        let successor = heap.alloc().expect("pending successor");
+        heap.set_edge(owner, KEY_SUCCESSOR, successor)
+            .expect("pending field");
+        Some(successor)
+    } else {
+        None
+    };
+    let cycle = plant_cycle(heap);
+    let frame = heap.enter_roots(4).expect("frame");
+    heap.write_root(frame, 0, later).expect("root later");
+    heap.write_root(frame, 1, owner).expect("root owner");
+    heap.write_root(frame, 2, cycle.watch).expect("root watch");
+    heap.write_root(frame, 3, cycle.mt).expect("root metatable");
+    StrongOwner {
+        later,
+        child,
+        owner,
+        kept,
+        successor,
+        cycle,
+    }
+}
+
+fn pause_on_owner_edge<'a>(
+    heap: &'a mut LuaHeap,
+    owner: TableRef,
+    key: u32,
+) -> (ParkedMark<'a>, u32) {
+    let mut parked = ParkedMark::start(heap).expect("park");
+    let index = parked.field_index(owner, key).expect("owner field");
+    pause_at(&mut parked, owner.slot(), index);
+    (parked, index)
+}
+
+#[test]
+fn barrier_black_owner_keeps_the_cycle_until_release() {
+    let mut heap = LuaHeap::new(limits(24, 8, 24));
+    let graph = plant_strong_owner(&mut heap, false);
+    let (mut parked, index) = pause_on_owner_edge(&mut heap, graph.owner, KEY_REPLACED);
+    let scanning = charge_pending(&mut parked);
+    assert_eq!(scanning, graph.owner.slot());
+    assert!(parked.marked(graph.owner), "black owner is already marked");
+    assert!(
+        !parked.marked(graph.child),
+        "the unprocessed child is not marked by setup"
+    );
+    assert!(!parked.marked(graph.cycle.p), "P is only weakly reachable");
+    let pending = parked.pending();
+    let before = parked.meter();
+    parked
+        .write_field(graph.owner, KEY_REPLACED, graph.cycle.p)
+        .expect("in-place replace on a black owner");
+    assert_eq!(parked.field_index(graph.owner, KEY_REPLACED), Some(index));
+    assert_eq!(
+        parked.edge(graph.owner, KEY_REPLACED).expect("replaced"),
+        Some(graph.cycle.p)
+    );
+    assert_eq!(
+        parked
+            .edge(graph.owner, KEY_KEPT)
+            .expect("original successor"),
+        Some(graph.kept)
+    );
+    assert!(
+        same_pending(parked.pending(), pending),
+        "the owner edge cursor moved"
+    );
+    assert_eq!(parked.scanning_owner(), Some(graph.owner.slot()));
+    assert_eq!(
+        parked.meter().parked_edge_writes,
+        before.parked_edge_writes + 1
+    );
+    assert_write_did_not_scan(&before, &parked.meter());
+    assert!(
+        !parked.marked(graph.child),
+        "the write marked an unprocessed child"
+    );
+    assert_one_more_pulse_unit(&mut parked);
+    let view = finish(&mut parked);
+    parked.complete().expect("sweep");
+    drop(parked);
+    assert!(heap.alive(graph.owner) && heap.alive(graph.kept) && heap.alive(graph.child));
+    assert!(
+        cycle_kept(&heap, &graph.cycle) && heap.scan.parked_barrier_marks == 1,
+        "{}",
+        cycle_lost_message(&heap, &graph.cycle, index)
+    );
+    assert_cycle_identity(&heap, &graph.cycle);
+    assert_eq!(view.mark_passes, 1);
+    assert_eq!(heap.scan.mark_passes, 1);
+
+    heap.clear_edge(graph.owner, &super::EdgeKey::Field(KEY_REPLACED));
+    heap.collect();
+    assert!(
+        !heap.alive(graph.cycle.p) && !heap.alive(graph.cycle.q) && !heap.alive(graph.cycle.r),
+        "clearing the replaced field did not release the cycle"
+    );
+    assert!(heap.alive(graph.owner) && heap.alive(graph.kept));
+}
+
+#[test]
+fn barrier_gray_owner_keeps_the_cycle_and_the_pending_successor() {
+    let mut heap = LuaHeap::new(limits(24, 8, 24));
+    let graph = plant_strong_owner(&mut heap, true);
+    let successor = graph.successor.expect("pending successor");
+    let (mut parked, index) = pause_on_owner_edge(&mut heap, graph.owner, KEY_SUCCESSOR);
+    assert_eq!(parked.phase_name(), "gray");
+    assert!(parked.marked(graph.owner));
+    assert!(!parked.marked(graph.cycle.p));
+    assert!(
+        !parked.marked(successor),
+        "the pending target is not marked yet"
+    );
+    let pending = parked.pending();
+    let before = parked.meter();
+    parked
+        .write_field(graph.owner, KEY_REPLACED, graph.cycle.p)
+        .expect("in-place replace on the current gray owner");
+    let replaced = parked
+        .field_index(graph.owner, KEY_REPLACED)
+        .expect("replaced record");
+    assert_ne!(
+        Some(replaced),
+        pending.map(|cursor| cursor.cursor),
+        "the replace reused the pending successor record"
+    );
+    assert!(
+        same_pending(parked.pending(), pending),
+        "the owner edge cursor moved"
+    );
+    assert_eq!(parked.scanning_owner(), Some(graph.owner.slot()));
+    assert_eq!(
+        parked
+            .edge(graph.owner, KEY_SUCCESSOR)
+            .expect("pending edge"),
+        Some(successor)
+    );
+    assert_eq!(
+        parked
+            .edge(graph.owner, KEY_KEPT)
+            .expect("original successor"),
+        Some(graph.kept)
+    );
+    assert_eq!(
+        parked.meter().parked_edge_writes,
+        before.parked_edge_writes + 1
+    );
+    assert_write_did_not_scan(&before, &parked.meter());
+    assert!(
+        !parked.marked(successor),
+        "the write marked the pending successor"
+    );
+    assert_one_more_pulse_unit(&mut parked);
+    let view = finish(&mut parked);
+    parked.complete().expect("sweep");
+    drop(parked);
+    assert_eq!(
+        heap.edge(graph.owner, KEY_SUCCESSOR).expect("successor"),
+        Some(successor)
+    );
+    assert!(heap.alive(successor) && heap.alive(graph.kept));
+    assert!(
+        cycle_kept(&heap, &graph.cycle) && heap.scan.parked_barrier_marks == 1,
+        "{}",
+        cycle_lost_message(&heap, &graph.cycle, index)
+    );
+    assert_cycle_identity(&heap, &graph.cycle);
+    assert_eq!(view.mark_passes, 1);
+    assert_eq!(heap.scan.mark_passes, 1);
+}
+
+#[test]
+fn barrier_omitted_write_collects_the_shared_cycle() {
+    let mut heap = LuaHeap::new(limits(24, 8, 24));
+    let graph = plant_strong_owner(&mut heap, false);
+    let (mut parked, _) = pause_on_owner_edge(&mut heap, graph.owner, KEY_REPLACED);
+    charge_pending(&mut parked);
+    assert_eq!(parked.meter().parked_edge_writes, 0);
+    assert_eq!(parked.meter().parked_barrier_marks, 0);
+    finish(&mut parked);
+    parked.complete().expect("sweep");
+    drop(parked);
+    assert!(
+        !cycle_kept(&heap, &graph.cycle),
+        "omitting the write kept the weakly held cycle"
+    );
+    assert!(!heap.alive(graph.cycle.orphan));
+    assert_eq!(heap.scan.parked_barrier_marks, 0);
+    assert_eq!(heap.scan.parked_edge_writes, 0);
+    assert_eq!(heap.scan.mark_passes, 1);
+}
+
+#[test]
+fn barrier_weak_owner_replace_does_not_keep_the_cycle() {
+    let mut heap = LuaHeap::new(limits(24, 8, 24));
+    let owner = heap.alloc().expect("weak owner");
+    let old = heap.alloc().expect("old");
+    let successor = heap.alloc().expect("successor");
+    let cycle = plant_cycle(&mut heap);
+    heap.set_metatable(owner, Some(cycle.mt))
+        .expect("weak owner");
+    heap.set_edge(owner, KEY_REPLACED, old).expect("weak field");
+    heap.set_edge(owner, KEY_SUCCESSOR, successor)
+        .expect("weak successor");
+    let frame = heap.enter_roots(4).expect("frame");
+    heap.write_root(frame, 0, owner).expect("root owner");
+    heap.write_root(frame, 1, cycle.watch).expect("root watch");
+    heap.write_root(frame, 2, cycle.mt).expect("root metatable");
+    heap.write_root(frame, 3, successor)
+        .expect("keep the successor readable");
+    let (mut parked, index) = pause_on_owner_edge(&mut heap, owner, KEY_SUCCESSOR);
+    let pending = parked.pending();
+    parked
+        .write_field(owner, KEY_REPLACED, cycle.p)
+        .expect("in-place replace on a weak owner");
+    assert_eq!(
+        parked.edge(owner, KEY_REPLACED).expect("replaced"),
+        Some(cycle.p)
+    );
+    assert_eq!(
+        parked
+            .edge(owner, KEY_SUCCESSOR)
+            .expect("successor still readable"),
+        Some(successor)
+    );
+    assert!(
+        same_pending(parked.pending(), pending),
+        "the owner edge cursor moved"
+    );
+    let replaced = parked
+        .field_index(owner, KEY_REPLACED)
+        .expect("replaced record");
+    assert_ne!(replaced, index, "the replace reused the pending record");
+    finish(&mut parked);
+    parked.complete().expect("sweep");
+    drop(parked);
+    assert!(
+        !cycle_kept(&heap, &cycle),
+        "a weak-value replace kept the cycle at record {index}"
+    );
+    assert!(!heap.alive(cycle.orphan));
+    assert!(heap.alive(owner) && heap.alive(successor));
+    assert_eq!(heap.scan.parked_barrier_marks, 0);
+    assert_eq!(heap.scan.parked_edge_writes, 1);
+    assert_eq!(heap.scan.mark_passes, 1);
+}
+
+#[test]
+fn barrier_already_marked_target_is_not_enqueued_again() {
+    fn run(write: bool) -> (u64, u64, u64) {
+        let mut heap = LuaHeap::new(limits(24, 8, 24));
+        let graph = plant_strong_owner(&mut heap, false);
+        let (mut parked, _) = pause_on_owner_edge(&mut heap, graph.owner, KEY_REPLACED);
+        charge_pending(&mut parked);
+        assert!(
+            parked.marked(graph.later),
+            "Later was rooted before the write"
+        );
+        let before = parked.meter();
+        if write {
+            parked
+                .write_field(graph.owner, KEY_REPLACED, graph.later)
+                .expect("replace with an already marked target");
+            assert_eq!(
+                parked.meter().scratch.work_pushed,
+                before.scratch.work_pushed
+            );
+            assert_eq!(
+                parked.meter().parked_barrier_marks,
+                before.parked_barrier_marks
+            );
+        }
+        finish(&mut parked);
+        let meter = parked.meter();
+        parked.cancel();
+        (
+            meter.outgoing_edge_checks,
+            meter.owner_head_checks,
+            meter.scratch.work_pushed,
+        )
+    }
+
+    let written = run(true);
+    let omitted = run(false);
+    assert_eq!(
+        written.0, omitted.0,
+        "an already marked target was scanned again"
+    );
+    assert_eq!(
+        written.1, omitted.1,
+        "an already marked target opened another owner"
+    );
+    assert_eq!(
+        written.2, omitted.2,
+        "an already marked target was queued again"
+    );
+}
+
+#[test]
+fn barrier_full_edges_replace_leaves_the_other_gap() {
+    let mut heap = LuaHeap::new(limits(8, 8, 3));
+    let mt = heap.alloc().expect("metatable");
+    let gap_owner = heap.alloc().expect("gap owner");
+    let key_obj = heap.alloc().expect("object key");
+    let dead = heap.alloc().expect("dead value");
+    let owner = heap.alloc().expect("owner");
+    let old = heap.alloc().expect("old value");
+    heap.set_mode_scalar(mt, Value::string("v\0"))
+        .expect("weak values");
+    heap.set_metatable(gap_owner, Some(mt))
+        .expect("gap metatable");
+    heap.set_object_edge(gap_owner, key_obj, dead)
+        .expect("object edge");
+    heap.set_edge(owner, KEY_REPLACED, old).expect("full field");
+    let frame = heap.enter_roots(4).expect("frame");
+    heap.write_root(frame, 0, mt).expect("root metatable");
+    heap.write_root(frame, 1, gap_owner)
+        .expect("root gap owner");
+    heap.write_root(frame, 2, key_obj).expect("root key");
+    heap.write_root(frame, 3, owner).expect("root owner");
+    heap.collect();
+    assert!(!heap.alive(dead));
+    assert!(heap.alive(gap_owner) && heap.alive(key_obj) && heap.alive(owner));
+    assert_eq!(
+        heap.stats().edge_slots,
+        3,
+        "mode, gap, and field fill the edge cap"
+    );
+    let _ = heap.take_scan_meter();
+    let target = heap.alloc().expect("replacement");
+    let mut parked = ParkedMark::start(&mut heap).expect("park");
+    let field = parked
+        .field_index(owner, KEY_REPLACED)
+        .expect("field at the cap");
+    let gap = parked
+        .object_index(gap_owner, key_obj)
+        .expect("other owner's gap");
+    assert!(parked.record_is_gap(gap), "prepared record is not a gap");
+    assert_ne!(field, gap);
+    pause_at(&mut parked, owner.slot(), field);
+    charge_pending(&mut parked);
+    assert!(parked.marked(owner));
+    assert!(!parked.marked(target));
+    let occupied = parked.meter();
+    parked
+        .write_field(owner, KEY_REPLACED, target)
+        .expect("in-place replace at the edge cap");
+    assert_eq!(parked.field_index(owner, KEY_REPLACED), Some(field));
+    assert_eq!(parked.object_index(gap_owner, key_obj), Some(gap));
+    assert!(
+        parked.record_is_gap(gap),
+        "the other gap was reclaimed or rewritten"
+    );
+    assert_eq!(
+        parked.stats().edge_slots,
+        3,
+        "the replace allocated another edge"
+    );
+    assert_eq!(
+        parked.meter().parked_cursor_repairs,
+        occupied.parked_cursor_repairs
+    );
+    assert_eq!(
+        parked.meter().parked_edge_writes,
+        occupied.parked_edge_writes + 1
+    );
+    finish(&mut parked);
+    parked.complete().expect("sweep");
+    drop(parked);
+    assert!(
+        heap.alive(target) && heap.scan.parked_barrier_marks == 1,
+        "record {field} stores the target but it was collected; barrier_marks {} gap {gap}",
+        heap.scan.parked_barrier_marks
+    );
+    assert!(heap.alive(gap_owner) && heap.alive(key_obj));
+    assert_eq!(heap.scan.mark_passes, 1);
+}
+
+struct PassedSlot {
+    frame: RootFrameId,
+    child: TableRef,
+    cycle: Cycle,
+}
+
+fn pause_passed_slot(heap: &mut LuaHeap, gray: bool) -> (ParkedMark<'_>, PassedSlot) {
+    let later = heap.alloc().expect("later");
+    let child = heap.alloc().expect("later child");
+    heap.set_edge(later, KEY_KEPT, child).expect("later edge");
+    let tail = heap.alloc().expect("tail");
+    let cycle = plant_cycle(heap);
+    let frame = heap.enter_roots(4).expect("frame");
+    heap.write_root(frame, 0, later).expect("root later");
+    heap.write_root(frame, 2, tail).expect("root tail");
+    heap.write_root(frame, 3, cycle.watch).expect("root watch");
+    let mut parked = ParkedMark::start(heap).expect("park");
+    if gray {
+        pause_after_root_visits(&mut parked, 4);
+        let orphan = parked
+            .field_index(cycle.watch, KEY_REPLACED)
+            .expect("watch orphan edge");
+        pulse_until_gray(&mut parked);
+        pause_at(&mut parked, cycle.watch.slot(), orphan);
+        charge_pending(&mut parked);
+        assert_eq!(parked.phase_name(), "gray");
+        assert_eq!(parked.meter().root_slot_visits, 4);
+    } else {
+        pause_after_root_visits(&mut parked, 2);
+        assert_eq!(parked.phase_name(), "roots");
+    }
+    assert!(
+        parked.meter().root_slot_visits > u64::from(PASSED_SLOT),
+        "the empty root slot has not been passed"
+    );
+    assert_eq!(
+        parked.root_table(frame, PASSED_SLOT).expect("slot"),
+        None,
+        "the passed slot was not empty"
+    );
+    assert!(!parked.marked(cycle.p), "P is marked before the root write");
+    (
+        parked,
+        PassedSlot {
+            frame,
+            child,
+            cycle,
+        },
+    )
+}
+
+fn assert_table_root_kept(gray: bool) {
+    let mut heap = LuaHeap::new(limits(24, 8, 24));
+    let (mut parked, slot) = pause_passed_slot(&mut heap, gray);
+    let before = parked.meter();
+    let visits = before.root_slot_visits;
+    let pending = parked.pending();
+    let scanning = parked.scanning_owner();
+    parked
+        .write_table_root(slot.frame, PASSED_SLOT, slot.cycle.p)
+        .expect("fixed table root update");
+    assert_eq!(
+        parked.root_table(slot.frame, PASSED_SLOT).expect("stored"),
+        Some(slot.cycle.p)
+    );
+    assert_eq!(parked.meter().root_slot_visits, visits);
+    assert_eq!(
+        parked.meter().parked_root_writes,
+        before.parked_root_writes + 1
+    );
+    assert!(
+        same_pending(parked.pending(), pending),
+        "the owner edge cursor moved"
+    );
+    assert_eq!(parked.scanning_owner(), scanning);
+    assert_write_did_not_scan(&before, &parked.meter());
+    assert_one_more_pulse_unit(&mut parked);
+    let view = finish(&mut parked);
+    parked.complete().expect("sweep");
+    drop(parked);
+    assert!(
+        cycle_kept(&heap, &slot.cycle) && heap.scan.parked_barrier_marks == 1,
+        "{}",
+        cycle_lost_message(&heap, &slot.cycle, PASSED_SLOT)
+    );
+    assert_cycle_identity(&heap, &slot.cycle);
+    assert!(
+        heap.alive(slot.child),
+        "the resumed gray queue lost Later's child"
+    );
+    assert_eq!(view.mark_passes, 1);
+    assert_eq!(heap.scan.parked_root_writes, 1);
+    assert_eq!(heap.scan.mark_passes, 1);
+    heap.clear_root(slot.frame, PASSED_SLOT)
+        .expect("clear the retaining root");
+    heap.collect();
+    assert!(
+        !heap.alive(slot.cycle.p),
+        "clearing the root did not release P"
+    );
+}
+
+#[test]
+fn barrier_roots_passed_slot_keeps_the_table() {
+    assert_table_root_kept(false);
+}
+
+#[test]
+fn barrier_gray_passed_slot_keeps_the_table() {
+    assert_table_root_kept(true);
+}
+
+#[test]
+fn barrier_passed_slot_keeps_the_closure_chain() {
+    let mut heap = LuaHeap::new(limits(16, 8, 16));
+    let later = heap.alloc().expect("later");
+    let tail = heap.alloc().expect("tail");
+    let mt = heap.alloc().expect("metatable");
+    let watch = heap.alloc().expect("watch");
+    let orphan = heap.alloc().expect("orphan");
+    let closure = heap.alloc_closure().expect("closure");
+    let cell = heap.alloc_upvalue().expect("upvalue");
+    let successor = heap.alloc().expect("successor");
+    heap.set_mode_scalar(mt, Value::string("v\0"))
+        .expect("mode");
+    heap.set_metatable(watch, Some(mt))
+        .expect("watch metatable");
+    heap.set_upvalue_edge(closure, cell).expect("closure cell");
+    heap.write_upvalue(cell, successor).expect("cell current");
+    heap.set_closure_edge(watch, KEY_KEPT, closure)
+        .expect("weak closure");
+    heap.set_edge(watch, KEY_REPLACED, orphan)
+        .expect("weak orphan");
+    let frame = heap.enter_roots(4).expect("frame");
+    heap.write_root(frame, 0, later).expect("root later");
+    heap.write_root(frame, 2, tail).expect("root tail");
+    heap.write_root(frame, 3, watch).expect("root watch");
+    let mut parked = ParkedMark::start(&mut heap).expect("park");
+    pause_after_root_visits(&mut parked, 2);
+    assert_eq!(parked.phase_name(), "roots");
+    let before = parked.meter();
+    parked
+        .write_closure_root(frame, PASSED_SLOT, closure)
+        .expect("fixed closure root update");
+    assert_eq!(
+        parked.root_closure(frame, PASSED_SLOT).expect("stored"),
+        Some(closure)
+    );
+    assert_eq!(parked.meter().root_slot_visits, before.root_slot_visits);
+    assert_eq!(parked.meter().parked_root_writes, 1);
+    assert_write_did_not_scan(&before, &parked.meter());
+    finish(&mut parked);
+    parked.complete().expect("sweep");
+    drop(parked);
+    assert!(
+        heap.closure_alive(closure)
+            && heap.upvalue_alive(cell)
+            && heap.alive(successor)
+            && heap.scan.parked_barrier_marks == 1,
+        "closure chain collected after a successful root write; closure {} cell {} successor {} barrier_marks {}",
+        heap.closure_alive(closure),
+        heap.upvalue_alive(cell),
+        heap.alive(successor),
+        heap.scan.parked_barrier_marks,
+    );
+    assert_eq!(heap.read_upvalue(closure).expect("chain"), successor);
+    assert!(!heap.alive(orphan), "weak orphan was retained");
+    assert_eq!(heap.scan.mark_passes, 1);
+    assert_eq!(heap.scan.parked_root_writes, 1);
+}
+
+#[test]
+fn barrier_passed_slot_keeps_the_upvalue_chain() {
+    let mut heap = LuaHeap::new(limits(16, 8, 16));
+    let later = heap.alloc().expect("later");
+    let tail = heap.alloc().expect("tail");
+    let mt = heap.alloc().expect("metatable");
+    let watch = heap.alloc().expect("watch");
+    let orphan = heap.alloc().expect("orphan");
+    let cell = heap.alloc_upvalue().expect("upvalue");
+    let successor = heap.alloc().expect("successor");
+    heap.set_mode_scalar(mt, Value::string("v\0"))
+        .expect("mode");
+    heap.set_metatable(watch, Some(mt))
+        .expect("watch metatable");
+    heap.write_upvalue(cell, successor).expect("cell current");
+    heap.set_cell_edge(watch, cell).expect("weak cell");
+    heap.set_edge(watch, KEY_REPLACED, orphan)
+        .expect("weak orphan");
+    let frame = heap.enter_roots(4).expect("frame");
+    heap.write_root(frame, 0, later).expect("root later");
+    heap.write_root(frame, 2, tail).expect("root tail");
+    heap.write_root(frame, 3, watch).expect("root watch");
+    let mut parked = ParkedMark::start(&mut heap).expect("park");
+    pause_after_root_visits(&mut parked, 4);
+    let orphan_edge = parked
+        .field_index(watch, KEY_REPLACED)
+        .expect("orphan edge");
+    pulse_until_gray(&mut parked);
+    pause_at(&mut parked, watch.slot(), orphan_edge);
+    charge_pending(&mut parked);
+    assert_eq!(parked.phase_name(), "gray");
+    assert!(
+        !parked.marked(successor),
+        "weak scan marked the cell current"
+    );
+    let before = parked.meter();
+    let scanning = parked.scanning_owner();
+    parked
+        .write_upvalue_root(frame, PASSED_SLOT, cell)
+        .expect("fixed upvalue root update");
+    assert_eq!(
+        parked.root_upvalue(frame, PASSED_SLOT).expect("stored"),
+        Some(cell)
+    );
+    assert_eq!(parked.meter().root_slot_visits, before.root_slot_visits);
+    assert_eq!(parked.scanning_owner(), scanning);
+    assert_eq!(parked.meter().parked_root_writes, 1);
+    assert_write_did_not_scan(&before, &parked.meter());
+    finish(&mut parked);
+    parked.complete().expect("sweep");
+    drop(parked);
+    assert!(
+        heap.upvalue_alive(cell) && heap.alive(successor) && heap.scan.parked_barrier_marks == 1,
+        "upvalue chain collected after a successful root write; cell {} successor {} barrier_marks {}",
+        heap.upvalue_alive(cell),
+        heap.alive(successor),
+        heap.scan.parked_barrier_marks,
+    );
+    assert_eq!(heap.current_table(cell).expect("current"), Some(successor));
+    assert!(!heap.alive(orphan));
+    assert_eq!(heap.scan.mark_passes, 1);
+    assert_eq!(heap.scan.parked_root_writes, 1);
+}
+
+#[test]
+fn barrier_refused_root_write_leaves_the_slot_and_meter() {
+    let mut heap = LuaHeap::new(limits(4, 4, 4));
+    let frame = heap.enter_roots(2).expect("frame");
+    let target = heap.alloc().expect("target");
+    let mut parked = ParkedMark::start(&mut heap).expect("park");
+    let before = picture(&parked);
+    let err = parked
+        .write_table_root(frame, 0, target)
+        .expect_err("closed phase");
+    assert_eq!(err, HeapError::MarkDenied);
+    assert_same(&picture(&parked), &before);
+    assert_eq!(parked.meter().parked_root_writes, 0);
+    assert_eq!(parked.meter().parked_barrier_marks, 0);
+    parked.cancel();
+
+    let mut heap = LuaHeap::new(limits(8, 4, 4));
+    let stale = heap.alloc().expect("stale");
+    heap.rollback(stale).expect("rollback");
+    let later = heap.alloc().expect("later");
+    let tail = heap.alloc().expect("tail");
+    let frame = heap.enter_roots(3).expect("frame");
+    heap.write_root(frame, 0, later).expect("root later");
+    heap.write_root(frame, 2, tail).expect("root tail");
+    let mut parked = ParkedMark::start(&mut heap).expect("park");
+    pause_after_root_visits(&mut parked, 2);
+    let before = picture(&parked);
+    let stale_err = parked
+        .write_table_root(frame, PASSED_SLOT, stale)
+        .expect_err("stale handle");
+    assert_eq!(stale_err, HeapError::StaleHandle);
+    assert_same(&picture(&parked), &before);
+    assert_eq!(parked.root_table(frame, PASSED_SLOT).expect("slot"), None);
+    let slot_err = parked
+        .write_table_root(frame, 3, later)
+        .expect_err("invalid slot");
+    assert_eq!(slot_err, HeapError::StaleFrame);
+    assert_same(&picture(&parked), &before);
+    assert_eq!(parked.root_table(frame, PASSED_SLOT).expect("slot"), None);
+    assert_eq!(parked.meter().parked_root_writes, 0);
+    assert_eq!(parked.meter().parked_barrier_marks, 0);
+    assert_eq!(parked.meter().mark_passes, 1);
 }
