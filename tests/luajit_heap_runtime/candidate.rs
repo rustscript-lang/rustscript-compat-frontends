@@ -1865,6 +1865,16 @@ impl Lower<'_> {
                 span,
                 targets,
                 values,
+            } if targets.len() >= 2
+                && targets.len() == values.exprs.len()
+                && targets.iter().all(plain_named_field) =>
+            {
+                self.lower_parallel_named_fields(*span, targets, &values.exprs)
+            }
+            ast::Stmt::Assign {
+                span,
+                targets,
+                values,
             } if let ([target], [value]) = (targets.as_slice(), values.exprs.as_slice()) => {
                 self.lower_assign(*span, target, value)
             }
@@ -2889,6 +2899,70 @@ impl Lower<'_> {
             Ok(text) => Expr::String(text.to_string()),
             Err(_) => Expr::Bytes(bytes.to_vec()),
         }
+    }
+
+    /// Save each local-table receiver, evaluate every right-hand value into a
+    /// private slot, then write those slots from right to left through the
+    /// same named-field edge. One target stays on `lower_assign`. The slots
+    /// are not guest bindings.
+    fn lower_parallel_named_fields(
+        &mut self,
+        span: ast::Span,
+        targets: &[ast::AssignTarget],
+        values: &[ast::Expr],
+    ) -> Result<(), ParseError> {
+        let temp_base = self.active_temps.len();
+        let mut receivers = Vec::with_capacity(targets.len());
+        for target in targets {
+            let ast::AssignTarget::Field {
+                table,
+                name,
+                nav: false,
+                ..
+            } = target
+            else {
+                return Err(self.statement_unsupported(span));
+            };
+            let key = utf8_field(&name.bytes).map_err(|_| self.unsupported(target.span()))?;
+            let from = self.expr(table)?;
+            let from = self.index_operand_slot(from, target.span())?;
+            receivers.push((from, key));
+        }
+        let mut saved = Vec::with_capacity(values.len());
+        for (index, value) in values.iter().enumerate() {
+            if !parallel_rhs_allowed(value) {
+                return Err(self.unsupported(value.span()));
+            }
+            let expr = match value {
+                ast::Expr::Nil { .. } => Expr::Null,
+                other => self.expr(other)?,
+            };
+            let slot = self.builder.alloc_local_named(&format!(
+                "#parallel-rhs:{}:{}",
+                self.stmts.len(),
+                index
+            ))?;
+            self.stmts.push(Stmt::Let {
+                index: slot,
+                declared_schema: None,
+                expr,
+                line: self.line(value.span()),
+            });
+            saved.push(slot);
+        }
+        self.active_temps.truncate(temp_base);
+        for (slot, (from, key)) in saved.iter().rev().zip(receivers.iter().rev()) {
+            let written = self.call(
+                SET_EDGE,
+                vec![
+                    Expr::Var(*from),
+                    Expr::String(key.clone()),
+                    Expr::Var(*slot),
+                ],
+            )?;
+            self.emit_ignored(written, self.line(span))?;
+        }
+        Ok(())
     }
 
     fn lower_assign(
@@ -3983,6 +4057,31 @@ fn statement_receiver_width(stmt: &ast::Stmt) -> u32 {
 
 fn utf8_field(name: &[u8]) -> Result<String, ()> {
     String::from_utf8(name.to_vec()).map_err(|_| ())
+}
+
+/// A non-optional `name.field` whose receiver is a local name.
+fn plain_named_field(target: &ast::AssignTarget) -> bool {
+    matches!(
+        target,
+        ast::AssignTarget::Field {
+            table,
+            nav: false,
+            ..
+        } if matches!(table.as_ref(), ast::Expr::Name { .. })
+    )
+}
+
+/// No call. Bool, string, nil, a local, or one ordinary field read.
+fn parallel_rhs_allowed(expr: &ast::Expr) -> bool {
+    match expr {
+        ast::Expr::Nil { .. } | ast::Expr::Bool { .. } | ast::Expr::String { .. } => true,
+        ast::Expr::Name { .. } => true,
+        ast::Expr::SuffixChain { base, steps, .. } => {
+            matches!(base.as_ref(), ast::Expr::Name { .. })
+                && matches!(steps.as_slice(), [ast::Suffix::Field { nav: false, .. }])
+        }
+        _ => false,
+    }
 }
 
 fn syntactic_direct_call(expr: &ast::Expr) -> bool {
