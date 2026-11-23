@@ -2241,11 +2241,23 @@ impl LuaHeap {
     }
 
     fn replace_edge_value(&mut self, owner: u32, index: u32, value: EdgeValue) {
+        let (old_gap, barrier) = {
+            let edge = self.edge_slots[index as usize]
+                .edge
+                .as_ref()
+                .expect("occupied edge record");
+            let old_gap = edge.value.is_cursor_gap();
+            let barrier = if self.mark.is_some() {
+                replaced_table_target(&edge.key, old_gap, &value)
+            } else {
+                None
+            };
+            (old_gap, barrier)
+        };
         let edge = self.edge_slots[index as usize]
             .edge
             .as_mut()
             .expect("occupied edge record");
-        let old_gap = edge.value.is_cursor_gap();
         self.payload_bytes -= value_payload(&edge.value);
         edge.value = value;
         let new_gap = edge.value.is_cursor_gap();
@@ -2256,6 +2268,9 @@ impl LuaHeap {
             _ => {}
         }
         self.note_mode_pointer(owner, index);
+        if let Some((slot, generation)) = barrier {
+            self.barrier_strong_field(owner, slot, generation);
+        }
     }
 
     fn rewrite_gap(&mut self, index: u32) {
@@ -2288,6 +2303,24 @@ impl LuaHeap {
 
 fn edge_key_is_slot(key: &EdgeKey, slot: u32) -> bool {
     matches!(key, EdgeKey::Object { slot: key_slot, .. } if *key_slot == slot)
+}
+
+/// Ordinary non-gap field whose new value is a table. Reserved fields,
+/// object keys, gaps, and non-table values stay out of the gray queue.
+fn replaced_table_target(key: &EdgeKey, old_gap: bool, value: &EdgeValue) -> Option<(u32, u32)> {
+    if old_gap {
+        return None;
+    }
+    let EdgeKey::Field(field) = key else {
+        return None;
+    };
+    if *field == LuaHeap::MODE_FIELD || *field == CELL_EDGE {
+        return None;
+    }
+    match value {
+        EdgeValue::Table { slot, generation } => Some((*slot, *generation)),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

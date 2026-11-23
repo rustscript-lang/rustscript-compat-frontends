@@ -16,7 +16,9 @@
 //! Roots and Gray open an ordinary field delete, an ordinary field write on
 //! an owner that is not yet marked, an in-place replacement of an existing
 //! non-gap ordinary field on an already marked owner, and a fixed root-slot
-//! update through the typed root writers. New keys, gap resurrection,
+//! update through the typed root writers. The shared field replacement
+//! applies that barrier, so an ordinary `set_edge` of an existing field uses
+//! the same gray queue. New keys, gap resurrection,
 //! allocation, rollback, metatable and `__mode` writes, root-frame changes,
 //! internal closure edges, the private cell edge, and token edits stay closed.
 //! A refused edit returns before it changes the heap.
@@ -306,6 +308,7 @@ impl<'a> ParkedMark<'a> {
     /// In-place replacement of one existing non-gap field. One key lookup.
     /// A missing key or a cursor gap is refused before any record changes.
     /// This does not insert, append, or reclaim another owner's gap.
+    /// The shared writer barriers the table value; this path does not enqueue again.
     fn replace_discovered_field(
         &mut self,
         from: TableRef,
@@ -332,8 +335,6 @@ impl<'a> ParkedMark<'a> {
             },
         );
         self.heap.scan.parked_edge_writes += 1;
-        self.heap
-            .barrier_strong_field(from.slot(), to.slot(), to.generation());
         Ok(())
     }
 
@@ -365,6 +366,15 @@ impl<'a> ParkedMark<'a> {
     ) -> Result<(), HeapError> {
         self.gate_mutation()?;
         self.heap.write_upvalue_root(frame, slot, handle)
+    }
+
+    /// Test borrow of the heap while saved mark state stays on it.
+    ///
+    /// `LuaHeap::set_edge` can replace an existing field through this borrow.
+    /// It is not a production entry and is absent outside tests.
+    #[cfg(test)]
+    pub(super) fn with_saved_heap<R>(&mut self, body: impl FnOnce(&mut LuaHeap) -> R) -> R {
+        body(self.heap)
     }
 
     pub(super) fn scanning_owner(&self) -> Option<u32> {
@@ -799,6 +809,13 @@ fn enqueue_barrier_target(
     }
 }
 
+/// Reads the mark bit of a table owner. No chain walk and no scan counter.
+fn discovered_table(heap: &LuaHeap, owner: u32) -> bool {
+    heap.slots.get(owner as usize).is_some_and(|slot| {
+        slot.kind == HandleKind::Table && matches!(slot.state, SlotState::Live { marked: true })
+    })
+}
+
 /// Reads the reset-time mode cache. No metatable follow and no scan counter.
 fn cached_values_weak(heap: &LuaHeap, state: &MarkState, owner: u32) -> bool {
     if heap.metatable_edges == 0 {
@@ -879,13 +896,17 @@ impl LuaHeap {
     }
 
     /// Marks a strong table value written into an already discovered field.
-    /// Weak values stay on the cached mode and are not followed. This does
-    /// not call `owner_mode` and does not move either cursor.
+    /// Weak values stay on the cached mode and are not followed. An owner
+    /// that is not yet marked does not enter the gray queue. This does not
+    /// call `owner_mode` and does not move either cursor.
     pub(super) fn barrier_strong_field(&mut self, owner: u32, slot: u32, generation: u32) {
         let Some(mut state) = self.mark.take() else {
             return;
         };
-        if state.mutation_open() && !cached_values_weak(self, &state, owner) {
+        if state.mutation_open()
+            && discovered_table(self, owner)
+            && !cached_values_weak(self, &state, owner)
+        {
             enqueue_barrier_target(self, &mut state, slot, generation, HandleKind::Table);
         }
         self.mark = Some(state);

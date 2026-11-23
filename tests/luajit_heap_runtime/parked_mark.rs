@@ -1032,6 +1032,11 @@ fn barrier_black_owner_keeps_the_cycle_until_release() {
         before.parked_edge_writes + 1
     );
     assert_write_did_not_scan(&before, &parked.meter());
+    assert_eq!(
+        parked.meter().node_slot_visits,
+        before.node_slot_visits + 2,
+        "the shared writer followed the new target once"
+    );
     assert!(
         !parked.marked(graph.child),
         "the write marked an unprocessed child"
@@ -1107,6 +1112,11 @@ fn barrier_gray_owner_keeps_the_cycle_and_the_pending_successor() {
         before.parked_edge_writes + 1
     );
     assert_write_did_not_scan(&before, &parked.meter());
+    assert_eq!(
+        parked.meter().node_slot_visits,
+        before.node_slot_visits + 2,
+        "the shared writer followed the new target once"
+    );
     assert!(
         !parked.marked(successor),
         "the write marked the pending successor"
@@ -1614,4 +1624,223 @@ fn barrier_refused_root_write_leaves_the_slot_and_meter() {
     assert_eq!(parked.meter().parked_root_writes, 0);
     assert_eq!(parked.meter().parked_barrier_marks, 0);
     assert_eq!(parked.meter().mark_passes, 1);
+}
+
+/// Raw `set_edge` on a scanned owner. The write must succeed in place.
+/// Keeping the white cycle is the product result; collecting it is the miss.
+#[test]
+fn raw_set_edge_on_scanned_owner_keeps_the_strong_cycle() {
+    let mut heap = LuaHeap::new(limits(24, 8, 24));
+    let graph = plant_strong_owner(&mut heap, false);
+    let (mut parked, index) = pause_on_owner_edge(&mut heap, graph.owner, KEY_REPLACED);
+    let scanning = charge_pending(&mut parked);
+    assert_eq!(scanning, graph.owner.slot());
+    assert_eq!(parked.phase_name(), "gray");
+    assert!(parked.mutation_open());
+    assert!(
+        parked.marked(graph.owner),
+        "the scanned owner is already marked"
+    );
+    assert!(!parked.marked(graph.cycle.p), "P is only weakly reachable");
+    assert!(
+        !parked.marked(graph.child),
+        "the unprocessed child is not marked by setup"
+    );
+    let pending = parked.pending();
+    let before = parked.meter();
+    parked.with_saved_heap(|heap| {
+        heap.set_edge(graph.owner, KEY_REPLACED, graph.cycle.p)
+            .expect("raw in-place replace");
+    });
+    assert_eq!(parked.field_index(graph.owner, KEY_REPLACED), Some(index));
+    assert_eq!(
+        parked.edge(graph.owner, KEY_REPLACED).expect("replaced"),
+        Some(graph.cycle.p)
+    );
+    assert_eq!(
+        parked
+            .edge(graph.owner, KEY_KEPT)
+            .expect("original successor"),
+        Some(graph.kept)
+    );
+    assert!(
+        same_pending(parked.pending(), pending),
+        "the owner edge cursor moved"
+    );
+    assert_eq!(parked.scanning_owner(), Some(graph.owner.slot()));
+    assert_eq!(parked.meter().parked_edge_writes, before.parked_edge_writes);
+    assert_write_did_not_scan(&before, &parked.meter());
+    assert!(
+        !parked.marked(graph.child),
+        "the write marked an unprocessed child"
+    );
+    let visit_delta = parked.meter().node_slot_visits - before.node_slot_visits;
+    let pushed_delta = parked.meter().scratch.work_pushed - before.scratch.work_pushed;
+    let barrier_delta = parked.meter().parked_barrier_marks - before.parked_barrier_marks;
+    assert_one_more_pulse_unit(&mut parked);
+    let view = finish(&mut parked);
+    parked.complete().expect("sweep");
+    drop(parked);
+    assert!(
+        cycle_kept(&heap, &graph.cycle),
+        "{}",
+        cycle_lost_message(&heap, &graph.cycle, index)
+    );
+    assert_cycle_identity(&heap, &graph.cycle);
+    assert_eq!(
+        barrier_delta, 1,
+        "the shared gray queue marked the new target once"
+    );
+    assert_eq!(
+        visit_delta, 2,
+        "one barrier follow reads the target slot twice"
+    );
+    assert_eq!(
+        pushed_delta, 1,
+        "only the new target joined gray at the write"
+    );
+    assert_eq!(heap.scan.parked_barrier_marks, 1);
+    assert_eq!(heap.scan.parked_edge_writes, 0);
+    assert_eq!(view.mark_passes, 1);
+    assert_eq!(heap.scan.mark_passes, 1);
+    assert!(heap.alive(graph.owner) && heap.alive(graph.kept) && heap.alive(graph.child));
+    heap.clear_edge(graph.owner, &super::EdgeKey::Field(KEY_REPLACED));
+    heap.collect();
+    assert!(
+        !heap.alive(graph.cycle.p) && !heap.alive(graph.cycle.q) && !heap.alive(graph.cycle.r),
+        "clearing the replaced field did not release the cycle"
+    );
+    assert!(heap.alive(graph.owner) && heap.alive(graph.kept));
+}
+
+#[test]
+fn raw_set_edge_on_a_weak_owner_does_not_keep_the_cycle() {
+    let mut heap = LuaHeap::new(limits(24, 8, 24));
+    let owner = heap.alloc().expect("weak owner");
+    let old = heap.alloc().expect("old");
+    let successor = heap.alloc().expect("successor");
+    let cycle = plant_cycle(&mut heap);
+    heap.set_metatable(owner, Some(cycle.mt))
+        .expect("weak owner");
+    heap.set_edge(owner, KEY_REPLACED, old).expect("weak field");
+    heap.set_edge(owner, KEY_SUCCESSOR, successor)
+        .expect("weak successor");
+    let frame = heap.enter_roots(4).expect("frame");
+    heap.write_root(frame, 0, owner).expect("root owner");
+    heap.write_root(frame, 1, cycle.watch).expect("root watch");
+    heap.write_root(frame, 2, cycle.mt).expect("root metatable");
+    heap.write_root(frame, 3, successor)
+        .expect("keep the successor readable");
+    let (mut parked, index) = pause_on_owner_edge(&mut heap, owner, KEY_SUCCESSOR);
+    charge_pending(&mut parked);
+    assert!(parked.marked(owner));
+    assert_eq!(parked.phase_name(), "gray");
+    let field = parked
+        .field_index(owner, KEY_REPLACED)
+        .expect("replaced field");
+    assert_ne!(field, index);
+    let before = parked.meter();
+    let pending = parked.pending();
+    parked.with_saved_heap(|heap| {
+        heap.set_edge(owner, KEY_REPLACED, cycle.p)
+            .expect("raw replace");
+    });
+    assert_eq!(parked.field_index(owner, KEY_REPLACED), Some(field));
+    assert_eq!(
+        parked.edge(owner, KEY_REPLACED).expect("replaced"),
+        Some(cycle.p)
+    );
+    assert!(
+        same_pending(parked.pending(), pending),
+        "the owner edge cursor moved"
+    );
+    assert_eq!(
+        parked.meter().parked_barrier_marks,
+        before.parked_barrier_marks
+    );
+    assert_eq!(parked.meter().parked_edge_writes, before.parked_edge_writes);
+    assert_eq!(
+        parked.meter().scratch.work_pushed,
+        before.scratch.work_pushed
+    );
+    assert_write_did_not_scan(&before, &parked.meter());
+    finish(&mut parked);
+    parked.complete().expect("sweep");
+    drop(parked);
+    assert!(
+        !cycle_kept(&heap, &cycle),
+        "a weak raw replace kept the cycle at record {field}"
+    );
+    assert!(!heap.alive(cycle.orphan));
+    assert!(heap.alive(owner) && heap.alive(successor));
+    assert_eq!(heap.scan.parked_barrier_marks, 0);
+    assert_eq!(heap.scan.parked_edge_writes, 0);
+    assert_eq!(heap.scan.mark_passes, 1);
+}
+
+#[test]
+fn raw_set_edge_on_an_unmarked_owner_waits_for_normal_discovery() {
+    let mut heap = LuaHeap::new(limits(16, 8, 16));
+    let later = heap.alloc().expect("later");
+    let owner = heap.alloc().expect("unmarked owner");
+    let old = heap.alloc().expect("old");
+    heap.set_edge(later, KEY_KEPT, owner)
+        .expect("later to owner");
+    heap.set_edge(owner, KEY_REPLACED, old).expect("field");
+    let cycle = plant_cycle(&mut heap);
+    let frame = heap.enter_roots(3).expect("frame");
+    heap.write_root(frame, 0, later).expect("root later");
+    heap.write_root(frame, 1, cycle.watch).expect("root watch");
+    heap.write_root(frame, 2, cycle.mt).expect("root metatable");
+    let mut parked = ParkedMark::start(&mut heap).expect("park");
+    let later_edge = parked.field_index(later, KEY_KEPT).expect("later edge");
+    pause_at(&mut parked, later.slot(), later_edge);
+    assert_eq!(parked.phase_name(), "gray");
+    assert!(
+        !parked.marked(owner),
+        "the owner is still ahead of the cursor"
+    );
+    assert!(!parked.marked(cycle.p));
+    let field = parked
+        .field_index(owner, KEY_REPLACED)
+        .expect("owner field");
+    let pending = parked.pending();
+    let before = parked.meter();
+    parked.with_saved_heap(|heap| {
+        heap.set_edge(owner, KEY_REPLACED, cycle.p)
+            .expect("raw replace");
+    });
+    assert_eq!(parked.field_index(owner, KEY_REPLACED), Some(field));
+    assert_eq!(
+        parked.edge(owner, KEY_REPLACED).expect("replaced"),
+        Some(cycle.p)
+    );
+    assert!(!parked.marked(owner));
+    assert!(!parked.marked(cycle.p));
+    assert!(
+        same_pending(parked.pending(), pending),
+        "the pending cursor moved"
+    );
+    assert_eq!(
+        parked.meter().parked_barrier_marks,
+        before.parked_barrier_marks
+    );
+    assert_eq!(parked.meter().parked_edge_writes, before.parked_edge_writes);
+    assert_eq!(
+        parked.meter().scratch.work_pushed,
+        before.scratch.work_pushed
+    );
+    assert_write_did_not_scan(&before, &parked.meter());
+    finish(&mut parked);
+    parked.complete().expect("sweep");
+    drop(parked);
+    assert!(
+        cycle_kept(&heap, &cycle) && heap.scan.parked_barrier_marks == 0,
+        "unmarked owner was not discovered by the later scan, or the write barrier ran; {}",
+        cycle_lost_message(&heap, &cycle, field)
+    );
+    assert_cycle_identity(&heap, &cycle);
+    assert!(heap.alive(later) && heap.alive(owner));
+    assert_eq!(heap.scan.parked_edge_writes, 0);
+    assert_eq!(heap.scan.mark_passes, 1);
 }
