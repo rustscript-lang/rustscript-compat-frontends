@@ -14,6 +14,12 @@
 //! head, or one outgoing edge or gap. Target checks and the metatable check
 //! ride with the edge or the owner head. A zero budget does not read the graph.
 //!
+//! A safepoint root batch is not one of those units. While Roots or Gray is
+//! open, the batch checks the phase, the root quota, and every typed handle
+//! before it marks anything. Those prechecks do not increment the scan meter.
+//! Success then hands each entry to the existing gray queue. It does not write
+//! a root slot, open a frame, copy the batch, or spend pulse budget.
+//!
 //! Reset and mode pulses still spend that budget. They do not open mutation.
 //! Roots and Gray open an ordinary field delete, an ordinary field write on
 //! an owner that is not yet marked, an in-place replacement of an existing
@@ -364,6 +370,64 @@ impl<'a> ParkedMark<'a> {
             },
         );
         self.heap.scan.parked_edge_writes += 1;
+        Ok(())
+    }
+
+    /// Accepts a borrowed root batch in this exclusive window.
+    ///
+    /// Open only in Roots or Gray. Checks run in order: phase, then
+    /// `roots.len() + batch.len()` (no overflow, and not above `limits.roots`;
+    /// reserved empty slots and duplicate entries count), then each handle
+    /// through `require_live`, `require_closure`, or `require_upvalue`. Those
+    /// calls keep `WrongDomain`, `WrongKind`, and `StaleHandle`. The precheck
+    /// reads are not scan visits. A refusal does not mark, enqueue, move a
+    /// cursor, write a root slot, or change a success meter.
+    ///
+    /// Success hands each accepted entry, including a duplicate or an
+    /// already-marked handle, to the existing gray queue through
+    /// `enqueue_barrier_target` / `follow_one`. `follow_one` charges two
+    /// `node_slot_visits` per entry. Accepted entries are
+    /// `parked_root_batch_accepts`. A first enqueue reuses
+    /// `parked_barrier_marks`. `work_pushed` still counts every newly marked
+    /// node, whatever enqueued it. The borrowed slice is not stored. No frame
+    /// is opened, and the call does not spend pulse budget.
+    pub(super) fn accept_root_batch(&mut self, batch: &[Rooted]) -> Result<(), HeapError> {
+        self.gate_root_batch(batch)?;
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let mut state = self.heap.mark.take().expect("open mark");
+        for rooted in batch {
+            let (slot, generation, kind) = rooted_identity(*rooted);
+            enqueue_barrier_target(self.heap, &mut state, slot, generation, kind);
+        }
+        self.heap.mark = Some(state);
+        self.heap.scan.parked_root_batch_accepts +=
+            u64::try_from(batch.len()).expect("quota already checked the length");
+        Ok(())
+    }
+
+    fn gate_root_batch(&self, batch: &[Rooted]) -> Result<(), HeapError> {
+        if self.done.is_some() || self.swept {
+            return Err(HeapError::MarkDenied);
+        }
+        let state = self.heap.mark.as_ref().ok_or(HeapError::MarkDenied)?;
+        if !state.mutation_open() {
+            return Err(HeapError::MarkDenied);
+        }
+        let occupied = u32::try_from(self.heap.roots.len()).map_err(|_| HeapError::RootCapacity)?;
+        let extra = u32::try_from(batch.len()).map_err(|_| HeapError::RootCapacity)?;
+        let end = occupied.checked_add(extra).ok_or(HeapError::RootCapacity)?;
+        if end > self.heap.limits.roots {
+            return Err(HeapError::RootCapacity);
+        }
+        for rooted in batch {
+            match *rooted {
+                Rooted::Table(handle) => self.heap.require_live(handle)?,
+                Rooted::Closure(handle) => self.heap.require_closure(handle)?,
+                Rooted::Upvalue(handle) => self.heap.require_upvalue(handle)?,
+            }
+        }
         Ok(())
     }
 
@@ -823,6 +887,15 @@ fn owner_mode(heap: &mut LuaHeap, state: &mut MarkState, slot: u32) -> WeakMode 
         return modes.get(to_slot as usize).copied().unwrap_or_default();
     }
     WeakMode::default()
+}
+
+/// Slot identity already stored on a typed root. This does not allocate a handle.
+fn rooted_identity(rooted: Rooted) -> (u32, u32, HandleKind) {
+    match rooted {
+        Rooted::Table(handle) => (handle.slot(), handle.generation(), HandleKind::Table),
+        Rooted::Closure(handle) => (handle.slot(), handle.generation(), HandleKind::Closure),
+        Rooted::Upvalue(handle) => (handle.slot(), handle.generation(), HandleKind::Upvalue),
+    }
 }
 
 /// Counts a newly gray target. An already-marked slot does not increment.

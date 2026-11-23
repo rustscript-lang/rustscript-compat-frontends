@@ -539,10 +539,15 @@ pub struct ScanMeter {
     /// Fixed root slots updated through `store_root` while a mark is parked.
     /// Not a pulse unit. A full collect leaves this at zero.
     pub parked_root_writes: u64,
-    /// Newly marked targets pushed to the parked gray queue by a write
-    /// barrier. An already-marked target does not increment this, and a weak
-    /// value is not pushed. Not a pulse unit. A full collect leaves this at zero.
+    /// Newly marked targets pushed to the parked gray queue by a write barrier
+    /// or a safepoint root batch. An already-marked target does not increment
+    /// this. Not a pulse unit. A full collect leaves this at zero.
     pub parked_barrier_marks: u64,
+    /// Entries accepted by a safepoint root batch, including duplicates.
+    /// A refused batch does not increment this. Precheck slot reads are not
+    /// counted here or in `node_slot_visits`. Not a pulse unit. A full collect
+    /// leaves this at zero.
+    pub parked_root_batch_accepts: u64,
     pub scratch: ScanScratch,
 }
 
@@ -2343,3 +2348,6 @@ mod parked_lifecycle;
 #[cfg(test)]
 #[path = "../../../../tests/luajit_heap_runtime/parked_mark.rs"]
 mod parked_mark;
+#[cfg(test)]
+#[path = "../../../../tests/luajit_heap_runtime/safepoint_roots.rs"]
+mod safepoint_roots;
