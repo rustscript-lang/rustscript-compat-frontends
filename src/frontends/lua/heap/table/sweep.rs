@@ -12,13 +12,20 @@
 //! That read is part of the head unit. It does not rescan a mode string and
 //! does not add `weak_mode_lookups`.
 //!
-//! Production callers drain this session before they return a report. A
-//! partial pulse is only visible to the private test that still holds the
-//! borrow. Guest `next` and raw reads belong after `drain`.
+//! Production callers drain this session before they return a report. `pulse`
+//! still rewrites one owner unit at a time. The private observation entry does
+//! not return that partial graph: before Owners the original edges are
+//! readable, and the same Owners walker publishes once when it finishes,
+//! still short of Release. That window's heads and edges are the walk it
+//! actually did. They are not a `pulse(1)` bound. Guest lookup on the entry
+//! rejects a handle already judged dead. A sweep with no dead slot never
+//! enters Owners and does not invent a publish window.
 
 use super::{
-    CollectReport, EdgeKey, EdgeValue, HandleKind, LuaHeap, MarkSnapshot, ScanMeter, SlotState,
+    CollectReport, EdgeKey, EdgeValue, GuestClass, HandleKind, HeapError, LuaHeap, MarkSnapshot,
+    ScanMeter, SlotState, TableRef,
 };
+use vm::Value;
 
 pub(super) struct SweepSession<'a> {
     heap: &'a mut LuaHeap,
@@ -386,6 +393,85 @@ impl<'a> SweepSession<'a> {
         })
     }
 
+    /// Reads the graph only outside the Owners walk.
+    ///
+    /// Select and Snapshot still hold the original edges. The first Release
+    /// index, after Owners, is the published graph. Any other phase, including
+    /// a unit inside Owners, returns nothing.
+    fn weak_view(&self) -> Option<WeakView<'_>> {
+        let publish = match self.phase {
+            SweepPhase::Select | SweepPhase::Snapshot => WeakPublish::Original,
+            SweepPhase::Release if self.index == 0 && !self.dead.is_empty() => {
+                WeakPublish::Published
+            }
+            _ => return None,
+        };
+        Some(self.boundary(publish))
+    }
+
+    /// Runs the current Owners walker to its end and returns that one boundary.
+    ///
+    /// The caller must still be before any owner unit. A walk that has already
+    /// rewritten an edge is not restarted and is not published. The transition
+    /// into Owners is not charged. Release does not start.
+    fn publish_owners(&mut self) -> Option<PublishWindow<'_>> {
+        if matches!(self.phase, SweepPhase::Snapshot) && self.index >= self.heap.slots.len() {
+            let charged = self.step();
+            debug_assert!(!charged);
+        }
+        if !matches!(self.phase, SweepPhase::Owners) || !self.at_owner_start() {
+            return None;
+        }
+        let mut spent = SweepUnits::default();
+        let mut spins = 0u32;
+        while matches!(self.phase, SweepPhase::Owners) {
+            self.pulse_spent = SweepUnits::default();
+            if self.step() {
+                spent.heads += self.pulse_spent.heads;
+                spent.edges += self.pulse_spent.edges;
+                spent.selection += self.pulse_spent.selection;
+                spent.snapshot += self.pulse_spent.snapshot;
+                spent.releases += self.pulse_spent.releases;
+                spent.roots += self.pulse_spent.roots;
+                spins = 0;
+            } else {
+                spins += 1;
+                debug_assert!(spins <= 4, "owner transition did not reach Release");
+            }
+        }
+        debug_assert!(matches!(self.phase, SweepPhase::Release));
+        debug_assert_eq!(self.index, 0);
+        debug_assert!(!self.owner_open);
+        debug_assert!(self.cursor.is_none());
+        Some(PublishWindow {
+            spent,
+            view: self.boundary(WeakPublish::Published),
+        })
+    }
+
+    fn at_owner_start(&self) -> bool {
+        self.owner == 0 && !self.owner_open && self.cursor.is_none()
+    }
+
+    fn boundary(&self, publish: WeakPublish) -> WeakView<'_> {
+        WeakView {
+            publish,
+            finished: false,
+            release_started: false,
+            heap: self.heap,
+            dead: &self.dead,
+            snapshot: &self.snapshot,
+        }
+    }
+
+    /// Occupancy of one slot. This is not a guest lookup and does not accept
+    /// a table handle.
+    fn slot_physical(&self, slot: u32) -> Option<(bool, u32)> {
+        let stored = self.heap.slots.get(slot as usize)?;
+        let live = matches!(stored.state, SlotState::Live { .. });
+        Some((live, stored.generation))
+    }
+
     fn guest_cursor(&self, key: &EdgeKey) -> bool {
         match key {
             EdgeKey::Utf8(_) | EdgeKey::Number(_) => true,
@@ -399,3 +485,133 @@ impl<'a> SweepSession<'a> {
         }
     }
 }
+
+/// Which exclusive boundary the observation entry is returning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WeakPublish {
+    /// Select or Snapshot. No owner edge has been rewritten.
+    Original,
+    /// Owners has finished. Release has not taken a slot.
+    Published,
+}
+
+/// Actual heads and edges of one exclusive Owners walk, plus the graph it left.
+struct PublishWindow<'a> {
+    spent: SweepUnits,
+    view: WeakView<'a>,
+}
+
+/// Read-only graph at one boundary. A judged-dead handle is not a target.
+struct WeakView<'a> {
+    publish: WeakPublish,
+    finished: bool,
+    release_started: bool,
+    heap: &'a LuaHeap,
+    dead: &'a [u32],
+    snapshot: &'a [SweepSlot],
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ObserveError {
+    JudgedDead,
+    Heap(HeapError),
+}
+
+impl WeakView<'_> {
+    fn publish(&self) -> WeakPublish {
+        self.publish
+    }
+
+    fn finished(&self) -> bool {
+        self.finished
+    }
+
+    fn release_started(&self) -> bool {
+        self.release_started
+    }
+
+    fn occupying_dead(&self) -> u32 {
+        self.dead.len() as u32
+    }
+
+    fn dead_still_physical(&self) -> u32 {
+        self.dead
+            .iter()
+            .filter(|&&slot| self.still_physical(slot))
+            .count() as u32
+    }
+
+    fn named(&self, table: TableRef, name: &str) -> Result<Option<TableRef>, ObserveError> {
+        self.reject(table)?;
+        match self.heap.named_edge(table, name) {
+            Ok(found) => Ok(found),
+            Err(error) => Err(ObserveError::Heap(error)),
+        }
+    }
+
+    fn number(&self, table: TableRef, key: f64) -> Result<Value, ObserveError> {
+        self.reject(table)?;
+        match self.heap.number_value(table, key) {
+            Ok(found) => Ok(found),
+            Err(error) => Err(ObserveError::Heap(error)),
+        }
+    }
+
+    fn object(&self, table: TableRef, key: TableRef) -> Result<Option<TableRef>, ObserveError> {
+        self.reject(table)?;
+        self.reject(key)?;
+        match self.heap.object_edge(table, key) {
+            Ok(found) => Ok(found),
+            Err(error) => Err(ObserveError::Heap(error)),
+        }
+    }
+
+    fn raw_sequence_len(&self, table: TableRef) -> Result<f64, ObserveError> {
+        self.reject(table)?;
+        match self.heap.raw_sequence_len(table) {
+            Ok(len) => Ok(len),
+            Err(error) => Err(ObserveError::Heap(error)),
+        }
+    }
+
+    fn next(
+        &self,
+        table: TableRef,
+        cursor: &Value,
+    ) -> Result<Option<(Value, Value)>, ObserveError> {
+        self.reject(table)?;
+        if let GuestClass::Table(key) = self.heap.guest_class(cursor) {
+            self.reject(key)?;
+        }
+        match self.heap.next_guest(table, cursor) {
+            Ok(found) => Ok(found),
+            Err(error) => Err(ObserveError::Heap(error)),
+        }
+    }
+
+    fn alive(&self, table: TableRef) -> Result<bool, ObserveError> {
+        self.reject(table)?;
+        Ok(self.heap.alive(table))
+    }
+
+    fn reject(&self, table: TableRef) -> Result<(), ObserveError> {
+        if self.dead.iter().any(|&slot| slot == table.slot()) {
+            return Err(ObserveError::JudgedDead);
+        }
+        Ok(())
+    }
+
+    fn still_physical(&self, slot: u32) -> bool {
+        let Some(stored) = self.heap.slots.get(slot as usize) else {
+            return false;
+        };
+        let Some(snap) = self.snapshot.get(slot as usize) else {
+            return false;
+        };
+        matches!(stored.state, SlotState::Live { .. }) && stored.generation == snap.generation
+    }
+}
+
+#[cfg(test)]
+#[path = "../../../../../tests/luajit_heap_runtime/weak_publish.rs"]
+mod weak_publish;
