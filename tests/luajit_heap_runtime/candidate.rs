@@ -24,7 +24,7 @@ const TABLE_ARG: &str = "lua_internal::table_arg";
 const NUMBER_ARG: &str = "lua_internal::number_arg";
 const BOOL_ARG: &str = "lua_internal::bool_arg";
 const STRING_ARG: &str = "lua_internal::string_arg";
-const GATHER_ROOT: &str = "lua_internal::gather_root";
+pub(super) const GATHER_ROOT: &str = "lua_internal::gather_root";
 pub(super) const COLLECT: &str = "lua_internal::collect";
 const STEP: &str = "lua_internal::step";
 const STEP_HAS_TAIL: &str = "lua_internal::step_has_tail";
@@ -32,7 +32,8 @@ const GC_STOP: &str = "lua_internal::gc_stop";
 const GC_RESTART: &str = "lua_internal::gc_restart";
 const GC_IS_RUNNING: &str = "lua_internal::gc_is_running";
 const STEP_DATA: &str = "lua_internal::step_data";
-const AUTO_TABLE_RESTART: &str = "lua_internal::auto_table_restart";
+pub(super) const AUTO_TABLE_DUE: &str = "lua_internal::auto_table_due";
+pub(super) const AUTO_TABLE_RESTART: &str = "lua_internal::auto_table_restart";
 const COUNT: &str = "lua_internal::count";
 const OPEN_CELL: &str = "lua_internal::open_cell";
 const READ_CELL: &str = "lua_internal::read_cell";
@@ -140,13 +141,28 @@ pub(super) fn install_run_control_schemas(builder: &mut HostApiBuilder) {
 }
 
 /// Opt in to one automatic empty-local safepoint. Not part of the ordinary
-/// catalog or the run-control catalog.
-pub(super) fn install_auto_table_restart_schema(builder: &mut HostApiBuilder) {
+/// catalog or the run-control catalog. Due is a read-only observation; the
+/// restart entry is the only writer. Either schema alone does not connect the
+/// source route.
+pub(super) fn install_auto_table_due_schema(builder: &mut HostApiBuilder) {
+    builder.function(HostFunctionSchema::with_return(
+        AUTO_TABLE_DUE,
+        vec![],
+        HostTypeSchema::Bool,
+    ));
+}
+
+pub(super) fn install_auto_table_restart_entry_schema(builder: &mut HostApiBuilder) {
     builder.function(HostFunctionSchema::with_return(
         AUTO_TABLE_RESTART,
         vec![HostParamSchema::value("roots", HostTypeSchema::Unknown)],
         HostTypeSchema::Float,
     ));
+}
+
+pub(super) fn install_auto_table_restart_schema(builder: &mut HostApiBuilder) {
+    install_auto_table_due_schema(builder);
+    install_auto_table_restart_entry_schema(builder);
 }
 
 pub(super) fn install_schemas(builder: &mut HostApiBuilder) {
@@ -321,6 +337,7 @@ pub(super) fn register(
         Op::GcRestart,
         Op::GcIsRunning,
         Op::StepData,
+        Op::AutoTableDue,
         Op::AutoTableRestart,
         Op::Count,
         Op::EnterResult,
@@ -369,6 +386,7 @@ pub(super) fn register(
             Op::GcRestart => GC_RESTART,
             Op::GcIsRunning => GC_IS_RUNNING,
             Op::StepData => STEP_DATA,
+            Op::AutoTableDue => AUTO_TABLE_DUE,
             Op::AutoTableRestart => AUTO_TABLE_RESTART,
             Op::Count => COUNT,
             Op::EnterResult => ENTER_RESULT,
@@ -406,6 +424,7 @@ pub(super) fn register(
                 | Op::GcRestart
                 | Op::GcIsRunning
                 | Op::StepData
+                | Op::AutoTableDue
                 | Op::AutoTableRestart
         ) && catalog.function(name).is_none()
         {
@@ -440,6 +459,7 @@ enum Op {
     GcRestart,
     GcIsRunning,
     StepData,
+    AutoTableDue,
     AutoTableRestart,
     Count,
     EnterResult,
@@ -637,6 +657,7 @@ impl HostOwnedFunction for Op {
             Self::StepHasTail => Value::Bool(heap::saved_source_tail(&call.vm().host_context())),
             Self::GcStop => set_gc_running(&mut call.vm().host_context(), false)?,
             Self::GcRestart => gc_restart(&mut call.vm().host_context())?,
+            Self::AutoTableDue => Value::Bool(auto_table_due(&mut call.vm().host_context())?),
             Self::AutoTableRestart => auto_table_restart(call)?,
             Self::GcIsRunning => gc_is_running(&call.vm().host_context()),
             Self::StepData => step_data_default(call)?,
@@ -1988,6 +2009,39 @@ fn auto_table_due(host: &mut vm::HostContext<'_>) -> Result<bool, VmError> {
     Ok(logical >= threshold)
 }
 
+/// Read-only snapshot for the once-only witness. Does not decode roots, pop a
+/// budget, set the latch, or start a cycle.
+pub(super) struct AutoTableMeter {
+    pub logical: u64,
+    pub threshold: u64,
+    pub running: bool,
+    pub requested: bool,
+    pub due: bool,
+}
+
+pub(super) fn auto_table_meter(host: &mut vm::HostContext<'_>) -> Result<AutoTableMeter, VmError> {
+    let due = auto_table_due(host)?;
+    let logical = host
+        .scope_state::<heap::LuaHeap>()
+        .map(|heap| heap.logical_bytes())
+        .unwrap_or(0);
+    let (running, threshold, requested) = match host.scope_state::<GcRunControl>() {
+        Some(control) => (
+            control.running,
+            control.threshold_bytes.unwrap_or(0),
+            control.auto_requested,
+        ),
+        None => (false, 0, false),
+    };
+    Ok(AutoTableMeter {
+        logical,
+        threshold,
+        running,
+        requested,
+        due,
+    })
+}
+
 fn confirm_round_finished(host: &mut vm::HostContext<'_>) -> Result<(), VmError> {
     if heap::saved_source_tail(host) || !heap::fixed_step_idle(host).map_err(heap_error)? {
         return Err(VmError::HostError(
@@ -3029,7 +3083,7 @@ impl Lower<'_> {
         name: &ast::Name,
         value: &ast::Expr,
     ) -> Result<(), ParseError> {
-        if self.catalog.function(AUTO_TABLE_RESTART).is_some()
+        if self.auto_table_routed()
             && matches!(value, ast::Expr::Table { fields, .. } if fields.is_empty())
         {
             self.emit_auto_table_safepoint(span)?;
@@ -3076,11 +3130,32 @@ impl Lower<'_> {
         Ok(())
     }
 
+    fn auto_table_routed(&self) -> bool {
+        self.catalog.function(AUTO_TABLE_DUE).is_some()
+            && self.catalog.function(AUTO_TABLE_RESTART).is_some()
+    }
+
     fn emit_auto_table_safepoint(&mut self, span: ast::Span) -> Result<(), ParseError> {
         // Only this source local. Shadow and cell constructors call NEW_TABLE
         // themselves and do not pass through here.
+        //
+        // The due call has no guest arguments, so the judgment does not read or
+        // move a live value. Gather statements are reserved in the taken branch
+        // and are not executed when the judgment is false. The restart entry
+        // still refuses a direct call that is not due.
+        let due = self.call(AUTO_TABLE_DUE, vec![])?;
+        let start = self.stmts.len();
         let roots = self.gather_safepoint_roots(span)?;
-        let expr = self.call(AUTO_TABLE_RESTART, vec![roots])?;
+        let gather = self.stmts.split_off(start);
+        let taken = self.call(AUTO_TABLE_RESTART, vec![roots])?;
+        let expr = Expr::IfElse {
+            condition: Box::new(due),
+            then_expr: Box::new(Expr::Block {
+                stmts: gather,
+                expr: Box::new(taken),
+            }),
+            else_expr: Box::new(Expr::Float(0.0)),
+        };
         self.emit_ignored(expr, self.line(span))
     }
 
@@ -4435,6 +4510,13 @@ impl Lower<'_> {
                 }
                 if name.is("external_shape") && args.exprs.is_empty() {
                     return self.call(EXTERNAL_SHAPE, vec![]);
+                }
+                if name.is("direct_auto_restart") && args.exprs.is_empty() {
+                    // Test probe for the dispatch gate. Not the automatic route.
+                    if self.catalog.function(AUTO_TABLE_RESTART).is_none() {
+                        return Err(self.unsupported(expr.span()));
+                    }
+                    return self.call(AUTO_TABLE_RESTART, vec![Expr::Null]);
                 }
                 let name =
                     std::str::from_utf8(&name.bytes).map_err(|_| self.unsupported(expr.span()))?;

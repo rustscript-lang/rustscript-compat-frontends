@@ -5,14 +5,15 @@
 //! The private host uses fixed frames; the opt-in guest spelling gathers the
 //! current source roots on mark steps and bypasses gathering on tail steps.
 
+use std::collections::HashSet;
 use std::num::NonZeroU64;
 use std::sync::{Arc, OnceLock};
 
 use vm::{
-    CallOutcome, CallReturn, CompileSourceFileOptions, FrontendImportSyntax, FrontendIr,
+    CallOutcome, CallReturn, CompileSourceFileOptions, Expr, FrontendImportSyntax, FrontendIr,
     HostFunctionRegistry, HostImportSchema, HostOwnedFunction, HostParamPassing, HostParamSchema,
-    HostTypeSchema, OpCode, OwnedHostCall, ParseError, Program, SourceFlavor, SourcePlugin, Value,
-    VmError, VmStatus,
+    HostTypeSchema, OpCode, OwnedHostCall, ParseError, Program, SourceFlavor, SourcePlugin, Stmt,
+    Value, VmError, VmStatus,
 };
 
 use super::ObservedTable;
@@ -25,6 +26,8 @@ const SAME: &str = "lua_host::same";
 const NOTE: &str = "lua_host::note";
 const TEXT: &str = "lua_host::text";
 const BIT: &str = "lua_host::bit";
+const SHAPE: &str = "lua_host::shape";
+const METER: &str = "lua_host::meter";
 
 const SOURCE: &str = r#"
 local function witness()
@@ -124,27 +127,51 @@ struct Plugin {
     guest_step: bool,
     run_control: bool,
     auto_table: bool,
+    restart_entry_only: bool,
+    due_only: bool,
 }
 
 static PLUGIN: Plugin = Plugin {
     guest_step: false,
     run_control: false,
     auto_table: false,
+    restart_entry_only: false,
+    due_only: false,
 };
 static STEP_PLUGIN: Plugin = Plugin {
     guest_step: true,
     run_control: false,
     auto_table: false,
+    restart_entry_only: false,
+    due_only: false,
 };
 static CONTROL_PLUGIN: Plugin = Plugin {
     guest_step: true,
     run_control: true,
     auto_table: false,
+    restart_entry_only: false,
+    due_only: false,
 };
 static AUTO_TABLE_PLUGIN: Plugin = Plugin {
     guest_step: true,
     run_control: true,
     auto_table: true,
+    restart_entry_only: false,
+    due_only: false,
+};
+static RESTART_ENTRY_PLUGIN: Plugin = Plugin {
+    guest_step: true,
+    run_control: true,
+    auto_table: false,
+    restart_entry_only: true,
+    due_only: false,
+};
+static DUE_ONLY_PLUGIN: Plugin = Plugin {
+    guest_step: true,
+    run_control: true,
+    auto_table: false,
+    restart_entry_only: false,
+    due_only: true,
 };
 
 impl SourcePlugin for Plugin {
@@ -161,12 +188,7 @@ impl SourcePlugin for Plugin {
     }
 
     fn parse_source(&self, source: &str) -> Result<FrontendIr, ParseError> {
-        let catalog = if self.auto_table {
-            catalog_auto()
-        } else {
-            catalog_for(self.guest_step, self.run_control)
-        };
-        candidate::lower(source, catalog)
+        candidate::lower(source, plugin_catalog(self))
     }
 }
 
@@ -213,6 +235,16 @@ fn install_witness_schemas(builder: &mut vm::HostApiBuilder) {
             HostParamSchema::value("text", HostTypeSchema::String),
         ],
         HostTypeSchema::Bool,
+    ));
+    builder.function(vm::HostFunctionSchema::with_return(
+        SHAPE,
+        vec![HostParamSchema::value("value", HostTypeSchema::Unknown)],
+        HostTypeSchema::Float,
+    ));
+    builder.function(vm::HostFunctionSchema::with_return(
+        METER,
+        vec![HostParamSchema::value("tag", HostTypeSchema::Float)],
+        HostTypeSchema::Float,
     ));
     builder.function(vm::HostFunctionSchema::with_return(
         BIT,
@@ -262,6 +294,44 @@ fn catalog_auto() -> &'static Arc<vm::HostApiCatalog> {
     })
 }
 
+fn catalog_restart_entry() -> &'static Arc<vm::HostApiCatalog> {
+    static ENTRY_CATALOG: OnceLock<Arc<vm::HostApiCatalog>> = OnceLock::new();
+    ENTRY_CATALOG.get_or_init(|| {
+        let mut builder = vm::HostApiBuilder::new();
+        candidate::install_schemas(&mut builder);
+        candidate::install_step_schemas(&mut builder);
+        candidate::install_run_control_schemas(&mut builder);
+        candidate::install_auto_table_restart_entry_schema(&mut builder);
+        install_witness_schemas(&mut builder);
+        Arc::new(builder.build().expect("restart entry catalog"))
+    })
+}
+
+fn catalog_due_only() -> &'static Arc<vm::HostApiCatalog> {
+    static DUE_CATALOG: OnceLock<Arc<vm::HostApiCatalog>> = OnceLock::new();
+    DUE_CATALOG.get_or_init(|| {
+        let mut builder = vm::HostApiBuilder::new();
+        candidate::install_schemas(&mut builder);
+        candidate::install_step_schemas(&mut builder);
+        candidate::install_run_control_schemas(&mut builder);
+        candidate::install_auto_table_due_schema(&mut builder);
+        install_witness_schemas(&mut builder);
+        Arc::new(builder.build().expect("due observation catalog"))
+    })
+}
+
+fn plugin_catalog(plugin: &Plugin) -> &'static Arc<vm::HostApiCatalog> {
+    if plugin.auto_table {
+        catalog_auto()
+    } else if plugin.restart_entry_only {
+        catalog_restart_entry()
+    } else if plugin.due_only {
+        catalog_due_only()
+    } else {
+        catalog_for(plugin.guest_step, plugin.run_control)
+    }
+}
+
 fn register(registry: &mut HostFunctionRegistry, catalog: &vm::HostApiCatalog) {
     for (name, op) in [
         (STEP, HostOp::Step),
@@ -270,6 +340,8 @@ fn register(registry: &mut HostFunctionRegistry, catalog: &vm::HostApiCatalog) {
         (NOTE, HostOp::Note),
         (TEXT, HostOp::Text),
         (BIT, HostOp::Bit),
+        (SHAPE, HostOp::Shape),
+        (METER, HostOp::Meter),
     ] {
         let function = catalog.function(name).expect("scalar step host schema");
         registry
@@ -291,6 +363,8 @@ enum HostOp {
     Note,
     Text,
     Bit,
+    Shape,
+    Meter,
 }
 
 impl HostOwnedFunction for HostOp {
@@ -344,6 +418,32 @@ impl HostOwnedFunction for HostOp {
                 let noted = (*tag, text.to_string());
                 note(&mut host, |state| state.texts.push(noted))?;
                 Value::Bool(true)
+            }
+            Self::Shape => Value::Float(if saved_external_shape(args.first()) {
+                1.0
+            } else {
+                0.0
+            }),
+            Self::Meter => {
+                let [Value::Float(tag)] = args.as_slice() else {
+                    return Err(host_fault("expected meter tag"));
+                };
+                let snap = candidate::auto_table_meter(&mut host)?;
+                let tag = *tag;
+                note(&mut host, |state| {
+                    state.notes.push((tag, snap.logical as f64));
+                    state.notes.push((tag + 1.0, snap.threshold as f64));
+                    state
+                        .notes
+                        .push((tag + 2.0, if snap.due { 1.0 } else { 0.0 }));
+                    state
+                        .notes
+                        .push((tag + 3.0, if snap.requested { 1.0 } else { 0.0 }));
+                    state
+                        .notes
+                        .push((tag + 4.0, if snap.running { 1.0 } else { 0.0 }));
+                })?;
+                Value::Float(snap.logical as f64)
             }
         };
         Ok(CallOutcome::Return(CallReturn::one(value)))
@@ -432,6 +532,16 @@ fn host_fault(message: &str) -> VmError {
     VmError::HostError(message.to_string())
 }
 
+/// The array from `external_shape`: saved and readable, but not a Lua table.
+fn saved_external_shape(value: Option<&Value>) -> bool {
+    let Some(Value::Array(items)) = value else {
+        return false;
+    };
+    items.len() == 2
+        && matches!(items.first(), Some(Value::Int(0)))
+        && matches!(items.get(1), Some(Value::Int(1)))
+}
+
 fn host_heap(error: heap::HeapError) -> VmError {
     VmError::HostError(error.to_string())
 }
@@ -469,13 +579,7 @@ fn drive_plugin(
     plugin: &'static Plugin,
     nodes: Option<u32>,
 ) -> Ran {
-    let catalog = Arc::clone(if plugin.auto_table {
-        catalog_auto()
-    } else if plugin.run_control {
-        catalog_for(true, true)
-    } else {
-        catalog(plugin.guest_step)
-    });
+    let catalog = Arc::clone(plugin_catalog(plugin));
     let options = CompileSourceFileOptions::new()
         .with_source_plugin(plugin)
         .with_host_api_catalog(Arc::clone(&catalog));
@@ -3516,7 +3620,7 @@ return 1
     assert_eq!(
         text_value(&ran.trace, 5.0),
         "table",
-        "a later empty table must not start another automatic cycle"
+        "w[3] = {{}} is an assignment, not `local name = {{}}`, so it is not an automatic safepoint"
     );
     assert_eq!(text_value(&ran.trace, 6.0), "nil");
     assert_eq!(note_value(&ran.trace, 9.0), 1.0);
@@ -3532,4 +3636,593 @@ return 1
     assert_eq!(ran.collects, 2, "both completions record the real report");
     assert!(ran.subject_alive.unwrap_or(false));
     assert!(ran.token_open.unwrap_or(false));
+}
+
+const LIVE_UNISSUED_PREFIX: &str = r#"
+local function witness()
+  local w = {}
+  local mt = {}
+  local held = {}
+  mt.__mode = "v"
+  setmetatable(w, mt)
+  w[1] = held
+  w[2] = {}
+  peek(held)
+  local unissued = external_shape()
+  note(1, shape(unissued))
+"#;
+
+/// Due empty local still gathers. The saved array is usable, then GATHER_ROOT
+/// rejects it. This is the positive control for the skipped-gather witness.
+#[test]
+fn due_empty_local_rejects_a_saved_unissued_shape_at_gather() {
+    let ran = run_auto_table(
+        &format!(
+            "{LIVE_UNISSUED_PREFIX}
+  note(2, collectgarbage(\"restart\"))
+  bit(1, collectgarbage(\"isrunning\"))
+  text(1, type(rawget(w, 2)))
+  local fresh = {{}}
+  peek(fresh)
+  return 1
+end
+witness()
+return 1
+"
+        ),
+        Some(&[10_000, 10_000]),
+    );
+    assert_eq!(
+        note_value(&ran.trace, 1.0),
+        1.0,
+        "the array was saved and read"
+    );
+    assert_eq!(
+        note_value(&ran.trace, 2.0),
+        0.0,
+        "restart itself does not collect"
+    );
+    assert!(
+        bit_value(&ran.trace, 1.0),
+        "restart leaves the collector running"
+    );
+    assert_eq!(
+        text_value(&ran.trace, 1.0),
+        "table",
+        "weak item before the local"
+    );
+    assert!(
+        matches!(ran.stop, Stop::HostError(ref message) if message.contains("invalid private Lua root candidate")),
+        "due gather must reject the unissued array at GATHER_ROOT, not a later host: {:?}",
+        ran.stop
+    );
+    assert_eq!(ran.trace.peeks.len(), 1, "the new table was not published");
+    assert_eq!(ran.collects, 0);
+    assert_eq!(ran.collections, 0);
+    assert!(!ran.tail);
+}
+
+/// Heap exists, restart has already reached the threshold, then stop. The next
+/// empty local is not due. A still-live unissued array must not be gathered.
+#[test]
+fn stopped_reached_threshold_skips_gather_on_the_next_empty_local() {
+    let ran = run_auto_table(
+        &format!(
+            "{LIVE_UNISSUED_PREFIX}
+  note(2, collectgarbage(\"restart\"))
+  note(3, collectgarbage(\"stop\"))
+  bit(1, collectgarbage(\"isrunning\"))
+  text(1, type(rawget(w, 2)))
+  local fresh = {{}}
+  peek(fresh)
+  text(2, type(fresh))
+  text(3, type(rawget(w, 2)))
+  note(4, same(held, rawget(w, 1)))
+  return 1
+end
+witness()
+return 1
+"
+        ),
+        Some(&[10_000, 10_000]),
+    );
+    assert_eq!(ran.stop, Stop::Halted, "{ran:?}");
+    assert_eq!(
+        note_value(&ran.trace, 1.0),
+        1.0,
+        "the array was saved and read"
+    );
+    assert_eq!(note_value(&ran.trace, 2.0), 0.0);
+    assert_eq!(note_value(&ran.trace, 3.0), 0.0);
+    assert!(!bit_value(&ran.trace, 1.0));
+    assert_eq!(text_value(&ran.trace, 1.0), "table");
+    assert_eq!(
+        text_value(&ran.trace, 2.0),
+        "table",
+        "the empty local is ordinary allocation"
+    );
+    assert_eq!(
+        text_value(&ran.trace, 3.0),
+        "table",
+        "stop after a reached threshold must not gather or collect"
+    );
+    assert_eq!(note_value(&ran.trace, 4.0), 1.0);
+    assert_eq!(ran.trace.peeks.len(), 2);
+    assert_eq!(ran.collects, 0);
+    assert_eq!(ran.collections, 0);
+    assert!(!ran.tail);
+    assert!(ran.trace.steps.is_empty());
+}
+
+/// Full opt-in, heap present, collector still running, but restart never wrote
+/// a threshold. The empty local is not due, so the live unissued array is not
+/// gathered.
+#[test]
+fn running_without_restart_skips_gather_on_an_empty_local() {
+    let ran = run_auto_table(
+        &format!(
+            "{LIVE_UNISSUED_PREFIX}
+  text(1, type(rawget(w, 2)))
+  local fresh = {{}}
+  peek(fresh)
+  text(2, type(fresh))
+  text(3, type(rawget(w, 2)))
+  note(4, same(held, rawget(w, 1)))
+  return 1
+end
+witness()
+return 1
+"
+        ),
+        Some(&[10_000, 10_000]),
+    );
+    assert_eq!(ran.stop, Stop::Halted, "{ran:?}");
+    assert_eq!(note_value(&ran.trace, 1.0), 1.0);
+    assert_eq!(text_value(&ran.trace, 2.0), "table");
+    assert_eq!(text_value(&ran.trace, 3.0), "table");
+    assert_eq!(note_value(&ran.trace, 4.0), 1.0);
+    assert_eq!(ran.collects, 0);
+    assert_eq!(ran.collections, 0);
+}
+
+/// A direct restart-entry call while stopped must return before decode, budget,
+/// latch, or a cycle. Empty budgets would fault if the dispatch gate were skipped.
+#[test]
+fn direct_auto_restart_while_stopped_does_not_pass_the_due_gate() {
+    let ran = run_auto_table(
+        r#"
+local function witness()
+  local w = {}
+  local mt = {}
+  local held = {}
+  mt.__mode = "v"
+  setmetatable(w, mt)
+  w[1] = held
+  w[2] = {}
+  peek(held)
+  note(1, collectgarbage("restart"))
+  note(2, collectgarbage("stop"))
+  note(3, direct_auto_restart())
+  text(1, type(rawget(w, 2)))
+  return 1
+end
+witness()
+return 1
+"#,
+        Some(&[]),
+    );
+    assert_eq!(ran.stop, Stop::Halted, "{ran:?}");
+    assert_eq!(note_value(&ran.trace, 1.0), 0.0);
+    assert_eq!(note_value(&ran.trace, 2.0), 0.0);
+    assert_eq!(
+        note_value(&ran.trace, 3.0),
+        0.0,
+        "not due returns before the body"
+    );
+    assert_eq!(text_value(&ran.trace, 1.0), "table");
+    assert_eq!(ran.collects, 0);
+    assert_eq!(ran.collections, 0);
+    assert!(!ran.tail);
+}
+
+fn incomplete_route_source() -> String {
+    format!(
+        "{LIVE_UNISSUED_PREFIX}
+  note(2, collectgarbage(\"restart\"))
+  bit(1, collectgarbage(\"isrunning\"))
+  local fresh = {{}}
+  peek(fresh)
+  text(2, type(fresh))
+  text(3, type(rawget(w, 2)))
+  return 1
+end
+witness()
+return 1
+"
+    )
+}
+
+fn assert_unrouted_empty_local(ran: &Ran) {
+    assert_eq!(ran.stop, Stop::Halted, "{ran:?}");
+    assert_eq!(
+        note_value(&ran.trace, 1.0),
+        1.0,
+        "the array was saved and read"
+    );
+    assert!(bit_value(&ran.trace, 1.0));
+    assert_eq!(text_value(&ran.trace, 2.0), "table");
+    assert_eq!(
+        text_value(&ran.trace, 3.0),
+        "table",
+        "an incomplete catalog must not gather or collect"
+    );
+    assert_eq!(ran.collects, 0);
+    assert_eq!(ran.collections, 0);
+}
+
+#[test]
+fn restart_entry_without_due_schema_does_not_connect_the_route() {
+    let ran = drive_plugin(
+        &incomplete_route_source(),
+        Some(&[10_000, 10_000]),
+        &RESTART_ENTRY_PLUGIN,
+        None,
+    );
+    assert_unrouted_empty_local(&ran);
+    assert!(
+        due_branch(&candidate::lower(&incomplete_route_source(), catalog_restart_entry()).unwrap())
+            .is_none()
+    );
+}
+
+#[test]
+fn due_schema_without_restart_entry_does_not_connect_the_route() {
+    let ran = drive_plugin(
+        &incomplete_route_source(),
+        Some(&[10_000, 10_000]),
+        &DUE_ONLY_PLUGIN,
+        None,
+    );
+    assert_unrouted_empty_local(&ran);
+    assert!(
+        due_branch(&candidate::lower(&incomplete_route_source(), catalog_due_only()).unwrap())
+            .is_none()
+    );
+}
+
+#[test]
+fn ordinary_run_control_catalog_does_not_connect_the_auto_route() {
+    let ran = drive_plugin(
+        &incomplete_route_source(),
+        Some(&[10_000, 10_000]),
+        &CONTROL_PLUGIN,
+        None,
+    );
+    assert_unrouted_empty_local(&ran);
+    assert!(
+        due_branch(&candidate::lower(&incomplete_route_source(), catalog_for(true, true)).unwrap())
+            .is_none()
+    );
+}
+
+/// First empty local spends the only two budget segments. A later real
+/// `local name = {}` stays available, and an assignment-seeded weak item is
+/// still present, because the latch makes that local not due.
+#[test]
+fn second_empty_local_does_not_repeat_the_automatic_cycle() {
+    let pad = "x".repeat(4096);
+    let ran = run_auto_table(
+        &format!(
+            r#"
+local function witness()
+  local w = {{}}
+  local mt = {{}}
+  local held = {{}}
+  mt.__mode = "v"
+  setmetatable(w, mt)
+  w[1] = held
+  w[2] = {{}}
+  peek(held)
+  note(11, collectgarbage("count"))
+  note(2, collectgarbage("restart"))
+  local fresh = {{}}
+  bit(5, peek(fresh))
+  text(3, type(fresh))
+  text(4, type(rawget(w, 2)))
+  w[3] = {{}}
+  held.pad = "{pad}"
+  meter(40)
+  note(13, collectgarbage("count"))
+  local again = {{}}
+  bit(6, peek(again))
+  text(7, type(again))
+  text(8, type(rawget(w, 3)))
+  collectgarbage("collect")
+  text(9, type(rawget(w, 3)))
+  note(9, same(held, rawget(w, 1)))
+  return 1
+end
+witness()
+return 1
+"#
+        ),
+        Some(&[10_000, 10_000]),
+    );
+    assert_eq!(ran.stop, Stop::Halted, "{ran:?}");
+    assert_eq!(text_value(&ran.trace, 3.0), "table");
+    assert_eq!(
+        text_value(&ran.trace, 4.0),
+        "nil",
+        "the first local collected"
+    );
+    assert_eq!(cycle_at(&ran.trace, 5.0), (false, 1));
+    let logical = note_value(&ran.trace, 40.0);
+    let threshold = note_value(&ran.trace, 41.0);
+    assert!(
+        threshold > 0.0 && logical >= threshold,
+        "logical {logical} must already meet the restart threshold {threshold} before the second local"
+    );
+    assert!(
+        note_value(&ran.trace, 13.0) >= note_value(&ran.trace, 11.0),
+        "count before the second local must not sit below the restart reading"
+    );
+    assert!(
+        note_value(&ran.trace, 42.0) == 0.0,
+        "the latch makes the second local not due"
+    );
+    assert!(
+        note_value(&ran.trace, 43.0) == 1.0,
+        "the first cycle set the one-shot latch"
+    );
+    assert!(
+        note_value(&ran.trace, 44.0) == 1.0,
+        "the collector is still running"
+    );
+    assert!(
+        bit_value(&ran.trace, 6.0),
+        "the second empty local is usable"
+    );
+    assert_eq!(text_value(&ran.trace, 7.0), "table");
+    assert_eq!(
+        text_value(&ran.trace, 8.0),
+        "table",
+        "the assignment-seeded weak item must survive the second local"
+    );
+    assert_eq!(
+        cycle_at(&ran.trace, 6.0),
+        (false, 1),
+        "the second local must not record another collection"
+    );
+    assert_eq!(
+        text_value(&ran.trace, 9.0),
+        "nil",
+        "a later explicit collect can clear it"
+    );
+    assert_eq!(note_value(&ran.trace, 9.0), 1.0);
+    assert_eq!(
+        ran.collections, 2,
+        "automatic cycle plus the explicit collect"
+    );
+    assert_eq!(ran.collects, 2);
+    assert!(ran.trace.steps.is_empty());
+    assert!(!ran.tail);
+}
+
+const RESERVED_SOURCE: &str = r#"
+local function witness()
+  local held = external_shape()
+  local fresh = {}
+  return 1
+end
+witness()
+return 1
+"#;
+
+/// The due call has no guest arguments. Gather statements, including their
+/// reserved slots, live only in the taken branch and are absent from the
+/// not-due branch.
+#[test]
+fn due_branch_reserves_gather_slots_without_a_guest_argument() {
+    let ir = candidate::lower(RESERVED_SOURCE, catalog_auto()).expect("lower opt-in");
+    let branch = due_branch(&ir).expect("opt-in empty local emits the due branch");
+    assert!(
+        branch.condition_args == 0,
+        "the judgment must not evaluate a guest argument"
+    );
+    assert!(
+        branch.gather_slots >= 1,
+        "the taken branch reserves gather slots"
+    );
+    assert!(branch.gather_slots_unique);
+    assert!(
+        !branch.then_calls.is_empty()
+            && branch
+                .then_calls
+                .iter()
+                .all(|name| name == candidate::GATHER_ROOT),
+        "the taken branch is only gather statements: {:?}",
+        branch.then_calls
+    );
+    assert_eq!(branch.then_expr, candidate::AUTO_TABLE_RESTART);
+    assert!(
+        branch.else_calls.is_empty(),
+        "the not-due branch does no host work"
+    );
+    assert!(branch.restart_args_have_no_call);
+    let plain = candidate::lower(RESERVED_SOURCE, catalog_for(true, true)).expect("lower plain");
+    assert!(due_branch(&plain).is_none());
+    assert!(
+        branch.gather_slots + count_lets(&plain) <= count_lets(&ir),
+        "skipping the branch at run time does not remove the reserved IR slots"
+    );
+}
+
+struct DueBranch {
+    condition_args: usize,
+    gather_slots: usize,
+    gather_slots_unique: bool,
+    then_calls: Vec<String>,
+    then_expr: String,
+    else_calls: Vec<String>,
+    restart_args_have_no_call: bool,
+}
+
+fn due_branch(ir: &FrontendIr) -> Option<DueBranch> {
+    let mut found = None;
+    for function in ir.function_impls.values() {
+        for stmt in &function.body_stmts {
+            visit_stmt(stmt, &mut found);
+        }
+        visit_expr(&function.body_expr, &mut found);
+    }
+    for stmt in &ir.stmts {
+        visit_stmt(stmt, &mut found);
+    }
+    found
+}
+
+fn visit_stmt(stmt: &Stmt, found: &mut Option<DueBranch>) {
+    match stmt {
+        Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } => visit_expr(expr, found),
+        _ => {}
+    }
+}
+
+fn visit_expr(expr: &Expr, found: &mut Option<DueBranch>) {
+    if let Expr::IfElse {
+        condition,
+        then_expr,
+        else_expr,
+    } = expr
+        && condition
+            .host_call_resolution()
+            .is_some_and(|call| call.name == candidate::AUTO_TABLE_DUE)
+    {
+        let Expr::Call(_, _, args, _, _) = condition.as_ref() else {
+            unreachable!("due resolution is a call");
+        };
+        let Expr::Block { stmts, expr: taken } = then_expr.as_ref() else {
+            panic!("due branch must hold the gather statements");
+        };
+        let mut slots = Vec::new();
+        let mut then_calls = Vec::new();
+        for stmt in stmts {
+            let Stmt::Let { index, expr, .. } = stmt else {
+                panic!("gather branch contains a non-let: {stmt:?}");
+            };
+            let name = expr
+                .host_call_resolution()
+                .map(|call| call.name.clone())
+                .unwrap_or_default();
+            then_calls.push(name);
+            slots.push(format!("{index:?}"));
+        }
+        let unique = slots.iter().collect::<HashSet<_>>().len() == slots.len();
+        let restart_args_have_no_call = match taken.as_ref() {
+            Expr::Call(_, _, args, _, _) => args.iter().all(|arg| call_names(arg).is_empty()),
+            _ => false,
+        };
+        *found = Some(DueBranch {
+            condition_args: args.len(),
+            gather_slots: slots.len(),
+            gather_slots_unique: unique,
+            then_calls,
+            then_expr: taken
+                .host_call_resolution()
+                .map(|call| call.name.clone())
+                .unwrap_or_default(),
+            else_calls: call_names(else_expr),
+            restart_args_have_no_call,
+        });
+        return;
+    }
+    match expr {
+        Expr::IfElse {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            visit_expr(condition, found);
+            visit_expr(then_expr, found);
+            visit_expr(else_expr, found);
+        }
+        Expr::Block { stmts, expr } => {
+            for stmt in stmts {
+                visit_stmt(stmt, found);
+            }
+            visit_expr(expr, found);
+        }
+        Expr::Call(_, _, args, _, _) => {
+            for arg in args {
+                visit_expr(arg, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn call_names(expr: &Expr) -> Vec<String> {
+    let mut names = Vec::new();
+    fn walk(expr: &Expr, names: &mut Vec<String>) {
+        if let Some(call) = expr.host_call_resolution() {
+            names.push(call.name.clone());
+        }
+        match expr {
+            Expr::Call(_, _, args, _, _) => {
+                for arg in args {
+                    walk(arg, names);
+                }
+            }
+            Expr::IfElse {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                walk(condition, names);
+                walk(then_expr, names);
+                walk(else_expr, names);
+            }
+            Expr::Block { stmts, expr } => {
+                for stmt in stmts {
+                    if let Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } = stmt {
+                        walk(expr, names);
+                    }
+                }
+                walk(expr, names);
+            }
+            _ => {}
+        }
+    }
+    walk(expr, &mut names);
+    names
+}
+
+fn count_lets(ir: &FrontendIr) -> usize {
+    fn stmts(stmts: &[Stmt]) -> usize {
+        stmts
+            .iter()
+            .map(|stmt| match stmt {
+                Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } => 1 + exprs(expr),
+                _ => 0,
+            })
+            .sum()
+    }
+    fn exprs(expr: &Expr) -> usize {
+        match expr {
+            Expr::Block { stmts: inner, expr } => stmts(inner) + exprs(expr),
+            Expr::IfElse {
+                condition,
+                then_expr,
+                else_expr,
+            } => exprs(condition) + exprs(then_expr) + exprs(else_expr),
+            Expr::Call(_, _, args, _, _) => args.iter().map(exprs).sum(),
+            _ => 0,
+        }
+    }
+    let mut total = stmts(&ir.stmts);
+    for function in ir.function_impls.values() {
+        total += stmts(&function.body_stmts);
+        total += exprs(&function.body_expr);
+    }
+    total
 }
