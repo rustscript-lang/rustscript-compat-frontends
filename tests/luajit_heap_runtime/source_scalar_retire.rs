@@ -2389,3 +2389,320 @@ return 1
     assert_eq!(missing.collections, 0);
     assert!(!missing.tail);
 }
+
+/// Four weak groups publish together through real `collectgarbage("step")`.
+///
+/// Upstream control: `evidence/lua52-gc-step/mixed-weak-clear-visibility.{lua,json}`.
+/// The lowerable subset has no loop and no `~=`, so a weak-key walk is two
+/// `next` calls inside a `do`. That block ends before the next step, which
+/// drops the cursors from the gather list; the test must not keep a doomed
+/// key or value live in order to count it. Weak values are read only as
+/// `type(rawget(...))`. `bit`, `text`, and `note` record those Lua results
+/// across the existing host boundary. They do not build the graph or choose
+/// the step outcome. The budget queue is the fixture `collectgarbage("step")`
+/// consumes, not a LuaJIT step index.
+#[test]
+fn guest_mixed_weak_step_publishes_four_groups_together() {
+    for shared in [false, true] {
+        let step = run_mixed(shared, MixedArm::Step);
+        assert_mixed_step(&step, shared);
+        let full = run_mixed(shared, MixedArm::Full);
+        assert_mixed_settled(&full, shared, MixedArm::Full, [0, 0, 0, 0], 1);
+        let omitted = run_mixed(shared, MixedArm::Omit);
+        assert_mixed_settled(&omitted, shared, MixedArm::Omit, [1, 1, 1, 1], 0);
+        let partial = run_mixed(shared, MixedArm::Partial);
+        assert_mixed_settled(&partial, shared, MixedArm::Partial, [1, 0, 1, 1], 0);
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum MixedArm {
+    Step,
+    Full,
+    Omit,
+    Partial,
+}
+
+fn run_mixed(shared: bool, arm: MixedArm) -> Ran {
+    let budgets: Option<&[u64]> = match arm {
+        MixedArm::Step => Some(&[1, 10_000, 1, 10_000]),
+        MixedArm::Full | MixedArm::Omit | MixedArm::Partial => None,
+    };
+    let source = mixed_source(shared, arm);
+    let ran = run_with_step_budgets(&source, budgets);
+    assert_eq!(
+        ran.stop,
+        Stop::Halted,
+        "shared={shared} {arm:?} did not halt\n{source}"
+    );
+    assert_eq!(ran.stack, [Value::Float(1.0)], "shared={shared} {arm:?}");
+    assert!(
+        ran.trace.steps.is_empty(),
+        "shared={shared} {arm:?} used the private step host"
+    );
+    assert!(!ran.tail, "shared={shared} {arm:?} left a sweep tail");
+    assert!(ran.frame.is_none(), "shared={shared} {arm:?} left a frame");
+    ran
+}
+
+fn assert_mixed_settled(
+    ran: &Ran,
+    shared: bool,
+    arm: MixedArm,
+    expected: [u32; 4],
+    collects: usize,
+) {
+    let counts = mixed_counts(&ran.trace, 0);
+    assert_eq!(
+        counts, expected,
+        "shared={shared} {arm:?} group counts, not a combined total"
+    );
+    assert!(
+        mixed_steps(&ran.trace).is_empty(),
+        "shared={shared} {arm:?} stepped"
+    );
+    assert_eq!(ran.collects, collects, "shared={shared} {arm:?} reports");
+    assert_eq!(
+        ran.collections, collects as u32,
+        "shared={shared} {arm:?} heap completions"
+    );
+}
+
+fn assert_mixed_step(ran: &Ran, shared: bool) {
+    let points: Vec<[u32; 4]> = (0..=4)
+        .map(|point| mixed_counts(&ran.trace, point))
+        .collect();
+    let steps = mixed_steps(&ran.trace);
+    assert_eq!(
+        points[0],
+        [1, 1, 1, 1],
+        "shared={shared} groups were not all present before the first step: {points:?}"
+    );
+    let mut cleared = false;
+    for counts in &points {
+        assert!(
+            *counts == [1, 1, 1, 1] || *counts == [0, 0, 0, 0],
+            "shared={shared} mixed weak snapshot {counts:?} in {points:?}"
+        );
+        if cleared {
+            assert_eq!(
+                *counts,
+                [0, 0, 0, 0],
+                "shared={shared} resurrected {points:?}"
+            );
+        }
+        cleared = *counts == [0, 0, 0, 0];
+    }
+    assert_eq!(steps.len(), 4, "shared={shared} steps {steps:?}");
+    let trues: Vec<_> = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, (bit, _, _))| *bit)
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(
+        trues,
+        vec![3],
+        "shared={shared} expected one final true, steps={steps:?} points={points:?}"
+    );
+    let mut saw_incomplete_clear = false;
+    for (index, (bit, tail, collections)) in steps.iter().enumerate() {
+        let after = points[index + 1];
+        if !*bit && after == [0, 0, 0, 0] {
+            assert_eq!(
+                (*tail, *collections),
+                (true, 0),
+                "shared={shared} cleared while a step was still incomplete"
+            );
+            saw_incomplete_clear = true;
+        }
+        if *bit {
+            assert_eq!(after, [0, 0, 0, 0], "shared={shared} true before clear");
+            assert_eq!(*collections, 1, "shared={shared} true without a report");
+            assert!(!*tail, "shared={shared} true left a tail");
+        }
+    }
+    assert!(
+        saw_incomplete_clear,
+        "shared={shared} never showed Bool false with all four groups clear: points={points:?} steps={steps:?}"
+    );
+    assert_eq!(ran.collects, 1, "shared={shared} completion reports");
+    assert_eq!(ran.collections, 1, "shared={shared} heap completions");
+}
+
+fn mixed_counts(trace: &Trace, point: u32) -> [u32; 4] {
+    [
+        mixed_key_count(trace, point, 1, "k"),
+        mixed_value_count(trace, point, 2, "v"),
+        mixed_key_count(trace, point, 3, "kv-key"),
+        mixed_value_count(trace, point, 4, "kv-value"),
+    ]
+}
+
+fn mixed_tag(point: u32, group: u32, signal: u32) -> f64 {
+    f64::from(1000 + point * 100 + group * 10 + signal)
+}
+
+fn mixed_bit(trace: &Trace, tag: f64) -> bool {
+    trace
+        .bits
+        .iter()
+        .find(|(found, _)| *found == tag)
+        .unwrap_or_else(|| panic!("missing mixed bit {tag}"))
+        .1
+}
+
+fn mixed_key_count(trace: &Trace, point: u32, group: u32, label: &str) -> u32 {
+    let tag = |signal| mixed_tag(point, group, signal);
+    let type_a = text_value(trace, tag(1));
+    let type_b = text_value(trace, tag(2));
+    let a_keep = mixed_bit(trace, tag(1));
+    let b_keep = mixed_bit(trace, tag(2));
+    let av_value = mixed_bit(trace, tag(3));
+    let bv_value = mixed_bit(trace, tag(4));
+    let b_nil = mixed_bit(trace, tag(5));
+    let bv_nil = mixed_bit(trace, tag(6));
+    assert_eq!(
+        note_value(trace, tag(1)),
+        1.0,
+        "{label} strong identity at point {point}"
+    );
+    match (
+        type_a, type_b, a_keep, b_keep, av_value, bv_value, b_nil, bv_nil,
+    ) {
+        ("table", "table", true, false, true, true, false, false)
+        | ("table", "table", false, true, true, true, false, false) => 1,
+        ("table", "nil", true, false, true, false, true, true) => 0,
+        other => panic!("{label} unexpected weak-key observation at point {point}: {other:?}"),
+    }
+}
+
+fn mixed_value_count(trace: &Trace, point: u32, group: u32, label: &str) -> u32 {
+    let tag = |signal| mixed_tag(point, group, signal);
+    assert_eq!(
+        note_value(trace, tag(1)),
+        1.0,
+        "{label} strong identity at point {point}"
+    );
+    match text_value(trace, tag(1)) {
+        "table" => 1,
+        "nil" => 0,
+        other => panic!("{label} unexpected weak-value type at point {point}: {other}"),
+    }
+}
+
+fn mixed_steps(trace: &Trace) -> Vec<(bool, bool, u32)> {
+    trace
+        .bits
+        .iter()
+        .zip(&trace.bit_cycle_state)
+        .filter(|((tag, _), _)| (1.0..=4.0).contains(tag))
+        .map(|((_, bit), (tail, collections))| (*bit, *tail, *collections))
+        .collect()
+}
+
+fn mixed_source(shared: bool, arm: MixedArm) -> String {
+    let mut source = String::from(
+        "local function witness()\n  return 1\nend\nwitness()\n\
+         local k_owner = {}\nlocal k_key = {}\nlocal k_value = {}\n\
+         local v_owner = {}\nlocal v_key = {}\nlocal v_value = {}\n\
+         local kvk_owner = {}\nlocal kvk_key = {}\nlocal kvk_value = {}\n\
+         local kvv_owner = {}\nlocal kvv_key = {}\nlocal kvv_value = {}\n",
+    );
+    if shared {
+        source.push_str(
+            "local mode_k = {}\nmode_k.__mode = \"k\"\n\
+             local mode_v = {}\nmode_v.__mode = \"v\"\n\
+             local mode_kv = {}\nmode_kv.__mode = \"kv\"\n\
+             setmetatable(k_owner, mode_k)\nsetmetatable(v_owner, mode_v)\n\
+             setmetatable(kvk_owner, mode_kv)\nsetmetatable(kvv_owner, mode_kv)\n",
+        );
+    } else {
+        for (owner, mode) in [
+            ("k_owner", "k"),
+            ("v_owner", "v"),
+            ("kvk_owner", "kv"),
+            ("kvv_owner", "kv"),
+        ] {
+            let mt = format!("{owner}_mt");
+            source.push_str(&format!(
+                "local {mt} = {{}}\n{mt}.__mode = \"{mode}\"\nsetmetatable({owner}, {mt})\n"
+            ));
+        }
+    }
+    source.push_str(
+        "k_owner[k_key] = k_value\nv_owner[v_key] = v_value\n\
+         kvk_owner[kvk_key] = kvk_value\nkvv_owner[kvv_key] = kvv_value\n\
+         do\n  local k_dead = {}\n  k_dead.self = k_dead\n  k_owner[k_dead] = k_value\nend\n\
+         do\n  local v_dead = {}\n  v_dead.self = v_dead\n  v_owner.orphan = v_dead\nend\n\
+         do\n  local kvk_dead = {}\n  kvk_dead.self = kvk_dead\n  kvk_owner[kvk_dead] = kvk_value\nend\n\
+         do\n  local kvv_dead = {}\n  kvv_dead.self = kvv_dead\n  kvv_owner.orphan = kvv_dead\nend\n",
+    );
+    if matches!(arm, MixedArm::Partial) {
+        source.push_str("rawset(v_owner, \"orphan\", nil)\n");
+    }
+    if matches!(arm, MixedArm::Full) {
+        source.push_str("collectgarbage(\"collect\")\n");
+    }
+    let points: &[u32] = if matches!(arm, MixedArm::Step) {
+        &[0, 1, 2, 3, 4]
+    } else {
+        &[0]
+    };
+    for point in points {
+        if *point > 0 {
+            source.push_str(&format!("bit({point}, collectgarbage(\"step\"))\n"));
+        }
+        push_key_observe(&mut source, *point, 1, "k_owner", "k_key", "k_value");
+        push_value_observe(&mut source, *point, 2, "v_owner", "v_key", "v_value");
+        push_key_observe(&mut source, *point, 3, "kvk_owner", "kvk_key", "kvk_value");
+        push_value_observe(&mut source, *point, 4, "kvv_owner", "kvv_key", "kvv_value");
+    }
+    source.push_str("return 1\n");
+    source
+}
+
+fn push_key_observe(
+    source: &mut String,
+    point: u32,
+    group: u32,
+    owner: &str,
+    key: &str,
+    value: &str,
+) {
+    let tag = |signal| 1000 + point * 100 + group * 10 + signal;
+    let prefix = format!("p{point}g{group}");
+    source.push_str(&format!(
+        "do\n  local {prefix}a, {prefix}av = next({owner}, nil)\n  \
+         local {prefix}b, {prefix}bv = next({owner}, {prefix}a)\n  \
+         text({t1}, type({prefix}a))\n  text({t2}, type({prefix}b))\n  \
+         bit({b1}, rawequal({prefix}a, {key}))\n  bit({b2}, rawequal({prefix}b, {key}))\n  \
+         bit({b3}, rawequal({prefix}av, {value}))\n  bit({b4}, rawequal({prefix}bv, {value}))\n  \
+         bit({b5}, rawequal({prefix}b, nil))\n  bit({b6}, rawequal({prefix}bv, nil))\n  \
+         note({n1}, same({value}, rawget({owner}, {key})))\nend\n",
+        t1 = tag(1),
+        t2 = tag(2),
+        b1 = tag(1),
+        b2 = tag(2),
+        b3 = tag(3),
+        b4 = tag(4),
+        b5 = tag(5),
+        b6 = tag(6),
+        n1 = tag(1),
+    ));
+}
+
+fn push_value_observe(
+    source: &mut String,
+    point: u32,
+    group: u32,
+    owner: &str,
+    key: &str,
+    value: &str,
+) {
+    let tag = 1000 + point * 100 + group * 10 + 1;
+    source.push_str(&format!(
+        "text({tag}, type(rawget({owner}, \"orphan\")))\n\
+         note({tag}, same({value}, rawget({owner}, {key})))\n"
+    ));
+}
