@@ -27,6 +27,8 @@ mod resolve;
 mod return_frame;
 #[path = "source_closure.rs"]
 mod source_closure;
+#[path = "source_scalar_retire.rs"]
+mod source_scalar_retire;
 #[path = "string_byte_length.rs"]
 mod string_byte_length;
 #[path = "table_metatable_protection.rs"]

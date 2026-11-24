@@ -1207,10 +1207,16 @@ fn retire_callee(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
         if caller == Some(callee) {
             return Err(host_fault("would retire the caller result frame"));
         }
-        heap::with_heap(&mut call.vm().host_context(), |heap| {
-            heap.leave_roots(callee)
-        })
-        .map_err(heap_error)?;
+        let tail = heap::saved_sweep_tail(&mut call.vm().host_context()).map_err(heap_error)?;
+        if tail {
+            heap::retire_saved_tail_frame(&mut call.vm().host_context(), callee)
+                .map_err(heap_error)?;
+        } else {
+            heap::with_heap(&mut call.vm().host_context(), |heap| {
+                heap.leave_roots(callee)
+            })
+            .map_err(heap_error)?;
+        }
         left = true;
     }
     let top_is_caller = heap::with_heap(&mut call.vm().host_context(), |heap| {

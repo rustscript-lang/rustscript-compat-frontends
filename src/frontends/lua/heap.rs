@@ -280,8 +280,8 @@ fn resume_published_sweep(
 /// `Paused { tail: false }` is a saved mark. `Paused { tail: true }` is a
 /// published release tail. Published counts are not a pause signal: a zero
 /// edge window is still [`StepOutcome::Published`] when a dead slot remains.
-#[derive(Debug)]
-enum StepOutcome {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StepOutcome {
     /// This call did not finish the saved mark or the saved tail.
     Paused { tail: bool },
     /// The mark finished and weak edges were published. Release did not start.
@@ -600,4 +600,57 @@ pub fn stats(host: &mut HostContext) -> Result<HeapStats, HeapError> {
 /// and does not record the read as collection work.
 pub fn take_scan_meter(host: &mut HostContext) -> Result<ScanMeter, HeapError> {
     with_heap(host, |heap| Ok(heap.take_scan_meter()))
+}
+
+/// Saves one private mark for a cycle whose roots already sit in fixed frames.
+///
+/// Does not scan. A missing heap, an existing mark, or a saved tail is the
+/// private open's existing refusal. Not a guest `collectgarbage` step.
+#[cfg(test)]
+pub fn open_fixed_step(host: &mut HostContext) -> Result<(), HeapError> {
+    open_private_step_cycle(host)
+}
+
+/// True when this scope has a heap and neither a saved mark nor a sweep tail.
+#[cfg(test)]
+pub fn fixed_step_idle(host: &mut HostContext) -> Result<bool, HeapError> {
+    let Some(heap) = host.scope_state::<LuaHeap>() else {
+        return Err(HeapError::SweepDenied);
+    };
+    Ok(!heap.has_sweep_tail() && !heap.has_saved_mark())
+}
+
+/// Steps one private cycle whose roots already sit in fixed frames.
+///
+/// `budget` must be positive. Zero is refused before the private stepper, so
+/// this adapter does not use the zero-budget observe path. The batch is empty:
+/// a root already registered in a frame is not submitted again. The result is
+/// the real [`StepOutcome`]. Not a guest `collectgarbage` step.
+#[cfg(test)]
+pub fn step_fixed_frames(host: &mut HostContext, budget: u64) -> Result<StepOutcome, HeapError> {
+    if budget == 0 {
+        return Err(HeapError::MarkDenied);
+    }
+    step_private_cycle(host, budget, &[])
+}
+
+/// Whether this scope still has the published sweep tail.
+#[cfg(test)]
+pub fn saved_sweep_tail(host: &mut HostContext) -> Result<bool, HeapError> {
+    let Some(heap) = host.scope_state::<LuaHeap>() else {
+        return Err(HeapError::SweepDenied);
+    };
+    Ok(heap.has_sweep_tail())
+}
+
+/// Drops one top frame while this scope's published sweep tail is saved.
+///
+/// The private retirement remains the authority. Refusal does not move the
+/// cursor, counts, root vector, or frame stack. Not a guest `collectgarbage` step.
+#[cfg(test)]
+pub fn retire_saved_tail_frame(
+    host: &mut HostContext,
+    frame: RootFrameId,
+) -> Result<(), HeapError> {
+    retire_published_root_frame(host, frame).map(|_| ())
 }
