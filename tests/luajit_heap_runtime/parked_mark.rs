@@ -248,6 +248,169 @@ fn omitted_pause_keeps_the_pending_edge() {
     assert_eq!(meter.mark_passes, 1);
 }
 
+#[derive(Clone, Copy)]
+enum NewNamedWrite {
+    Strong,
+    WeakValue,
+    Omitted,
+}
+
+fn new_named_write_after_owner_scan(write: NewNamedWrite) {
+    use crate::heap::{self, GuestClass, StepOutcome};
+
+    const NAME: &str = "新键";
+    const CHILD: &str = "child";
+    let retained = matches!(write, NewNamedWrite::Strong);
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits(8, 2, 8)).expect("install");
+        let raw = crate::publish_raw(&mut host);
+        let target = crate::table_ref(&host, raw);
+        let (owner, sentinel, child, carrier) = heap::with_heap(&mut host, |heap| {
+            let owner = heap.alloc()?;
+            let sentinel = heap.alloc()?;
+            let child = heap.alloc()?;
+            let unrelated = heap.alloc()?; // Forces a real published tail in all arms.
+            if matches!(write, NewNamedWrite::WeakValue) {
+                let meta = heap.alloc()?;
+                heap.set_mode_scalar(meta, Value::string("v"))?;
+                heap.set_metatable(owner, Some(meta))?;
+            }
+            let frame = heap.enter_roots(2)?;
+            // The Gray stack pops the owner first, then the sentinel.
+            heap.write_root(frame, 0, sentinel)?;
+            heap.write_root(frame, 1, owner)?;
+            heap.set_named_scalar(owner, "old", Value::Bool(true))?;
+            heap.set_named_scalar(sentinel, "pending", Value::Bool(true))?;
+            // Exercise a normal insertion and then an in-place replacement before marking.
+            heap.set_named_edge(target, CHILD, unrelated)?;
+            assert_eq!(heap.named_edge(target, CHILD)?, Some(unrelated));
+            heap.set_named_edge(target, CHILD, child)?;
+            assert_eq!(heap.named_edge(target, CHILD)?, Some(child));
+            Ok((owner, sentinel, child, heap.issue_carrier(target)?))
+        })
+        .expect("graph");
+        heap::open_fixed_step(&mut host).expect("start a saved mark");
+        let (pending, before) = heap::with_heap(&mut host, |heap| {
+            let (_, old_record) = heap.locate_named(owner.slot(), "old").expect("old field");
+            let (_, sentinel_record) = heap
+                .locate_named(sentinel.slot(), "pending")
+                .expect("sentinel field");
+            let mut parked = ParkedMark::resume(heap).expect("resume saved mark");
+            pause_at(&mut parked, owner.slot(), old_record);
+            let before_owner_edge = parked.meter().outgoing_edge_checks;
+            let pending = pause_at(&mut parked, sentinel.slot(), sentinel_record);
+            let before = parked.meter();
+            assert!(before.outgoing_edge_checks > before_owner_edge);
+            assert!(parked.marked(owner));
+            assert!(!parked.marked(target) && !parked.marked(child));
+            parked.park()?;
+            assert!(heap.locate_named(owner.slot(), NAME).is_none());
+            if !matches!(write, NewNamedWrite::Omitted) {
+                heap.set_named_edge(owner, NAME, target)?;
+                assert_eq!(heap.named_edge(owner, NAME)?, Some(target));
+            }
+            Ok((pending, before))
+        })
+        .expect("ordinary write while Gray is parked");
+        let after = heap::with_heap(&mut host, |heap| {
+            let parked = ParkedMark::resume(heap).expect("write kept the saved mark");
+            assert_eq!(parked.phase_name(), "gray");
+            let cursor = parked.pending().expect("sentinel still pending");
+            assert_eq!(
+                (cursor.owner, cursor.cursor),
+                (pending.owner, pending.cursor)
+            );
+            assert!(!parked.marked(child), "the write must not scan descendants");
+            let after = parked.meter();
+            assert_eq!(after.outgoing_edge_checks, before.outgoing_edge_checks);
+            assert_eq!(after.owner_head_checks, before.owner_head_checks);
+            parked.park()?;
+            Ok(after)
+        })
+        .expect("cursor observation");
+
+        // The private fixed-frame path passes an empty supplemental root batch.
+        let published = heap::step_fixed_frames(&mut host, 128).expect("publish saved mark");
+        assert!(
+            matches!(published, StepOutcome::Published { .. }),
+            "{published:?}"
+        );
+        assert_eq!(heap::stats(&mut host).expect("stats").collections, 0);
+        heap::with_heap(&mut host, |heap| {
+            assert_eq!(
+                heap.set_named_edge(owner, "blocked", sentinel),
+                Err(HeapError::SweepPending)
+            );
+            assert!(heap.locate_named(owner.slot(), "blocked").is_none());
+            if !retained {
+                assert_eq!(heap.named_value(owner, NAME)?, Value::Null);
+                assert_eq!(
+                    heap.locate_named(owner.slot(), NAME).is_some(),
+                    matches!(write, NewNamedWrite::WeakValue),
+                    "a weak-value write leaves a cleared cursor; omission adds no record"
+                );
+            }
+            Ok(())
+        })
+        .expect("read during publication");
+        let done = heap::step_fixed_frames(&mut host, 128).expect("finish saved tail");
+        assert!(matches!(done, StepOutcome::Completed(_)), "{done:?}");
+        assert!(heap::fixed_step_idle(&mut host).expect("idle"));
+        heap::with_heap(&mut host, |heap| {
+            assert_eq!(
+                heap.alive(target),
+                retained,
+                "a fresh strong UTF-8 field on a scanned owner must keep its target alive"
+            );
+            assert_eq!(
+                heap.alive(child),
+                retained,
+                "transitive marking in the same pass"
+            );
+            assert_eq!(heap.stats().collections, 1);
+            assert_eq!(heap.scan_meter().mark_passes, 1);
+            if retained {
+                let value = heap.named_value(owner, NAME)?;
+                assert_eq!(value, carrier);
+                assert_eq!(heap.guest_class(&value), GuestClass::Table(target));
+                assert_eq!(heap.named_edge(target, CHILD)?, Some(child));
+                heap.set_named_scalar(owner, NAME, Value::Null)?;
+            }
+            Ok(())
+        })
+        .expect("same-cycle reachability");
+        assert_eq!(
+            after.parked_barrier_marks - before.parked_barrier_marks,
+            u64::from(retained)
+        );
+        if retained {
+            heap::collect(&mut host).expect("next collection after removing the only strong edge");
+            heap::with_heap(&mut host, |heap| {
+                assert!(!heap.alive(target) && !heap.alive(child));
+                assert_eq!(heap.stats().collections, 2);
+                Ok(())
+            })
+            .expect("later reclamation");
+        }
+    });
+}
+
+#[test]
+fn gray_new_named_strong_edge_keeps_target_and_descendant() {
+    new_named_write_after_owner_scan(NewNamedWrite::Strong);
+}
+
+#[test]
+fn gray_new_named_weak_value_clears_at_publication() {
+    new_named_write_after_owner_scan(NewNamedWrite::WeakValue);
+}
+
+#[test]
+fn gray_new_named_write_omitted_leaves_target_unreachable() {
+    new_named_write_after_owner_scan(NewNamedWrite::Omitted);
+}
+
 #[test]
 fn tail_slot_reuse_does_not_keep_the_new_target() {
     let mut heap = LuaHeap::new(limits(8, 2, 8));

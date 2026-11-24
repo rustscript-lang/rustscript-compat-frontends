@@ -1727,6 +1727,16 @@ impl LuaHeap {
         if self.occupied_edges >= self.limits.edges && !self.reclaim_cursor_gap() {
             return Err(HeapError::EdgeCapacity);
         }
+        // A parked mark may have already scanned this owner. Only a new
+        // ordinary string field with a table value needs this insertion barrier.
+        let barrier = if self.mark.is_some()
+            && matches!(key, EdgeKey::Utf8(_))
+            && let EdgeValue::Table { slot, generation } = &value
+        {
+            Some((*slot, *generation))
+        } else {
+            None
+        };
         let added = key_payload(&key) + value_payload(&value);
         let index = self.take_edge_slot();
         self.edge_slots[index as usize].edge = Some(Edge { key, value });
@@ -1736,6 +1746,9 @@ impl LuaHeap {
         self.live_edge_count += 1;
         self.note_mode_pointer(from_slot, index);
         self.note_edge_peak();
+        if let Some((slot, generation)) = barrier {
+            self.barrier_strong_field(from_slot, slot, generation);
+        }
         Ok(())
     }
 
