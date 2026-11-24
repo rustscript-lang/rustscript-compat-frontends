@@ -726,7 +726,7 @@ fn marked_slot_count(heap: &LuaHeap) -> u32 {
 fn tail_receipt(phase: &str, index: usize, dead: &[u32], marked: u32, live_roots: u32) -> String {
     format!(
         "Some(SweepTail {{ phase: {phase}, index: {index}, dead: {dead:?}, \
-         marked_nodes: {marked}, live_roots: {live_roots} }})"
+         marked_nodes: {marked}, live_roots: {live_roots}, late_nodes: 0 }})"
     )
 }
 
