@@ -29,6 +29,7 @@ const BIT: &str = "lua_host::bit";
 const SHAPE: &str = "lua_host::shape";
 const METER: &str = "lua_host::meter";
 const MARK_PHASE: &str = "lua_host::mark_phase";
+const OCCUPY: &str = "lua_host::occupy";
 
 const SOURCE: &str = r#"
 local function witness()
@@ -95,6 +96,21 @@ struct MarkNote {
     collects: usize,
 }
 
+/// Read-only occupancy taken from the already installed heap. A missing heap
+/// is an error from the host; this note does not call `with_heap`.
+#[derive(Clone, Copy, Debug)]
+struct OccupancyNote {
+    tag: f64,
+    root_slots: u32,
+    live_roots: u32,
+    live_nodes: u32,
+    node_slots: u32,
+    edge_slots: u32,
+    phase: Option<&'static str>,
+    mark_passes: u64,
+    node_slot_visits: u64,
+}
+
 #[derive(Clone, Debug, Default)]
 struct Trace {
     steps: Vec<StepNote>,
@@ -105,6 +121,7 @@ struct Trace {
     bits: Vec<(f64, bool)>,
     bit_cycle_state: Vec<(bool, u32)>,
     marks: Vec<MarkNote>,
+    occupancy: Vec<OccupancyNote>,
 }
 
 #[derive(Clone, Debug)]
@@ -276,6 +293,11 @@ fn install_witness_schemas(builder: &mut vm::HostApiBuilder) {
         vec![HostParamSchema::value("tag", HostTypeSchema::Float)],
         HostTypeSchema::Float,
     ));
+    builder.function(vm::HostFunctionSchema::with_return(
+        OCCUPY,
+        vec![HostParamSchema::value("tag", HostTypeSchema::Float)],
+        HostTypeSchema::Float,
+    ));
 }
 
 fn catalog_for(guest_step: bool, run_control: bool) -> &'static Arc<vm::HostApiCatalog> {
@@ -365,6 +387,7 @@ fn register(registry: &mut HostFunctionRegistry, catalog: &vm::HostApiCatalog) {
         (SHAPE, HostOp::Shape),
         (METER, HostOp::Meter),
         (MARK_PHASE, HostOp::MarkPhase),
+        (OCCUPY, HostOp::Occupy),
     ] {
         let function = catalog.function(name).expect("scalar step host schema");
         registry
@@ -389,6 +412,7 @@ enum HostOp {
     Shape,
     Meter,
     MarkPhase,
+    Occupy,
 }
 
 impl HostOwnedFunction for HostOp {
@@ -492,6 +516,32 @@ impl HostOwnedFunction for HostOp {
                         collects,
                     });
                 })?;
+                Value::Float(0.0)
+            }
+            Self::Occupy => {
+                let [Value::Float(tag)] = args.as_slice() else {
+                    return Err(host_fault("expected occupy tag"));
+                };
+                let snap = {
+                    let Some(heap) = host.scope_state::<heap::LuaHeap>() else {
+                        return Err(host_fault("occupy requires the installed heap"));
+                    };
+                    let stats = heap.stats();
+                    let mark = heap.saved_mark_query();
+                    let meter = heap.scan_meter();
+                    OccupancyNote {
+                        tag: *tag,
+                        root_slots: stats.root_slots,
+                        live_roots: stats.live_roots,
+                        live_nodes: stats.live_nodes,
+                        node_slots: stats.node_slots,
+                        edge_slots: stats.edge_slots,
+                        phase: mark.map(|(phase, _)| phase),
+                        mark_passes: meter.mark_passes,
+                        node_slot_visits: meter.node_slot_visits,
+                    }
+                };
+                note(&mut host, |state| state.occupancy.push(snap))?;
                 Value::Float(0.0)
             }
         };
@@ -4649,4 +4699,368 @@ bit(1, peek(held))
         ran.stop
     );
     assert_fresh_not_built(&ran);
+}
+
+/// Fixed frame at the first due empty local: `w`, `mt`, `held`, `fresh`, `spare`.
+const ROOT_CAPACITY_SLOTS: u32 = 5;
+/// Issued tables in the decoded batch. The live scalar is not one of them.
+const ROOT_CAPACITY_BATCH: u32 = 3;
+const ROOT_CAPACITY_PLANNED: u32 = ROOT_CAPACITY_SLOTS + ROOT_CAPACITY_BATCH;
+const ROOT_STEP_BUDGETS: [u64; 2] = [10_000, 10_000];
+
+const AUTOMATIC_ROOT_CAPACITY_SOURCE: &str = r#"
+local function witness()
+  local w = {}
+  local mt = {}
+  local held = {}
+  local scalar = 7
+  mt.__mode = "v"
+  setmetatable(w, mt)
+  w[1] = held
+  w[2] = {}
+  peek(held)
+  note(1, collectgarbage("restart"))
+  note(20, scalar)
+  meter(30)
+  occupy(1)
+  text(1, type(rawget(w, 2)))
+  local fresh = {}
+  bit(5, peek(fresh))
+  text(3, type(fresh))
+  text(4, type(rawget(w, 2)))
+  note(8, same(held, rawget(w, 1)))
+  note(21, scalar)
+  local spare = {}
+  bit(9, peek(spare))
+  return 1
+end
+witness()
+return 1
+"#;
+
+#[derive(Clone, Debug)]
+struct RootArm {
+    roots_limit: u32,
+    stop: Stop,
+    trace: Trace,
+    tail: bool,
+    collections: u32,
+    live_nodes: u32,
+    root_slots: u32,
+    live_roots: u32,
+    node_slots: u32,
+    edge_slots: u32,
+    collects: usize,
+    mark_phase: Option<&'static str>,
+    mark_passes: u64,
+    node_slot_visits: u64,
+    parked_root_writes: u64,
+    budgets: Vec<u64>,
+    meter: candidate::AutoTableMeter,
+    plan: Option<candidate::AutoRootPlan>,
+    idle: bool,
+    held_alive: Option<bool>,
+}
+
+fn occupy_note(trace: &Trace) -> &OccupancyNote {
+    trace
+        .occupancy
+        .first()
+        .unwrap_or_else(|| panic!("occupy did not run in this scope: {:?}", trace.occupancy))
+}
+
+fn run_auto_roots(source: &str, roots: u32) -> RootArm {
+    let plugin = &AUTO_TABLE_PLUGIN;
+    let catalog = Arc::clone(plugin_catalog(plugin));
+    let options = CompileSourceFileOptions::new()
+        .with_source_plugin(plugin)
+        .with_host_api_catalog(Arc::clone(&catalog));
+    let prepared = vm::compile_source_with_flavor_and_options(source, SourceFlavor::Lua, options)
+        .unwrap_or_else(|error| panic!("compile rejected the source: {error}"));
+    let mut vm = prepared.into_vm().expect("create VM");
+    assert_return_window(vm.program());
+    let mut registry = HostFunctionRegistry::empty();
+    candidate::register(&mut registry, &catalog).expect("register candidate runtime");
+    register(&mut registry, &catalog);
+    registry.bind_vm_cached(&mut vm).expect("bind runtime");
+    let prepared_budgets: Vec<_> = ROOT_STEP_BUDGETS
+        .iter()
+        .map(|&budget| NonZeroU64::new(budget).expect("positive fixture budget"))
+        .collect();
+    candidate::set_step_budgets(&mut vm.host_context(), &prepared_budgets);
+    let production = heap::HeapLimits::production();
+    heap::install(
+        &mut vm.host_context(),
+        heap::HeapLimits {
+            nodes: production.nodes,
+            roots,
+            edges: production.edges,
+            max_generation: production.max_generation,
+        },
+    )
+    .expect("install the roots limit before execution");
+    let status = vm.run();
+    let stop = match status {
+        Ok(VmStatus::Halted) => Stop::Halted,
+        Err(VmError::HostError(message)) => Stop::HostError(message),
+        Ok(other) => Stop::Other(format!("{other:?}")),
+        Err(other) => Stop::Other(other.to_string()),
+    };
+    let mut host = vm.host_context();
+    let trace = host.scope_state::<Trace>().cloned().unwrap_or_default();
+    let stats = host
+        .scope_state::<heap::LuaHeap>()
+        .map(|heap| heap.stats())
+        .unwrap_or_else(|| {
+            panic!("installed heap missing after {stop:?}; refusing to install again")
+        });
+    let mark = heap::saved_mark_query(&host);
+    let scan = heap::copy_scan_meter(&mut host)
+        .unwrap_or_else(|error| panic!("scan copy failed without installing: {error}"));
+    let tail = heap::saved_sweep_tail(&mut host)
+        .unwrap_or_else(|error| panic!("tail read failed without installing: {error}"));
+    let idle = heap::fixed_step_idle(&mut host)
+        .unwrap_or_else(|error| panic!("idle read failed without installing: {error}"));
+    let meter = candidate::auto_table_meter(&mut host)
+        .unwrap_or_else(|error| panic!("meter read failed without installing: {error}"));
+    let budgets = candidate::step_budget_snapshot(&host);
+    let plan = candidate::auto_root_plan(&host);
+    let collects = host
+        .scope_state::<candidate::ReturnWitness>()
+        .map(|witness| witness.collects.len())
+        .unwrap_or(0);
+    let held_alive = trace.peeks.first().map(|observed| {
+        host.scope_state::<heap::LuaHeap>()
+            .is_some_and(|heap| heap.alive(observed.table))
+    });
+    RootArm {
+        roots_limit: roots,
+        stop,
+        trace,
+        tail,
+        collections: stats.collections,
+        live_nodes: stats.live_nodes,
+        root_slots: stats.root_slots,
+        live_roots: stats.live_roots,
+        node_slots: stats.node_slots,
+        edge_slots: stats.edge_slots,
+        collects,
+        mark_phase: mark.map(|(phase, _)| phase),
+        mark_passes: scan.mark_passes,
+        node_slot_visits: scan.node_slot_visits,
+        parked_root_writes: scan.parked_root_writes,
+        budgets,
+        meter,
+        plan,
+        idle,
+        held_alive,
+    }
+}
+
+fn assert_same_scope_plan(ran: &RootArm) {
+    let occupy = occupy_note(&ran.trace);
+    assert_eq!(occupy.tag, 1.0);
+    assert!(
+        occupy.phase.is_none(),
+        "the pre-safepoint read must still be idle: {occupy:?}"
+    );
+    assert!(
+        occupy.root_slots > occupy.live_roots,
+        "an empty fixed slot must count in root capacity: {occupy:?}"
+    );
+    assert_eq!(
+        note_value(&ran.trace, 20.0),
+        7.0,
+        "the scalar is live and is not a table root"
+    );
+    assert_eq!(occupy.root_slots, ROOT_CAPACITY_SLOTS, "{occupy:?}");
+    assert_eq!(
+        occupy.live_roots, ROOT_CAPACITY_BATCH,
+        "issued tables only; the scalar is not a root slot: {occupy:?}"
+    );
+    let plan = ran
+        .plan
+        .unwrap_or_else(|| panic!("decoded plan was not recorded in this scope: {ran:?}"));
+    assert!(
+        plan.phase.is_none(),
+        "the decoded batch was measured before a mark: {plan:?}"
+    );
+    assert_eq!(
+        plan.root_slots, occupy.root_slots,
+        "plan {plan:?} occupy {occupy:?}"
+    );
+    assert_eq!(plan.batch, ROOT_CAPACITY_BATCH, "{plan:?}");
+    assert_eq!(plan.planned, plan.root_slots + plan.batch);
+    assert_eq!(plan.planned, ROOT_CAPACITY_PLANNED, "{plan:?}");
+    assert_ne!(
+        ran.roots_limit, 0,
+        "the arm must install a real roots limit"
+    );
+}
+
+/// Exact `roots.len() + batch` still finishes the first automatic empty local.
+#[test]
+fn exact_automatic_root_capacity_finishes_the_empty_local() {
+    let ran = run_auto_roots(AUTOMATIC_ROOT_CAPACITY_SOURCE, ROOT_CAPACITY_PLANNED);
+    assert_eq!(ran.stop, Stop::Halted, "{ran:?}");
+    assert_same_scope_plan(&ran);
+    assert!(bit_value(&ran.trace, 5.0), "fresh was allocated");
+    assert!(
+        bit_value(&ran.trace, 9.0),
+        "the later empty slot was allocated"
+    );
+    assert_eq!(ran.trace.peeks.len(), 3);
+    assert_ne!(ran.trace.peeks[0].table, ran.trace.peeks[1].table);
+    assert_eq!(text_value(&ran.trace, 3.0), "table");
+    assert_eq!(
+        text_value(&ran.trace, 4.0),
+        "nil",
+        "the automatic cycle clears the independent weak item"
+    );
+    assert_eq!(note_value(&ran.trace, 8.0), 1.0, "held keeps its identity");
+    assert_eq!(
+        note_value(&ran.trace, 21.0),
+        7.0,
+        "the scalar survives the cycle"
+    );
+    assert_eq!(cycle_at(&ran.trace, 5.0), (false, 1));
+    assert_eq!(ran.collects, 1);
+    assert_eq!(ran.collections, 1);
+    assert!(!ran.tail);
+    assert!(ran.mark_phase.is_none());
+    assert!(ran.idle);
+    assert!(ran.held_alive.unwrap_or(false));
+    assert!(ran.trace.steps.is_empty());
+    assert!(
+        ran.budgets.len() < ROOT_STEP_BUDGETS.len(),
+        "the exact arm must actually spend a step allowance: {:?}",
+        ran.budgets
+    );
+}
+
+/// One root short of the decoded batch must refuse before latch, budget, or mark.
+#[test]
+fn automatic_root_capacity_one_short_keeps_the_idle_heap() {
+    let ran = run_auto_roots(AUTOMATIC_ROOT_CAPACITY_SOURCE, ROOT_CAPACITY_PLANNED - 1);
+    assert!(
+        matches!(ran.stop, Stop::HostError(ref message) if message == "lua heap root capacity"),
+        "first refusal must be root capacity, not another resource error: {:?}",
+        ran.stop
+    );
+    assert_same_scope_plan(&ran);
+    assert_eq!(ran.roots_limit + 1, ran.plan.expect("plan").planned);
+    assert!(
+        ran.mark_phase.is_none(),
+        "refusal must not leave a saved mark, got {:?} plan {:?}",
+        ran.mark_phase,
+        ran.plan
+    );
+    assert!(ran.idle, "fixed step must stay idle");
+    assert!(!ran.tail, "refusal must not publish a tail");
+    assert!(!ran.meter.requested, "auto_requested {:?}", ran.meter);
+    assert!(ran.meter.due, "due must stay true: {:?}", ran.meter);
+    assert!(ran.meter.running, "running changed: {:?}", ran.meter);
+    assert_eq!(
+        ran.meter.threshold as f64,
+        note_value(&ran.trace, 31.0),
+        "threshold changed: {:?} notes {:?}",
+        ran.meter,
+        ran.trace.notes
+    );
+    assert_eq!(
+        note_value(&ran.trace, 32.0),
+        1.0,
+        "due was true before the safepoint"
+    );
+    assert_eq!(
+        note_value(&ran.trace, 33.0),
+        0.0,
+        "latch was clear before the safepoint"
+    );
+    assert_eq!(
+        note_value(&ran.trace, 34.0),
+        1.0,
+        "running before the safepoint"
+    );
+    assert_eq!(
+        ran.budgets,
+        ROOT_STEP_BUDGETS.to_vec(),
+        "both allowances must remain"
+    );
+    let occupy = occupy_note(&ran.trace);
+    assert_eq!(ran.root_slots, occupy.root_slots);
+    assert_eq!(ran.live_roots, occupy.live_roots);
+    assert_eq!(ran.live_nodes, occupy.live_nodes);
+    assert_eq!(ran.node_slots, occupy.node_slots);
+    assert_eq!(ran.edge_slots, occupy.edge_slots);
+    assert_eq!(ran.mark_passes, occupy.mark_passes);
+    assert_eq!(ran.node_slot_visits, occupy.node_slot_visits);
+    assert_eq!(ran.parked_root_writes, 0);
+    assert_eq!(ran.collects, 0);
+    assert_eq!(ran.collections, 0);
+    assert_eq!(ran.trace.peeks.len(), 1, "fresh was not built");
+    assert_eq!(
+        text_value(&ran.trace, 1.0),
+        "table",
+        "weak item still present"
+    );
+    assert!(ran.held_alive.unwrap_or(false));
+    assert!(ran.trace.steps.is_empty(), "no scan step ran");
+}
+
+/// The short roots limit still admits the frame and an ordinary allocation.
+/// Stop keeps the non-due path, so this is not the automatic refusal.
+#[test]
+fn stopped_tight_root_limit_still_allocates_the_empty_local() {
+    let source = r#"
+local function witness()
+  local w = {}
+  local mt = {}
+  local held = {}
+  local scalar = 7
+  mt.__mode = "v"
+  setmetatable(w, mt)
+  w[1] = held
+  w[2] = {}
+  peek(held)
+  note(1, collectgarbage("stop"))
+  note(20, scalar)
+  meter(30)
+  occupy(1)
+  text(1, type(rawget(w, 2)))
+  local fresh = {}
+  bit(5, peek(fresh))
+  note(21, scalar)
+  local spare = {}
+  bit(9, peek(spare))
+  return 1
+end
+witness()
+return 1
+"#;
+    let ran = run_auto_roots(source, ROOT_CAPACITY_PLANNED - 1);
+    assert_eq!(ran.stop, Stop::Halted, "{ran:?}");
+    let occupy = occupy_note(&ran.trace);
+    assert_eq!(occupy.root_slots, ROOT_CAPACITY_SLOTS, "{occupy:?}");
+    assert!(occupy.root_slots > occupy.live_roots, "{occupy:?}");
+    assert_eq!(note_value(&ran.trace, 20.0), 7.0);
+    assert!(
+        ran.plan.is_none(),
+        "stop is not due, so no automatic batch is decoded"
+    );
+    assert!(
+        bit_value(&ran.trace, 5.0),
+        "fresh allocated without a collection"
+    );
+    assert!(bit_value(&ran.trace, 9.0));
+    assert_eq!(text_value(&ran.trace, 1.0), "table");
+    assert_eq!(note_value(&ran.trace, 21.0), 7.0);
+    assert_eq!(ran.collects, 0);
+    assert_eq!(ran.collections, 0);
+    assert!(!ran.tail);
+    assert!(ran.mark_phase.is_none());
+    assert!(ran.idle);
+    assert!(!ran.meter.requested);
+    assert_eq!(ran.budgets, ROOT_STEP_BUDGETS.to_vec());
+    assert_eq!(ran.trace.peeks.len(), 3);
 }

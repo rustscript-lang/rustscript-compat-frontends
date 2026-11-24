@@ -700,6 +700,22 @@ pub fn saved_mark_query(host: &HostContext) -> Option<(&'static str, bool)> {
         .and_then(LuaHeap::saved_mark_query)
 }
 
+/// Capacity of an already decoded automatic root batch.
+///
+/// A missing heap is `SweepDenied` and does not install one. This does not
+/// pop a budget, set a latch, open a mark, or scan. The private stepper still
+/// rechecks the same sum before it takes a saved mark.
+#[cfg(test)]
+pub fn preflight_automatic_root_capacity(
+    host: &HostContext,
+    batch_len: usize,
+) -> Result<(), HeapError> {
+    let Some(heap) = host.scope_state::<LuaHeap>() else {
+        return Err(HeapError::SweepDenied);
+    };
+    heap.root_batch_fits(batch_len)
+}
+
 /// Copies the scan meter without clearing it.
 #[cfg(test)]
 pub fn copy_scan_meter(host: &mut HostContext) -> Result<ScanMeter, HeapError> {

@@ -661,6 +661,12 @@ impl Drop for ParkedMark<'_> {
 }
 
 impl LuaHeap {
+    /// Checked `roots.len() + extra` against `limits.roots`.
+    /// Does not read handles, open a mark, or scan.
+    pub(crate) fn root_batch_fits(&self, extra: usize) -> Result<(), HeapError> {
+        checked_root_occupancy(self, extra)
+    }
+
     /// Positive-budget step of a mark already stored on this heap.
     ///
     /// Order is the parked driver's order: saved state, Done, quota, then
@@ -696,13 +702,18 @@ impl LuaHeap {
     }
 }
 
-fn validate_root_batch(heap: &LuaHeap, batch: &[Rooted]) -> Result<(), HeapError> {
+fn checked_root_occupancy(heap: &LuaHeap, extra: usize) -> Result<(), HeapError> {
     let occupied = u32::try_from(heap.roots.len()).map_err(|_| HeapError::RootCapacity)?;
-    let extra = u32::try_from(batch.len()).map_err(|_| HeapError::RootCapacity)?;
+    let extra = u32::try_from(extra).map_err(|_| HeapError::RootCapacity)?;
     let end = occupied.checked_add(extra).ok_or(HeapError::RootCapacity)?;
     if end > heap.limits.roots {
         return Err(HeapError::RootCapacity);
     }
+    Ok(())
+}
+
+fn validate_root_batch(heap: &LuaHeap, batch: &[Rooted]) -> Result<(), HeapError> {
+    checked_root_occupancy(heap, batch.len())?;
     for rooted in batch {
         match *rooted {
             Rooted::Table(handle) => heap.require_live(handle)?,

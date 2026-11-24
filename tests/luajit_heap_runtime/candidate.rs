@@ -101,6 +101,13 @@ pub(super) fn remaining_step_budgets(host: &mut vm::HostContext<'_>) -> Vec<u64>
         .unwrap_or_default()
 }
 
+/// Remaining fixture allowances, oldest first. Does not pop, install, or step.
+pub(super) fn step_budget_snapshot(host: &vm::HostContext<'_>) -> Vec<u64> {
+    host.scope_state::<StepBudgets>()
+        .map(|budgets| budgets.0.iter().map(|budget| budget.get()).collect())
+        .unwrap_or_default()
+}
+
 /// Opt in to the fixture-budgeted guest step in this catalog only.
 pub(super) fn install_step_schemas(builder: &mut HostApiBuilder) {
     builder.function(HostFunctionSchema::with_return(
@@ -2014,6 +2021,7 @@ fn auto_table_due(host: &mut vm::HostContext<'_>) -> Result<bool, VmError> {
 
 /// Read-only snapshot for the once-only witness. Does not decode roots, pop a
 /// budget, set the latch, or start a cycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct AutoTableMeter {
     pub logical: u64,
     pub threshold: u64,
@@ -2054,6 +2062,50 @@ fn confirm_round_finished(host: &mut vm::HostContext<'_>) -> Result<(), VmError>
     Ok(())
 }
 
+/// Decoded automatic batch measured in the same scope, before a budget pop.
+///
+/// `planned` is `roots.len() + batch`. Empty fixed slots are in `root_slots`;
+/// a live scalar is in neither count. Recording this does not install a heap,
+/// pop a budget, set the latch, or open a mark.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct AutoRootPlan {
+    pub phase: Option<&'static str>,
+    pub root_slots: u32,
+    pub batch: u32,
+    pub planned: u32,
+}
+
+pub(super) fn auto_root_plan(host: &vm::HostContext<'_>) -> Option<AutoRootPlan> {
+    host.scope_state::<AutoRootPlan>().copied()
+}
+
+fn note_auto_root_plan(host: &mut vm::HostContext<'_>, batch: usize) -> Result<(), VmError> {
+    let (phase, root_slots) = {
+        let Some(heap) = host.scope_state::<heap::LuaHeap>() else {
+            return Err(VmError::HostError(
+                "auto root plan has no installed heap".to_string(),
+            ));
+        };
+        (
+            heap.saved_mark_query().map(|(phase, _)| phase),
+            heap.stats().root_slots,
+        )
+    };
+    let batch = u32::try_from(batch)
+        .map_err(|_| VmError::HostError("auto root plan batch does not fit u32".to_string()))?;
+    let planned = root_slots
+        .checked_add(batch)
+        .ok_or_else(|| VmError::HostError("auto root plan overflow".to_string()))?;
+    host.scope_state_or_insert_with(|| AutoRootPlan {
+        phase,
+        root_slots,
+        batch,
+        planned,
+    })
+    .map_err(|error| VmError::HostError(error.to_string()))?;
+    Ok(())
+}
+
 /// One idle empty-local safepoint after single-arg restart.
 ///
 /// The mark allowance and, only when that call publishes a tail, the
@@ -2070,6 +2122,11 @@ fn auto_table_restart(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
     // are NEW_TABLE and ROOT_ISSUED. The host still requires a saved gray phase
     // with a pending scan; chunk locals and direct calls pass 0.
     let root_handoff = matches!(call.args().get(1), Some(Value::Float(flag)) if *flag == 1.0);
+    {
+        let mut host = call.vm().host_context();
+        note_auto_root_plan(&mut host, tables.len())?;
+        heap::preflight_automatic_root_capacity(&host, tables.len()).map_err(heap_error)?;
+    }
     let mut host = call.vm().host_context();
     let mark_budget = pop_step_budget(&mut host)?;
     if let Some(control) = host.scope_state_mut::<GcRunControl>() {
