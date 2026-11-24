@@ -2,8 +2,10 @@
 //!
 //! The Lua source is lowered, compiled, and run. The step host records the
 //! real `StepOutcome`. It does not invent a pause, a publication, or a report.
-//! Roots already sit in the callee frame, so the step batch is empty.
+//! The private host uses fixed frames; the opt-in guest spelling gathers the
+//! current source roots on mark steps and bypasses gathering on tail steps.
 
+use std::num::NonZeroU64;
 use std::sync::{Arc, OnceLock};
 
 use vm::{
@@ -22,6 +24,7 @@ const PEEK: &str = "lua_host::peek";
 const SAME: &str = "lua_host::same";
 const NOTE: &str = "lua_host::note";
 const TEXT: &str = "lua_host::text";
+const BIT: &str = "lua_host::bit";
 
 const SOURCE: &str = r#"
 local function witness()
@@ -83,6 +86,8 @@ struct Trace {
     sames: Vec<(heap::TableRef, heap::TableRef)>,
     notes: Vec<(f64, f64)>,
     texts: Vec<(f64, String)>,
+    bits: Vec<(f64, bool)>,
+    bit_cycle_state: Vec<(bool, u32)>,
 }
 
 #[derive(Clone, Debug)]
@@ -113,7 +118,12 @@ struct Ran {
     release_root: Option<candidate::ReleaseRootNote>,
 }
 
-struct Plugin;
+struct Plugin {
+    guest_step: bool,
+}
+
+static PLUGIN: Plugin = Plugin { guest_step: false };
+static STEP_PLUGIN: Plugin = Plugin { guest_step: true };
 
 impl SourcePlugin for Plugin {
     fn flavor(&self) -> SourceFlavor {
@@ -129,15 +139,20 @@ impl SourcePlugin for Plugin {
     }
 
     fn parse_source(&self, source: &str) -> Result<FrontendIr, ParseError> {
-        candidate::lower(source, catalog())
+        candidate::lower(source, catalog(self.guest_step))
     }
 }
 
-fn catalog() -> &'static Arc<vm::HostApiCatalog> {
+fn catalog(guest_step: bool) -> &'static Arc<vm::HostApiCatalog> {
     static CATALOG: OnceLock<Arc<vm::HostApiCatalog>> = OnceLock::new();
-    CATALOG.get_or_init(|| {
+    static STEP_CATALOG: OnceLock<Arc<vm::HostApiCatalog>> = OnceLock::new();
+    let catalog = if guest_step { &STEP_CATALOG } else { &CATALOG };
+    catalog.get_or_init(|| {
         let mut builder = vm::HostApiBuilder::new();
         candidate::install_schemas(&mut builder);
+        if guest_step {
+            candidate::install_step_schemas(&mut builder);
+        }
         let table = HostTypeSchema::Resource(heap::LuaTableResource::key());
         builder.function(vm::HostFunctionSchema::with_return(
             STEP,
@@ -177,6 +192,14 @@ fn catalog() -> &'static Arc<vm::HostApiCatalog> {
             ],
             HostTypeSchema::Bool,
         ));
+        builder.function(vm::HostFunctionSchema::with_return(
+            BIT,
+            vec![
+                HostParamSchema::value("tag", HostTypeSchema::Float),
+                HostParamSchema::value("bit", HostTypeSchema::Bool),
+            ],
+            HostTypeSchema::Bool,
+        ));
         Arc::new(builder.build().expect("source scalar catalog"))
     })
 }
@@ -188,6 +211,7 @@ fn register(registry: &mut HostFunctionRegistry, catalog: &vm::HostApiCatalog) {
         (SAME, HostOp::Same),
         (NOTE, HostOp::Note),
         (TEXT, HostOp::Text),
+        (BIT, HostOp::Bit),
     ] {
         let function = catalog.function(name).expect("scalar step host schema");
         registry
@@ -208,6 +232,7 @@ enum HostOp {
     Same,
     Note,
     Text,
+    Bit,
 }
 
 impl HostOwnedFunction for HostOp {
@@ -241,6 +266,18 @@ impl HostOwnedFunction for HostOp {
                 let noted = (*tag, *value);
                 note(&mut host, |state| state.notes.push(noted))?;
                 Value::Float(noted.1)
+            }
+            Self::Bit => {
+                let [Value::Float(tag), Value::Bool(bit)] = args.as_slice() else {
+                    return Err(host_fault("expected a guest boolean"));
+                };
+                let tail = heap::saved_sweep_tail(&mut host).map_err(host_heap)?;
+                let collections = heap::stats(&mut host).map_err(host_heap)?.collections;
+                note(&mut host, |state| {
+                    state.bits.push((*tag, *bit));
+                    state.bit_cycle_state.push((tail, collections));
+                })?;
+                Value::Bool(*bit)
             }
             Self::Text => {
                 let [Value::Float(tag), Value::String(text)] = args.as_slice() else {
@@ -342,9 +379,18 @@ fn host_heap(error: heap::HeapError) -> VmError {
 }
 
 fn run(source: &str) -> Ran {
-    let catalog = Arc::clone(catalog());
+    run_with_step_budgets(source, None)
+}
+
+fn run_with_step_budgets(source: &str, budgets: Option<&[u64]>) -> Ran {
+    let catalog = Arc::clone(catalog(budgets.is_some()));
+    let plugin = if budgets.is_some() {
+        &STEP_PLUGIN
+    } else {
+        &PLUGIN
+    };
     let options = CompileSourceFileOptions::new()
-        .with_source_plugin(&Plugin)
+        .with_source_plugin(plugin)
         .with_host_api_catalog(Arc::clone(&catalog));
     let prepared = vm::compile_source_with_flavor_and_options(source, SourceFlavor::Lua, options)
         .unwrap_or_else(|error| panic!("compile rejected the source: {error}"));
@@ -354,6 +400,13 @@ fn run(source: &str) -> Ran {
     candidate::register(&mut registry, &catalog).expect("register candidate runtime");
     register(&mut registry, &catalog);
     registry.bind_vm_cached(&mut vm).expect("bind runtime");
+    if let Some(budgets) = budgets {
+        let budgets: Vec<_> = budgets
+            .iter()
+            .map(|&budget| NonZeroU64::new(budget).expect("positive fixture budget"))
+            .collect();
+        candidate::set_step_budgets(&mut vm.host_context(), &budgets);
+    }
     let status = vm.run();
     let trace = vm
         .host_context()
@@ -582,6 +635,223 @@ fn text_value(trace: &Trace, tag: f64) -> &str {
         .unwrap_or_else(|| panic!("missing text {tag} in {:?}", trace.texts))
         .1
         .as_str()
+}
+
+const STEP_WITNESS: &str = r#"local function witness()
+  local w = {}
+  local mt = {}
+  local t = {}
+  mt.__mode = "v"
+  setmetatable(w, mt)
+  w[1] = t
+  w[2] = {}
+  w[3] = {}
+  peek(t)
+  note(10, rawlen(w))
+  note(20, same(t, rawget(w, 1)))
+  -- tick 1
+  note(11, rawlen(w))
+  note(21, same(t, rawget(w, 1)))
+  -- tick 2
+  note(12, rawlen(w))
+  note(22, same(t, rawget(w, 1)))
+  -- tick 3
+  note(13, rawlen(w))
+  note(23, same(t, rawget(w, 1)))
+  -- tick 4
+  note(14, rawlen(w))
+  note(24, same(t, rawget(w, 1)))
+  text(2, type(rawget(w, 2)))
+  text(3, type(rawget(w, 3)))
+  return 1
+end
+witness()
+return 1
+"#;
+
+fn run_step_witness(arm: &str, ticks: [&str; 4], budgets: Option<&[u64]>) -> Ran {
+    let mut source = STEP_WITNESS.to_owned();
+    for (i, tick) in ticks.into_iter().enumerate() {
+        if !tick.is_empty() {
+            source = source.replace(&format!("-- tick {}", i + 1), tick);
+        }
+    }
+    let ran = run_with_step_budgets(&source, budgets);
+    assert_eq!(ran.stop, Stop::Halted, "{arm}: {ran:#?}");
+    assert_eq!(ran.stack, [Value::Float(1.0)]);
+    let original = ran.trace.peeks[0].table;
+    assert_eq!(ran.trace.peeks.len(), 1);
+    assert_eq!(ran.trace.sames, [(original, original); 5]);
+    for tag in [20.0, 21.0, 22.0, 23.0, 24.0] {
+        assert_eq!(note_value(&ran.trace, tag), 1.0);
+    }
+    assert!(!ran.tail, "all successful arms leave no saved tail");
+    assert!(ran.frame.is_none());
+    ran
+}
+
+fn weak_lengths(ran: &Ran) -> [f64; 5] {
+    [10.0, 11.0, 12.0, 13.0, 14.0].map(|tag| note_value(&ran.trace, tag))
+}
+
+fn assert_final_weak_types(ran: &Ran, expected: &str) {
+    assert_eq!(text_value(&ran.trace, 2.0), expected);
+    assert_eq!(text_value(&ran.trace, 3.0), expected);
+}
+
+#[test]
+fn guest_step_reports_completion_after_visible_weak_clear() {
+    let ran = run_step_witness(
+        "guest-step",
+        [
+            r#"bit(1, collectgarbage("step"))"#,
+            r#"bit(2, collectgarbage("step"))"#,
+            r#"bit(3, collectgarbage("step"))"#,
+            r#"bit(4, collectgarbage("step"))"#,
+        ],
+        Some(&[1, 10_000, 1, 10_000]),
+    );
+    let lengths = weak_lengths(&ran);
+    assert_eq!(
+        ran.trace.bits,
+        [(1.0, false), (2.0, false), (3.0, false), (4.0, true)]
+    );
+    assert_eq!(
+        ran.trace.bit_cycle_state,
+        [(false, 0), (true, 0), (true, 0), (false, 1)]
+    );
+    assert_eq!(lengths[0], 3.0);
+    assert_eq!(lengths[4], 1.0);
+    assert!(
+        lengths[1..]
+            .iter()
+            .zip(&ran.trace.bit_cycle_state)
+            .any(|(&length, &(tail, collections))| length == 1.0 && tail && collections == 0),
+        "weak clear visible while the incomplete tail is saved",
+    );
+    assert_final_weak_types(&ran, "nil");
+    assert!(ran.trace.steps.is_empty(), "no private test step host ran");
+    assert_eq!(ran.collects, 1);
+    assert_eq!(ran.collections, 1);
+}
+
+const TEMPORARY_STEP: &str = r#"
+local function witness()
+  local w = {}
+  local mt = {}
+  mt.__mode = "v"
+  setmetatable(w, mt)
+  w[1] = {}
+  w[2] = {}
+  peek(rawget(w, 1))
+  -- publish
+  text(1, type(rawget(w, 1)))
+  text(2, type(rawget(w, 2)))
+  -- identity
+  -- This is not a guest value. Any root gather during the saved tail rejects it.
+  local unissued = external_shape()
+  bit(2, collectgarbage("step"))
+  return 1
+end
+witness()
+return 1
+"#;
+
+#[test]
+fn guest_step_marks_current_argument_and_skips_tail_root_gather() {
+    for hold_argument in [true, false] {
+        let (publish, identity) = if hold_argument {
+            (
+                r#"bit(1, rawequal(rawget(w, 1), (collectgarbage("step"))))"#,
+                "peek(rawget(w, 1))",
+            )
+        } else {
+            (r#"bit(1, collectgarbage("step"))"#, "")
+        };
+        let ran = run_with_step_budgets(
+            &TEMPORARY_STEP
+                .replace("-- publish", publish)
+                .replace("-- identity", identity),
+            Some(&[10_000, 10_000]),
+        );
+        assert_eq!(ran.stop, Stop::Halted, "{ran:#?}");
+        assert_eq!(ran.trace.bits, [(1.0, false), (2.0, true)]);
+        assert_eq!(ran.trace.bit_cycle_state, [(true, 0), (false, 1)]);
+        assert_eq!(
+            text_value(&ran.trace, 1.0),
+            if hold_argument { "table" } else { "nil" }
+        );
+        assert_eq!(text_value(&ran.trace, 2.0), "nil");
+        assert_eq!(ran.trace.peeks.len(), if hold_argument { 2 } else { 1 });
+        if hold_argument {
+            assert_eq!(ran.trace.peeks[0].table, ran.trace.peeks[1].table);
+        }
+        assert_eq!(ran.subject_alive, Some(hold_argument));
+        assert!(ran.frame.is_none() && !ran.tail);
+        assert_eq!(ran.root_slots, 0);
+        assert_eq!(ran.collections, 1);
+        assert!(ran.trace.steps.is_empty());
+    }
+}
+
+#[test]
+fn private_step_matches_guest_witness_graph() {
+    let ran = run_step_witness(
+        "private-step",
+        [
+            "note(1, step(1))",
+            "note(2, step(10000))",
+            "note(3, step(1))",
+            "note(4, step(10000))",
+        ],
+        None,
+    );
+    assert_eq!(weak_lengths(&ran), [3.0, 3.0, 1.0, 1.0, 1.0]);
+    assert_final_weak_types(&ran, "nil");
+    let [mark, publish, release, done] = ran.trace.steps.as_slice() else {
+        panic!("expected four private step observations: {ran:#?}");
+    };
+    assert!(matches!(mark.outcome, StepOutcome::Paused { tail: false }));
+    assert!(matches!(publish.outcome, StepOutcome::Published { .. }));
+    assert!(matches!(
+        release.outcome,
+        StepOutcome::Paused { tail: true }
+    ));
+    assert!(matches!(done.outcome, StepOutcome::Completed(_)));
+    assert_eq!(
+        [mark, publish, release, done].map(|step| step.collections),
+        [0, 0, 0, 1]
+    );
+    assert_eq!(
+        [1.0, 2.0, 3.0, 4.0].map(|tag| note_value(&ran.trace, tag)),
+        [0.0, 1.0, 2.0, 3.0]
+    );
+    assert_eq!(ran.collections, 1);
+    assert!(ran.trace.bits.is_empty());
+}
+
+#[test]
+fn full_collect_matches_guest_witness_graph() {
+    let ran = run_step_witness(
+        "full-collect",
+        [r#"collectgarbage("collect")"#, "", "", ""],
+        None,
+    );
+    assert_eq!(weak_lengths(&ran), [3.0, 1.0, 1.0, 1.0, 1.0]);
+    assert_final_weak_types(&ran, "nil");
+    assert!(ran.trace.steps.is_empty());
+    assert_eq!(ran.collects, 1);
+    assert_eq!(ran.collections, 1);
+}
+
+#[test]
+fn omitted_collect_matches_guest_witness_graph() {
+    let ran = run_step_witness("omitted", [""; 4], None);
+    assert_eq!(weak_lengths(&ran), [3.0; 5]);
+    assert_final_weak_types(&ran, "table");
+    assert!(ran.trace.steps.is_empty());
+    assert_eq!(ran.collects, 0);
+    assert_eq!(ran.collections, 0);
 }
 
 #[test]

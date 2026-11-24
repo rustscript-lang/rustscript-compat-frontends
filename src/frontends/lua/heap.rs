@@ -604,6 +604,32 @@ pub fn take_scan_meter(host: &mut HostContext) -> Result<ScanMeter, HeapError> {
     with_heap(host, |heap| Ok(heap.take_scan_meter()))
 }
 
+/// Advances the explicitly enabled source candidate at a positive-budget safepoint.
+/// Root candidates have been classified only on the mark path; the private
+/// stepper validates the complete batch before scanning and ignores it on a tail.
+#[cfg(test)]
+pub fn step_source_safepoint(
+    host: &mut HostContext,
+    budget: std::num::NonZeroU64,
+    tables: Vec<TableRef>,
+) -> Result<StepOutcome, HeapError> {
+    if saved_source_tail(host) {
+        return step_private_cycle(host, budget.get(), &[]);
+    }
+    with_heap(host, |_| Ok(()))?;
+    if fixed_step_idle(host)? {
+        open_private_step_cycle(host)?;
+    }
+    let batch: Vec<_> = tables.into_iter().map(table::Rooted::Table).collect();
+    step_private_cycle(host, budget.get(), &batch)
+}
+
+#[cfg(test)]
+pub fn saved_source_tail(host: &HostContext) -> bool {
+    host.scope_state::<LuaHeap>()
+        .is_some_and(LuaHeap::has_sweep_tail)
+}
+
 /// Saves one private mark for a cycle whose roots already sit in fixed frames.
 ///
 /// Does not scan. A missing heap, an existing mark, or a saved tail is the

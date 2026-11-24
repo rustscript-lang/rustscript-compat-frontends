@@ -1,7 +1,8 @@
 //! Executable slice of the AST lowering. The production file entry does not
 //! select it until the supported execution and root-transfer gates pass.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::num::NonZeroU64;
 use vm::compiler::ir::{FunctionDecl, FunctionImpl, ResolvedHostCall, ResolvedHostParam};
 use vm::{
     AssignmentKind, CallOutcome, CallReturn, Expr, FrontendIr, HostApiBuilder, HostApiCatalog,
@@ -25,6 +26,8 @@ const BOOL_ARG: &str = "lua_internal::bool_arg";
 const STRING_ARG: &str = "lua_internal::string_arg";
 const GATHER_ROOT: &str = "lua_internal::gather_root";
 pub(super) const COLLECT: &str = "lua_internal::collect";
+const STEP: &str = "lua_internal::step";
+const STEP_HAS_TAIL: &str = "lua_internal::step_has_tail";
 const COUNT: &str = "lua_internal::count";
 const OPEN_CELL: &str = "lua_internal::open_cell";
 const READ_CELL: &str = "lua_internal::read_cell";
@@ -74,6 +77,29 @@ pub(super) fn next_counts(vm: &mut vm::Vm) -> Vec<u32> {
         .scope_state::<NextCounts>()
         .map(|counts| counts.consumed.clone())
         .unwrap_or_default()
+}
+
+#[derive(Default)]
+struct StepBudgets(VecDeque<NonZeroU64>);
+
+pub(super) fn set_step_budgets(host: &mut vm::HostContext<'_>, budgets: &[NonZeroU64]) {
+    host.scope_state_or_insert_with(StepBudgets::default)
+        .expect("test step budget state")
+        .0 = budgets.iter().copied().collect();
+}
+
+/// Opt in to the fixture-budgeted guest step in this catalog only.
+pub(super) fn install_step_schemas(builder: &mut HostApiBuilder) {
+    builder.function(HostFunctionSchema::with_return(
+        STEP_HAS_TAIL,
+        vec![],
+        HostTypeSchema::Bool,
+    ));
+    builder.function(HostFunctionSchema::with_return(
+        STEP,
+        vec![HostParamSchema::value("roots", HostTypeSchema::Unknown)],
+        HostTypeSchema::Bool,
+    ));
 }
 
 pub(super) fn install_schemas(builder: &mut HostApiBuilder) {
@@ -242,6 +268,8 @@ pub(super) fn register(
         Op::StringArg,
         Op::GatherRoot,
         Op::Collect,
+        Op::Step,
+        Op::StepHasTail,
         Op::Count,
         Op::EnterResult,
         Op::EnterCallee,
@@ -283,6 +311,8 @@ pub(super) fn register(
             Op::StringArg => STRING_ARG,
             Op::GatherRoot => GATHER_ROOT,
             Op::Collect => COLLECT,
+            Op::Step => STEP,
+            Op::StepHasTail => STEP_HAS_TAIL,
             Op::Count => COUNT,
             Op::EnterResult => ENTER_RESULT,
             Op::EnterCallee => ENTER_CALLEE,
@@ -311,6 +341,9 @@ pub(super) fn register(
             Op::WriteCell => WRITE_CELL,
             Op::TrackClosure => TRACK_CLOSURE,
         };
+        if matches!(op, Op::Step | Op::StepHasTail) && catalog.function(name).is_none() {
+            continue;
+        }
         let function = catalog.function(name).expect("private Lua operation");
         let schema = HostImportSchema::from_function(catalog, function);
         registry.register_exact_owned(name, function.params.len() as u8, schema, move |_| {
@@ -334,6 +367,8 @@ enum Op {
     StringArg,
     GatherRoot,
     Collect,
+    Step,
+    StepHasTail,
     Count,
     EnterResult,
     EnterCallee,
@@ -517,29 +552,12 @@ impl HostOwnedFunction for Op {
                 Value::Array(roots)
             }
             Self::Collect => {
-                let roots = match call.args() {
-                    [Value::Null] => Vec::new(),
-                    [Value::Array(roots)] => roots.iter().cloned().collect(),
-                    _ => {
-                        return Err(VmError::HostError(
-                            "invalid private Lua root list".to_string(),
-                        ));
-                    }
-                };
-                let mut tables = Vec::with_capacity(roots.len());
-                for root in &roots {
-                    match classify(&mut call.vm().host_context(), root)? {
-                        heap::GuestClass::Table(table) => tables.push(table),
-                        _ => {
-                            return Err(VmError::HostError(
-                                "invalid private Lua table root".to_string(),
-                            ));
-                        }
-                    }
-                }
+                let tables = decode_safepoint_roots(call)?;
                 collect_at_safepoint(&mut call.vm().host_context(), &tables)?;
                 Value::Float(0.0)
             }
+            Self::Step => step_at_safepoint(call)?,
+            Self::StepHasTail => Value::Bool(heap::saved_source_tail(&call.vm().host_context())),
             Self::Count => {
                 let kib =
                     heap::with_heap(&mut call.vm().host_context(), |heap| Ok(heap.logical_kib()))
@@ -1728,6 +1746,49 @@ pub(super) fn capture_counts(vm: &mut vm::Vm) -> (u32, u32) {
         .scope_state::<CaptureGraph>()
         .map(|graph| (graph.reads, graph.writes))
         .unwrap_or((0, 0))
+}
+
+fn decode_safepoint_roots(call: &mut OwnedHostCall<'_>) -> Result<Vec<heap::TableRef>, VmError> {
+    let roots = match call.args() {
+        [Value::Null] => return Ok(Vec::new()),
+        [Value::Array(roots)] => roots.clone(),
+        _ => {
+            return Err(VmError::HostError(
+                "invalid private Lua root list".to_string(),
+            ));
+        }
+    };
+    let mut host = call.vm().host_context();
+    roots
+        .iter()
+        .map(|root| match classify(&mut host, root)? {
+            heap::GuestClass::Table(table) => Ok(table),
+            _ => Err(VmError::HostError(
+                "invalid private Lua table root".to_string(),
+            )),
+        })
+        .collect()
+}
+
+fn step_at_safepoint(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
+    let mut host = call.vm().host_context();
+    let budget = host
+        .scope_state_mut::<StepBudgets>()
+        .and_then(|budgets| budgets.0.pop_front())
+        .ok_or_else(|| VmError::HostError("missing source step fixture budget".to_string()))?;
+    let tables = if heap::saved_source_tail(&host) {
+        Vec::new()
+    } else {
+        decode_safepoint_roots(call)?
+    };
+    let mut host = call.vm().host_context();
+    let outcome = heap::step_source_safepoint(&mut host, budget, tables).map_err(heap_error)?;
+    if let heap::StepOutcome::Completed(report) = outcome {
+        note_collect(&mut host, report)?;
+        Ok(Value::Bool(true))
+    } else {
+        Ok(Value::Bool(false))
+    }
 }
 
 fn collect_at_safepoint(
@@ -3975,6 +4036,13 @@ impl Lower<'_> {
                     if bytes == b"count" {
                         return self.count_expr(expr.span());
                     }
+                    if bytes == b"step"
+                        && !self.name_is_bound(name)
+                        && self.catalog.function(STEP).is_some()
+                        && self.catalog.function(STEP_HAS_TAIL).is_some()
+                    {
+                        return self.step_expr(expr.span());
+                    }
                 }
                 if name.is("copy_fields")
                     && let [arg] = args.exprs.as_slice()
@@ -4218,6 +4286,27 @@ impl Lower<'_> {
     }
 
     fn collect_expr(&mut self, span: ast::Span) -> Result<Expr, ParseError> {
+        let roots = self.gather_safepoint_roots(span)?;
+        self.call(COLLECT, vec![roots])
+    }
+
+    fn step_expr(&mut self, span: ast::Span) -> Result<Expr, ParseError> {
+        // Defer root gathering to the mark branch, including the reads of
+        // IR locals. A saved tail passes only the null placeholder to Core.
+        let start = self.stmts.len();
+        let roots = self.gather_safepoint_roots(span)?;
+        let gather = self.stmts.split_off(start);
+        Ok(Expr::IfElse {
+            condition: Box::new(self.call(STEP_HAS_TAIL, vec![])?),
+            then_expr: Box::new(self.call(STEP, vec![Expr::Null])?),
+            else_expr: Box::new(Expr::Block {
+                stmts: gather,
+                expr: Box::new(self.call(STEP, vec![roots])?),
+            }),
+        })
+    }
+
+    fn gather_safepoint_roots(&mut self, span: ast::Span) -> Result<Expr, ParseError> {
         // All supported collects are explicit safepoints. Completed arguments
         // live in compat-emitted temporaries, not in an implicit Core stack scan.
         let live: Vec<_> = self
@@ -4240,7 +4329,7 @@ impl Lower<'_> {
             });
             roots = Expr::MoveVar(next);
         }
-        self.call(COLLECT, vec![roots])
+        Ok(roots)
     }
 
     fn count_expr(&mut self, _span: ast::Span) -> Result<Expr, ParseError> {
