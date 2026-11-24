@@ -120,10 +120,21 @@ struct Ran {
 
 struct Plugin {
     guest_step: bool,
+    run_control: bool,
 }
 
-static PLUGIN: Plugin = Plugin { guest_step: false };
-static STEP_PLUGIN: Plugin = Plugin { guest_step: true };
+static PLUGIN: Plugin = Plugin {
+    guest_step: false,
+    run_control: false,
+};
+static STEP_PLUGIN: Plugin = Plugin {
+    guest_step: true,
+    run_control: false,
+};
+static CONTROL_PLUGIN: Plugin = Plugin {
+    guest_step: true,
+    run_control: true,
+};
 
 impl SourcePlugin for Plugin {
     fn flavor(&self) -> SourceFlavor {
@@ -139,19 +150,33 @@ impl SourcePlugin for Plugin {
     }
 
     fn parse_source(&self, source: &str) -> Result<FrontendIr, ParseError> {
-        candidate::lower(source, catalog(self.guest_step))
+        candidate::lower(source, catalog_for(self.guest_step, self.run_control))
     }
 }
 
 fn catalog(guest_step: bool) -> &'static Arc<vm::HostApiCatalog> {
+    catalog_for(guest_step, false)
+}
+
+fn catalog_for(guest_step: bool, run_control: bool) -> &'static Arc<vm::HostApiCatalog> {
     static CATALOG: OnceLock<Arc<vm::HostApiCatalog>> = OnceLock::new();
     static STEP_CATALOG: OnceLock<Arc<vm::HostApiCatalog>> = OnceLock::new();
-    let catalog = if guest_step { &STEP_CATALOG } else { &CATALOG };
+    static CONTROL_CATALOG: OnceLock<Arc<vm::HostApiCatalog>> = OnceLock::new();
+    let catalog = if run_control {
+        &CONTROL_CATALOG
+    } else if guest_step {
+        &STEP_CATALOG
+    } else {
+        &CATALOG
+    };
     catalog.get_or_init(|| {
         let mut builder = vm::HostApiBuilder::new();
         candidate::install_schemas(&mut builder);
-        if guest_step {
+        if guest_step || run_control {
             candidate::install_step_schemas(&mut builder);
+        }
+        if run_control {
+            candidate::install_run_control_schemas(&mut builder);
         }
         let table = HostTypeSchema::Resource(heap::LuaTableResource::key());
         builder.function(vm::HostFunctionSchema::with_return(
@@ -379,12 +404,26 @@ fn host_heap(error: heap::HeapError) -> VmError {
 }
 
 fn run(source: &str) -> Ran {
-    run_with_step_budgets(source, None)
+    drive(source, None, false, None)
 }
 
 fn run_with_step_budgets(source: &str, budgets: Option<&[u64]>) -> Ran {
-    let catalog = Arc::clone(catalog(budgets.is_some()));
-    let plugin = if budgets.is_some() {
+    drive(source, budgets, false, None)
+}
+
+fn run_control(source: &str, budgets: Option<&[u64]>) -> Ran {
+    drive(source, budgets, true, None)
+}
+
+fn drive(source: &str, budgets: Option<&[u64]>, run_control: bool, nodes: Option<u32>) -> Ran {
+    let catalog = Arc::clone(if run_control {
+        catalog_for(true, true)
+    } else {
+        catalog(budgets.is_some())
+    });
+    let plugin: &Plugin = if run_control {
+        &CONTROL_PLUGIN
+    } else if budgets.is_some() {
         &STEP_PLUGIN
     } else {
         &PLUGIN
@@ -406,6 +445,18 @@ fn run_with_step_budgets(source: &str, budgets: Option<&[u64]>) -> Ran {
             .map(|&budget| NonZeroU64::new(budget).expect("positive fixture budget"))
             .collect();
         candidate::set_step_budgets(&mut vm.host_context(), &budgets);
+    }
+    if let Some(nodes) = nodes {
+        heap::install(
+            &mut vm.host_context(),
+            heap::HeapLimits {
+                nodes,
+                roots: 64,
+                edges: 64,
+                max_generation: 8,
+            },
+        )
+        .expect("test host installs the node quota before execution");
     }
     let status = vm.run();
     let trace = vm
@@ -635,6 +686,24 @@ fn text_value(trace: &Trace, tag: f64) -> &str {
         .unwrap_or_else(|| panic!("missing text {tag} in {:?}", trace.texts))
         .1
         .as_str()
+}
+
+fn bit_value(trace: &Trace, tag: f64) -> bool {
+    trace
+        .bits
+        .iter()
+        .find(|(found, _)| *found == tag)
+        .unwrap_or_else(|| panic!("missing bit {tag} in {:?}", trace.bits))
+        .1
+}
+
+fn cycle_at(trace: &Trace, tag: f64) -> (bool, u32) {
+    let index = trace
+        .bits
+        .iter()
+        .position(|(found, _)| *found == tag)
+        .unwrap_or_else(|| panic!("missing bit {tag} in {:?}", trace.bits));
+    trace.bit_cycle_state[index]
 }
 
 const STEP_WITNESS: &str = r#"local function witness()
@@ -1777,4 +1846,466 @@ fn release_return_root_refuses_without_writing() {
             }
         });
     }
+}
+
+fn bind_control(source: &str) -> vm::Vm {
+    let catalog = Arc::clone(catalog_for(true, true));
+    let options = CompileSourceFileOptions::new()
+        .with_source_plugin(&CONTROL_PLUGIN)
+        .with_host_api_catalog(Arc::clone(&catalog));
+    let prepared = vm::compile_source_with_flavor_and_options(source, SourceFlavor::Lua, options)
+        .unwrap_or_else(|error| panic!("compile rejected the source: {error}"));
+    let mut vm = prepared.into_vm().expect("create VM");
+    assert_return_window(vm.program());
+    let mut registry = HostFunctionRegistry::empty();
+    candidate::register(&mut registry, &catalog).expect("register candidate runtime");
+    register(&mut registry, &catalog);
+    registry.bind_vm_cached(&mut vm).expect("bind runtime");
+    vm
+}
+
+fn finish_reset(vm: &mut vm::Vm) {
+    vm.reset_for_reuse().expect("start reset");
+    let waker = std::task::Waker::noop();
+    let mut context = std::task::Context::from_waker(waker);
+    match vm.poll_reset_for_reuse(&mut context) {
+        std::task::Poll::Ready(Ok(())) => {}
+        other => panic!("reset did not finish: {other:?}"),
+    }
+}
+
+fn control_bits(vm: &mut vm::Vm) -> Vec<(f64, bool)> {
+    vm.host_context()
+        .scope_state::<Trace>()
+        .map(|trace| trace.bits.clone())
+        .unwrap_or_default()
+}
+
+const CONTROL_SWITCH: &str = r#"
+local function witness()
+  local t = {}
+  peek(t)
+  bit(1, collectgarbage("isrunning"))
+  note(1, collectgarbage("stop"))
+  bit(2, collectgarbage("isrunning"))
+  return 1
+end
+witness()
+return 1
+"#;
+
+#[test]
+fn guest_run_control_is_observable_and_does_not_collect() {
+    let ran = run_control(
+        r#"
+local function witness()
+  local w = {}
+  local mt = {}
+  local t = {}
+  mt.__mode = "v"
+  setmetatable(w, mt)
+  w[1] = t
+  w[2] = {}
+  peek(t)
+  bit(1, collectgarbage("isrunning"))
+  note(1, collectgarbage("stop"))
+  note(2, collectgarbage("stop"))
+  bit(2, collectgarbage("isrunning"))
+  note(3, collectgarbage("count"))
+  note(4, collectgarbage("count"))
+  note(5, rawlen(w))
+  text(1, type(rawget(w, 2)))
+  note(6, collectgarbage("restart"))
+  note(7, collectgarbage("restart"))
+  bit(3, collectgarbage("isrunning"))
+  note(8, rawlen(w))
+  text(2, type(rawget(w, 2)))
+  collectgarbage("collect")
+  bit(4, collectgarbage("isrunning"))
+  note(9, rawlen(w))
+  text(3, type(rawget(w, 2)))
+  note(10, same(t, rawget(w, 1)))
+  return 1
+end
+witness()
+return 1
+"#,
+        None,
+    );
+    assert_eq!(ran.stop, Stop::Halted, "{ran:?}");
+    assert_eq!(ran.stack, [Value::Float(1.0)]);
+    assert!(
+        bit_value(&ran.trace, 1.0),
+        "a fresh execution starts running"
+    );
+    assert_eq!(note_value(&ran.trace, 1.0), 0.0);
+    assert_eq!(note_value(&ran.trace, 2.0), 0.0, "stop is idempotent");
+    assert!(!bit_value(&ran.trace, 2.0));
+    let count = note_value(&ran.trace, 3.0);
+    assert!(
+        count.is_finite() && count > 0.0,
+        "count is the logical meter: {count}"
+    );
+    assert_eq!(count, note_value(&ran.trace, 4.0), "stop does not allocate");
+    assert_eq!(note_value(&ran.trace, 5.0), 2.0);
+    assert_eq!(text_value(&ran.trace, 1.0), "table");
+    assert_eq!(note_value(&ran.trace, 6.0), 0.0);
+    assert_eq!(note_value(&ran.trace, 7.0), 0.0, "restart is idempotent");
+    assert!(bit_value(&ran.trace, 3.0));
+    assert_eq!(note_value(&ran.trace, 8.0), 2.0);
+    assert_eq!(
+        text_value(&ran.trace, 2.0),
+        "table",
+        "restart does not collect"
+    );
+    assert!(bit_value(&ran.trace, 4.0));
+    assert_eq!(note_value(&ran.trace, 9.0), 1.0);
+    assert_eq!(text_value(&ran.trace, 3.0), "nil");
+    assert_eq!(note_value(&ran.trace, 10.0), 1.0, "the strong value stays");
+    assert!(
+        ran.trace.steps.is_empty(),
+        "control does not run the private step host"
+    );
+    assert_eq!(ran.collects, 1, "only the final explicit collect completes");
+    assert_eq!(ran.collections, 1);
+    assert!(!ran.tail);
+}
+
+#[test]
+fn explicit_collect_from_stop_restores_running_and_clears_weak() {
+    let ran = run_control(
+        r#"
+local function witness()
+  local w = {}
+  local mt = {}
+  local t = {}
+  mt.__mode = "v"
+  setmetatable(w, mt)
+  w[1] = t
+  w[2] = {}
+  peek(t)
+  bit(1, collectgarbage("isrunning"))
+  note(1, collectgarbage("stop"))
+  bit(2, collectgarbage("isrunning"))
+  text(1, type(rawget(w, 2)))
+  collectgarbage("collect")
+  bit(3, collectgarbage("isrunning"))
+  text(2, type(rawget(w, 2)))
+  note(2, same(t, rawget(w, 1)))
+  note(3, rawlen(w))
+  return 1
+end
+witness()
+return 1
+"#,
+        None,
+    );
+    assert_eq!(ran.stop, Stop::Halted, "{ran:?}");
+    assert!(bit_value(&ran.trace, 1.0));
+    assert_eq!(note_value(&ran.trace, 1.0), 0.0);
+    assert!(!bit_value(&ran.trace, 2.0));
+    assert_eq!(text_value(&ran.trace, 1.0), "table");
+    assert!(
+        bit_value(&ran.trace, 3.0),
+        "explicit collect restores running"
+    );
+    assert_eq!(text_value(&ran.trace, 2.0), "nil");
+    assert_eq!(note_value(&ran.trace, 2.0), 1.0);
+    assert_eq!(note_value(&ran.trace, 3.0), 1.0);
+    assert_eq!(ran.collects, 1);
+    assert_eq!(ran.collections, 1);
+}
+
+#[test]
+fn stopped_guest_step_advances_and_restores_even_when_false() {
+    let ran = run_control(
+        r#"
+local function witness()
+  local w = {}
+  local mt = {}
+  local t = {}
+  mt.__mode = "v"
+  setmetatable(w, mt)
+  w[1] = t
+  w[2] = {}
+  w[3] = {}
+  peek(t)
+  note(1, collectgarbage("stop"))
+  bit(1, collectgarbage("isrunning"))
+  bit(2, collectgarbage("step"))
+  bit(3, collectgarbage("isrunning"))
+  note(11, rawlen(w))
+  bit(4, collectgarbage("step"))
+  note(12, rawlen(w))
+  bit(5, collectgarbage("step"))
+  bit(6, collectgarbage("step"))
+  note(14, rawlen(w))
+  text(2, type(rawget(w, 2)))
+  text(3, type(rawget(w, 3)))
+  note(20, same(t, rawget(w, 1)))
+  return 1
+end
+witness()
+return 1
+"#,
+        Some(&[1, 10_000, 1, 10_000]),
+    );
+    assert_eq!(ran.stop, Stop::Halted, "{ran:?}");
+    assert_eq!(note_value(&ran.trace, 1.0), 0.0);
+    assert!(!bit_value(&ran.trace, 1.0));
+    assert!(
+        !bit_value(&ran.trace, 2.0),
+        "the small budget does not complete"
+    );
+    assert!(
+        bit_value(&ran.trace, 3.0),
+        "a false step still restores running"
+    );
+    assert!(!bit_value(&ran.trace, 4.0));
+    assert!(!bit_value(&ran.trace, 5.0));
+    assert!(bit_value(&ran.trace, 6.0));
+    assert_eq!(
+        [
+            cycle_at(&ran.trace, 2.0),
+            cycle_at(&ran.trace, 4.0),
+            cycle_at(&ran.trace, 5.0),
+            cycle_at(&ran.trace, 6.0),
+        ],
+        [(false, 0), (true, 0), (true, 0), (false, 1)]
+    );
+    assert_eq!(note_value(&ran.trace, 11.0), 3.0);
+    assert_eq!(
+        note_value(&ran.trace, 12.0),
+        1.0,
+        "weak clear is visible on the tail"
+    );
+    assert_eq!(note_value(&ran.trace, 14.0), 1.0);
+    assert_eq!(text_value(&ran.trace, 2.0), "nil");
+    assert_eq!(text_value(&ran.trace, 3.0), "nil");
+    assert_eq!(note_value(&ran.trace, 20.0), 1.0);
+    assert!(ran.trace.steps.is_empty());
+    assert_eq!(ran.collects, 1);
+    assert_eq!(ran.collections, 1);
+}
+
+#[test]
+fn stop_during_published_tail_keeps_the_cycle_and_budget() {
+    let ran = run_control(
+        r#"
+local function witness()
+  local w = {}
+  local mt = {}
+  local held = {}
+  mt.__mode = "v"
+  setmetatable(w, mt)
+  w[1] = held
+  w[2] = {}
+  peek(held)
+  bit(1, collectgarbage("step"))
+  note(1, collectgarbage("stop"))
+  bit(2, collectgarbage("isrunning"))
+  note(2, collectgarbage("restart"))
+  bit(3, collectgarbage("isrunning"))
+  bit(4, collectgarbage("step"))
+  bit(5, collectgarbage("step"))
+  note(20, same(held, rawget(w, 1)))
+  return 1
+end
+witness()
+return 1
+"#,
+        Some(&[10_000, 1, 10_000]),
+    );
+    assert_eq!(ran.stop, Stop::Halted, "{ran:?}");
+    assert!(!bit_value(&ran.trace, 1.0));
+    assert_eq!(cycle_at(&ran.trace, 1.0), (true, 0));
+    assert_eq!(note_value(&ran.trace, 1.0), 0.0);
+    assert!(!bit_value(&ran.trace, 2.0));
+    assert_eq!(
+        cycle_at(&ran.trace, 2.0),
+        (true, 0),
+        "stop does not open a cycle"
+    );
+    assert_eq!(note_value(&ran.trace, 2.0), 0.0);
+    assert!(bit_value(&ran.trace, 3.0));
+    assert_eq!(
+        cycle_at(&ran.trace, 3.0),
+        (true, 0),
+        "restart does not open a cycle"
+    );
+    assert!(
+        !bit_value(&ran.trace, 4.0),
+        "the saved unit budget still pauses"
+    );
+    assert_eq!(cycle_at(&ran.trace, 4.0), (true, 0));
+    assert!(bit_value(&ran.trace, 5.0));
+    assert_eq!(cycle_at(&ran.trace, 5.0), (false, 1));
+    assert_eq!(note_value(&ran.trace, 20.0), 1.0);
+    assert_eq!(ran.collects, 1);
+    assert_eq!(ran.collections, 1);
+    assert!(!ran.tail);
+}
+
+#[test]
+fn run_control_does_not_cross_vms_or_a_reset_execution() {
+    let stopped = run_control(CONTROL_SWITCH, None);
+    assert_eq!(stopped.stop, Stop::Halted, "{stopped:?}");
+    assert!(bit_value(&stopped.trace, 1.0));
+    assert!(!bit_value(&stopped.trace, 2.0));
+    let fresh = run_control(CONTROL_SWITCH, None);
+    assert_eq!(fresh.stop, Stop::Halted, "{fresh:?}");
+    assert!(
+        bit_value(&fresh.trace, 1.0),
+        "the shared catalog must not carry the stopped switch into another VM"
+    );
+    assert!(!bit_value(&fresh.trace, 2.0));
+
+    let mut vm = bind_control(CONTROL_SWITCH);
+    assert!(matches!(vm.run(), Ok(VmStatus::Halted)));
+    assert_eq!(control_bits(&mut vm), [(1.0, true), (2.0, false)]);
+    finish_reset(&mut vm);
+    assert!(
+        vm.host_context().scope_state::<Trace>().is_none(),
+        "reset publishes a new execution scope"
+    );
+    assert!(matches!(vm.run(), Ok(VmStatus::Halted)));
+    assert_eq!(
+        control_bits(&mut vm),
+        [(1.0, true), (2.0, false)],
+        "a new execution on the reused VM starts running"
+    );
+}
+
+#[test]
+fn ordinary_catalog_and_shadowed_name_reject_run_control() {
+    let witness = |body: &str| {
+        format!("local function witness()\n  {body}\n  return 1\nend\nwitness()\nreturn 1\n")
+    };
+    for option in ["stop", "restart", "isrunning"] {
+        let source = witness(&format!("collectgarbage(\"{option}\")"));
+        candidate::lower(&source, catalog(false)).expect_err("ordinary catalog keeps the refusal");
+        candidate::lower(&source, catalog(true)).expect_err("step opt-in is not run control");
+    }
+    candidate::lower(&witness("collectgarbage(\"collect\")"), catalog(false))
+        .expect("ordinary collect still lowers");
+    candidate::lower(&witness("collectgarbage(\"count\")"), catalog(false))
+        .expect("ordinary count still lowers");
+    let dynamic = witness("local opt = \"stop\"\n  collectgarbage(opt)");
+    candidate::lower(&dynamic, catalog_for(true, true))
+        .expect_err("a dynamic option is not this slice");
+    let extra = witness("collectgarbage(\"stop\", 0)");
+    candidate::lower(&extra, catalog_for(true, true)).expect_err("extra data is not this slice");
+    let shadowed = r#"
+local collectgarbage = 1
+local function witness()
+  return collectgarbage("stop")
+end
+witness()
+return 1
+"#;
+    candidate::lower(shadowed, catalog_for(true, true))
+        .expect_err("an upvalue shadows the builtin");
+    for option in ["restart", "isrunning"] {
+        let source = format!(
+            "local collectgarbage = 1\nlocal function witness()\n  return collectgarbage(\"{option}\")\nend\nwitness()\nreturn 1\n"
+        );
+        candidate::lower(&source, catalog_for(true, true)).expect_err(option);
+    }
+}
+
+#[test]
+fn stop_does_not_cancel_a_host_supplied_node_quota() {
+    let ran = drive(
+        r#"
+local function witness()
+  local a = {}
+  peek(a)
+  note(1, collectgarbage("stop"))
+  bit(1, collectgarbage("isrunning"))
+  local b = {}
+  peek(b)
+  return 1
+end
+witness()
+return 1
+"#,
+        None,
+        true,
+        Some(1),
+    );
+    assert!(
+        matches!(ran.stop, Stop::HostError(ref message) if message.contains("lua heap node capacity")),
+        "the installed node cap still refuses: {:?}",
+        ran.stop
+    );
+    assert_eq!(note_value(&ran.trace, 1.0), 0.0);
+    assert!(!bit_value(&ran.trace, 1.0));
+    assert_eq!(
+        ran.live_nodes, 1,
+        "the refused table did not occupy another node"
+    );
+    assert_eq!(ran.collects, 0);
+    assert_eq!(ran.collections, 0);
+}
+
+#[test]
+fn refused_progress_does_not_fake_completion_or_skip_the_gate() {
+    let sweep = run_control(
+        r#"
+local function witness()
+  local w = {}
+  local mt = {}
+  mt.__mode = "v"
+  setmetatable(w, mt)
+  w[1] = {}
+  w[2] = {}
+  peek(rawget(w, 1))
+  bit(1, collectgarbage("step"))
+  note(1, collectgarbage("stop"))
+  bit(2, collectgarbage("isrunning"))
+  collectgarbage("collect")
+  return 1
+end
+witness()
+return 1
+"#,
+        Some(&[10_000]),
+    );
+    assert!(
+        matches!(sweep.stop, Stop::HostError(ref message) if message.contains("lua sweep is still pending")),
+        "collect must keep the published-tail gate: {:?}",
+        sweep.stop
+    );
+    assert!(!bit_value(&sweep.trace, 1.0));
+    assert_eq!(cycle_at(&sweep.trace, 1.0), (true, 0));
+    assert!(!bit_value(&sweep.trace, 2.0));
+    assert_eq!(cycle_at(&sweep.trace, 2.0), (true, 0));
+    assert!(sweep.tail, "the refusal must leave the original tail");
+    assert_eq!(sweep.collects, 0);
+    assert_eq!(sweep.collections, 0);
+
+    let missing = run_control(
+        r#"
+local function witness()
+  local t = {}
+  peek(t)
+  note(1, collectgarbage("stop"))
+  bit(1, collectgarbage("isrunning"))
+  collectgarbage("step")
+  return 1
+end
+witness()
+return 1
+"#,
+        Some(&[]),
+    );
+    assert!(
+        matches!(missing.stop, Stop::HostError(ref message) if message.contains("missing source step fixture budget")),
+        "a missing budget is a real refusal: {:?}",
+        missing.stop
+    );
+    assert!(!bit_value(&missing.trace, 1.0));
+    assert_eq!(missing.collects, 0);
+    assert_eq!(missing.collections, 0);
+    assert!(!missing.tail);
 }

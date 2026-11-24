@@ -28,6 +28,9 @@ const GATHER_ROOT: &str = "lua_internal::gather_root";
 pub(super) const COLLECT: &str = "lua_internal::collect";
 const STEP: &str = "lua_internal::step";
 const STEP_HAS_TAIL: &str = "lua_internal::step_has_tail";
+const GC_STOP: &str = "lua_internal::gc_stop";
+const GC_RESTART: &str = "lua_internal::gc_restart";
+const GC_IS_RUNNING: &str = "lua_internal::gc_is_running";
 const COUNT: &str = "lua_internal::count";
 const OPEN_CELL: &str = "lua_internal::open_cell";
 const READ_CELL: &str = "lua_internal::read_cell";
@@ -98,6 +101,26 @@ pub(super) fn install_step_schemas(builder: &mut HostApiBuilder) {
     builder.function(HostFunctionSchema::with_return(
         STEP,
         vec![HostParamSchema::value("roots", HostTypeSchema::Unknown)],
+        HostTypeSchema::Bool,
+    ));
+}
+
+/// Opt in to guest `stop` / `restart` / `isrunning` in this catalog only.
+/// The switch lives in the VM execution scope, not in this catalog.
+pub(super) fn install_run_control_schemas(builder: &mut HostApiBuilder) {
+    builder.function(HostFunctionSchema::with_return(
+        GC_STOP,
+        vec![],
+        HostTypeSchema::Float,
+    ));
+    builder.function(HostFunctionSchema::with_return(
+        GC_RESTART,
+        vec![],
+        HostTypeSchema::Float,
+    ));
+    builder.function(HostFunctionSchema::with_return(
+        GC_IS_RUNNING,
+        vec![],
         HostTypeSchema::Bool,
     ));
 }
@@ -270,6 +293,9 @@ pub(super) fn register(
         Op::Collect,
         Op::Step,
         Op::StepHasTail,
+        Op::GcStop,
+        Op::GcRestart,
+        Op::GcIsRunning,
         Op::Count,
         Op::EnterResult,
         Op::EnterCallee,
@@ -313,6 +339,9 @@ pub(super) fn register(
             Op::Collect => COLLECT,
             Op::Step => STEP,
             Op::StepHasTail => STEP_HAS_TAIL,
+            Op::GcStop => GC_STOP,
+            Op::GcRestart => GC_RESTART,
+            Op::GcIsRunning => GC_IS_RUNNING,
             Op::Count => COUNT,
             Op::EnterResult => ENTER_RESULT,
             Op::EnterCallee => ENTER_CALLEE,
@@ -341,7 +370,11 @@ pub(super) fn register(
             Op::WriteCell => WRITE_CELL,
             Op::TrackClosure => TRACK_CLOSURE,
         };
-        if matches!(op, Op::Step | Op::StepHasTail) && catalog.function(name).is_none() {
+        if matches!(
+            op,
+            Op::Step | Op::StepHasTail | Op::GcStop | Op::GcRestart | Op::GcIsRunning
+        ) && catalog.function(name).is_none()
+        {
             continue;
         }
         let function = catalog.function(name).expect("private Lua operation");
@@ -369,6 +402,9 @@ enum Op {
     Collect,
     Step,
     StepHasTail,
+    GcStop,
+    GcRestart,
+    GcIsRunning,
     Count,
     EnterResult,
     EnterCallee,
@@ -554,10 +590,18 @@ impl HostOwnedFunction for Op {
             Self::Collect => {
                 let tables = decode_safepoint_roots(call)?;
                 collect_at_safepoint(&mut call.vm().host_context(), &tables)?;
+                restore_running_after_progress(&mut call.vm().host_context())?;
                 Value::Float(0.0)
             }
-            Self::Step => step_at_safepoint(call)?,
+            Self::Step => {
+                let value = step_at_safepoint(call)?;
+                restore_running_after_progress(&mut call.vm().host_context())?;
+                value
+            }
             Self::StepHasTail => Value::Bool(heap::saved_source_tail(&call.vm().host_context())),
+            Self::GcStop => set_gc_running(&mut call.vm().host_context(), false)?,
+            Self::GcRestart => set_gc_running(&mut call.vm().host_context(), true)?,
+            Self::GcIsRunning => gc_is_running(&call.vm().host_context()),
             Self::Count => {
                 let kib =
                     heap::with_heap(&mut call.vm().host_context(), |heap| Ok(heap.logical_kib()))
@@ -1768,6 +1812,39 @@ fn decode_safepoint_roots(call: &mut OwnedHostCall<'_>) -> Result<Vec<heap::Tabl
             )),
         })
         .collect()
+}
+
+/// Absent means running. A new VM scope, including one published by reset,
+/// therefore starts running even when another execution of this catalog stopped.
+struct GcRunControl {
+    running: bool,
+}
+
+fn set_gc_running(host: &mut vm::HostContext<'_>, running: bool) -> Result<Value, VmError> {
+    // Control only. Do not publish roots, pop a step budget, or touch a saved tail.
+    let control = host
+        .scope_state_or_insert_with(|| GcRunControl { running: true })
+        .map_err(|error| VmError::HostError(error.to_string()))?;
+    control.running = running;
+    Ok(Value::Float(0.0))
+}
+
+fn gc_is_running(host: &vm::HostContext<'_>) -> Value {
+    Value::Bool(
+        host.scope_state::<GcRunControl>()
+            .map(|control| control.running)
+            .unwrap_or(true),
+    )
+}
+
+fn restore_running_after_progress(host: &mut vm::HostContext<'_>) -> Result<(), VmError> {
+    // Only a completed explicit collect or omitted-data step reaches here.
+    // A refusal returns before this call, so it cannot record a completion or
+    // skip the heap gate by flipping the switch.
+    if let Some(control) = host.scope_state_mut::<GcRunControl>() {
+        control.running = true;
+    }
+    Ok(())
 }
 
 fn step_at_safepoint(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
@@ -4043,6 +4120,9 @@ impl Lower<'_> {
                     {
                         return self.step_expr(expr.span());
                     }
+                    if self.run_control_spelling(bytes) && self.run_control_ready(name) {
+                        return self.run_control_expr(bytes, expr.span());
+                    }
                 }
                 if name.is("copy_fields")
                     && let [arg] = args.exprs.as_slice()
@@ -4283,6 +4363,27 @@ impl Lower<'_> {
             ast::Expr::String { bytes, .. } => Ok(self.string_literal(bytes)),
             other => self.expr(other),
         }
+    }
+
+    fn run_control_spelling(&self, bytes: &[u8]) -> bool {
+        matches!(bytes, b"stop" | b"restart" | b"isrunning")
+    }
+
+    fn run_control_ready(&self, name: &ast::Name) -> bool {
+        !self.name_is_bound(name)
+            && self.catalog.function(GC_STOP).is_some()
+            && self.catalog.function(GC_RESTART).is_some()
+            && self.catalog.function(GC_IS_RUNNING).is_some()
+    }
+
+    fn run_control_expr(&mut self, bytes: &[u8], span: ast::Span) -> Result<Expr, ParseError> {
+        let name = match bytes {
+            b"stop" => GC_STOP,
+            b"restart" => GC_RESTART,
+            b"isrunning" => GC_IS_RUNNING,
+            _ => return Err(self.unsupported(span)),
+        };
+        self.call(name, vec![])
     }
 
     fn collect_expr(&mut self, span: ast::Span) -> Result<Expr, ParseError> {
