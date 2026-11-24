@@ -648,6 +648,276 @@ fn gray_existing_utf8_omitted_replacement_keeps_the_original_scalar() {
     existing_named_replacement_after_owner_scan(ExistingNamedWrite::Omitted);
 }
 
+#[derive(Clone, Copy)]
+enum ExistingNumberWrite {
+    Strong,
+    WeakValue,
+    Omitted,
+}
+
+/// Ordinary finite key. `EdgeKey::number` already stores `+0` and `-0` as the
+/// same bits, so this witness does not pair those spellings.
+const NUMBER_KEY: f64 = 7.0;
+const ORIGINAL_NUMBER_SCALAR: &str = "原值";
+
+/// Replaces an already scanned ordinary number record in place.
+fn existing_number_replacement_after_owner_scan(write: ExistingNumberWrite) {
+    use crate::heap::{self, GuestClass, StepOutcome};
+
+    const CHILD: &str = "child";
+    const OTHER_KEY: f64 = 9.0;
+    let retained = matches!(write, ExistingNumberWrite::Strong);
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits(8, 2, 8)).expect("install");
+        let raw = crate::publish_raw(&mut host);
+        let target = crate::table_ref(&host, raw);
+        let (owner, sentinel, child, stale, carrier) = heap::with_heap(&mut host, |heap| {
+            let owner = heap.alloc()?;
+            let sentinel = heap.alloc()?;
+            let child = heap.alloc()?;
+            let unrelated = heap.alloc()?; // Forces a real published tail in all arms.
+            let stale = heap.alloc()?;
+            heap.rollback(stale)?;
+            if matches!(write, ExistingNumberWrite::WeakValue) {
+                let meta = heap.alloc()?;
+                heap.set_mode_scalar(meta, Value::string("v"))?;
+                heap.set_metatable(owner, Some(meta))?;
+            }
+            let frame = heap.enter_roots(2)?;
+            // The Gray stack pops the owner first, then the sentinel.
+            heap.write_root(frame, 0, sentinel)?;
+            heap.write_root(frame, 1, owner)?;
+            heap.set_number_scalar(owner, NUMBER_KEY, Value::string(ORIGINAL_NUMBER_SCALAR))?;
+            heap.set_named_scalar(sentinel, "pending", Value::Bool(true))?;
+            heap.set_named_edge(target, CHILD, unrelated)?;
+            heap.set_named_edge(target, CHILD, child)?;
+            assert_eq!(heap.named_edge(target, CHILD)?, Some(child));
+            assert_eq!(
+                heap.number_value(owner, NUMBER_KEY)?,
+                Value::string(ORIGINAL_NUMBER_SCALAR)
+            );
+            Ok((owner, sentinel, child, stale, heap.issue_carrier(target)?))
+        })
+        .expect("graph");
+        heap::open_fixed_step(&mut host).expect("start a saved mark");
+        let old_record = heap::with_heap(&mut host, |heap| {
+            let number_key = super::EdgeKey::number(NUMBER_KEY);
+            let old_record = heap
+                .find_key(owner.slot(), &number_key)
+                .expect("existing number record");
+            let stored = heap.edge_slots[old_record as usize]
+                .edge
+                .as_ref()
+                .expect("occupied number record");
+            assert_eq!(&stored.key, &number_key);
+            assert!(matches!(stored.key, super::EdgeKey::Number(_)));
+            assert!(!matches!(stored.key, super::EdgeKey::Field(_)));
+            assert!(!stored.value.is_cursor_gap());
+            let (_, sentinel_record) = heap
+                .locate_named(sentinel.slot(), "pending")
+                .expect("sentinel field");
+            let mut parked = ParkedMark::resume(heap).expect("resume saved mark");
+            pause_at(&mut parked, owner.slot(), old_record);
+            let pending = pause_at(&mut parked, sentinel.slot(), sentinel_record);
+            assert_eq!(pending.owner, sentinel.slot());
+            assert!(parked.marked(owner), "the scanned owner is already marked");
+            assert!(
+                !parked.marked(target),
+                "the replacement target has no supplemental root"
+            );
+            let before = parked.meter();
+            parked.park()?;
+            let edges_before = (heap.stats().live_edges, heap.stats().edge_slots);
+            if !matches!(write, ExistingNumberWrite::Omitted) {
+                heap.set_number_edge(owner, NUMBER_KEY, target)?;
+                assert_eq!(heap.number_value(owner, NUMBER_KEY)?, carrier);
+            } else {
+                assert_eq!(
+                    heap.number_value(owner, NUMBER_KEY)?,
+                    Value::string(ORIGINAL_NUMBER_SCALAR)
+                );
+            }
+            assert_eq!(
+                heap.find_key(owner.slot(), &number_key),
+                Some(old_record),
+                "the old number record index is unchanged"
+            );
+            assert_eq!(
+                (heap.stats().live_edges, heap.stats().edge_slots),
+                edges_before,
+                "the write does not change the edge count"
+            );
+            if !matches!(write, ExistingNumberWrite::Omitted) {
+                let stored = heap.edge_slots[old_record as usize]
+                    .edge
+                    .as_ref()
+                    .expect("replaced record");
+                assert_eq!(&stored.key, &number_key);
+                assert!(matches!(
+                    stored.value,
+                    super::EdgeValue::Table { slot, generation }
+                        if slot == target.slot() && generation == target.generation()
+                ));
+            }
+            let parked = ParkedMark::resume(heap).expect("write kept the saved mark");
+            assert_eq!(parked.phase_name(), "gray");
+            let cursor = parked.pending().expect("sentinel still pending");
+            assert_eq!(
+                (cursor.owner, cursor.cursor),
+                (pending.owner, pending.cursor),
+                "the pending scan cursor is unchanged"
+            );
+            assert!(
+                !parked.marked(child),
+                "the write must not scan the child edge"
+            );
+            assert_eq!(
+                parked.marked(target),
+                retained,
+                "only a strong number replacement enters the gray queue immediately"
+            );
+            let after = parked.meter();
+            assert_write_did_not_scan(&before, &after);
+            assert_eq!(after.parked_edge_writes, before.parked_edge_writes);
+            assert_eq!(
+                after.parked_barrier_marks - before.parked_barrier_marks,
+                u64::from(retained)
+            );
+            assert_eq!(
+                after.scratch.work_pushed - before.scratch.work_pushed,
+                u64::from(retained)
+            );
+            assert_eq!(
+                after.node_slot_visits - before.node_slot_visits,
+                u64::from(retained) * 2
+            );
+            parked.park()?;
+            Ok(old_record)
+        })
+        .expect("in-place number replacement while Gray is parked");
+
+        let published = heap::step_fixed_frames(&mut host, 128).expect("publish saved mark");
+        assert!(
+            matches!(published, StepOutcome::Published { .. }),
+            "{published:?}"
+        );
+        assert_eq!(heap::stats(&mut host).expect("stats").collections, 0);
+        heap::with_heap(&mut host, |heap| {
+            // NaN and a stale handle stay ahead of the sweep refusal.
+            assert_eq!(
+                heap.set_number_edge(owner, f64::NAN, sentinel),
+                Err(HeapError::NanIndex)
+            );
+            assert_eq!(
+                heap.clear_number_edge(owner, f64::NAN),
+                Err(HeapError::NanIndex)
+            );
+            assert_eq!(
+                heap.set_number_edge(stale, NUMBER_KEY, sentinel),
+                Err(HeapError::StaleHandle)
+            );
+            assert_eq!(
+                heap.set_number_edge(owner, NUMBER_KEY, stale),
+                Err(HeapError::StaleHandle)
+            );
+            assert_eq!(
+                heap.set_number_edge(owner, OTHER_KEY, sentinel),
+                Err(HeapError::SweepPending)
+            );
+            assert!(
+                heap.find_key(owner.slot(), &super::EdgeKey::number(OTHER_KEY))
+                    .is_none()
+            );
+            if matches!(write, ExistingNumberWrite::WeakValue) {
+                assert_eq!(
+                    heap.number_value(owner, NUMBER_KEY)?,
+                    Value::Null,
+                    "a weak number replacement publishes nil"
+                );
+                let index = heap
+                    .find_key(owner.slot(), &super::EdgeKey::number(NUMBER_KEY))
+                    .expect("a weak-value replacement leaves the cleared cursor");
+                assert_eq!(index, old_record);
+                let stored = heap.edge_slots[index as usize]
+                    .edge
+                    .as_ref()
+                    .expect("retained gap");
+                assert!(stored.value.is_cursor_gap());
+                assert_eq!(&stored.key, &super::EdgeKey::number(NUMBER_KEY));
+            }
+            if matches!(write, ExistingNumberWrite::Omitted) {
+                assert_eq!(
+                    heap.number_value(owner, NUMBER_KEY)?,
+                    Value::string(ORIGINAL_NUMBER_SCALAR)
+                );
+            }
+            if matches!(write, ExistingNumberWrite::Strong) {
+                assert_eq!(heap.number_value(owner, NUMBER_KEY)?, carrier);
+            }
+            Ok(())
+        })
+        .expect("read during publication");
+        let done = heap::step_fixed_frames(&mut host, 128).expect("finish saved tail");
+        assert!(matches!(done, StepOutcome::Completed(_)), "{done:?}");
+        assert!(heap::fixed_step_idle(&mut host).expect("idle"));
+        heap::with_heap(&mut host, |heap| {
+            assert_eq!(
+                heap.alive(target),
+                retained,
+                "an in-place strong number replacement on a scanned owner must keep its target alive"
+            );
+            assert_eq!(
+                heap.alive(child),
+                retained,
+                "the child is reached only by the continued scan"
+            );
+            assert_eq!(heap.stats().collections, 1);
+            assert_eq!(heap.scan_meter().mark_passes, 1);
+            if matches!(write, ExistingNumberWrite::Omitted) {
+                assert_eq!(
+                    heap.number_value(owner, NUMBER_KEY)?,
+                    Value::string(ORIGINAL_NUMBER_SCALAR),
+                    "an omitted number replacement keeps the original string"
+                );
+            }
+            if retained {
+                let value = heap.number_value(owner, NUMBER_KEY)?;
+                assert_eq!(value, carrier);
+                assert_eq!(heap.guest_class(&value), GuestClass::Table(target));
+                assert_eq!(heap.named_edge(target, CHILD)?, Some(child));
+                heap.clear_number_edge(owner, NUMBER_KEY)?;
+            }
+            Ok(())
+        })
+        .expect("same-cycle reachability");
+        if retained {
+            heap::collect(&mut host).expect("next collection after removing the only strong edge");
+            heap::with_heap(&mut host, |heap| {
+                assert!(!heap.alive(target) && !heap.alive(child));
+                assert_eq!(heap.stats().collections, 2);
+                Ok(())
+            })
+            .expect("later reclamation");
+        }
+    });
+}
+
+#[test]
+fn gray_existing_number_strong_replacement_keeps_the_new_graph() {
+    existing_number_replacement_after_owner_scan(ExistingNumberWrite::Strong);
+}
+
+#[test]
+fn gray_existing_number_weak_replacement_clears_at_publication() {
+    existing_number_replacement_after_owner_scan(ExistingNumberWrite::WeakValue);
+}
+
+#[test]
+fn gray_existing_number_omitted_replacement_keeps_the_original_string() {
+    existing_number_replacement_after_owner_scan(ExistingNumberWrite::Omitted);
+}
+
 #[test]
 fn tail_slot_reuse_does_not_keep_the_new_target() {
     let mut heap = LuaHeap::new(limits(8, 2, 8));
