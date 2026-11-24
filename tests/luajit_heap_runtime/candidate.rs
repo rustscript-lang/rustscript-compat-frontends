@@ -2973,18 +2973,24 @@ impl Lower<'_> {
     /// same named-field edge. One target stays on `lower_assign`. The slots
     /// are not guest bindings.
     ///
-    /// The only call accepted here is a last value wrapped in at least one
-    /// pair of parentheses and naming a no-argument static Lua function.
-    /// That shape copies every receiver before the call, then keeps those
-    /// copies and the already-evaluated values in one pending frame until
-    /// the right-to-left writes finish. Scalars and nil are not roots.
+    /// A parenthesized no-argument static Lua function is accepted in any
+    /// value, including more than once. Receivers are copied first, including
+    /// a captured table. One pending frame opens before the first such call.
+    /// Its width is the receivers plus every value index before the last
+    /// call. Already-evaluated values, and each later value that still has a
+    /// call after it, are written into that frame before the next call. The
+    /// last call's result is not rooted. Scalars and nil are not roots.
+    /// Right-to-left writes then leave the frame once.
     fn lower_parallel_named_fields(
         &mut self,
         span: ast::Span,
         targets: &[ast::AssignTarget],
         values: &[ast::Expr],
     ) -> Result<(), ParseError> {
-        if self.trailing_parenthesized_direct_call(values) {
+        if values
+            .iter()
+            .any(|value| self.parenthesized_static_call(value))
+        {
             return self.lower_parallel_named_call(span, targets, values);
         }
         let temp_base = self.active_temps.len();
@@ -3041,27 +3047,32 @@ impl Lower<'_> {
         Ok(())
     }
 
-    fn trailing_parenthesized_direct_call(&self, values: &[ast::Expr]) -> bool {
-        let Some(last) = values.last() else {
-            return false;
-        };
-        matches!(last, ast::Expr::Paren { .. })
-            && self.direct_function_call(skip_parens(last)).is_some()
+    fn parenthesized_static_call(&self, expr: &ast::Expr) -> bool {
+        matches!(expr, ast::Expr::Paren { .. })
+            && self.direct_function_call(skip_parens(expr)).is_some()
     }
 
-    /// Receivers are copied before any right-hand value. The pending frame
-    /// stays open across the call and the reverse writes, then leaves once.
+    /// Receivers are copied before any right-hand value. One pending frame
+    /// stays open from the first parenthesized static call through the
+    /// reverse writes, then leaves once.
     fn lower_parallel_named_call(
         &mut self,
         span: ast::Span,
         targets: &[ast::AssignTarget],
         values: &[ast::Expr],
     ) -> Result<(), ParseError> {
-        let Some(last) = values.last() else {
+        let mut call_indexes = Vec::new();
+        for (index, value) in values.iter().enumerate() {
+            if self.parenthesized_static_call(value) {
+                call_indexes.push(index);
+            }
+        }
+        let Some(&last_call_index) = call_indexes.last() else {
             return Err(self.statement_unsupported(span));
         };
+        let first_call_index = call_indexes[0];
         if self.in_function {
-            return Err(self.unsupported(last.span()));
+            return Err(self.unsupported(values[first_call_index].span()));
         }
         let temp_base = self.active_temps.len();
         let mut receivers = Vec::with_capacity(targets.len());
@@ -3081,16 +3092,11 @@ impl Lower<'_> {
             receivers.push((from, key));
         }
         let mut saved = Vec::with_capacity(values.len());
-        for value in values.iter().take(values.len() - 1) {
+        for value in values.iter().take(first_call_index) {
             if !parallel_rhs_allowed(value) {
                 return Err(self.unsupported(value.span()));
             }
-            let expr = if matches!(value, ast::Expr::Nil { .. }) {
-                Expr::Null
-            } else {
-                self.expr(value)?
-            };
-            saved.push(self.snapshot_private(expr, value.span(), "parallel-rhs")?);
+            saved.push(self.save_parallel_value(value)?);
         }
         self.active_temps.truncate(temp_base);
         let mut rooted = Vec::with_capacity(receivers.len() + saved.len());
@@ -3098,13 +3104,25 @@ impl Lower<'_> {
             rooted.push(*slot);
         }
         rooted.extend(saved.iter().copied());
-        let frame = self.open_optional_pending(&rooted, span)?;
-        let call = self.lower_direct_value(skip_parens(last))?;
-        let call_slot = match call {
-            Expr::Var(slot) => slot,
-            other => self.snapshot_private(other, last.span(), "parallel-rhs")?,
-        };
-        saved.push(call_slot);
+        let width = receivers.len() + last_call_index;
+        let frame = self.open_optional_pending(&rooted, width, span)?;
+        for (index, value) in values.iter().enumerate().skip(first_call_index) {
+            let slot = if self.parenthesized_static_call(value) {
+                let call = self.lower_direct_value(skip_parens(value))?;
+                match call {
+                    Expr::Var(slot) => slot,
+                    other => self.snapshot_private(other, value.span(), "parallel-rhs")?,
+                }
+            } else if parallel_rhs_allowed(value) {
+                self.save_parallel_value(value)?
+            } else {
+                return Err(self.unsupported(value.span()));
+            };
+            if index < last_call_index {
+                self.write_optional_pending(frame, receivers.len() + index, slot, value.span())?;
+            }
+            saved.push(slot);
+        }
         if saved.len() != receivers.len() {
             return Err(self.statement_unsupported(span));
         }
@@ -3122,6 +3140,33 @@ impl Lower<'_> {
         let leave = self.call(LEAVE_PENDING, vec![Expr::Var(frame)])?;
         self.emit_ignored(leave, self.line(span))?;
         Ok(())
+    }
+
+    fn save_parallel_value(&mut self, value: &ast::Expr) -> Result<LocalSlot, ParseError> {
+        let expr = if matches!(value, ast::Expr::Nil { .. }) {
+            Expr::Null
+        } else {
+            self.expr(value)?
+        };
+        self.snapshot_private(expr, value.span(), "parallel-rhs")
+    }
+
+    fn write_optional_pending(
+        &mut self,
+        frame: LocalSlot,
+        index: usize,
+        source: LocalSlot,
+        span: ast::Span,
+    ) -> Result<(), ParseError> {
+        let written = self.call(
+            WRITE_OPTIONAL_PENDING,
+            vec![
+                Expr::Var(frame),
+                Expr::Float(index as f64),
+                Expr::Var(source),
+            ],
+        )?;
+        self.emit_ignored(written, self.line(span))
     }
 
     fn snapshot_private(
@@ -3145,15 +3190,16 @@ impl Lower<'_> {
     fn open_optional_pending(
         &mut self,
         slots: &[LocalSlot],
+        width: usize,
         span: ast::Span,
     ) -> Result<LocalSlot, ParseError> {
-        if slots.is_empty() {
+        if slots.is_empty() || width < slots.len() {
             return Err(self.statement_unsupported(span));
         }
         let frame = self
             .builder
             .alloc_local_named(&format!("#optional-pending:{}", self.stmts.len()))?;
-        let entered = self.call(ENTER_PENDING, vec![Expr::Float(slots.len() as f64)])?;
+        let entered = self.call(ENTER_PENDING, vec![Expr::Float(width as f64)])?;
         self.stmts.push(Stmt::Let {
             index: frame,
             declared_schema: None,
@@ -3161,15 +3207,7 @@ impl Lower<'_> {
             line: self.line(span),
         });
         for (slot, source) in slots.iter().enumerate() {
-            let written = self.call(
-                WRITE_OPTIONAL_PENDING,
-                vec![
-                    Expr::Var(frame),
-                    Expr::Float(slot as f64),
-                    Expr::Var(*source),
-                ],
-            )?;
-            self.emit_ignored(written, self.line(span))?;
+            self.write_optional_pending(frame, slot, *source, span)?;
         }
         Ok(frame)
     }

@@ -1,4 +1,4 @@
-//! Equal named-field assignment whose last value is a parenthesized static call.
+//! Equal named-field assignment with parenthesized static calls.
 //!
 //! Lua text goes through the candidate SourcePlugin, Core, and the VM.
 //! Parentheses keep one result. A function still cannot return a boolean or
@@ -22,6 +22,8 @@ const PEEK: &str = "lua_host::peek";
 const SNAP: &str = "lua_host::snap";
 const NOTE: &str = "lua_host::note";
 const EDGE: &str = "lua_host::edge";
+const ARM: &str = "lua_host::arm";
+const TOUCH: &str = "lua_host::touch";
 
 #[derive(Clone, Debug, Default)]
 struct Obs {
@@ -29,6 +31,8 @@ struct Obs {
     snaps: Vec<Snap>,
     notes: Vec<(f64, String)>,
     edges: Vec<Option<heap::TableRef>>,
+    /// Table a no-arg function can stamp. Not a heap root.
+    armed: Option<heap::TableRef>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -94,9 +98,23 @@ fn catalog() -> &'static Arc<vm::HostApiCatalog> {
         builder.function(vm::HostFunctionSchema::with_return(
             EDGE,
             vec![
-                HostParamSchema::with_passing("table", table, HostParamPassing::Borrow),
+                HostParamSchema::with_passing("table", table.clone(), HostParamPassing::Borrow),
                 HostParamSchema::value("key", HostTypeSchema::String),
             ],
+            HostTypeSchema::Bool,
+        ));
+        builder.function(vm::HostFunctionSchema::with_return(
+            ARM,
+            vec![HostParamSchema::with_passing(
+                "table",
+                table,
+                HostParamPassing::Borrow,
+            )],
+            HostTypeSchema::Bool,
+        ));
+        builder.function(vm::HostFunctionSchema::with_return(
+            TOUCH,
+            vec![],
             HostTypeSchema::Bool,
         ));
         Arc::new(builder.build().unwrap())
@@ -109,6 +127,8 @@ enum HostOp {
     Snap,
     Note,
     Edge,
+    Arm,
+    Touch,
 }
 
 impl HostOwnedFunction for HostOp {
@@ -181,6 +201,22 @@ impl HostOwnedFunction for HostOp {
                 note(&mut host, |state| state.edges.push(found))?;
                 Value::Bool(found.is_some())
             }
+            Self::Arm => {
+                let observed = borrowed_table(&mut host, &args[0])?;
+                note(&mut host, |state| state.armed = Some(observed.table))?;
+                Value::Bool(true)
+            }
+            Self::Touch => {
+                let armed = host
+                    .scope_state::<Obs>()
+                    .and_then(|state| state.armed)
+                    .ok_or_else(|| host_fault("touch without arm"))?;
+                heap::with_heap(&mut host, |heap| {
+                    heap.set_named_scalar(armed, "step", Value::string("called"))
+                })
+                .map_err(|error| VmError::HostError(error.to_string()))?;
+                Value::Bool(true)
+            }
         };
         Ok(CallOutcome::Return(CallReturn::one(value)))
     }
@@ -192,6 +228,8 @@ fn register(registry: &mut HostFunctionRegistry, catalog: &vm::HostApiCatalog) {
         (SNAP, HostOp::Snap),
         (NOTE, HostOp::Note),
         (EDGE, HostOp::Edge),
+        (ARM, HostOp::Arm),
+        (TOUCH, HostOp::Touch),
     ] {
         let function = catalog.function(name).expect("assignment root host schema");
         registry
@@ -429,21 +467,288 @@ return true
 }
 
 #[test]
-fn call_in_an_earlier_value_stays_unlowered() {
-    let error = match super::try_candidate(
-        r#"local function sweep()
-  return nil
+fn early_call_then_plain_rhs_observes_evaluation_and_write_order() {
+    // A local function cannot capture the log table, so the host stamps it.
+    // The stamp is not a heap root. The later field read must see it, and
+    // the overlapping left write must beat the right-hand marker.
+    let ran = run_source(
+        r#"local log = {}
+log.step = "start"
+arm(log)
+local function first()
+  touch()
+  local made = {}
+  return made
 end
-local t = {}
-local u = {}
-t.a, u.b = (sweep()), true
+local dest = {}
+local marker = {}
+dest.slot, dest.seen, dest.slot = (first()), log.step, marker
+note(1, dest.seen)
+peek(marker)
+edge(dest, "slot")
 return true
 "#,
-    ) {
-        Err(error) => error,
-        Ok(_) => panic!("only the last value may call"),
-    };
-    assert!(error.contains("Lua expression not lowered yet"), "{error}");
+    );
+    assert_eq!(ran.status.as_ref().map(|_| ()), Ok(()), "{:?}", ran.status);
+    assert_eq!(ran.obs.notes, vec![(1.0, "called".to_string())]);
+    let marker = ran.obs.peeked[0];
+    let stored = ran.obs.edges[0].expect("left write kept a table");
+    assert_ne!(
+        stored, marker.table,
+        "right-to-left write leaves the call result"
+    );
+}
+
+#[test]
+fn first_call_table_survives_second_call_collect() {
+    let ran = run_source(
+        r#"local function seed()
+  local weak = {}
+  local mode = {}
+  mode.__mode = "v"
+  setmetatable(weak, mode)
+  local orphan = {}
+  orphan.self = orphan
+  rawset(weak, 2, orphan)
+  return weak
+end
+local function fresh()
+  local made = {}
+  return made
+end
+local weak = seed()
+local a = fresh()
+local b = fresh()
+local lost = rawget(weak, 2)
+peek(lost)
+lost = nil
+local function first()
+  local made = {}
+  made.self = made
+  peek(made)
+  return made
+end
+local function sweep()
+  collectgarbage("collect")
+  snap(2)
+  return nil
+end
+snap(1)
+a.field, b.field = (first()), (sweep())
+snap(3)
+edge(a, "field")
+note(1, type(a.field))
+note(2, type(b.field))
+rawset(weak, 1, a.field)
+collectgarbage("collect")
+snap(4)
+note(3, type(rawget(weak, 1)))
+a.field = nil
+collectgarbage("collect")
+snap(5)
+note(4, type(rawget(weak, 1)))
+return true
+"#,
+    );
+    assert_eq!(ran.status.as_ref().map(|_| ()), Ok(()), "{:?}", ran.status);
+    let before = snap(&ran, 1.0);
+    let during = snap(&ran, 2.0);
+    let after = snap(&ran, 3.0);
+    let held = snap(&ran, 4.0);
+    let dropped = snap(&ran, 5.0);
+    let target = ran.obs.peeked[1];
+    assert_eq!(during.collections, 1);
+    assert_eq!(during.peeked_alive, vec![false, true]);
+    assert_eq!(during.token_open, vec![false, true]);
+    assert_eq!(during.root_slots, before.root_slots + 3);
+    assert_eq!(during.live_roots, before.live_roots + 3);
+    assert_eq!(after.root_slots, before.root_slots);
+    assert_eq!(after.live_roots, before.live_roots);
+    assert_eq!(ran.obs.edges, vec![Some(target.table)]);
+    assert_eq!(
+        ran.obs.notes,
+        vec![
+            (1.0, "table".to_string()),
+            (2.0, "nil".to_string()),
+            (3.0, "table".to_string()),
+            (4.0, "nil".to_string()),
+        ]
+    );
+    assert!(
+        held.token_open[1],
+        "written edge keeps the target: {held:?}"
+    );
+    assert!(
+        !dropped.token_open[1],
+        "next collect reclaims the target: {dropped:?}"
+    );
+    assert!(
+        !dropped.token_open[0],
+        "orphan stays collected: {dropped:?}"
+    );
+    assert_eq!(dropped.collections, 3);
+    assert_eq!(ran.visits.len(), 3, "three real collects: {:?}", ran.visits);
+}
+
+#[test]
+fn evaluated_table_between_calls_survives_the_later_collect() {
+    let ran = run_source(
+        r#"local function seed()
+  local weak = {}
+  local mode = {}
+  mode.__mode = "v"
+  setmetatable(weak, mode)
+  local orphan = {}
+  orphan.self = orphan
+  rawset(weak, 2, orphan)
+  local mid = {}
+  mid.self = mid
+  rawset(weak, 3, mid)
+  return weak
+end
+local function fresh()
+  local made = {}
+  return made
+end
+local weak = seed()
+local a = fresh()
+local b = fresh()
+local c = fresh()
+local mid = rawget(weak, 3)
+local lost = rawget(weak, 2)
+peek(mid)
+peek(lost)
+lost = nil
+local function first()
+  local made = {}
+  made.self = made
+  peek(made)
+  return made
+end
+local function sweep()
+  collectgarbage("collect")
+  snap(2)
+  return nil
+end
+snap(1)
+a.field, b.field, c.field = (first()), mid, (sweep())
+snap(3)
+edge(a, "field")
+edge(b, "field")
+note(1, type(a.field))
+note(2, type(b.field))
+note(3, type(c.field))
+return true
+"#,
+    );
+    assert_eq!(ran.status.as_ref().map(|_| ()), Ok(()), "{:?}", ran.status);
+    let before = snap(&ran, 1.0);
+    let during = snap(&ran, 2.0);
+    let mid = ran.obs.peeked[0];
+    let target = ran.obs.peeked[2];
+    assert_eq!(during.collections, 1);
+    assert_eq!(during.peeked_alive, vec![true, false, true]);
+    assert_eq!(during.token_open, vec![true, false, true]);
+    assert_eq!(during.root_slots, before.root_slots + 5);
+    assert_eq!(during.live_roots, before.live_roots + 5);
+    assert_eq!(ran.obs.edges, vec![Some(target.table), Some(mid.table)]);
+    assert_eq!(
+        ran.obs.notes,
+        vec![
+            (1.0, "table".to_string()),
+            (2.0, "table".to_string()),
+            (3.0, "nil".to_string()),
+        ]
+    );
+    assert_eq!(snap(&ran, 3.0).root_slots, before.root_slots);
+}
+
+#[test]
+fn scalar_or_nil_between_calls_is_not_a_root() {
+    let nil_between = r#"local function fresh()
+  local made = {}
+  return made
+end
+local function first()
+  return nil
+end
+local function sweep()
+  collectgarbage("collect")
+  snap(2)
+  return nil
+end
+local a = fresh()
+local b = fresh()
+local c = fresh()
+snap(1)
+a.field, b.field, c.field = (first()), nil, (sweep())
+snap(3)
+note(1, type(a.field))
+note(2, type(b.field))
+note(3, type(c.field))
+return true
+"#;
+    let ran = run_source(nil_between);
+    assert_eq!(ran.status.as_ref().map(|_| ()), Ok(()), "{:?}", ran.status);
+    let before = snap(&ran, 1.0);
+    let during = snap(&ran, 2.0);
+    assert_eq!(during.root_slots, before.root_slots + 5);
+    assert_eq!(during.live_roots, before.live_roots + 3);
+    assert_eq!(
+        ran.obs.notes,
+        vec![
+            (1.0, "nil".to_string()),
+            (2.0, "nil".to_string()),
+            (3.0, "nil".to_string()),
+        ]
+    );
+
+    let kept = nil_between.replace(
+        "(first()), nil, (sweep())",
+        "(first()), \"kept\", (sweep())",
+    );
+    let ran = run_source(&kept);
+    assert_eq!(ran.status.as_ref().map(|_| ()), Ok(()), "{:?}", ran.status);
+    assert_eq!(snap(&ran, 2.0).live_roots, snap(&ran, 1.0).live_roots + 3);
+    assert_eq!(ran.obs.notes[1], (2.0, "string".to_string()));
+
+    let flag = nil_between.replace("(first()), nil, (sweep())", "(first()), true, (sweep())");
+    let ran = run_source(&flag);
+    assert_eq!(ran.status.as_ref().map(|_| ()), Ok(()), "{:?}", ran.status);
+    assert_eq!(snap(&ran, 2.0).live_roots, snap(&ran, 1.0).live_roots + 3);
+    assert_eq!(ran.obs.notes[1], (2.0, "boolean".to_string()));
+
+    let early = r#"local function fresh()
+  local made = {}
+  return made
+end
+local function first()
+  return nil
+end
+local function sweep()
+  collectgarbage("collect")
+  snap(2)
+  return nil
+end
+local a = fresh()
+local b = fresh()
+local c = fresh()
+local d = fresh()
+snap(1)
+a.field, b.field, c.field, d.field = "early", (first()), nil, (sweep())
+snap(3)
+note(1, a.field)
+note(2, type(c.field))
+return true
+"#;
+    let ran = run_source(early);
+    assert_eq!(ran.status.as_ref().map(|_| ()), Ok(()), "{:?}", ran.status);
+    let before = snap(&ran, 1.0);
+    let during = snap(&ran, 2.0);
+    assert_eq!(during.root_slots, before.root_slots + 7);
+    assert_eq!(during.live_roots, before.live_roots + 4);
+    assert_eq!(ran.obs.notes[0], (1.0, "early".to_string()));
+    assert_eq!(ran.obs.notes[1], (2.0, "nil".to_string()));
 }
 
 #[test]
