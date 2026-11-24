@@ -32,6 +32,7 @@ const GC_STOP: &str = "lua_internal::gc_stop";
 const GC_RESTART: &str = "lua_internal::gc_restart";
 const GC_IS_RUNNING: &str = "lua_internal::gc_is_running";
 const STEP_DATA: &str = "lua_internal::step_data";
+const AUTO_TABLE_RESTART: &str = "lua_internal::auto_table_restart";
 const COUNT: &str = "lua_internal::count";
 const OPEN_CELL: &str = "lua_internal::open_cell";
 const READ_CELL: &str = "lua_internal::read_cell";
@@ -135,6 +136,16 @@ pub(super) fn install_run_control_schemas(builder: &mut HostApiBuilder) {
         GC_IS_RUNNING,
         vec![],
         HostTypeSchema::Bool,
+    ));
+}
+
+/// Opt in to one automatic empty-local safepoint. Not part of the ordinary
+/// catalog or the run-control catalog.
+pub(super) fn install_auto_table_restart_schema(builder: &mut HostApiBuilder) {
+    builder.function(HostFunctionSchema::with_return(
+        AUTO_TABLE_RESTART,
+        vec![HostParamSchema::value("roots", HostTypeSchema::Unknown)],
+        HostTypeSchema::Float,
     ));
 }
 
@@ -310,6 +321,7 @@ pub(super) fn register(
         Op::GcRestart,
         Op::GcIsRunning,
         Op::StepData,
+        Op::AutoTableRestart,
         Op::Count,
         Op::EnterResult,
         Op::EnterCallee,
@@ -357,6 +369,7 @@ pub(super) fn register(
             Op::GcRestart => GC_RESTART,
             Op::GcIsRunning => GC_IS_RUNNING,
             Op::StepData => STEP_DATA,
+            Op::AutoTableRestart => AUTO_TABLE_RESTART,
             Op::Count => COUNT,
             Op::EnterResult => ENTER_RESULT,
             Op::EnterCallee => ENTER_CALLEE,
@@ -393,6 +406,7 @@ pub(super) fn register(
                 | Op::GcRestart
                 | Op::GcIsRunning
                 | Op::StepData
+                | Op::AutoTableRestart
         ) && catalog.function(name).is_none()
         {
             continue;
@@ -426,6 +440,7 @@ enum Op {
     GcRestart,
     GcIsRunning,
     StepData,
+    AutoTableRestart,
     Count,
     EnterResult,
     EnterCallee,
@@ -621,7 +636,8 @@ impl HostOwnedFunction for Op {
             }
             Self::StepHasTail => Value::Bool(heap::saved_source_tail(&call.vm().host_context())),
             Self::GcStop => set_gc_running(&mut call.vm().host_context(), false)?,
-            Self::GcRestart => set_gc_running(&mut call.vm().host_context(), true)?,
+            Self::GcRestart => gc_restart(&mut call.vm().host_context())?,
+            Self::AutoTableRestart => auto_table_restart(call)?,
             Self::GcIsRunning => gc_is_running(&call.vm().host_context()),
             Self::StepData => step_data_default(call)?,
             Self::Count => {
@@ -1838,16 +1854,44 @@ fn decode_safepoint_roots(call: &mut OwnedHostCall<'_>) -> Result<Vec<heap::Tabl
 
 /// Absent means running. A new VM scope, including one published by reset,
 /// therefore starts running even when another execution of this catalog stopped.
+///
+/// `threshold_bytes` is written only by single-arg restart and is the current
+/// logical byte count. It is not a pause-adjusted debt.
 struct GcRunControl {
     running: bool,
+    threshold_bytes: Option<u64>,
+    auto_requested: bool,
+}
+
+fn fresh_run_control() -> GcRunControl {
+    GcRunControl {
+        running: true,
+        threshold_bytes: None,
+        auto_requested: false,
+    }
 }
 
 fn set_gc_running(host: &mut vm::HostContext<'_>, running: bool) -> Result<Value, VmError> {
     // Control only. Do not publish roots, pop a step budget, or touch a saved tail.
     let control = host
-        .scope_state_or_insert_with(|| GcRunControl { running: true })
+        .scope_state_or_insert_with(fresh_run_control)
         .map_err(|error| VmError::HostError(error.to_string()))?;
     control.running = running;
+    Ok(Value::Float(0.0))
+}
+
+fn gc_restart(host: &mut vm::HostContext<'_>) -> Result<Value, VmError> {
+    // Current logical amount only. Do not install a heap, collect, or pop a budget.
+    let bytes = host
+        .scope_state::<heap::LuaHeap>()
+        .map(|heap| heap.logical_bytes())
+        .unwrap_or(0);
+    let control = host
+        .scope_state_or_insert_with(fresh_run_control)
+        .map_err(|error| VmError::HostError(error.to_string()))?;
+    control.running = true;
+    control.threshold_bytes = Some(bytes);
+    control.auto_requested = false;
     Ok(Value::Float(0.0))
 }
 
@@ -1906,6 +1950,99 @@ fn step_data_default(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
             "step data is not the default".to_string(),
         ))
     }
+}
+
+fn pop_step_budget(host: &mut vm::HostContext<'_>) -> Result<NonZeroU64, VmError> {
+    host.scope_state_mut::<StepBudgets>()
+        .and_then(|budgets| budgets.0.pop_front())
+        .ok_or_else(|| VmError::HostError("missing source step fixture budget".to_string()))
+}
+
+fn auto_table_due(host: &mut vm::HostContext<'_>) -> Result<bool, VmError> {
+    let (running, threshold, requested) = match host.scope_state::<GcRunControl>() {
+        Some(control) => (
+            control.running,
+            control.threshold_bytes,
+            control.auto_requested,
+        ),
+        None => return Ok(false),
+    };
+    if !running || requested {
+        return Ok(false);
+    }
+    let Some(threshold) = threshold else {
+        return Ok(false);
+    };
+    // An absent heap is not an idle cycle. Do not install one here.
+    if host.scope_state::<heap::LuaHeap>().is_none() {
+        return Ok(false);
+    }
+    // A saved tail or mark is an existing cycle. Leave the ordinary allocation gate.
+    if heap::saved_source_tail(host) || !heap::fixed_step_idle(host).map_err(heap_error)? {
+        return Ok(false);
+    }
+    let logical = host
+        .scope_state::<heap::LuaHeap>()
+        .map(|heap| heap.logical_bytes())
+        .unwrap_or(0);
+    Ok(logical >= threshold)
+}
+
+fn confirm_round_finished(host: &mut vm::HostContext<'_>) -> Result<(), VmError> {
+    if heap::saved_source_tail(host) || !heap::fixed_step_idle(host).map_err(heap_error)? {
+        return Err(VmError::HostError(
+            "auto table restart left a cycle open before publish".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// One idle empty-local safepoint after single-arg restart.
+///
+/// The mark allowance and, only when that call publishes a tail, the
+/// continuation allowance are separate host phase budgets. Pending close,
+/// token close, and the Owners walk stay on the existing driver's own meters
+/// and are not limited by either allowance. This does not call `heap::collect`
+/// and does not treat a saved tail as idle.
+fn auto_table_restart(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
+    if !auto_table_due(&mut call.vm().host_context())? {
+        return Ok(Value::Float(0.0));
+    }
+    let tables = decode_safepoint_roots(call)?;
+    let mut host = call.vm().host_context();
+    let mark_budget = pop_step_budget(&mut host)?;
+    if let Some(control) = host.scope_state_mut::<GcRunControl>() {
+        control.auto_requested = true;
+    }
+    let first = heap::step_source_safepoint(&mut host, mark_budget, tables).map_err(heap_error)?;
+    match first {
+        heap::StepOutcome::Completed(report) => {
+            note_collect(&mut host, report)?;
+            confirm_round_finished(&mut host)?;
+        }
+        heap::StepOutcome::Published { .. } => {
+            let sweep_budget = pop_step_budget(&mut host)?;
+            let second = heap::step_source_safepoint(&mut host, sweep_budget, Vec::new())
+                .map_err(heap_error)?;
+            match second {
+                heap::StepOutcome::Completed(report) => {
+                    note_collect(&mut host, report)?;
+                    confirm_round_finished(&mut host)?;
+                }
+                other => {
+                    return Err(VmError::HostError(format!(
+                        "auto table restart did not finish the published tail: {other:?}"
+                    )));
+                }
+            }
+        }
+        heap::StepOutcome::Paused { tail } => {
+            return Err(VmError::HostError(format!(
+                "auto table restart mark paused tail={tail}"
+            )));
+        }
+    }
+    Ok(Value::Float(0.0))
 }
 
 fn step_at_safepoint(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
@@ -2892,6 +3029,11 @@ impl Lower<'_> {
         name: &ast::Name,
         value: &ast::Expr,
     ) -> Result<(), ParseError> {
+        if self.catalog.function(AUTO_TABLE_RESTART).is_some()
+            && matches!(value, ast::Expr::Table { fields, .. } if fields.is_empty())
+        {
+            self.emit_auto_table_safepoint(span)?;
+        }
         let expr = self.expr(value)?;
         let index = self
             .builder
@@ -2932,6 +3074,14 @@ impl Lower<'_> {
             self.open_captured_cell(span, name, index)?;
         }
         Ok(())
+    }
+
+    fn emit_auto_table_safepoint(&mut self, span: ast::Span) -> Result<(), ParseError> {
+        // Only this source local. Shadow and cell constructors call NEW_TABLE
+        // themselves and do not pass through here.
+        let roots = self.gather_safepoint_roots(span)?;
+        let expr = self.call(AUTO_TABLE_RESTART, vec![roots])?;
+        self.emit_ignored(expr, self.line(span))
     }
 
     fn open_captured_cell(

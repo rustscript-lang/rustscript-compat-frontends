@@ -123,19 +123,28 @@ struct Ran {
 struct Plugin {
     guest_step: bool,
     run_control: bool,
+    auto_table: bool,
 }
 
 static PLUGIN: Plugin = Plugin {
     guest_step: false,
     run_control: false,
+    auto_table: false,
 };
 static STEP_PLUGIN: Plugin = Plugin {
     guest_step: true,
     run_control: false,
+    auto_table: false,
 };
 static CONTROL_PLUGIN: Plugin = Plugin {
     guest_step: true,
     run_control: true,
+    auto_table: false,
+};
+static AUTO_TABLE_PLUGIN: Plugin = Plugin {
+    guest_step: true,
+    run_control: true,
+    auto_table: true,
 };
 
 impl SourcePlugin for Plugin {
@@ -152,12 +161,67 @@ impl SourcePlugin for Plugin {
     }
 
     fn parse_source(&self, source: &str) -> Result<FrontendIr, ParseError> {
-        candidate::lower(source, catalog_for(self.guest_step, self.run_control))
+        let catalog = if self.auto_table {
+            catalog_auto()
+        } else {
+            catalog_for(self.guest_step, self.run_control)
+        };
+        candidate::lower(source, catalog)
     }
 }
 
 fn catalog(guest_step: bool) -> &'static Arc<vm::HostApiCatalog> {
     catalog_for(guest_step, false)
+}
+
+fn install_witness_schemas(builder: &mut vm::HostApiBuilder) {
+    let table = HostTypeSchema::Resource(heap::LuaTableResource::key());
+    builder.function(vm::HostFunctionSchema::with_return(
+        STEP,
+        vec![HostParamSchema::value("budget", HostTypeSchema::Float)],
+        HostTypeSchema::Float,
+    ));
+    builder.function(vm::HostFunctionSchema::with_return(
+        PEEK,
+        vec![HostParamSchema::with_passing(
+            "table",
+            table.clone(),
+            HostParamPassing::Borrow,
+        )],
+        HostTypeSchema::Bool,
+    ));
+    builder.function(vm::HostFunctionSchema::with_return(
+        SAME,
+        vec![
+            HostParamSchema::with_passing("left", table.clone(), HostParamPassing::Borrow),
+            HostParamSchema::with_passing("right", table, HostParamPassing::Borrow),
+        ],
+        HostTypeSchema::Float,
+    ));
+    builder.function(vm::HostFunctionSchema::with_return(
+        NOTE,
+        vec![
+            HostParamSchema::value("tag", HostTypeSchema::Float),
+            HostParamSchema::value("value", HostTypeSchema::Float),
+        ],
+        HostTypeSchema::Float,
+    ));
+    builder.function(vm::HostFunctionSchema::with_return(
+        TEXT,
+        vec![
+            HostParamSchema::value("tag", HostTypeSchema::Float),
+            HostParamSchema::value("text", HostTypeSchema::String),
+        ],
+        HostTypeSchema::Bool,
+    ));
+    builder.function(vm::HostFunctionSchema::with_return(
+        BIT,
+        vec![
+            HostParamSchema::value("tag", HostTypeSchema::Float),
+            HostParamSchema::value("bit", HostTypeSchema::Bool),
+        ],
+        HostTypeSchema::Bool,
+    ));
 }
 
 fn catalog_for(guest_step: bool, run_control: bool) -> &'static Arc<vm::HostApiCatalog> {
@@ -180,54 +244,21 @@ fn catalog_for(guest_step: bool, run_control: bool) -> &'static Arc<vm::HostApiC
         if run_control {
             candidate::install_run_control_schemas(&mut builder);
         }
-        let table = HostTypeSchema::Resource(heap::LuaTableResource::key());
-        builder.function(vm::HostFunctionSchema::with_return(
-            STEP,
-            vec![HostParamSchema::value("budget", HostTypeSchema::Float)],
-            HostTypeSchema::Float,
-        ));
-        builder.function(vm::HostFunctionSchema::with_return(
-            PEEK,
-            vec![HostParamSchema::with_passing(
-                "table",
-                table.clone(),
-                HostParamPassing::Borrow,
-            )],
-            HostTypeSchema::Bool,
-        ));
-        builder.function(vm::HostFunctionSchema::with_return(
-            SAME,
-            vec![
-                HostParamSchema::with_passing("left", table.clone(), HostParamPassing::Borrow),
-                HostParamSchema::with_passing("right", table, HostParamPassing::Borrow),
-            ],
-            HostTypeSchema::Float,
-        ));
-        builder.function(vm::HostFunctionSchema::with_return(
-            NOTE,
-            vec![
-                HostParamSchema::value("tag", HostTypeSchema::Float),
-                HostParamSchema::value("value", HostTypeSchema::Float),
-            ],
-            HostTypeSchema::Float,
-        ));
-        builder.function(vm::HostFunctionSchema::with_return(
-            TEXT,
-            vec![
-                HostParamSchema::value("tag", HostTypeSchema::Float),
-                HostParamSchema::value("text", HostTypeSchema::String),
-            ],
-            HostTypeSchema::Bool,
-        ));
-        builder.function(vm::HostFunctionSchema::with_return(
-            BIT,
-            vec![
-                HostParamSchema::value("tag", HostTypeSchema::Float),
-                HostParamSchema::value("bit", HostTypeSchema::Bool),
-            ],
-            HostTypeSchema::Bool,
-        ));
+        install_witness_schemas(&mut builder);
         Arc::new(builder.build().expect("source scalar catalog"))
+    })
+}
+
+fn catalog_auto() -> &'static Arc<vm::HostApiCatalog> {
+    static AUTO_CATALOG: OnceLock<Arc<vm::HostApiCatalog>> = OnceLock::new();
+    AUTO_CATALOG.get_or_init(|| {
+        let mut builder = vm::HostApiBuilder::new();
+        candidate::install_schemas(&mut builder);
+        candidate::install_step_schemas(&mut builder);
+        candidate::install_run_control_schemas(&mut builder);
+        candidate::install_auto_table_restart_schema(&mut builder);
+        install_witness_schemas(&mut builder);
+        Arc::new(builder.build().expect("auto table restart catalog"))
     })
 }
 
@@ -417,12 +448,11 @@ fn run_control(source: &str, budgets: Option<&[u64]>) -> Ran {
     drive(source, budgets, true, None)
 }
 
+fn run_auto_table(source: &str, budgets: Option<&[u64]>) -> Ran {
+    drive_plugin(source, budgets, &AUTO_TABLE_PLUGIN, None)
+}
+
 fn drive(source: &str, budgets: Option<&[u64]>, run_control: bool, nodes: Option<u32>) -> Ran {
-    let catalog = Arc::clone(if run_control {
-        catalog_for(true, true)
-    } else {
-        catalog(budgets.is_some())
-    });
     let plugin: &Plugin = if run_control {
         &CONTROL_PLUGIN
     } else if budgets.is_some() {
@@ -430,6 +460,22 @@ fn drive(source: &str, budgets: Option<&[u64]>, run_control: bool, nodes: Option
     } else {
         &PLUGIN
     };
+    drive_plugin(source, budgets, plugin, nodes)
+}
+
+fn drive_plugin(
+    source: &str,
+    budgets: Option<&[u64]>,
+    plugin: &'static Plugin,
+    nodes: Option<u32>,
+) -> Ran {
+    let catalog = Arc::clone(if plugin.auto_table {
+        catalog_auto()
+    } else if plugin.run_control {
+        catalog_for(true, true)
+    } else {
+        catalog(plugin.guest_step)
+    });
     let options = CompileSourceFileOptions::new()
         .with_source_plugin(plugin)
         .with_host_api_catalog(Arc::clone(&catalog));
@@ -3152,4 +3198,338 @@ return 1
     assert_eq!(gathered.collects, 0);
     assert_eq!(gathered.collections, 0);
     assert!(gathered.trace.bits.is_empty(), "{gathered:?}");
+}
+
+/// Ordinary catalog has no automatic table safepoint. An empty local after a
+/// weak witness must not collect.
+#[test]
+fn ordinary_catalog_empty_local_does_not_collect_a_weak_witness() {
+    let ran = run(r#"
+local function witness()
+  local w = {}
+  local mt = {}
+  local held = {}
+  mt.__mode = "v"
+  setmetatable(w, mt)
+  w[1] = held
+  w[2] = {}
+  peek(held)
+  local fresh = {}
+  peek(fresh)
+  text(1, type(fresh))
+  text(2, type(rawget(w, 2)))
+  note(1, same(held, rawget(w, 1)))
+  note(2, rawlen(w))
+  return 1
+end
+witness()
+return 1
+"#);
+    assert_eq!(ran.stop, Stop::Halted, "{ran:?}");
+    assert_eq!(ran.stack, [Value::Float(1.0)]);
+    assert_eq!(text_value(&ran.trace, 1.0), "table");
+    assert_eq!(text_value(&ran.trace, 2.0), "table");
+    assert_eq!(note_value(&ran.trace, 1.0), 1.0);
+    assert_eq!(note_value(&ran.trace, 2.0), 2.0);
+    assert_eq!(ran.trace.peeks.len(), 2);
+    assert_ne!(ran.trace.peeks[0].table, ran.trace.peeks[1].table);
+    assert_eq!(ran.collects, 0);
+    assert_eq!(ran.collections, 0);
+    assert!(!ran.tail);
+    assert!(ran.trace.steps.is_empty());
+}
+
+/// Stop still suppresses collection. The following empty local is ordinary
+/// allocation, not a safepoint.
+#[test]
+fn stopped_empty_local_keeps_the_weak_witness() {
+    let ran = run_control(
+        r#"
+local function witness()
+  local w = {}
+  local mt = {}
+  local held = {}
+  mt.__mode = "v"
+  setmetatable(w, mt)
+  w[1] = held
+  w[2] = {}
+  peek(held)
+  note(1, collectgarbage("stop"))
+  bit(1, collectgarbage("isrunning"))
+  text(1, type(rawget(w, 2)))
+  local fresh = {}
+  peek(fresh)
+  bit(2, collectgarbage("isrunning"))
+  text(2, type(fresh))
+  text(3, type(rawget(w, 2)))
+  note(2, same(held, rawget(w, 1)))
+  note(3, rawlen(w))
+  return 1
+end
+witness()
+return 1
+"#,
+        None,
+    );
+    assert_eq!(ran.stop, Stop::Halted, "{ran:?}");
+    assert_eq!(note_value(&ran.trace, 1.0), 0.0);
+    assert!(!bit_value(&ran.trace, 1.0));
+    assert_eq!(text_value(&ran.trace, 1.0), "table");
+    assert!(!bit_value(&ran.trace, 2.0));
+    assert_eq!(text_value(&ran.trace, 2.0), "table");
+    assert_eq!(
+        text_value(&ran.trace, 3.0),
+        "table",
+        "stop must keep the weak item across the empty local"
+    );
+    assert_eq!(note_value(&ran.trace, 2.0), 1.0);
+    assert_eq!(note_value(&ran.trace, 3.0), 2.0);
+    assert_eq!(ran.trace.peeks.len(), 2);
+    assert_eq!(ran.collects, 0);
+    assert_eq!(ran.collections, 0);
+    assert!(!ran.tail);
+    assert!(ran.subject_alive.unwrap_or(false));
+}
+
+/// Same refusal as the existing node cap: stop must not collect to make room.
+#[test]
+fn stopped_empty_local_keeps_the_installed_node_quota_refusal() {
+    let ran = drive(
+        r#"
+local function witness()
+  local a = {}
+  peek(a)
+  note(1, collectgarbage("stop"))
+  bit(1, collectgarbage("isrunning"))
+  local b = {}
+  peek(b)
+  return 1
+end
+witness()
+return 1
+"#,
+        None,
+        true,
+        Some(1),
+    );
+    assert!(
+        matches!(ran.stop, Stop::HostError(ref message) if message.contains("lua heap node capacity")),
+        "stop must not change the installed node refusal: {:?}",
+        ran.stop
+    );
+    assert_eq!(note_value(&ran.trace, 1.0), 0.0);
+    assert!(!bit_value(&ran.trace, 1.0));
+    assert_eq!(ran.live_nodes, 1, "the refused table did not occupy a node");
+    assert_eq!(
+        ran.trace.peeks.len(),
+        1,
+        "the second table was not published"
+    );
+    assert_eq!(ran.collects, 0);
+    assert_eq!(ran.collections, 0);
+    assert!(!ran.tail);
+    assert!(ran.subject_alive.unwrap_or(false));
+    assert!(ran.token_open.unwrap_or(false));
+}
+
+/// The run-control catalog does not grow this automatic safepoint.
+#[test]
+fn run_control_empty_local_keeps_the_weak_witness() {
+    let ran = run_control(
+        r#"
+local function witness()
+  local w = {}
+  local mt = {}
+  local held = {}
+  mt.__mode = "v"
+  setmetatable(w, mt)
+  w[1] = held
+  w[2] = {}
+  peek(held)
+  note(1, collectgarbage("stop"))
+  note(2, collectgarbage("restart"))
+  text(1, type(rawget(w, 2)))
+  local fresh = {}
+  peek(fresh)
+  text(2, type(fresh))
+  text(3, type(rawget(w, 2)))
+  note(3, same(held, rawget(w, 1)))
+  return 1
+end
+witness()
+return 1
+"#,
+        Some(&[10_000, 10_000]),
+    );
+    assert_eq!(ran.stop, Stop::Halted, "{ran:?}");
+    assert_eq!(text_value(&ran.trace, 1.0), "table");
+    assert_eq!(text_value(&ran.trace, 2.0), "table");
+    assert_eq!(
+        text_value(&ran.trace, 3.0),
+        "table",
+        "run control without the empty-local opt-in must keep the weak item"
+    );
+    assert_eq!(note_value(&ran.trace, 3.0), 1.0);
+    assert_eq!(ran.collects, 0);
+    assert_eq!(ran.collections, 0);
+    assert!(!ran.tail);
+    assert!(ran.trace.steps.is_empty());
+}
+
+/// The opt-in schema does not collect or widen the node cap while stopped.
+#[test]
+fn stopped_auto_table_keeps_the_installed_node_quota_refusal() {
+    let ran = drive_plugin(
+        r#"
+local function witness()
+  local a = {}
+  peek(a)
+  note(1, collectgarbage("stop"))
+  bit(1, collectgarbage("isrunning"))
+  local b = {}
+  peek(b)
+  return 1
+end
+witness()
+return 1
+"#,
+        None,
+        &AUTO_TABLE_PLUGIN,
+        Some(1),
+    );
+    assert!(
+        matches!(ran.stop, Stop::HostError(ref message) if message.contains("lua heap node capacity")),
+        "stopped opt-in must keep the installed node refusal: {:?}",
+        ran.stop
+    );
+    assert_eq!(note_value(&ran.trace, 1.0), 0.0);
+    assert!(!bit_value(&ran.trace, 1.0));
+    assert_eq!(ran.live_nodes, 1);
+    assert_eq!(ran.trace.peeks.len(), 1);
+    assert_eq!(ran.collects, 0);
+    assert_eq!(ran.collections, 0);
+    assert!(!ran.tail);
+}
+
+/// Restart and a pure read keep the weak witness. With the empty-local opt-in
+/// and two configured host budgets, the next empty local finishes one idle
+/// cycle before publish.
+#[test]
+fn restarted_empty_local_clears_old_weak_before_the_new_table_is_published() {
+    let ran = run_auto_table(
+        r#"
+local function witness()
+  local w = {}
+  local mt = {}
+  local held = {}
+  mt.__mode = "v"
+  setmetatable(w, mt)
+  w[1] = held
+  w[2] = {}
+  peek(held)
+  bit(1, collectgarbage("isrunning"))
+  note(1, collectgarbage("stop"))
+  bit(2, collectgarbage("isrunning"))
+  text(1, type(rawget(w, 2)))
+  note(2, rawlen(w))
+  note(3, same(held, rawget(w, 1)))
+  note(11, collectgarbage("count"))
+  note(4, collectgarbage("restart"))
+  bit(3, collectgarbage("isrunning"))
+  note(12, collectgarbage("count"))
+  text(2, type(rawget(w, 2)))
+  note(5, rawlen(w))
+  note(6, same(held, rawget(w, 1)))
+  bit(4, collectgarbage("isrunning"))
+  local fresh = {}
+  bit(5, peek(fresh))
+  text(3, type(fresh))
+  text(4, type(rawget(w, 2)))
+  note(7, rawlen(w))
+  note(8, same(held, rawget(w, 1)))
+  w[3] = {}
+  text(5, type(rawget(w, 3)))
+  collectgarbage("collect")
+  text(6, type(rawget(w, 3)))
+  note(9, same(held, rawget(w, 1)))
+  return 1
+end
+witness()
+return 1
+"#,
+        Some(&[10_000, 10_000]),
+    );
+    assert_eq!(ran.stop, Stop::Halted, "{ran:?}");
+    assert_eq!(ran.stack, [Value::Float(1.0)]);
+    assert!(
+        bit_value(&ran.trace, 1.0),
+        "a fresh execution starts running"
+    );
+    assert_eq!(note_value(&ran.trace, 1.0), 0.0);
+    assert!(!bit_value(&ran.trace, 2.0));
+    assert_eq!(text_value(&ran.trace, 1.0), "table");
+    assert_eq!(note_value(&ran.trace, 2.0), 2.0);
+    assert_eq!(note_value(&ran.trace, 3.0), 1.0);
+    let before = note_value(&ran.trace, 11.0);
+    assert!(
+        before.is_finite() && before > 0.0,
+        "count is the logical meter: {before}"
+    );
+    assert_eq!(note_value(&ran.trace, 4.0), 0.0);
+    assert!(bit_value(&ran.trace, 3.0));
+    assert_eq!(
+        note_value(&ran.trace, 12.0),
+        before,
+        "restart does not allocate"
+    );
+    assert_eq!(
+        text_value(&ran.trace, 2.0),
+        "table",
+        "restart and the following read must keep the weak item"
+    );
+    assert_eq!(note_value(&ran.trace, 5.0), 2.0);
+    assert_eq!(note_value(&ran.trace, 6.0), 1.0);
+    assert!(bit_value(&ran.trace, 4.0));
+    assert_eq!(cycle_at(&ran.trace, 4.0), (false, 0));
+    assert!(bit_value(&ran.trace, 5.0), "the new table is usable");
+    assert_eq!(text_value(&ran.trace, 3.0), "table");
+    assert_eq!(ran.trace.peeks.len(), 2);
+    assert_ne!(ran.trace.peeks[0].table, ran.trace.peeks[1].table);
+    assert_eq!(
+        text_value(&ran.trace, 4.0),
+        "nil",
+        "the empty local must clear the old weak item before publish; got {:?}",
+        ran.trace.texts
+    );
+    assert_eq!(note_value(&ran.trace, 7.0), 1.0);
+    assert_eq!(
+        note_value(&ran.trace, 8.0),
+        1.0,
+        "the strong root keeps its identity"
+    );
+    assert_eq!(
+        cycle_at(&ran.trace, 5.0),
+        (false, 1),
+        "the safepoint must finish before the new table is published: {:?}",
+        ran.trace.bit_cycle_state
+    );
+    assert_eq!(
+        text_value(&ran.trace, 5.0),
+        "table",
+        "a later empty table must not start another automatic cycle"
+    );
+    assert_eq!(text_value(&ran.trace, 6.0), "nil");
+    assert_eq!(note_value(&ran.trace, 9.0), 1.0);
+    assert!(
+        ran.trace.steps.is_empty(),
+        "lua_host::step is not this safepoint"
+    );
+    assert!(!ran.tail);
+    assert_eq!(
+        ran.collections, 2,
+        "automatic cycle plus the explicit collect"
+    );
+    assert_eq!(ran.collects, 2, "both completions record the real report");
+    assert!(ran.subject_alive.unwrap_or(false));
+    assert!(ran.token_open.unwrap_or(false));
 }
