@@ -3950,3 +3950,480 @@ fn owner_chain_has_gap(heap: &LuaHeap, owner: u32) -> bool {
     }
     false
 }
+
+const GAP_TEXT: &str = "gap";
+const PEER_TEXT: &str = "peer";
+const GAP_NUMBER: f64 = -7.0;
+const PEER_NUMBER: f64 = -8.0;
+const NUMBER_SPELLING: &str = "-7";
+const GAP_CHILD: &str = "child";
+
+#[derive(Clone, Copy)]
+enum OrdinaryGapKey {
+    Text,
+    Number,
+}
+
+#[derive(Clone, Copy)]
+enum OrdinaryGapWrite {
+    Strong,
+    WeakValue,
+    Omitted,
+}
+
+fn ordinary_gap_retains(write: OrdinaryGapWrite) -> bool {
+    matches!(write, OrdinaryGapWrite::Strong)
+}
+
+fn locate_ordinary(
+    heap: &LuaHeap,
+    owner: TableRef,
+    key: OrdinaryGapKey,
+    peer: bool,
+) -> Option<u32> {
+    match (key, peer) {
+        (OrdinaryGapKey::Text, false) => heap
+            .locate_named(owner.slot(), GAP_TEXT)
+            .map(|(_, index)| index),
+        (OrdinaryGapKey::Text, true) => heap
+            .locate_named(owner.slot(), PEER_TEXT)
+            .map(|(_, index)| index),
+        (OrdinaryGapKey::Number, false) => {
+            heap.find_key(owner.slot(), &super::EdgeKey::number(GAP_NUMBER))
+        }
+        (OrdinaryGapKey::Number, true) => {
+            heap.find_key(owner.slot(), &super::EdgeKey::number(PEER_NUMBER))
+        }
+    }
+}
+
+fn read_ordinary(heap: &LuaHeap, owner: TableRef, key: OrdinaryGapKey) -> Result<Value, HeapError> {
+    match key {
+        OrdinaryGapKey::Text => heap.named_value(owner, GAP_TEXT),
+        OrdinaryGapKey::Number => heap.number_value(owner, GAP_NUMBER),
+    }
+}
+
+fn write_ordinary_table(
+    heap: &mut LuaHeap,
+    owner: TableRef,
+    key: OrdinaryGapKey,
+    target: TableRef,
+) -> Result<(), HeapError> {
+    match key {
+        OrdinaryGapKey::Text => heap.set_named_edge(owner, GAP_TEXT, target),
+        OrdinaryGapKey::Number => heap.set_number_edge(owner, GAP_NUMBER, target),
+    }
+}
+
+fn write_ordinary_peer(
+    heap: &mut LuaHeap,
+    owner: TableRef,
+    key: OrdinaryGapKey,
+) -> Result<(), HeapError> {
+    match key {
+        OrdinaryGapKey::Text => heap.set_named_scalar(owner, PEER_TEXT, Value::string("peer")),
+        OrdinaryGapKey::Number => heap.set_number_scalar(owner, PEER_NUMBER, Value::string("peer")),
+    }
+}
+
+fn clear_ordinary(
+    heap: &mut LuaHeap,
+    owner: TableRef,
+    key: OrdinaryGapKey,
+) -> Result<(), HeapError> {
+    match key {
+        OrdinaryGapKey::Text => heap.set_named_scalar(owner, GAP_TEXT, Value::Null),
+        OrdinaryGapKey::Number => heap.clear_number_edge(owner, GAP_NUMBER),
+    }
+}
+
+fn stored_table(heap: &LuaHeap, index: u32) -> Option<TableRef> {
+    let edge = heap.edge_slots[index as usize].edge.as_ref()?;
+    match &edge.value {
+        super::EdgeValue::Table { slot, generation } => {
+            Some(TableRef::table(heap.domain, *slot, *generation))
+        }
+        _ => None,
+    }
+}
+
+fn record_is_gap(heap: &LuaHeap, index: u32) -> bool {
+    heap.edge_slots[index as usize]
+        .edge
+        .as_ref()
+        .is_some_and(|edge| edge.value.is_cursor_gap())
+}
+
+fn pause_on_later_pass(parked: &mut ParkedMark<'_>, owner: u32, cursor: u32) -> PendingScan {
+    let sweep = parked.meter().sweep_edge_checks;
+    for _ in 0..HARNESS_BOUND {
+        let view = parked.pulse(1);
+        assert!(
+            !view.finished,
+            "mark finished before owner {owner} record {cursor} was pending"
+        );
+        assert_eq!(
+            view.meter.sweep_edge_checks, sweep,
+            "a later-pass pulse must not sweep"
+        );
+        if let Some(pending) = parked.pending()
+            && pending.owner == owner
+            && pending.cursor == cursor
+        {
+            assert_eq!(parked.phase_name(), "gray");
+            assert_eq!(
+                view.meter.mark_passes, 2,
+                "the pending record is in the new pass"
+            );
+            assert!(parked.mutation_open());
+            return pending;
+        }
+    }
+    panic!("pending record {cursor} on owner {owner} was not observed");
+}
+
+fn slot_generation(heap: &LuaHeap, table: TableRef) -> u32 {
+    heap.slots[table.slot() as usize].generation
+}
+
+fn root_holds(slot: &Option<super::Rooted>, table: TableRef) -> bool {
+    matches!(
+        slot,
+        Some(super::Rooted::Table(found))
+            if found.slot() == table.slot() && found.generation() == table.generation()
+    )
+}
+
+/// Refills a physical gap left by a real weak-value cycle.
+///
+/// The first collection clears the old value and keeps the record. The second
+/// cycle is a saved Gray pause after that record has been charged. The refill
+/// uses the ordinary text or number writer, not the published tail entry.
+fn ordinary_gap_refill_after_real_clear(key: OrdinaryGapKey, write: OrdinaryGapWrite) {
+    use crate::heap::{self, StepOutcome};
+
+    let retained = ordinary_gap_retains(write);
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits(16, 4, 16)).expect("install");
+        let built = heap::with_heap(&mut host, |heap| {
+            let mode = heap.alloc()?;
+            heap.set_mode_scalar(mode, Value::string("v"))?;
+            let owner = heap.alloc()?;
+            let sentinel = heap.alloc()?;
+            let weak = heap.alloc()?;
+            let old = heap.alloc()?;
+            heap.set_metatable(owner, Some(mode))?;
+            heap.set_metatable(weak, Some(mode))?;
+            let frame = heap.enter_roots(4)?;
+            // Gray pops the highest root first: owner, then the pending sentinel.
+            heap.write_root(frame, 0, mode)?;
+            heap.write_root(frame, 1, weak)?;
+            heap.write_root(frame, 2, sentinel)?;
+            heap.write_root(frame, 3, owner)?;
+            write_ordinary_table(heap, owner, key, old)?;
+            write_ordinary_peer(heap, owner, key)?;
+            heap.issue_carrier(old)?;
+            heap.set_named_scalar(sentinel, "pending", Value::Bool(true))?;
+            let gap_key = heap
+                .next_guest(owner, &Value::Null)?
+                .expect("the old value is the first cursor")
+                .0;
+            let peer = heap
+                .next_guest(owner, &gap_key)?
+                .expect("the sibling follows the old value");
+            assert!(heap.next_guest(owner, &peer.0)?.is_none());
+            let gap_index = locate_ordinary(heap, owner, key, false).expect("gap record");
+            let peer_index = locate_ordinary(heap, owner, key, true).expect("peer record");
+            let sentinel_index = heap
+                .locate_named(sentinel.slot(), "pending")
+                .map(|(_, index)| index)
+                .expect("sentinel record");
+            Ok((
+                mode,
+                owner,
+                sentinel,
+                weak,
+                old,
+                gap_key,
+                peer,
+                gap_index,
+                peer_index,
+                sentinel_index,
+            ))
+        })
+        .expect("first-cycle graph");
+        let (
+            mode,
+            owner,
+            sentinel,
+            weak,
+            old,
+            gap_key,
+            peer,
+            gap_index,
+            peer_index,
+            sentinel_index,
+        ) = built;
+        let old_generation = old.generation();
+
+        heap::collect(&mut host).expect("weak values clear in a full cycle");
+        heap::with_heap(&mut host, |heap| {
+            assert!(!heap.alive(old), "the old node is not live");
+            assert_ne!(
+                slot_generation(heap, old),
+                old_generation,
+                "the old node generation was released"
+            );
+            assert!(
+                record_is_gap(heap, gap_index),
+                "the original record is a physical gap"
+            );
+            assert_eq!(
+                locate_ordinary(heap, owner, key, false),
+                Some(gap_index),
+                "the gap kept its record index"
+            );
+            assert_eq!(
+                locate_ordinary(heap, owner, key, true),
+                Some(peer_index),
+                "the other same-owner record remains"
+            );
+            assert_eq!(read_ordinary(heap, owner, key)?, Value::Null);
+            assert_eq!(heap.next_guest(owner, &Value::Null)?, Some(peer.clone()));
+            assert_eq!(
+                heap.next_guest(owner, &gap_key)?,
+                Some(peer.clone()),
+                "the saved next cursor continues"
+            );
+            assert_eq!(heap.stats().collections, 1);
+            assert_eq!(heap.scan_meter().mark_passes, 1);
+            if matches!(key, OrdinaryGapKey::Number) {
+                let spelling = super::EdgeKey::named(NUMBER_SPELLING);
+                assert_ne!(
+                    super::EdgeKey::number(GAP_NUMBER),
+                    spelling,
+                    "a negative integer does not alias its spelling"
+                );
+                assert!(heap.find_key(owner.slot(), &spelling).is_none());
+                assert_ne!(gap_key, Value::string(NUMBER_SPELLING));
+            }
+            Ok(())
+        })
+        .expect("physical gap after the first cycle");
+
+        assert!(
+            heap::fixed_step_idle(&mut host).expect("between cycles"),
+            "the mode change is idle"
+        );
+        let (target, child, orphan, owner_carrier, target_carrier) =
+            heap::with_heap(&mut host, |heap| {
+                if !matches!(write, OrdinaryGapWrite::WeakValue) {
+                    heap.set_metatable(owner, None)?;
+                    assert_eq!(heap.metatable(owner)?, None);
+                } else {
+                    assert_eq!(heap.metatable(owner)?, Some(mode));
+                }
+                let target = heap.alloc()?;
+                let child = heap.alloc()?;
+                let orphan = heap.alloc()?;
+                heap.set_named_edge(target, GAP_CHILD, child)?;
+                heap.set_named_edge(weak, "watch", target)?;
+                heap.set_named_edge(weak, GAP_CHILD, child)?;
+                heap.set_named_edge(weak, "orphan", orphan)?;
+                assert!(
+                    heap.roots.iter().all(|slot| !root_holds(slot, target)
+                        && !root_holds(slot, child)
+                        && !root_holds(slot, orphan)),
+                    "the new objects have no fixed root"
+                );
+                assert_eq!(heap.stats().live_roots, 4);
+                let owner_carrier = heap.issue_carrier(owner)?;
+                let target_carrier = heap.issue_carrier(target)?;
+                Ok((target, child, orphan, owner_carrier, target_carrier))
+            })
+            .expect("weak observation only");
+
+        heap::open_fixed_step(&mut host).expect("second Gray cycle");
+        heap::with_heap(&mut host, |heap| {
+            let mut parked = ParkedMark::resume(heap).expect("resume second mark");
+            let seen = pause_on_later_pass(&mut parked, owner.slot(), gap_index);
+            assert_eq!(parked.meter().mark_passes, 2, "this is a new mark pass");
+            assert_eq!((seen.owner, seen.cursor), (owner.slot(), gap_index));
+            let gaps_before = parked.meter().outgoing_gap_checks;
+            let pending = pause_on_later_pass(&mut parked, sentinel.slot(), sentinel_index);
+            assert_eq!(
+                parked.meter().outgoing_gap_checks,
+                gaps_before + 1,
+                "the original gap record was charged"
+            );
+            assert!(parked.marked(owner), "the owner was scanned");
+            assert!(
+                !parked.marked(target) && !parked.marked(child),
+                "weak observation does not mark the refill"
+            );
+            assert_eq!(
+                (pending.owner, pending.cursor),
+                (sentinel.slot(), sentinel_index),
+                "another owner is still pending"
+            );
+            parked.park()?;
+            assert!(
+                record_is_gap(heap, gap_index),
+                "scanning the gap did not rewrite the record"
+            );
+            let chain_next = heap.edge_slots[gap_index as usize].next;
+            let occupied = heap.stats().edge_slots;
+            let live = heap.stats().live_edges;
+            let before = heap.scan_meter();
+            if !matches!(write, OrdinaryGapWrite::Omitted) {
+                write_ordinary_table(heap, owner, key, target)?;
+            }
+            assert_eq!(locate_ordinary(heap, owner, key, false), Some(gap_index));
+            assert_eq!(locate_ordinary(heap, owner, key, true), Some(peer_index));
+            assert_eq!(heap.edge_slots[gap_index as usize].next, chain_next);
+            assert_eq!(heap.issued_value(owner)?, owner_carrier);
+            assert_eq!(heap.issued_value(target)?, target_carrier);
+            assert_eq!(
+                heap.stats().edge_slots,
+                occupied,
+                "replace does not allocate"
+            );
+            let live_delta = u32::from(!matches!(write, OrdinaryGapWrite::Omitted));
+            assert_eq!(heap.stats().live_edges, live + live_delta);
+            if !matches!(write, OrdinaryGapWrite::Omitted) {
+                let index = locate_ordinary(heap, owner, key, false).expect("refilled record");
+                assert_eq!(stored_table(heap, index), Some(target));
+            } else {
+                assert!(
+                    record_is_gap(heap, gap_index),
+                    "an omitted write leaves the gap"
+                );
+                assert_eq!(read_ordinary(heap, owner, key)?, Value::Null);
+            }
+            let mut parked = ParkedMark::resume(heap).expect("mark survived the ordinary write");
+            let cursor = parked.pending().expect("sentinel still pending");
+            assert_eq!(
+                (cursor.owner, cursor.cursor),
+                (pending.owner, pending.cursor)
+            );
+            assert!(!parked.marked(child), "the write must not scan the child");
+            let after = parked.meter();
+            assert_eq!(after.mark_passes, 2);
+            assert_eq!(after.mark_passes, before.mark_passes);
+            assert_eq!(after.outgoing_edge_checks, before.outgoing_edge_checks);
+            assert_eq!(after.outgoing_gap_checks, before.outgoing_gap_checks);
+            assert_eq!(after.owner_head_checks, before.owner_head_checks);
+            assert_eq!(after.root_slot_visits, before.root_slot_visits);
+            assert_eq!(after.parked_cursor_repairs, before.parked_cursor_repairs);
+            parked.park()?;
+            Ok(())
+        })
+        .expect("ordinary refill while Gray is parked");
+
+        let published = heap::step_fixed_frames(&mut host, 128).expect("publish");
+        assert!(
+            matches!(published, StepOutcome::Published { .. }),
+            "{published:?}"
+        );
+        assert_eq!(heap::stats(&mut host).expect("published").collections, 1);
+        heap::with_heap(&mut host, |heap| {
+            assert_eq!(
+                heap.set_named_edge(owner, "blocked", sentinel),
+                Err(HeapError::SweepPending)
+            );
+            if matches!(write, OrdinaryGapWrite::WeakValue) {
+                assert_eq!(read_ordinary(heap, owner, key)?, Value::Null);
+                assert!(
+                    record_is_gap(heap, gap_index),
+                    "weak publication restores the gap"
+                );
+                assert_eq!(locate_ordinary(heap, owner, key, false), Some(gap_index));
+            }
+            if matches!(write, OrdinaryGapWrite::Omitted) {
+                assert!(record_is_gap(heap, gap_index));
+                assert_eq!(read_ordinary(heap, owner, key)?, Value::Null);
+            }
+            Ok(())
+        })
+        .expect("publication");
+        let done = heap::step_fixed_frames(&mut host, 128).expect("finish this cycle");
+        assert!(matches!(done, StepOutcome::Completed(_)), "{done:?}");
+        assert!(heap::fixed_step_idle(&mut host).expect("idle"));
+        heap::with_heap(&mut host, |heap| {
+            assert_eq!(
+                heap.alive(target),
+                retained,
+                "ordinary gap refill must keep a strong value alive through this cycle"
+            );
+            assert_eq!(
+                heap.alive(child),
+                retained,
+                "the child is reached only by the continued scan"
+            );
+            assert!(
+                !heap.alive(orphan),
+                "the weak orphan proves this cycle released nodes"
+            );
+            assert_ne!(slot_generation(heap, orphan), orphan.generation());
+            assert_eq!(heap.stats().collections, 2);
+            assert_eq!(heap.scan_meter().mark_passes, 2);
+            assert_eq!(locate_ordinary(heap, owner, key, true), Some(peer_index));
+            if retained {
+                assert_eq!(slot_generation(heap, target), target.generation());
+                assert_eq!(read_ordinary(heap, owner, key)?, target_carrier);
+                assert_eq!(heap.named_edge(target, GAP_CHILD)?, Some(child));
+                clear_ordinary(heap, owner, key)?;
+            } else {
+                assert_ne!(slot_generation(heap, target), target.generation());
+                assert!(record_is_gap(heap, gap_index));
+            }
+            Ok(())
+        })
+        .expect("this cycle's release");
+        if retained {
+            heap::collect(&mut host).expect("next cycle after the only strong edge is removed");
+            heap::with_heap(&mut host, |heap| {
+                assert!(!heap.alive(target) && !heap.alive(child));
+                assert_ne!(slot_generation(heap, target), target.generation());
+                assert_ne!(slot_generation(heap, child), child.generation());
+                assert_eq!(heap.stats().collections, 3);
+                assert_eq!(heap.scan_meter().mark_passes, 3);
+                assert!(locate_ordinary(heap, owner, key, false).is_none());
+                Ok(())
+            })
+            .expect("later reclamation");
+        }
+    });
+}
+
+#[test]
+fn gray_ordinary_gap_text_strong_refill_keeps_the_new_graph() {
+    ordinary_gap_refill_after_real_clear(OrdinaryGapKey::Text, OrdinaryGapWrite::Strong);
+}
+
+#[test]
+fn gray_ordinary_gap_number_strong_refill_keeps_the_new_graph() {
+    ordinary_gap_refill_after_real_clear(OrdinaryGapKey::Number, OrdinaryGapWrite::Strong);
+}
+
+#[test]
+fn gray_ordinary_gap_text_weak_refill_publishes_nil() {
+    ordinary_gap_refill_after_real_clear(OrdinaryGapKey::Text, OrdinaryGapWrite::WeakValue);
+}
+
+#[test]
+fn gray_ordinary_gap_number_weak_refill_publishes_nil() {
+    ordinary_gap_refill_after_real_clear(OrdinaryGapKey::Number, OrdinaryGapWrite::WeakValue);
+}
+
+#[test]
+fn gray_ordinary_gap_text_omitted_write_keeps_the_gap() {
+    ordinary_gap_refill_after_real_clear(OrdinaryGapKey::Text, OrdinaryGapWrite::Omitted);
+}
+
+#[test]
+fn gray_ordinary_gap_number_omitted_write_keeps_the_gap() {
+    ordinary_gap_refill_after_real_clear(OrdinaryGapKey::Number, OrdinaryGapWrite::Omitted);
+}

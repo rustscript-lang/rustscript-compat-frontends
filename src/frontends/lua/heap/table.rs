@@ -2937,12 +2937,15 @@ fn edge_key_is_slot(key: &EdgeKey, slot: u32) -> bool {
     matches!(key, EdgeKey::Object { slot: key_slot, .. } if *key_slot == slot)
 }
 
-/// Ordinary non-gap field, UTF-8, number, or table-object key whose new value
-/// is a table. Reserved fields, closure and upvalue object keys, gaps, and
-/// non-table values stay out of the gray queue. The table-object key itself
+/// Ordinary field, UTF-8, number, or table-object key whose new value is a
+/// table. Reserved fields, closure and upvalue object keys, and non-table
+/// values stay out of the gray queue. A prior gap is also refused, except when
+/// an ordinary UTF-8 or number key is refilled with a table: that value uses
+/// the same strong-field enqueue as a live edge. The table-object key itself
 /// is not recolored; only the new table value is offered to the barrier.
 fn replaced_table_target(key: &EdgeKey, old_gap: bool, value: &EdgeValue) -> Option<(u32, u32)> {
-    if old_gap {
+    let ordinary_named_or_number = matches!(key, EdgeKey::Utf8(_) | EdgeKey::Number(_));
+    if old_gap && !ordinary_named_or_number {
         return None;
     }
     let ordinary = match key {
