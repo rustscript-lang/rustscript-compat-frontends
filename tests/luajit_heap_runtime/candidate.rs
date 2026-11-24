@@ -1078,23 +1078,41 @@ fn finish_return(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
     for value in values.iter() {
         elements.push(return_element(call, value)?);
     }
-    // Shapes are already validated. A retiring callee cannot carry a table
-    // across a saved tail, before any caller root, handoff, or frame exit.
-    // Number and nil still retire. publish and the diagnostic witness are not
-    // this check.
-    if callee_flag
+    // A saved Release tail may publish one issued table into the direct
+    // caller's empty slot, then the existing retire drops the callee frame.
+    // Every other table shape, including publish=0, still refuses before any
+    // root write. Number and nil do not enter this path.
+    let release_root = if callee_flag
         && elements
             .iter()
             .any(|element| matches!(element, ReturnedElement::Table { .. }))
     {
-        let tail = heap::saved_sweep_tail(&mut call.vm().host_context()).map_err(heap_error)?;
-        if tail {
-            return Err(heap_error(heap::HeapError::SweepPending));
+        match heap::saved_tail_state(&mut call.vm().host_context()).map_err(heap_error)? {
+            Some(_) => {
+                if !publish || values.len() != 1 || root_slots.len() != 1 {
+                    return Err(heap_error(heap::HeapError::SweepPending));
+                }
+                Some(publish_release_table(
+                    call,
+                    &values[0],
+                    &frame_token,
+                    &root_slots,
+                )?)
+            }
+            None => None,
         }
-    }
+    } else {
+        None
+    };
     // Classify each consumed position. Nil, scalars, and the transport array
-    // do not become roots. The callee source name is not consulted.
-    let wrote = publish_consumed_tables(call, &values, &frame_token, publish, &root_slots)?;
+    // do not become roots. The callee source name is not consulted. The
+    // Release handoff above already wrote its one root and must not call this
+    // writer again.
+    let wrote = if release_root.is_some() {
+        true
+    } else {
+        publish_consumed_tables(call, &values, &frame_token, publish, &root_slots)?
+    };
     let lua_frame_alive = if callee_flag {
         heap::with_heap(&mut call.vm().host_context(), |heap| {
             Ok(heap.current_frame().is_some())
@@ -1125,6 +1143,7 @@ fn finish_return(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
         witness.lua_frame_alive_at_publish = lua_frame_alive;
         witness.returned_edge_at_handoff = returned_edge;
         witness.discarded_edge_at_handoff = discarded_edge;
+        witness.release_root = release_root;
         witness.handoffs.push(Handoff {
             elements,
             published_root: wrote,
@@ -1138,6 +1157,41 @@ fn finish_return(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
         });
     })?;
     Ok(transport)
+}
+
+fn publish_release_table(
+    call: &mut OwnedHostCall<'_>,
+    value: &Value,
+    frame_token: &Value,
+    root_slots: &[Value],
+) -> Result<ReleaseRootNote, VmError> {
+    if !matches!(
+        classify(&mut call.vm().host_context(), value)?,
+        heap::GuestClass::Table(_)
+    ) {
+        return Err(heap_error(heap::HeapError::SweepPending));
+    }
+    if matches!(frame_token, Value::Null) {
+        return Err(heap_error(heap::HeapError::SweepPending));
+    }
+    let frame = decode_frame(call, frame_token)?;
+    let slot = float_u32(&root_slots[0])?;
+    let meter_before = heap::copy_scan_meter(&mut call.vm().host_context()).map_err(heap_error)?;
+    let tail_before = heap::saved_tail_state(&mut call.vm().host_context())
+        .map_err(heap_error)?
+        .ok_or_else(|| heap_error(heap::HeapError::SweepDenied))?;
+    heap::publish_release_return_root(&mut call.vm().host_context(), frame, slot, value)
+        .map_err(heap_error)?;
+    let meter_after = heap::copy_scan_meter(&mut call.vm().host_context()).map_err(heap_error)?;
+    let tail_after = heap::saved_tail_state(&mut call.vm().host_context())
+        .map_err(heap_error)?
+        .ok_or_else(|| heap_error(heap::HeapError::SweepDenied))?;
+    Ok(ReleaseRootNote {
+        meter_before,
+        meter_after,
+        tail_before,
+        tail_after,
+    })
 }
 
 fn publish_consumed_tables(
@@ -4406,6 +4460,17 @@ pub(super) struct ReturnWitness {
     pub issued: Vec<heap::TableRef>,
     /// Whether the latest issued table was still alive at each guest collect.
     pub issued_alive_at_collect: Vec<bool>,
+    /// Meter and tail snapshot around a Release caller-root write. Absent when
+    /// that path did not run.
+    pub release_root: Option<ReleaseRootNote>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ReleaseRootNote {
+    pub meter_before: heap::ScanMeter,
+    pub meter_after: heap::ScanMeter,
+    pub tail_before: heap::SavedTailState,
+    pub tail_after: heap::SavedTailState,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

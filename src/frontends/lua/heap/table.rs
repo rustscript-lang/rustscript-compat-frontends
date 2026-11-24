@@ -171,6 +171,26 @@ pub struct HeapStats {
     pub peak_edges: u32,
 }
 
+/// Phase of a saved published tail. Callers use this instead of `Debug` text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SavedTailPhase {
+    /// Dead slots are still being released.
+    Release,
+    /// Occupied root slots are being counted.
+    Roots,
+    /// The tail recorded its report and is finished.
+    Done,
+}
+
+/// Cursor and accounted roots of one saved tail. Reading this does not scan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SavedTailState {
+    pub phase: SavedTailPhase,
+    pub cursor: usize,
+    pub live_roots: u32,
+    pub dead_len: usize,
+}
+
 /// Result of one collection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CollectReport {
@@ -2094,6 +2114,58 @@ impl LuaHeap {
         Ok(())
     }
 
+    /// Stores one marked, published table in the direct caller's empty slot.
+    ///
+    /// Only a saved Release tail admits this. Phase, frame, slot, emptiness,
+    /// liveness, and the mark bit are all checked before the assignment. The
+    /// ordinary writer is not used: this does not call `ensure_sweep_open`,
+    /// does not park a mark, and does not move the tail cursor, its accounted
+    /// root count, the scan meter, or the frame stack.
+    #[cfg(test)]
+    pub(super) fn store_release_caller_root(
+        &mut self,
+        caller: RootFrameId,
+        slot: u32,
+        table: TableRef,
+    ) -> Result<(), HeapError> {
+        let release = self
+            .sweep_tail
+            .as_ref()
+            .is_some_and(|tail| tail.phase() == sweep::TailPhase::Release);
+        if self.sweep_tail.is_none() {
+            return Err(HeapError::SweepDenied);
+        }
+        if !release {
+            return Err(HeapError::SweepPending);
+        }
+        let Some(direct) = self.frames.len().checked_sub(2) else {
+            return Err(HeapError::StaleFrame);
+        };
+        let found = &self.frames[direct];
+        if found.index != caller.index || found.generation != caller.generation {
+            return Err(HeapError::StaleFrame);
+        }
+        if slot >= found.width {
+            return Err(HeapError::StaleFrame);
+        }
+        let index = found.start as usize + slot as usize;
+        if self.roots.get(index).is_none() {
+            return Err(HeapError::StaleFrame);
+        }
+        if self.roots[index].is_some() {
+            return Err(HeapError::SweepPending);
+        }
+        self.require_live(table)?;
+        if !Self::slot_marked(&self.slots[table.slot() as usize].state) {
+            return Err(HeapError::SweepPending);
+        }
+        // The binding must still be on this slot. Core usability is a separate
+        // check and is not implied by this raw id.
+        self.published_token(table)?;
+        self.roots[index] = Some(Rooted::Table(table));
+        Ok(())
+    }
+
     /// Clears one slot of an open frame. The frame does not have to be the
     /// top frame. Other slots, including another slot holding the same table,
     /// stay. A stale id or an out-of-range slot is refused. An empty slot
@@ -2211,6 +2283,51 @@ impl LuaHeap {
     /// True when a published sweep tail is stored. Does not read slots or edges.
     pub(super) fn has_sweep_tail(&self) -> bool {
         self.sweep_tail.is_some()
+    }
+
+    /// Phase, cursor, and accounted roots. Does not scan or resume the tail.
+    #[cfg(test)]
+    pub fn saved_tail_state(&self) -> Option<SavedTailState> {
+        let tail = self.sweep_tail.as_ref()?;
+        let phase = match tail.phase() {
+            sweep::TailPhase::Release => SavedTailPhase::Release,
+            sweep::TailPhase::Roots => SavedTailPhase::Roots,
+            sweep::TailPhase::Done => SavedTailPhase::Done,
+        };
+        Some(SavedTailState {
+            phase,
+            cursor: tail.cursor(),
+            live_roots: tail.accounted_roots(),
+            dead_len: tail.dead_len(),
+        })
+    }
+
+    /// Copies the scan meter. Does not clear it and does not visit a slot.
+    #[cfg(test)]
+    pub fn scan_meter(&self) -> ScanMeter {
+        self.scan
+    }
+
+    /// The table in one frame slot, if that slot holds a table. Does not scan.
+    #[cfg(test)]
+    pub fn rooted_table(
+        &self,
+        frame: RootFrameId,
+        slot: u32,
+    ) -> Result<Option<TableRef>, HeapError> {
+        let (start, width) = {
+            let found = self.frame(frame)?;
+            (found.start, found.width)
+        };
+        if slot >= width {
+            return Err(HeapError::StaleFrame);
+        }
+        let index = start as usize + slot as usize;
+        match self.roots.get(index).copied().flatten() {
+            None => Ok(None),
+            Some(Rooted::Table(table)) => Ok(Some(table)),
+            Some(_) => Err(HeapError::StaleHandle),
+        }
     }
 
     /// Domain that issued handles for this heap. Does not read slots.

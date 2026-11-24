@@ -65,6 +65,7 @@ struct StepNote {
     opened: bool,
     outcome: StepOutcome,
     node_slot_visits: u64,
+    root_slot_visits: u64,
     live_nodes_before: u32,
     live_nodes_after: u32,
     root_slots: u32,
@@ -108,6 +109,8 @@ struct Ran {
     token_open: Option<bool>,
     handoff: Option<HandoffSnap>,
     collects: usize,
+    returned: Option<heap::TableRef>,
+    release_root: Option<candidate::ReleaseRootNote>,
 }
 
 struct Plugin;
@@ -284,6 +287,7 @@ fn step_host(host: &mut vm::HostContext<'_>, args: &[Value]) -> Result<Value, Vm
             opened: idle,
             outcome,
             node_slot_visits: meter.node_slot_visits,
+            root_slot_visits: meter.root_slot_visits,
             live_nodes_before: before.live_nodes,
             live_nodes_after: after.live_nodes,
             root_slots: after.root_slots,
@@ -403,6 +407,11 @@ fn run(source: &str) -> Ran {
         .scope_state::<candidate::ReturnWitness>()
         .map(|witness| witness.collects.len())
         .unwrap_or(0);
+    let (returned, release_root) = vm
+        .host_context()
+        .scope_state::<candidate::ReturnWitness>()
+        .map(|witness| (witness.returned, witness.release_root.clone()))
+        .unwrap_or((None, None));
     let stop = match status {
         Ok(VmStatus::Halted) => Stop::Halted,
         Err(VmError::HostError(message)) => Stop::HostError(message),
@@ -423,6 +432,8 @@ fn run(source: &str) -> Ran {
         token_open,
         handoff,
         collects,
+        returned,
+        release_root,
     }
 }
 
@@ -1052,4 +1063,448 @@ fn published_tail_refuses_direct_table_consumption() {
             .is_none_or(|item| !item.callee_left && item.elements.is_empty()),
         "the table is refused before handoff and retire: {ran:#?}"
     );
+}
+
+const RETAIN_OPEN: &str = r#"
+local function callee()
+  local w = {}
+  local mt = {}
+  local t = {}
+  mt.__mode = "v"
+  setmetatable(w, mt)
+  t[1] = t
+  w[1] = t
+  w[2] = {}
+  w[3] = {}
+  peek(t)
+  note(12, same(t, rawget(t, 1)))
+  return t
+end
+local kept = callee()
+peek(kept)
+note(13, same(kept, rawget(kept, 1)))
+collectgarbage("collect")
+peek(kept)
+note(14, same(kept, rawget(kept, 1)))
+kept = nil
+collectgarbage("collect")
+return 1
+"#;
+
+const RETAIN_RELEASE: &str = r#"
+local function callee()
+  local w = {}
+  local mt = {}
+  local t = {}
+  mt.__mode = "v"
+  setmetatable(w, mt)
+  t[1] = t
+  w[1] = t
+  w[2] = {}
+  w[3] = {}
+  peek(t)
+  note(30, rawlen(w))
+  step(1)
+  step(10000)
+  note(10, rawlen(w))
+  note(11, same(t, rawget(w, 1)))
+  note(12, same(t, rawget(t, 1)))
+  text(2, type(rawget(w, 2)))
+  text(3, type(rawget(w, 3)))
+  step(1)
+  return t
+end
+local kept = callee()
+peek(kept)
+note(13, same(kept, rawget(kept, 1)))
+step(10000)
+collectgarbage("collect")
+peek(kept)
+note(14, same(kept, rawget(kept, 1)))
+kept = nil
+collectgarbage("collect")
+return 1
+"#;
+
+fn assert_kept_identity(ran: &Ran) {
+    assert_eq!(ran.stop, Stop::Halted, "{ran:#?}");
+    assert_eq!(ran.stack, vec![Value::Float(1.0)], "{ran:#?}");
+    assert_eq!(
+        ran.trace.peeks.len(),
+        3,
+        "callee, caller, and held collect: {ran:#?}"
+    );
+    let issued = ran.trace.peeks[0].table;
+    assert_eq!(
+        ran.trace.peeks[1].table, issued,
+        "caller keeps the original table"
+    );
+    assert_eq!(
+        ran.trace.peeks[2].table, issued,
+        "the next collection keeps that identity"
+    );
+    assert_eq!(issued.domain(), ran.trace.peeks[1].table.domain());
+    assert_eq!(issued.slot(), ran.trace.peeks[1].table.slot());
+    assert_eq!(issued.generation(), ran.trace.peeks[1].table.generation());
+    assert_eq!(note_value(&ran.trace, 12.0), 1.0, "self-loop before return");
+    assert_eq!(note_value(&ran.trace, 13.0), 1.0, "self-loop after publish");
+    assert_eq!(
+        note_value(&ran.trace, 14.0),
+        1.0,
+        "self-loop after the held collection"
+    );
+    assert_eq!(ran.returned, Some(issued));
+    let handoff = ran.handoff.as_ref().expect("finish_return witness");
+    assert!(handoff.published_root, "the caller slot receives the table");
+    assert!(
+        handoff.callee_left,
+        "the callee frame leaves after the publish"
+    );
+    assert!(
+        handoff.lua_frame_alive_at_publish,
+        "the callee frame is still current when the caller slot is written"
+    );
+    assert!(matches!(
+        handoff.elements.as_slice(),
+        [ReturnedElement::Table {
+            same_ref: true,
+            same_carrier: true
+        }]
+    ));
+    assert_eq!(
+        ran.subject_alive,
+        Some(false),
+        "clearing the slot lets the next collection reclaim it"
+    );
+    assert_eq!(
+        ran.token_open,
+        Some(false),
+        "that collection closes the original token"
+    );
+    assert_eq!(ran.live_roots, 0);
+    assert_eq!(ran.collects, 2, "held collect, then the clear collect");
+}
+
+#[test]
+fn no_tail_local_keeps_the_returned_table_identity() {
+    let ran = run(RETAIN_OPEN);
+    assert!(!ran.tail, "no tail was saved: {ran:#?}");
+    assert!(
+        ran.release_root.is_none(),
+        "the open path does not use the Release writer"
+    );
+    assert_kept_identity(&ran);
+    assert_eq!(ran.collections, 2, "only the two guest collections ran");
+}
+
+#[test]
+fn published_release_retains_one_returned_table() {
+    let ran = run(RETAIN_RELEASE);
+    assert_kept_identity(&ran);
+    let steps = &ran.trace.steps;
+    assert!(
+        steps.len() >= 4,
+        "publish, release pause, then the continuation: {steps:?}"
+    );
+    assert!(matches!(
+        steps[0].outcome,
+        StepOutcome::Paused { tail: false }
+    ));
+    assert!(matches!(steps[1].outcome, StepOutcome::Published { .. }));
+    assert!(matches!(
+        steps[2].outcome,
+        StepOutcome::Paused { tail: true }
+    ));
+    assert_eq!(
+        steps[2].node_slot_visits, 1,
+        "one release visit before the return"
+    );
+    assert_eq!(
+        steps[2].root_slot_visits, 0,
+        "Release has not scanned roots"
+    );
+    assert_eq!(note_value(&ran.trace, 30.0), 3.0);
+    assert_eq!(
+        note_value(&ran.trace, 10.0),
+        1.0,
+        "weak clear was published"
+    );
+    assert_eq!(note_value(&ran.trace, 11.0), 1.0);
+    assert_eq!(text_value(&ran.trace, 2.0), "nil");
+    assert_eq!(text_value(&ran.trace, 3.0), "nil");
+    let note = ran.release_root.as_ref().expect("Release handoff note");
+    assert_eq!(
+        note.meter_before, note.meter_after,
+        "the handoff does not scan"
+    );
+    assert_eq!(
+        note.meter_before.root_slot_visits,
+        note.meter_after.root_slot_visits
+    );
+    assert_eq!(note.tail_before.phase, heap::SavedTailPhase::Release);
+    assert_eq!(note.tail_after.phase, heap::SavedTailPhase::Release);
+    assert_eq!(note.tail_before.cursor, note.tail_after.cursor);
+    assert_eq!(note.tail_before.live_roots, note.tail_after.live_roots);
+    assert_eq!(note.tail_before.dead_len, note.tail_after.dead_len);
+    assert_eq!(
+        note.tail_before.live_roots, 0,
+        "Release has not accounted a root yet"
+    );
+    let completed: Vec<_> = steps
+        .iter()
+        .filter(|step| matches!(step.outcome, StepOutcome::Completed(_)))
+        .collect();
+    assert_eq!(completed.len(), 1, "this cycle reports once: {steps:?}");
+    let report = match completed[0].outcome {
+        StepOutcome::Completed(report) => report,
+        _ => unreachable!("filtered"),
+    };
+    assert_eq!(
+        report.live_roots, 1,
+        "the continuation counts the caller slot once"
+    );
+    assert_eq!(
+        completed[0].root_slot_visits, 1,
+        "the later root scan visits that slot once"
+    );
+    assert!(
+        steps
+            .iter()
+            .take(3)
+            .all(|step| !matches!(step.outcome, StepOutcome::Completed(_))),
+        "completion is after the return"
+    );
+    assert_ne!(
+        steps[2].frame, completed[0].frame,
+        "the callee has left before the report"
+    );
+    assert_eq!(
+        ran.collections, 3,
+        "tail report, held collect, then the clear collect"
+    );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Refusal {
+    WrongFrame,
+    StaleGeneration,
+    Occupied,
+    Unmarked,
+    ClosedToken,
+    Roots,
+    NoTail,
+}
+
+struct ReleaseGraph {
+    caller: heap::RootFrameId,
+    callee: heap::RootFrameId,
+    subject: Value,
+    subject_ref: heap::TableRef,
+    unmarked: Value,
+    spare: Value,
+    occupant: Option<heap::TableRef>,
+}
+
+fn table_of(host: &mut vm::HostContext<'_>, value: &Value) -> heap::TableRef {
+    match heap::with_heap(host, |heap| Ok(heap.guest_class(value))).expect("class") {
+        heap::GuestClass::Table(table) => table,
+        other => panic!("expected an issued table, got {other:?}"),
+    }
+}
+
+fn open_release(vm: &mut vm::Vm, prefill: bool) -> ReleaseGraph {
+    let mut host = vm.host_context();
+    heap::install(&mut host, heap::HeapLimits::production()).expect("install");
+    let caller = heap::with_heap(&mut host, |heap| heap.enter_roots(1)).expect("caller");
+    let occupant = if prefill {
+        let value = heap::publish_guest(&mut host).expect("occupant");
+        let table = table_of(&mut host, &value);
+        heap::with_heap(&mut host, |heap| heap.write_root(caller, 0, table)).expect("prefill");
+        Some(table)
+    } else {
+        None
+    };
+    let callee = heap::with_heap(&mut host, |heap| heap.enter_roots(1)).expect("callee");
+    let subject = heap::publish_guest(&mut host).expect("subject");
+    let subject_ref = table_of(&mut host, &subject);
+    heap::with_heap(&mut host, |heap| heap.write_root(callee, 0, subject_ref))
+        .expect("root subject");
+    let unmarked = heap::publish_guest(&mut host).expect("unmarked");
+    let spare = heap::publish_guest(&mut host).expect("spare unmarked");
+    let _dead = heap::publish(&mut host).expect("dead slot");
+    heap::open_fixed_step(&mut host).expect("open");
+    let _pause = heap::step_fixed_frames(&mut host, 1).expect("mark pause");
+    let published = heap::step_fixed_frames(&mut host, 10_000).expect("publish");
+    assert!(
+        matches!(published, StepOutcome::Published { .. }),
+        "the graph must publish a tail: {published:?}"
+    );
+    let release = heap::step_fixed_frames(&mut host, 1).expect("release");
+    assert!(
+        matches!(release, StepOutcome::Paused { tail: true }),
+        "one release unit must leave the tail saved: {release:?}"
+    );
+    let state = heap::saved_tail_state(&mut host)
+        .expect("tail")
+        .expect("saved");
+    assert_eq!(state.phase, heap::SavedTailPhase::Release);
+    ReleaseGraph {
+        caller,
+        callee,
+        subject,
+        subject_ref,
+        unmarked,
+        spare,
+        occupant,
+    }
+}
+
+fn drive_to_roots(host: &mut vm::HostContext<'_>) {
+    for _ in 0..16 {
+        let state = heap::saved_tail_state(host).expect("tail read");
+        if state.is_some_and(|item| item.phase == heap::SavedTailPhase::Roots) {
+            return;
+        }
+        assert!(state.is_some(), "the tail ended before Roots");
+        heap::step_fixed_frames(host, 1).expect("step toward Roots");
+    }
+    panic!("did not reach Roots");
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AdmissionSnap {
+    tail: Option<heap::SavedTailState>,
+    meter: heap::ScanMeter,
+    stats: heap::HeapStats,
+    caller_root: Option<heap::TableRef>,
+    frame: Option<heap::RootFrameId>,
+}
+
+fn admission_snap(host: &mut vm::HostContext<'_>, caller: heap::RootFrameId) -> AdmissionSnap {
+    AdmissionSnap {
+        tail: heap::saved_tail_state(host).expect("tail"),
+        meter: heap::copy_scan_meter(host).expect("meter"),
+        stats: heap::stats(host).expect("stats"),
+        caller_root: heap::rooted_table(host, caller, 0).expect("slot"),
+        frame: heap::with_heap(host, |heap| Ok(heap.current_frame())).expect("frame"),
+    }
+}
+
+#[test]
+fn release_return_root_refuses_without_writing() {
+    for case in [
+        Refusal::WrongFrame,
+        Refusal::StaleGeneration,
+        Refusal::Occupied,
+        Refusal::Unmarked,
+        Refusal::ClosedToken,
+        Refusal::Roots,
+        Refusal::NoTail,
+    ] {
+        crate::support::with_idle_vm(|vm| {
+            let graph = open_release(vm, matches!(case, Refusal::Occupied));
+            let mut host = vm.host_context();
+            if matches!(case, Refusal::Roots) {
+                drive_to_roots(&mut host);
+            }
+            if matches!(case, Refusal::NoTail) {
+                let done = heap::step_fixed_frames(&mut host, 10_000).expect("finish tail");
+                assert!(
+                    matches!(done, StepOutcome::Completed(_)),
+                    "the no-tail case starts after the report: {done:?}"
+                );
+            }
+            if matches!(case, Refusal::ClosedToken) {
+                let raw =
+                    heap::with_heap(&mut host, |heap| heap.published_token(graph.subject_ref))
+                        .expect("binding");
+                let handle = vm::ResourceHandle::from_raw(raw).expect("handle");
+                host.close_resource::<heap::LuaTableResource>(
+                    handle,
+                    vm::ResourceCloseReason::Requested,
+                )
+                .expect("close token");
+            }
+            let before = admission_snap(&mut host, graph.caller);
+            let unmarked_live = matches!(
+                heap::with_heap(&mut host, |heap| Ok(heap.guest_class(&graph.unmarked)))
+                    .expect("class"),
+                heap::GuestClass::Table(_)
+            );
+            let value = if !matches!(case, Refusal::Unmarked) {
+                &graph.subject
+            } else if unmarked_live {
+                &graph.unmarked
+            } else {
+                &graph.spare
+            };
+            if matches!(case, Refusal::Unmarked) {
+                assert!(
+                    matches!(
+                        heap::with_heap(&mut host, |heap| Ok(heap.guest_class(value)))
+                            .expect("class"),
+                        heap::GuestClass::Table(_)
+                    ),
+                    "the unmarked refusal needs a still-issued table"
+                );
+            }
+            let frame = match case {
+                Refusal::WrongFrame => graph.callee,
+                Refusal::StaleGeneration => {
+                    let (index, generation) = graph.caller.parts();
+                    heap::RootFrameId::from_parts(index, generation.wrapping_add(1))
+                }
+                _ => graph.caller,
+            };
+            let error = heap::publish_release_return_root(&mut host, frame, 0, value)
+                .expect_err("the refused shape must not write");
+            match case {
+                Refusal::WrongFrame | Refusal::StaleGeneration => {
+                    assert!(
+                        matches!(error, heap::HeapError::StaleFrame),
+                        "{case:?} returned {error:?}"
+                    );
+                }
+                Refusal::NoTail => {
+                    assert!(
+                        matches!(error, heap::HeapError::SweepDenied),
+                        "{case:?} returned {error:?}"
+                    );
+                }
+                Refusal::ClosedToken => {
+                    assert!(
+                        matches!(error, heap::HeapError::Scope(_)),
+                        "a stored raw id must not pass a closed token: {error:?}"
+                    );
+                    let still =
+                        heap::with_heap(&mut host, |heap| heap.published_token(graph.subject_ref));
+                    assert!(
+                        still.is_ok(),
+                        "the heap binding remains; Core usability is a separate check: {still:?}"
+                    );
+                }
+                Refusal::Occupied | Refusal::Roots => {
+                    assert!(
+                        matches!(error, heap::HeapError::SweepPending),
+                        "{case:?} returned {error:?}"
+                    );
+                }
+                Refusal::Unmarked => {
+                    assert!(
+                        matches!(error, heap::HeapError::StaleHandle),
+                        "publish already cleared the doomed binding: {error:?}"
+                    );
+                }
+            }
+            let after = admission_snap(&mut host, graph.caller);
+            assert_eq!(before, after, "{case:?} changed heap state");
+            if let Some(occupant) = graph.occupant {
+                assert_eq!(
+                    after.caller_root,
+                    Some(occupant),
+                    "the occupied slot was replaced"
+                );
+            }
+        });
+    }
 }

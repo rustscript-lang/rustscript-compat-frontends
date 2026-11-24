@@ -61,7 +61,7 @@ enum SweepPhase {
 }
 
 /// Release or root scan saved after publish. No snapshot, modes, or owner cursor.
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum TailPhase {
     Release,
     Roots,
@@ -86,6 +86,27 @@ pub(super) enum TailStep {
 }
 
 impl SweepTail {
+    #[cfg(test)]
+    pub(super) fn phase(&self) -> TailPhase {
+        self.phase
+    }
+
+    #[cfg(test)]
+    pub(super) fn cursor(&self) -> usize {
+        self.index
+    }
+
+    /// Roots already accounted by a root scan. A Release handoff must not change this.
+    #[cfg(test)]
+    pub(super) fn accounted_roots(&self) -> u32 {
+        self.live_roots
+    }
+
+    #[cfg(test)]
+    pub(super) fn dead_len(&self) -> usize {
+        self.dead.len()
+    }
+
     /// Spends `budget` on the shared release/root machine. Zero does not read the heap.
     pub(super) fn drive(self, heap: &mut LuaHeap, budget: u64) -> TailStep {
         let mut phase = self.phase;

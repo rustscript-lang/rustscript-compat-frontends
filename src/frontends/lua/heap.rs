@@ -55,6 +55,8 @@ pub use table::{
     CellValue, CollectReport, GuestClass, HeapError, HeapLimits, HeapStats, LuaHeap, ObserveFault,
     PublishedRead, RootFrameId, ScanMeter,
 };
+#[cfg(test)]
+pub use table::{SavedTailPhase, SavedTailState};
 
 use vm::{HostContext, Value};
 
@@ -653,4 +655,72 @@ pub fn retire_saved_tail_frame(
     frame: RootFrameId,
 ) -> Result<(), HeapError> {
     retire_published_root_frame(host, frame).map(|_| ())
+}
+
+/// Phase, cursor, and accounted roots of the saved tail. Does not resume it.
+#[cfg(test)]
+pub fn saved_tail_state(host: &mut HostContext) -> Result<Option<SavedTailState>, HeapError> {
+    let Some(heap) = host.scope_state::<LuaHeap>() else {
+        return Err(HeapError::SweepDenied);
+    };
+    Ok(heap.saved_tail_state())
+}
+
+/// Copies the scan meter without clearing it.
+#[cfg(test)]
+pub fn copy_scan_meter(host: &mut HostContext) -> Result<ScanMeter, HeapError> {
+    let Some(heap) = host.scope_state::<LuaHeap>() else {
+        return Err(HeapError::SweepDenied);
+    };
+    Ok(heap.scan_meter())
+}
+
+/// The table currently stored in one frame slot. Does not scan.
+#[cfg(test)]
+pub fn rooted_table(
+    host: &mut HostContext,
+    frame: RootFrameId,
+    slot: u32,
+) -> Result<Option<TableRef>, HeapError> {
+    with_heap(host, |heap| heap.rooted_table(frame, slot))
+}
+
+/// Publishes one returned table into the direct caller slot during Release.
+///
+/// The guest carrier and the Core token are checked separately. A stored raw
+/// id is not treated as proof that the token is still open. Phase, frame,
+/// slot, and mark are checked again before the slot is written. This does not
+/// call the ordinary root writer.
+#[cfg(test)]
+pub fn publish_release_return_root(
+    host: &mut HostContext,
+    caller: RootFrameId,
+    slot: u32,
+    value: &Value,
+) -> Result<(), HeapError> {
+    if host.scope_state::<LuaHeap>().is_none() {
+        return Err(HeapError::SweepDenied);
+    }
+    let table = with_heap(host, |heap| match heap.guest_class(value) {
+        GuestClass::Table(table) => Ok(table),
+        _ => Err(HeapError::StaleHandle),
+    })?;
+    let raw = with_heap(host, |heap| heap.published_token(table))?;
+    admit_open_table_token(host, table, raw)?;
+    with_heap(host, |heap| {
+        heap.store_release_caller_root(caller, slot, table)
+    })
+}
+
+/// Borrows the typed token. Does not take ownership and does not write a root.
+#[cfg(test)]
+fn admit_open_table_token(host: &HostContext, table: TableRef, raw: u64) -> Result<(), HeapError> {
+    let handle = vm::ResourceHandle::from_raw(raw).map_err(|_| HeapError::CarrierOutOfRange)?;
+    let borrowed = host
+        .borrow_resource_with_key::<LuaTableResource>(handle, &LuaTableResource::key())
+        .map_err(HeapError::from_scope)?;
+    if borrowed.get().table() != table {
+        return Err(HeapError::StaleHandle);
+    }
+    Ok(())
 }
