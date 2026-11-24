@@ -155,7 +155,10 @@ pub(super) fn install_auto_table_due_schema(builder: &mut HostApiBuilder) {
 pub(super) fn install_auto_table_restart_entry_schema(builder: &mut HostApiBuilder) {
     builder.function(HostFunctionSchema::with_return(
         AUTO_TABLE_RESTART,
-        vec![HostParamSchema::value("roots", HostTypeSchema::Unknown)],
+        vec![
+            HostParamSchema::value("roots", HostTypeSchema::Unknown),
+            HostParamSchema::value("handoff", HostTypeSchema::Float),
+        ],
         HostTypeSchema::Float,
     ));
 }
@@ -1853,8 +1856,8 @@ pub(super) fn capture_counts(vm: &mut vm::Vm) -> (u32, u32) {
 
 fn decode_safepoint_roots(call: &mut OwnedHostCall<'_>) -> Result<Vec<heap::TableRef>, VmError> {
     let roots = match call.args() {
-        [Value::Null] => return Ok(Vec::new()),
-        [Value::Array(roots)] => roots.clone(),
+        [Value::Null] | [Value::Null, _] => return Ok(Vec::new()),
+        [Value::Array(roots)] | [Value::Array(roots), _] => roots.clone(),
         _ => {
             return Err(VmError::HostError(
                 "invalid private Lua root list".to_string(),
@@ -2063,6 +2066,10 @@ fn auto_table_restart(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
         return Ok(Value::Float(0.0));
     }
     let tables = decode_safepoint_roots(call)?;
+    // 1 is emitted only for a function-local empty table, whose next statements
+    // are NEW_TABLE and ROOT_ISSUED. The host still requires a saved gray phase
+    // with a pending scan; chunk locals and direct calls pass 0.
+    let root_handoff = matches!(call.args().get(1), Some(Value::Float(flag)) if *flag == 1.0);
     let mut host = call.vm().host_context();
     let mark_budget = pop_step_budget(&mut host)?;
     if let Some(control) = host.scope_state_mut::<GcRunControl>() {
@@ -2089,6 +2096,11 @@ fn auto_table_restart(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
                     )));
                 }
             }
+        }
+        heap::StepOutcome::Paused { tail: false }
+            if root_handoff && matches!(heap::saved_mark_query(&host), Some(("gray", true))) =>
+        {
+            return Ok(Value::Float(0.0));
         }
         heap::StepOutcome::Paused { tail } => {
             return Err(VmError::HostError(format!(
@@ -3147,7 +3159,11 @@ impl Lower<'_> {
         let start = self.stmts.len();
         let roots = self.gather_safepoint_roots(span)?;
         let gather = self.stmts.split_off(start);
-        let taken = self.call(AUTO_TABLE_RESTART, vec![roots])?;
+        // Only a function-local empty table continues into NEW_TABLE and then
+        // ROOT_ISSUED, with no guest safepoint between those statements.
+        // Chunk locals, and the direct probe, pass 0 and keep the pause error.
+        let handoff = Expr::Float(if self.in_function { 1.0 } else { 0.0 });
+        let taken = self.call(AUTO_TABLE_RESTART, vec![roots, handoff])?;
         let expr = Expr::IfElse {
             condition: Box::new(due),
             then_expr: Box::new(Expr::Block {
@@ -4516,7 +4532,7 @@ impl Lower<'_> {
                     if self.catalog.function(AUTO_TABLE_RESTART).is_none() {
                         return Err(self.unsupported(expr.span()));
                     }
-                    return self.call(AUTO_TABLE_RESTART, vec![Expr::Null]);
+                    return self.call(AUTO_TABLE_RESTART, vec![Expr::Null, Expr::Float(0.0)]);
                 }
                 let name =
                     std::str::from_utf8(&name.bytes).map_err(|_| self.unsupported(expr.span()))?;

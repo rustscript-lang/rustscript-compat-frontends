@@ -1110,6 +1110,17 @@ fn mode_string_byte(heap: &LuaHeap, edge_index: u32, at: usize) -> Option<u8> {
 }
 
 impl LuaHeap {
+    /// Phase and whether a gray edge or queued owner is still unscanned.
+    /// Does not take the mark, scan, or write.
+    #[cfg(test)]
+    pub fn saved_mark_query(&self) -> Option<(&'static str, bool)> {
+        let state = self.mark.as_ref()?;
+        Some((
+            state.phase_name(),
+            !state.gray.is_empty() || state.cursor.is_some(),
+        ))
+    }
+
     /// Counts a fixed root store and marks its target while mutation is open.
     /// The enqueue uses the same `follow_one` path as a root visit. It does
     /// not move the root cursor or the current owner cursor.

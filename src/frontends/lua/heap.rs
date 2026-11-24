@@ -692,6 +692,14 @@ pub fn saved_tail_state(host: &mut HostContext) -> Result<Option<SavedTailState>
     Ok(heap.saved_tail_state())
 }
 
+/// Saved mark phase and whether gray work remains. Absent means no saved mark.
+/// Does not take the mark, scan, enqueue, or write.
+#[cfg(test)]
+pub fn saved_mark_query(host: &HostContext) -> Option<(&'static str, bool)> {
+    host.scope_state::<LuaHeap>()
+        .and_then(LuaHeap::saved_mark_query)
+}
+
 /// Copies the scan meter without clearing it.
 #[cfg(test)]
 pub fn copy_scan_meter(host: &mut HostContext) -> Result<ScanMeter, HeapError> {

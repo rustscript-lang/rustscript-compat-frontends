@@ -28,6 +28,7 @@ const TEXT: &str = "lua_host::text";
 const BIT: &str = "lua_host::bit";
 const SHAPE: &str = "lua_host::shape";
 const METER: &str = "lua_host::meter";
+const MARK_PHASE: &str = "lua_host::mark_phase";
 
 const SOURCE: &str = r#"
 local function witness()
@@ -82,6 +83,18 @@ struct StepNote {
     collections: u32,
 }
 
+#[derive(Clone, Debug)]
+struct MarkNote {
+    tag: f64,
+    phase: Option<&'static str>,
+    pending: bool,
+    parked_root_writes: u64,
+    work_pushed: u64,
+    mark_passes: u64,
+    live_nodes: u32,
+    collects: usize,
+}
+
 #[derive(Clone, Debug, Default)]
 struct Trace {
     steps: Vec<StepNote>,
@@ -91,6 +104,7 @@ struct Trace {
     texts: Vec<(f64, String)>,
     bits: Vec<(f64, bool)>,
     bit_cycle_state: Vec<(bool, u32)>,
+    marks: Vec<MarkNote>,
 }
 
 #[derive(Clone, Debug)]
@@ -121,6 +135,9 @@ struct Ran {
     release_root: Option<candidate::ReleaseRootNote>,
     budgets: Vec<u64>,
     running: bool,
+    mark_phase: Option<&'static str>,
+    mark_pending: bool,
+    parked_root_writes: u64,
 }
 
 struct Plugin {
@@ -254,6 +271,11 @@ fn install_witness_schemas(builder: &mut vm::HostApiBuilder) {
         ],
         HostTypeSchema::Bool,
     ));
+    builder.function(vm::HostFunctionSchema::with_return(
+        MARK_PHASE,
+        vec![HostParamSchema::value("tag", HostTypeSchema::Float)],
+        HostTypeSchema::Float,
+    ));
 }
 
 fn catalog_for(guest_step: bool, run_control: bool) -> &'static Arc<vm::HostApiCatalog> {
@@ -342,6 +364,7 @@ fn register(registry: &mut HostFunctionRegistry, catalog: &vm::HostApiCatalog) {
         (BIT, HostOp::Bit),
         (SHAPE, HostOp::Shape),
         (METER, HostOp::Meter),
+        (MARK_PHASE, HostOp::MarkPhase),
     ] {
         let function = catalog.function(name).expect("scalar step host schema");
         registry
@@ -365,6 +388,7 @@ enum HostOp {
     Bit,
     Shape,
     Meter,
+    MarkPhase,
 }
 
 impl HostOwnedFunction for HostOp {
@@ -444,6 +468,31 @@ impl HostOwnedFunction for HostOp {
                         .push((tag + 4.0, if snap.running { 1.0 } else { 0.0 }));
                 })?;
                 Value::Float(snap.logical as f64)
+            }
+            Self::MarkPhase => {
+                let [Value::Float(tag)] = args.as_slice() else {
+                    return Err(host_fault("expected mark phase tag"));
+                };
+                let mark = heap::saved_mark_query(&host);
+                let meter = heap::copy_scan_meter(&mut host).map_err(host_heap)?;
+                let stats = heap::stats(&mut host).map_err(host_heap)?;
+                let collects = host
+                    .scope_state::<candidate::ReturnWitness>()
+                    .map(|witness| witness.collects.len())
+                    .unwrap_or(0);
+                note(&mut host, |state| {
+                    state.marks.push(MarkNote {
+                        tag: *tag,
+                        phase: mark.map(|(phase, _)| phase),
+                        pending: mark.is_some_and(|(_, pending)| pending),
+                        parked_root_writes: meter.parked_root_writes,
+                        work_pushed: meter.scratch.work_pushed,
+                        mark_passes: meter.mark_passes,
+                        live_nodes: stats.live_nodes,
+                        collects,
+                    });
+                })?;
+                Value::Float(0.0)
             }
         };
         Ok(CallOutcome::Return(CallReturn::one(value)))
@@ -676,6 +725,8 @@ fn drive_plugin(
         Ok(other) => Stop::Other(format!("{other:?}")),
         Err(other) => Stop::Other(other.to_string()),
     };
+    let mark = heap::saved_mark_query(&vm.host_context());
+    let meter = heap::copy_scan_meter(&mut vm.host_context()).unwrap_or_default();
     Ran {
         stop,
         stack: vm.stack().to_vec(),
@@ -694,6 +745,9 @@ fn drive_plugin(
         release_root,
         budgets,
         running,
+        mark_phase: mark.map(|(phase, _)| phase),
+        mark_pending: mark.is_some_and(|(_, pending)| pending),
+        parked_root_writes: meter.parked_root_writes,
     }
 }
 
@@ -4225,4 +4279,374 @@ fn count_lets(ir: &FrontendIr) -> usize {
         total += exprs(&function.body_expr);
     }
     total
+}
+
+/// This graph's measured pause map, from a read-only phase sweep on the parent:
+/// 1 is reset, 33 is roots, 34..=54 is gray with a pending scan, 56 is gray
+/// with the scan already drained, and 58 publishes the tail. 40 is inside the
+/// pending gray window, not a one-unit guess.
+const GRAY_PENDING_BUDGET: u64 = 40;
+const GRAY_NODES_BEFORE_FRESH: u32 = 13;
+
+fn gray_function(tail: &str) -> String {
+    format!(
+        "local function witness()\n  \
+local w = {{}}\n  \
+local mt = {{}}\n  \
+local held = {{}}\n  \
+local ballast = {{}}\n  \
+mt.__mode = \"v\"\n  \
+setmetatable(w, mt)\n  \
+w[1] = held\n  \
+w[2] = {{}}\n  \
+ballast[1] = {{}}\n  \
+ballast[2] = {{}}\n  \
+ballast[3] = {{}}\n  \
+ballast[4] = {{}}\n  \
+ballast[5] = {{}}\n  \
+ballast[6] = {{}}\n  \
+ballast[7] = {{}}\n  \
+ballast[8] = {{}}\n  \
+{tail}\n\
+end\nwitness()\nreturn 1\n",
+        tail = tail
+    )
+}
+
+fn mark_note(trace: &Trace, tag: f64) -> &MarkNote {
+    trace
+        .marks
+        .iter()
+        .find(|note| note.tag == tag)
+        .unwrap_or_else(|| panic!("missing mark note {tag} in {:?}", trace.marks))
+}
+
+fn assert_fresh_not_built(ran: &Ran) {
+    assert_eq!(
+        ran.trace.peeks.len(),
+        1,
+        "only the pre-existing root was peeked"
+    );
+    assert_eq!(ran.parked_root_writes, 0, "ROOT_ISSUED did not run");
+    assert_eq!(ran.collects, 0);
+    assert_eq!(ran.collections, 0);
+    assert!(!ran.tail);
+    assert_eq!(
+        text_value(&ran.trace, 1.0),
+        "table",
+        "weak item still present"
+    );
+}
+
+/// Opt-in restart that pauses in gray with scan work still queued must finish
+/// the empty local through the existing NEW_TABLE plus ROOT_ISSUED handoff,
+/// leave that cycle saved, and let a later explicit step finish it once.
+#[test]
+fn auto_gray_pause_allocates_the_empty_local_and_keeps_the_cycle() {
+    let source = gray_function(
+        "\
+bit(1, peek(held))
+  note(1, collectgarbage(\"restart\"))
+  text(1, type(rawget(w, 2)))
+  local fresh = {}
+  bit(2, peek(fresh))
+  mark_phase(1)
+  text(2, type(rawget(w, 2)))
+  bit(3, collectgarbage(\"step\"))
+  mark_phase(2)
+  text(3, type(rawget(w, 2)))
+  bit(4, collectgarbage(\"step\"))
+  text(4, type(rawget(w, 2)))
+  bit(5, collectgarbage(\"step\"))
+  bit(6, peek(held))
+  bit(7, peek(fresh))
+  return 1",
+    );
+    let ran = run_auto_table(&source, Some(&[GRAY_PENDING_BUDGET, 1, 10_000, 10_000]));
+    assert_eq!(ran.stop, Stop::Halted, "{ran:?}");
+    assert!(
+        bit_value(&ran.trace, 1.0),
+        "held was alive before the pause"
+    );
+    assert!(bit_value(&ran.trace, 2.0), "fresh was allocated");
+    assert!(bit_value(&ran.trace, 6.0), "held survived the continuation");
+    assert!(
+        bit_value(&ran.trace, 7.0),
+        "fresh survived the continuation"
+    );
+    let held = ran.trace.peeks[0].table;
+    let fresh = ran.trace.peeks[1].table;
+    assert_ne!(held, fresh, "the new table is not the existing strong root");
+    assert_eq!(ran.trace.peeks[2].table, held);
+    assert_eq!(ran.trace.peeks[3].table, fresh);
+    let at_handoff = mark_note(&ran.trace, 1.0);
+    assert_eq!(at_handoff.phase, Some("gray"));
+    assert!(
+        at_handoff.pending,
+        "scan work remained after the root handoff"
+    );
+    assert!(
+        at_handoff.parked_root_writes >= 1,
+        "ROOT_ISSUED wrote the new root during gray: {at_handoff:?}"
+    );
+    assert!(
+        at_handoff.work_pushed >= 11,
+        "the new root was marked onto the gray queue: {at_handoff:?}"
+    );
+    assert_eq!(at_handoff.mark_passes, 1);
+    assert_eq!(
+        at_handoff.collects, 0,
+        "the automatic pause did not record a completion"
+    );
+    assert_eq!(at_handoff.live_nodes, GRAY_NODES_BEFORE_FRESH + 1);
+    assert_eq!(text_value(&ran.trace, 1.0), "table");
+    assert_eq!(
+        text_value(&ran.trace, 2.0),
+        "table",
+        "weak item survived the handoff"
+    );
+    assert!(
+        !bit_value(&ran.trace, 3.0),
+        "the one-unit explicit step must be the next budget, not a later 10000"
+    );
+    let after_unit = mark_note(&ran.trace, 2.0);
+    assert_eq!(after_unit.phase, Some("gray"));
+    assert!(after_unit.pending);
+    assert_eq!(text_value(&ran.trace, 3.0), "table");
+    assert!(
+        !bit_value(&ran.trace, 4.0),
+        "publishing the weak clear is not a completion"
+    );
+    assert_eq!(
+        text_value(&ran.trace, 4.0),
+        "nil",
+        "the explicit continuation cleared the weak item"
+    );
+    assert!(
+        bit_value(&ran.trace, 5.0),
+        "the following explicit step completed the saved tail"
+    );
+    assert_eq!(
+        ran.collects, 1,
+        "the continuation recorded the completion once"
+    );
+    assert_eq!(ran.collections, 1);
+    assert!(!ran.tail);
+    assert!(
+        ran.trace.steps.is_empty(),
+        "guest collectgarbage step is not the private step host"
+    );
+}
+
+/// The same pause must not skip the ordinary node-capacity refusal.
+#[test]
+fn auto_gray_pause_still_refuses_a_full_node_quota() {
+    let source = gray_function(
+        "\
+bit(1, peek(held))
+  note(1, collectgarbage(\"restart\"))
+  text(1, type(rawget(w, 2)))
+  local fresh = {}
+  bit(2, peek(fresh))
+  return 1",
+    );
+    let ran = drive_plugin(
+        &source,
+        Some(&[GRAY_PENDING_BUDGET]),
+        &AUTO_TABLE_PLUGIN,
+        Some(GRAY_NODES_BEFORE_FRESH),
+    );
+    assert!(
+        matches!(ran.stop, Stop::HostError(ref message) if message.contains("lua heap node capacity")),
+        "gray pause must not bypass the node quota: {:?}",
+        ran.stop
+    );
+    assert_fresh_not_built(&ran);
+    assert_eq!(ran.mark_phase, Some("gray"));
+    assert!(ran.mark_pending);
+    assert_eq!(ran.live_nodes, GRAY_NODES_BEFORE_FRESH);
+}
+
+#[test]
+fn auto_gray_graph_reset_pause_does_not_allocate() {
+    let source = gray_function(
+        "\
+bit(1, peek(held))
+  note(1, collectgarbage(\"restart\"))
+  text(1, type(rawget(w, 2)))
+  local fresh = {}
+  bit(2, peek(fresh))
+  return 1",
+    );
+    let ran = run_auto_table(&source, Some(&[1]));
+    assert!(
+        matches!(ran.stop, Stop::HostError(ref message) if message == "auto table restart mark paused tail=false"),
+        "{:?}",
+        ran.stop
+    );
+    assert_eq!(ran.mark_phase, Some("reset"));
+    assert!(!ran.mark_pending);
+    assert_fresh_not_built(&ran);
+}
+
+#[test]
+fn auto_gray_graph_roots_pause_does_not_allocate() {
+    let source = gray_function(
+        "\
+bit(1, peek(held))
+  note(1, collectgarbage(\"restart\"))
+  text(1, type(rawget(w, 2)))
+  local fresh = {}
+  bit(2, peek(fresh))
+  return 1",
+    );
+    let ran = run_auto_table(&source, Some(&[33]));
+    assert!(
+        matches!(ran.stop, Stop::HostError(ref message) if message == "auto table restart mark paused tail=false"),
+        "{:?}",
+        ran.stop
+    );
+    assert_eq!(ran.mark_phase, Some("roots"));
+    assert!(ran.mark_pending);
+    assert_fresh_not_built(&ran);
+}
+
+#[test]
+fn auto_gray_pause_without_pending_scan_does_not_allocate() {
+    let source = gray_function(
+        "\
+bit(1, peek(held))
+  note(1, collectgarbage(\"restart\"))
+  text(1, type(rawget(w, 2)))
+  local fresh = {}
+  bit(2, peek(fresh))
+  return 1",
+    );
+    let ran = run_auto_table(&source, Some(&[56]));
+    assert!(
+        matches!(ran.stop, Stop::HostError(ref message) if message == "auto table restart mark paused tail=false"),
+        "{:?}",
+        ran.stop
+    );
+    assert_eq!(ran.mark_phase, Some("gray"));
+    assert!(!ran.mark_pending, "drained gray is not remaining scan work");
+    assert_fresh_not_built(&ran);
+}
+
+#[test]
+fn auto_gray_published_tail_is_not_swallowed() {
+    let source = gray_function(
+        "\
+bit(1, peek(held))
+  note(1, collectgarbage(\"restart\"))
+  text(1, type(rawget(w, 2)))
+  local fresh = {}
+  bit(2, peek(fresh))
+  return 1",
+    );
+    let ran = run_auto_table(&source, Some(&[58]));
+    assert!(
+        matches!(
+            ran.stop,
+            Stop::HostError(ref message)
+                if message.contains("missing source step fixture budget")
+                    || message.contains("did not finish the published tail")
+        ),
+        "a published tail must stay an error: {:?}",
+        ran.stop
+    );
+    assert_eq!(ran.trace.peeks.len(), 1, "fresh was not constructed");
+    assert_eq!(ran.parked_root_writes, 0);
+    assert_eq!(ran.collects, 0);
+    assert_eq!(ran.collections, 0);
+    assert_eq!(text_value(&ran.trace, 1.0), "table");
+    assert!(ran.tail);
+    assert!(ran.mark_phase.is_none());
+}
+
+#[test]
+fn chunk_auto_gray_pause_does_not_allocate() {
+    let source = r#"
+local function keep_return_window()
+  return 1
+end
+local w = {}
+local mt = {}
+local held = {}
+local ballast = {}
+mt.__mode = "v"
+setmetatable(w, mt)
+w[1] = held
+w[2] = {}
+ballast[1] = {}
+ballast[2] = {}
+ballast[3] = {}
+ballast[4] = {}
+ballast[5] = {}
+ballast[6] = {}
+ballast[7] = {}
+ballast[8] = {}
+bit(1, peek(held))
+note(1, collectgarbage("restart"))
+text(1, type(rawget(w, 2)))
+local fresh = {}
+bit(2, peek(fresh))
+keep_return_window()
+return 1
+"#;
+    let ran = run_auto_table(source, Some(&[GRAY_PENDING_BUDGET]));
+    assert!(
+        matches!(ran.stop, Stop::HostError(ref message) if message == "auto table restart mark paused tail=false"),
+        "chunk has no ROOT_ISSUED handoff: {:?}",
+        ran.stop
+    );
+    assert_eq!(ran.mark_phase, Some("gray"));
+    assert!(ran.mark_pending);
+    assert_fresh_not_built(&ran);
+}
+
+#[test]
+fn stopped_gray_graph_does_not_start_a_cycle() {
+    let source = gray_function(
+        "\
+bit(1, peek(held))
+  note(1, collectgarbage(\"stop\"))
+  bit(2, collectgarbage(\"isrunning\"))
+  text(1, type(rawget(w, 2)))
+  local fresh = {}
+  bit(3, peek(fresh))
+  return 1",
+    );
+    let ran = run_auto_table(&source, None);
+    assert_eq!(ran.stop, Stop::Halted, "{ran:?}");
+    assert!(bit_value(&ran.trace, 1.0));
+    assert!(!bit_value(&ran.trace, 2.0));
+    assert!(bit_value(&ran.trace, 3.0));
+    assert_eq!(text_value(&ran.trace, 1.0), "table");
+    assert_eq!(ran.trace.peeks.len(), 2);
+    assert_ne!(ran.trace.peeks[0].table, ran.trace.peeks[1].table);
+    assert_eq!(ran.collects, 0);
+    assert_eq!(ran.collections, 0);
+    assert!(ran.mark_phase.is_none());
+    assert!(!ran.tail);
+    assert!(ran.trace.steps.is_empty());
+}
+
+#[test]
+fn direct_auto_restart_gray_pause_does_not_allocate() {
+    let source = gray_function(
+        "\
+bit(1, peek(held))
+  note(1, collectgarbage(\"restart\"))
+  text(1, type(rawget(w, 2)))
+  note(2, direct_auto_restart())
+  return 1",
+    );
+    let ran = run_auto_table(&source, Some(&[GRAY_PENDING_BUDGET]));
+    assert!(
+        matches!(ran.stop, Stop::HostError(ref message) if message == "auto table restart mark paused tail=false"),
+        "a direct call is not the root handoff: {:?}",
+        ran.stop
+    );
+    assert_fresh_not_built(&ran);
 }
