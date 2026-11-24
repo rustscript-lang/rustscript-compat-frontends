@@ -253,6 +253,12 @@ impl<'a> ParkedMark<'a> {
         Ok(())
     }
 
+    /// Opens one saved mark and parks it. Does not scan.
+    /// Refusal leaves the heap unchanged.
+    pub(super) fn open_saved(heap: &'a mut LuaHeap) -> Result<(), HeapError> {
+        Self::start(heap)?.park()
+    }
+
     pub(super) fn meter(&self) -> super::ScanMeter {
         self.heap.scan
     }

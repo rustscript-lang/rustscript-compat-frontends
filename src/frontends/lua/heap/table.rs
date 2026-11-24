@@ -2218,6 +2218,11 @@ impl LuaHeap {
         }
     }
 
+    /// Saves one mark for a private step cycle. Does not scan.
+    pub(super) fn open_private_step(&mut self) -> Result<(), HeapError> {
+        mark::ParkedMark::open_saved(self)
+    }
+
     /// Marks once, then drains the pending-close enumerator. Each slot check
     /// is one scan unit. The drain finishes before this returns, so host close
     /// still sees every doomed token and the original mark snapshot. A partial
@@ -2773,3 +2778,6 @@ mod resume_cycle;
 #[cfg(test)]
 #[path = "../../../../tests/luajit_heap_runtime/safepoint_roots.rs"]
 mod safepoint_roots;
+#[cfg(test)]
+#[path = "../../../../tests/luajit_heap_runtime/step_cycle.rs"]
+mod step_cycle;

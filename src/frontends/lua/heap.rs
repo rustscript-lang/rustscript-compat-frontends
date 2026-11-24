@@ -221,6 +221,17 @@ fn collect_until_published(host: &mut HostContext) -> Result<PublishedBoundary, 
         return Err(HeapError::MarkActive);
     }
     let marked = with_heap(host, |heap| Ok(heap.mark_and_doomed_tokens()))?;
+    close_then_halt_at_publish(host, marked)
+}
+
+/// Closes doomed tokens, then publishes or finishes. Same order as the
+/// original collector: a close error returns before publish, so there is no
+/// tail and no report. Pending-close enumeration already ran; per-token close
+/// and the Owners walk are not limited by a step budget.
+fn close_then_halt_at_publish(
+    host: &mut HostContext,
+    marked: table::DoomedMark,
+) -> Result<PublishedBoundary, HeapError> {
     for token in marked.tokens {
         retire_doomed_token(host, token)?;
     }
@@ -261,6 +272,83 @@ fn resume_published_sweep(
         table::TailResume::Denied => Err(HeapError::SweepDenied),
         table::TailResume::Paused => Ok(PublishedResume::Paused),
         table::TailResume::Completed(report) => Ok(PublishedResume::Completed(report)),
+    }
+}
+
+/// One call of a private host step cycle.
+///
+/// `Paused { tail: false }` is a saved mark. `Paused { tail: true }` is a
+/// published release tail. Published counts are not a pause signal: a zero
+/// edge window is still [`StepOutcome::Published`] when a dead slot remains.
+#[derive(Debug)]
+enum StepOutcome {
+    /// This call did not finish the saved mark or the saved tail.
+    Paused { tail: bool },
+    /// The mark finished and weak edges were published. Release did not start.
+    Published {
+        window_heads: u64,
+        window_edges: u64,
+    },
+    /// The cycle finished in this call. The report was recorded once.
+    Completed(table::CollectReport),
+}
+
+/// Saves one mark. Does not scan, install a heap, or clear an existing mark or tail.
+fn open_private_step_cycle(host: &mut HostContext) -> Result<(), HeapError> {
+    let Some(heap) = host.scope_state_mut::<LuaHeap>() else {
+        return Err(HeapError::SweepDenied);
+    };
+    heap.open_private_step()
+}
+
+/// Advances one private cycle by `budget`.
+///
+/// No heap is [`HeapError::SweepDenied`] and installs nothing. A heap with
+/// neither a saved mark nor a sweep tail, including after completion, is
+/// [`HeapError::MarkDenied`]. A saved tail is resumed first; that path does
+/// not read `batch`. Zero budget does not read `batch` or the graph. A
+/// positive mark budget uses the existing batch check before any scan.
+/// Finishing the mark closes tokens and publishes in this call. Pending-close
+/// enumeration, per-token close, and the Owners walk are metered on their own
+/// fields and are not limited by `budget`. Close failure returns the original
+/// error and does not restore the taken mark. This call does not resume a
+/// tail it just published.
+fn step_private_cycle(
+    host: &mut HostContext,
+    budget: u64,
+    batch: &[table::Rooted],
+) -> Result<StepOutcome, HeapError> {
+    let (tail, saved) = {
+        let Some(heap) = host.scope_state::<LuaHeap>() else {
+            return Err(HeapError::SweepDenied);
+        };
+        (heap.has_sweep_tail(), heap.has_saved_mark())
+    };
+    if tail {
+        return match resume_published_sweep(host, budget)? {
+            PublishedResume::Paused => Ok(StepOutcome::Paused { tail: true }),
+            PublishedResume::Completed(report) => Ok(StepOutcome::Completed(report)),
+        };
+    }
+    if !saved {
+        return Err(HeapError::MarkDenied);
+    }
+    if budget == 0 {
+        return Ok(StepOutcome::Paused { tail: false });
+    }
+    let marked = with_heap(host, |heap| heap.take_finished_saved_mark(budget, batch))?;
+    let Some(marked) = marked else {
+        return Ok(StepOutcome::Paused { tail: false });
+    };
+    match close_then_halt_at_publish(host, marked)? {
+        PublishedBoundary::Completed(report) => Ok(StepOutcome::Completed(report)),
+        PublishedBoundary::Published {
+            window_heads,
+            window_edges,
+        } => Ok(StepOutcome::Published {
+            window_heads,
+            window_edges,
+        }),
     }
 }
 
