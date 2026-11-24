@@ -1078,6 +1078,20 @@ fn finish_return(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
     for value in values.iter() {
         elements.push(return_element(call, value)?);
     }
+    // Shapes are already validated. A retiring callee cannot carry a table
+    // across a saved tail, before any caller root, handoff, or frame exit.
+    // Number and nil still retire. publish and the diagnostic witness are not
+    // this check.
+    if callee_flag
+        && elements
+            .iter()
+            .any(|element| matches!(element, ReturnedElement::Table { .. }))
+    {
+        let tail = heap::saved_sweep_tail(&mut call.vm().host_context()).map_err(heap_error)?;
+        if tail {
+            return Err(heap_error(heap::HeapError::SweepPending));
+        }
+    }
     // Classify each consumed position. Nil, scalars, and the transport array
     // do not become roots. The callee source name is not consulted.
     let wrote = publish_consumed_tables(call, &values, &frame_token, publish, &root_slots)?;

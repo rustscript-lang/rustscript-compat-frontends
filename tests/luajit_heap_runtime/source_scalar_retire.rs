@@ -614,6 +614,9 @@ fn source_scalar_return_keeps_the_published_round() {
     assert_eq!(steps[2].subject_alive, Some(true));
     assert!(steps[2].tail, "the release step keeps the published tail");
     assert_eq!(steps[2].collections, 0);
+    let callee_before_return = steps[2]
+        .frame
+        .expect("callee frame before the scalar return");
     assert_eq!(
         steps[2].live_roots, 3,
         "the callee frame still holds its three roots"
@@ -640,6 +643,11 @@ fn source_scalar_return_keeps_the_published_round() {
     );
     assert!(handoff.callee_left, "the callee frame left during retire");
     assert_eq!(handoff.handoff_depth, Some(1));
+    assert_ne!(
+        ran.frame,
+        Some(callee_before_return),
+        "the caller slot is not the retired callee {callee_before_return:?}"
+    );
     assert!(ran.frame.is_none(), "no caller frame remains: {ran:#?}");
     assert_eq!(ran.root_slots, 0, "root count follows retained frames");
     assert!(
@@ -900,4 +908,148 @@ fn ordinary_scalar_return_still_leaves_roots() {
         matches!(handoff.elements.as_slice(), [ReturnedElement::Number(number)] if *number == 1.0)
     );
     assert!(!handoff.published_root);
+}
+
+/// Direct `return rawlen(witness())` consumes the callee table with publish 0.
+/// A saved tail must refuse that table before rawlen runs. The same shape with
+/// no tail still returns the length.
+const TABLE_RETURN: &str = r#"
+local function witness()
+  local w = {}
+  local mt = {}
+  local t = {}
+  mt.__mode = "v"
+  setmetatable(w, mt)
+  t[1] = t
+  w[1] = t
+  w[2] = {}
+  w[3] = {}
+  peek(t)
+  note(30, rawlen(w))
+  step(1)
+  step(10000)
+  note(10, rawlen(w))
+  note(11, same(t, rawget(w, 1)))
+  text(2, type(rawget(w, 2)))
+  text(3, type(rawget(w, 3)))
+  step(1)
+  return w
+end
+return rawlen(witness())
+"#;
+
+const TABLE_RETURN_OPEN: &str = r#"
+local function witness()
+  local w = {}
+  local mt = {}
+  local t = {}
+  mt.__mode = "v"
+  setmetatable(w, mt)
+  t[1] = t
+  w[1] = t
+  w[2] = {}
+  w[3] = {}
+  return w
+end
+return rawlen(witness())
+"#;
+
+#[test]
+fn published_tail_refuses_direct_table_consumption() {
+    let open = run(TABLE_RETURN_OPEN);
+    assert_eq!(
+        open.stop,
+        Stop::Halted,
+        "no-tail table return must still reach rawlen: {open:#?}"
+    );
+    assert_eq!(
+        open.stack,
+        vec![Value::Float(3.0)],
+        "no-tail rawlen sees the self-cycle and both orphans: {open:#?}"
+    );
+    assert!(!open.tail, "the open control must not publish a tail");
+    let open_handoff = open.handoff.expect("no-tail finish_return");
+    assert!(
+        !open_handoff.published_root,
+        "direct consumption does not write a caller root"
+    );
+    assert!(matches!(
+        open_handoff.elements.as_slice(),
+        [ReturnedElement::Table { .. }]
+    ));
+    assert!(
+        open_handoff.callee_left,
+        "no tail still retires through leave_roots"
+    );
+
+    let ran = run(TABLE_RETURN);
+    let steps = &ran.trace.steps;
+    assert!(
+        steps.len() >= 3,
+        "the witness must publish and release before it returns w: {ran:#?}"
+    );
+    assert!(
+        matches!(steps[0].outcome, StepOutcome::Paused { tail: false }),
+        "budget 1 must pause before publication: {ran:#?}"
+    );
+    assert!(
+        matches!(steps[1].outcome, StepOutcome::Published { .. }),
+        "the return must happen after publication: {ran:#?}"
+    );
+    assert_eq!(note_value(&ran.trace, 30.0), 3.0, "rawlen before publish");
+    assert_eq!(note_value(&ran.trace, 10.0), 1.0, "rawlen after publish");
+    assert_eq!(
+        note_value(&ran.trace, 11.0),
+        1.0,
+        "published weak read keeps t"
+    );
+    assert_eq!(text_value(&ran.trace, 2.0), "nil");
+    assert_eq!(text_value(&ran.trace, 3.0), "nil");
+    assert!(
+        matches!(steps[2].outcome, StepOutcome::Paused { tail: true }),
+        "budget 1 after publish must pause in Release: {ran:#?}"
+    );
+    assert_eq!(steps[2].budget, 1);
+    assert!(steps[2].tail, "the release pause keeps the published tail");
+    assert_eq!(steps[2].collections, 0);
+    let callee = steps[2]
+        .frame
+        .expect("callee frame during the release pause");
+    assert!(
+        steps
+            .iter()
+            .all(|step| !matches!(step.outcome, StepOutcome::Completed(_))),
+        "the cycle is still open at the table return: {ran:#?}"
+    );
+    assert!(
+        matches!(
+            ran.stop,
+            Stop::HostError(ref message) if message == "lua sweep is still pending"
+        ),
+        "direct rawlen consumed a published tail table: stop={:?} stack={:?} published_root={:?} frame={:?} tail={} callee={:?} handoff={:?}",
+        ran.stop,
+        ran.stack,
+        ran.handoff.as_ref().map(|item| item.published_root),
+        ran.frame,
+        ran.tail,
+        callee,
+        ran.handoff,
+    );
+    assert_eq!(ran.frame, Some(callee), "the original callee stays current");
+    assert!(ran.tail, "the published tail stays saved");
+    assert_eq!(ran.collects, 0, "refusal records no completion report");
+    assert!(
+        ran.collections == 0,
+        "the step host recorded no completion report: {ran:#?}"
+    );
+    assert!(
+        !matches!(ran.stack.as_slice(), [Value::Float(_)]),
+        "rawlen must not publish a length: {ran:#?}"
+    );
+    assert!(
+        ran.handoff
+            .as_ref()
+            .is_none_or(|item| !item.callee_left && item.elements.is_empty()),
+        "the table is refused before handoff and retire: {ran:#?}"
+    );
 }
