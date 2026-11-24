@@ -841,9 +841,9 @@ impl LuaHeap {
         Ok((index, 1))
     }
 
-    /// One unmarked table while a published tail is saved. Capacity is checked
-    /// before the tail gate, matching [`Self::alloc_slot`]. The reservation is
-    /// not a handle until the caller commits or releases it.
+    /// Reserves one unmarked table after checking for a saved published tail.
+    /// The tail gate runs before slot reuse or the growth capacity check.
+    /// The reservation is not a handle until committed.
     pub(super) fn reserve_late_table(&mut self) -> Result<LateReservation, HeapError> {
         self.ensure_published_tail()?;
         let (index, generation) = self.place_published_table()?;
