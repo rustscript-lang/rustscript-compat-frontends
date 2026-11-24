@@ -4302,7 +4302,7 @@ fn ordinary_gap_refill_after_real_clear(key: OrdinaryGapKey, write: OrdinaryGapW
                 );
                 assert_eq!(read_ordinary(heap, owner, key)?, Value::Null);
             }
-            let mut parked = ParkedMark::resume(heap).expect("mark survived the ordinary write");
+            let parked = ParkedMark::resume(heap).expect("mark survived the ordinary write");
             let cursor = parked.pending().expect("sentinel still pending");
             assert_eq!(
                 (cursor.owner, cursor.cursor),
