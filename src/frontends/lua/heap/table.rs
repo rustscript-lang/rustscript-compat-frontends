@@ -1313,6 +1313,65 @@ impl LuaHeap {
         Ok(true)
     }
 
+    /// Replaces one ordinary UTF-8 gap while a sweep tail is saved.
+    ///
+    /// The owner checks match [`Self::delete_published_named`]: live, then a
+    /// saved tail, then this round's mark, then the reserved mode name, then
+    /// one borrowed [`Self::locate_named`]. A missing name is `Ok(false)` and
+    /// does not reclaim storage or inspect `to`. A located record that is not
+    /// ordinary UTF-8, or not a gap, is [`HeapError::SweepPending`]. Only a
+    /// real hit checks `to`: domain, kind, generation, and physical live,
+    /// then this round's mark, then the carrier [`Self::issued_value`] would
+    /// refuse as [`HeapError::StaleHandle`]. One [`Self::replace_edge_value`]
+    /// commits that table and returns `Ok(true)`. This does not mark, resume
+    /// the tail, add a key, or call the ordinary writer.
+    pub(super) fn refill_published_gap(
+        &mut self,
+        from: TableRef,
+        name: &str,
+        to: TableRef,
+    ) -> Result<bool, HeapError> {
+        self.require_live(from)?;
+        if self.sweep_tail.is_none() {
+            return Err(HeapError::SweepDenied);
+        }
+        if !Self::slot_marked(&self.slots[from.slot() as usize].state) {
+            return Err(HeapError::SweepPending);
+        }
+        if EdgeKey::is_mode_name(name) {
+            return Err(HeapError::SweepPending);
+        }
+        let Some((_, index)) = self.locate_named(from.slot(), name) else {
+            return Ok(false);
+        };
+        if !self.published_utf8_gap(index) {
+            return Err(HeapError::SweepPending);
+        }
+        self.require_live(to)?;
+        if !Self::slot_marked(&self.slots[to.slot() as usize].state) {
+            return Err(HeapError::SweepPending);
+        }
+        self.issued_value(to)?;
+        self.replace_edge_value(
+            from.slot(),
+            index,
+            EdgeValue::Table {
+                slot: to.slot(),
+                generation: to.generation(),
+            },
+        );
+        Ok(true)
+    }
+
+    /// The located record is an ordinary UTF-8 cursor gap.
+    fn published_utf8_gap(&self, index: u32) -> bool {
+        let edge = self.edge_slots[index as usize]
+            .edge
+            .as_ref()
+            .expect("owner chain holds an occupied record");
+        matches!(edge.key, EdgeKey::Utf8(_)) && edge.value.is_cursor_gap()
+    }
+
     fn slot_marked(state: &SlotState) -> bool {
         matches!(state, SlotState::Live { marked: true })
     }
@@ -2702,6 +2761,9 @@ mod published_delete;
 #[cfg(test)]
 #[path = "../../../../tests/luajit_heap_runtime/published_late_allocation.rs"]
 mod published_late_allocation;
+#[cfg(test)]
+#[path = "../../../../tests/luajit_heap_runtime/published_refill.rs"]
+mod published_refill;
 #[cfg(test)]
 #[path = "../../../../tests/luajit_heap_runtime/published_sweep.rs"]
 mod published_sweep;

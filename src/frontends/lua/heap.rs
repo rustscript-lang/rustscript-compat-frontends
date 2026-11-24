@@ -317,6 +317,30 @@ fn publish_late(host: &mut HostContext) -> Result<(TableRef, vm::ResourceHandle)
     }
 }
 
+/// Replaces one ordinary UTF-8 gap with an already issued table while this
+/// scope's published sweep tail is saved. Does not install a heap and does
+/// not resume the tail.
+///
+/// No installed heap is [`HeapError::SweepDenied`]. The installed domain is
+/// checked on `from` before any other handle or tail result, so a foreign
+/// owner is [`HeapError::WrongDomain`] even when no tail is saved. `to` is
+/// not examined until a real gap is found. This is not a guest
+/// `collectgarbage` step or a guest `rawset`.
+fn refill_published_gap(
+    host: &mut HostContext,
+    from: TableRef,
+    name: &str,
+    to: TableRef,
+) -> Result<bool, HeapError> {
+    let Some(heap) = host.scope_state::<LuaHeap>() else {
+        return Err(HeapError::SweepDenied);
+    };
+    if from.domain() != heap.domain() {
+        return Err(HeapError::WrongDomain);
+    }
+    with_heap(host, |heap| heap.refill_published_gap(from, name, to))
+}
+
 /// One host call: a fresh mark, the existing synchronous token close, then
 /// one sweep. The observer is lent only at the published boundary and does
 /// not receive the host. A parked mark is refused and left in place. This is
