@@ -231,6 +231,30 @@ struct Slot {
     mode_edge: Option<u32>,
 }
 
+/// Empty slot reserved for one late table. It is not a handle and cannot be
+/// cloned. The caller must commit the real token or release the slot.
+pub(super) struct LateReservation {
+    domain: u64,
+    index: u32,
+    generation: u32,
+    spent: bool,
+}
+
+impl LateReservation {
+    pub(super) fn table(&self) -> TableRef {
+        TableRef::table(self.domain, self.index, self.generation)
+    }
+}
+
+impl Drop for LateReservation {
+    fn drop(&mut self) {
+        debug_assert!(
+            self.spent,
+            "late reservation dropped without commit or release"
+        );
+    }
+}
+
 /// Bytes of a string or byte payload stored in a heap record. Capacity is not
 /// part of the logical extent: only the stored length is. `usize` fits in
 /// `u64` on every Rust target, so the conversion is exact.
@@ -771,20 +795,7 @@ impl LuaHeap {
     fn alloc_slot(&mut self, kind: HandleKind) -> Result<(u32, u32), HeapError> {
         if !self.free_list.is_empty() {
             self.ensure_sweep_open()?;
-            let index = self.free_list.pop().expect("free list was not empty");
-            let slot = &mut self.slots[index as usize];
-            if !matches!(slot.state, SlotState::Free) {
-                return Err(HeapError::StaleHandle);
-            }
-            slot.kind = kind;
-            slot.state = SlotState::Live { marked: false };
-            slot.token = None;
-            slot.carrier = None;
-            slot.metatable = None;
-            slot.edge_head = None;
-            slot.edge_tail = None;
-            slot.mode_edge = None;
-            return Ok((index, slot.generation));
+            return self.take_free_slot(kind);
         }
         if self.slots.len() >= self.limits.nodes as usize {
             return Err(HeapError::NodeCapacity);
@@ -793,6 +804,27 @@ impl LuaHeap {
             return Err(HeapError::GenerationExhausted);
         }
         self.ensure_sweep_open()?;
+        self.grow_slot(kind)
+    }
+
+    fn take_free_slot(&mut self, kind: HandleKind) -> Result<(u32, u32), HeapError> {
+        let index = self.free_list.pop().expect("free list was not empty");
+        let slot = &mut self.slots[index as usize];
+        if !matches!(slot.state, SlotState::Free) {
+            return Err(HeapError::StaleHandle);
+        }
+        slot.kind = kind;
+        slot.state = SlotState::Live { marked: false };
+        slot.token = None;
+        slot.carrier = None;
+        slot.metatable = None;
+        slot.edge_head = None;
+        slot.edge_tail = None;
+        slot.mode_edge = None;
+        Ok((index, slot.generation))
+    }
+
+    fn grow_slot(&mut self, kind: HandleKind) -> Result<(u32, u32), HeapError> {
         let index = u32::try_from(self.slots.len()).map_err(|_| HeapError::NodeCapacity)?;
         self.slots.push(Slot {
             generation: 1,
@@ -807,6 +839,59 @@ impl LuaHeap {
         });
         self.note_node_peak();
         Ok((index, 1))
+    }
+
+    /// One unmarked table while a published tail is saved. Capacity is checked
+    /// before the tail gate, matching [`Self::alloc_slot`]. The reservation is
+    /// not a handle until the caller commits or releases it.
+    pub(super) fn reserve_late_table(&mut self) -> Result<LateReservation, HeapError> {
+        self.ensure_published_tail()?;
+        let (index, generation) = self.place_published_table()?;
+        Ok(LateReservation {
+            domain: self.domain,
+            index,
+            generation,
+            spent: false,
+        })
+    }
+
+    fn place_published_table(&mut self) -> Result<(u32, u32), HeapError> {
+        if !self.free_list.is_empty() {
+            self.ensure_published_tail()?;
+            return self.take_free_slot(HandleKind::Table);
+        }
+        if self.slots.len() >= self.limits.nodes as usize {
+            return Err(HeapError::NodeCapacity);
+        }
+        if self.limits.max_generation == 0 {
+            return Err(HeapError::GenerationExhausted);
+        }
+        self.ensure_published_tail()?;
+        self.grow_slot(HandleKind::Table)
+    }
+
+    pub(super) fn commit_late(&mut self, mut reservation: LateReservation, raw: u64) {
+        debug_assert!(self.sweep_tail.is_some());
+        let index = reservation.index as usize;
+        debug_assert!(self.slots[index].token.is_none());
+        debug_assert!(matches!(
+            self.slots[index].state,
+            SlotState::Live { marked: false }
+        ));
+        self.slots[index].token = Some(raw);
+        self.sweep_tail
+            .as_mut()
+            .expect("published tail accepted the reservation")
+            .note_late();
+        reservation.spent = true;
+    }
+
+    pub(super) fn abandon_late(&mut self, mut reservation: LateReservation) {
+        let index = reservation.index;
+        debug_assert!(self.slots[index as usize].token.is_none());
+        debug_assert!(self.slots[index as usize].edge_head.is_none());
+        self.release_slot(index);
+        reservation.spent = true;
     }
 
     /// Releases a reserved node. A stale or foreign handle is refused and the
@@ -2038,6 +2123,14 @@ impl LuaHeap {
         }
     }
 
+    fn ensure_published_tail(&self) -> Result<(), HeapError> {
+        if self.sweep_tail.is_some() {
+            Ok(())
+        } else {
+            Err(HeapError::SweepDenied)
+        }
+    }
+
     /// Spends `budget` on the saved tail. Zero restores it without a scan.
     pub(super) fn resume_sweep_tail(&mut self, budget: u64) -> TailResume {
         let Some(tail) = self.sweep_tail.take() else {
@@ -2606,6 +2699,9 @@ mod private_cycle;
 #[cfg(test)]
 #[path = "../../../../tests/luajit_heap_runtime/published_delete.rs"]
 mod published_delete;
+#[cfg(test)]
+#[path = "../../../../tests/luajit_heap_runtime/published_late_allocation.rs"]
+mod published_late_allocation;
 #[cfg(test)]
 #[path = "../../../../tests/luajit_heap_runtime/published_sweep.rs"]
 mod published_sweep;

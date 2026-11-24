@@ -68,7 +68,8 @@ pub(super) enum TailPhase {
     Done,
 }
 
-/// Owned continuation of one published sweep. Only the fields Release and Roots need.
+/// Owned continuation of one published sweep. Release, Roots, and the
+/// late-node count recorded after publish.
 #[derive(Debug)]
 pub(super) struct SweepTail {
     phase: TailPhase,
@@ -76,6 +77,7 @@ pub(super) struct SweepTail {
     dead: Vec<u32>,
     marked_nodes: u32,
     live_roots: u32,
+    late_nodes: u32,
 }
 
 pub(super) enum TailStep {
@@ -90,6 +92,7 @@ impl SweepTail {
         let mut index = self.index;
         let dead = self.dead;
         let marked_nodes = self.marked_nodes;
+        let late_nodes = self.late_nodes;
         let mut live_roots = self.live_roots;
         let mut report = None;
         let mut releases = 0u64;
@@ -102,6 +105,7 @@ impl SweepTail {
                 index: &mut index,
                 dead: &dead,
                 marked_nodes,
+                late_nodes,
                 live_roots: &mut live_roots,
                 report: &mut report,
                 releases: &mut releases,
@@ -124,7 +128,12 @@ impl SweepTail {
             dead,
             marked_nodes,
             live_roots,
+            late_nodes,
         })
+    }
+
+    pub(super) fn note_late(&mut self) {
+        self.late_nodes = self.late_nodes.saturating_add(1);
     }
 }
 
@@ -134,6 +143,7 @@ struct TailCursor<'a> {
     index: &'a mut usize,
     dead: &'a [u32],
     marked_nodes: u32,
+    late_nodes: u32,
     live_roots: &'a mut u32,
     report: &'a mut Option<CollectReport>,
     releases: &'a mut u64,
@@ -161,7 +171,7 @@ fn step_tail(heap: &mut LuaHeap, cursor: &mut TailCursor<'_>) -> bool {
                     heap.collections = heap.collections.saturating_add(1);
                     heap.last_marked = cursor.marked_nodes;
                     *cursor.report = Some(CollectReport {
-                        live_nodes: cursor.marked_nodes,
+                        live_nodes: cursor.marked_nodes.saturating_add(cursor.late_nodes),
                         marked_nodes: cursor.marked_nodes,
                         live_roots: *cursor.live_roots,
                     });
@@ -355,6 +365,7 @@ impl<'a> SweepSession<'a> {
             index: &mut self.index,
             dead: &self.dead,
             marked_nodes: self.marked_nodes,
+            late_nodes: 0,
             live_roots: &mut self.live_roots,
             report: &mut self.report,
             releases: &mut self.pulse_spent.releases,
@@ -616,6 +627,7 @@ impl<'a> SweepSession<'a> {
             dead: self.dead,
             marked_nodes: self.marked_nodes,
             live_roots: self.live_roots,
+            late_nodes: 0,
         }
     }
 

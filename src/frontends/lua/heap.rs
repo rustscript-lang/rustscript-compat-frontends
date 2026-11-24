@@ -287,6 +287,36 @@ fn delete_published_named(
     with_heap(host, |heap| heap.delete_published_named(table, name))
 }
 
+/// Allocates one unmarked table while this scope's published sweep tail is
+/// saved. Does not install a heap, resume the tail, or open a write.
+///
+/// No installed heap, or no saved tail, is [`HeapError::SweepDenied`] and
+/// does not change the scope. A full node vector is [`HeapError::NodeCapacity`]
+/// before a resource is pushed. A refused `push_resource` releases only that
+/// empty reservation. This is not a guest `collectgarbage` step.
+fn publish_late(host: &mut HostContext) -> Result<(TableRef, vm::ResourceHandle), HeapError> {
+    let Some(heap) = host.scope_state_mut::<LuaHeap>() else {
+        return Err(HeapError::SweepDenied);
+    };
+    let reservation = heap.reserve_late_table()?;
+    let table = reservation.table();
+    match host.push_resource(LuaTableResource::new(table)) {
+        Ok(resource) => {
+            let handle = resource.handle();
+            host.scope_state_mut::<LuaHeap>()
+                .expect("late reservation keeps the installed heap")
+                .commit_late(reservation, handle.raw());
+            Ok((table, handle))
+        }
+        Err(error) => {
+            host.scope_state_mut::<LuaHeap>()
+                .expect("late reservation keeps the installed heap")
+                .abandon_late(reservation);
+            Err(HeapError::from_scope(error))
+        }
+    }
+}
+
 /// One host call: a fresh mark, the existing synchronous token close, then
 /// one sweep. The observer is lent only at the published boundary and does
 /// not receive the host. A parked mark is refused and left in place. This is
