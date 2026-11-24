@@ -411,6 +411,243 @@ fn gray_new_named_write_omitted_leaves_target_unreachable() {
     new_named_write_after_owner_scan(NewNamedWrite::Omitted);
 }
 
+#[derive(Clone, Copy)]
+enum ExistingNamedWrite {
+    Strong,
+    WeakValue,
+    Omitted,
+}
+
+const FRESH_UTF8: &str = "新键";
+
+fn assert_ordinary_utf8_hit(heap: &LuaHeap, owner: u32, name: &str, index: u32) {
+    let key = super::EdgeKey::named(name);
+    let fresh = super::EdgeKey::named(FRESH_UTF8);
+    assert_ne!(name, FRESH_UTF8);
+    assert!(matches!(key, super::EdgeKey::Utf8(ref text) if text == name));
+    assert!(matches!(fresh, super::EdgeKey::Utf8(_)));
+    assert_ne!(key, fresh);
+    assert_eq!(
+        heap.find_key(owner, &key),
+        Some(index),
+        "find_key hits the existing ordinary UTF-8 record"
+    );
+    assert_eq!(
+        heap.find_key(owner, &fresh),
+        None,
+        "the replacement key is not a new key"
+    );
+    let stored = heap.edge_slots[index as usize]
+        .edge
+        .as_ref()
+        .expect("occupied record");
+    assert!(matches!(&stored.key, super::EdgeKey::Utf8(text) if text == name));
+    assert!(!stored.value.is_cursor_gap());
+}
+
+/// Replaces an already scanned ordinary UTF-8 record in place.
+fn existing_named_replacement_after_owner_scan(write: ExistingNamedWrite) {
+    use crate::heap::{self, GuestClass, StepOutcome};
+
+    const OLD: &str = "旧键";
+    const CHILD: &str = "child";
+    let retained = matches!(write, ExistingNamedWrite::Strong);
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits(8, 2, 8)).expect("install");
+        let raw = crate::publish_raw(&mut host);
+        let target = crate::table_ref(&host, raw);
+        let (owner, sentinel, child, carrier) = heap::with_heap(&mut host, |heap| {
+            let owner = heap.alloc()?;
+            let sentinel = heap.alloc()?;
+            let child = heap.alloc()?;
+            let unrelated = heap.alloc()?; // Forces a real published tail in all arms.
+            if matches!(write, ExistingNamedWrite::WeakValue) {
+                let meta = heap.alloc()?;
+                heap.set_mode_scalar(meta, Value::string("v"))?;
+                heap.set_metatable(owner, Some(meta))?;
+            }
+            let frame = heap.enter_roots(2)?;
+            // The Gray stack pops the owner first, then the sentinel.
+            heap.write_root(frame, 0, sentinel)?;
+            heap.write_root(frame, 1, owner)?;
+            heap.set_named_scalar(owner, OLD, Value::Bool(true))?;
+            heap.set_named_scalar(sentinel, "pending", Value::Bool(true))?;
+            heap.set_named_edge(target, CHILD, unrelated)?;
+            heap.set_named_edge(target, CHILD, child)?;
+            assert_eq!(heap.named_edge(target, CHILD)?, Some(child));
+            assert_eq!(heap.named_value(owner, OLD)?, Value::Bool(true));
+            Ok((owner, sentinel, child, heap.issue_carrier(target)?))
+        })
+        .expect("graph");
+        heap::open_fixed_step(&mut host).expect("start a saved mark");
+        let old_record = heap::with_heap(&mut host, |heap| {
+            let (_, old_record) = heap.locate_named(owner.slot(), OLD).expect("old field");
+            let (_, sentinel_record) = heap
+                .locate_named(sentinel.slot(), "pending")
+                .expect("sentinel field");
+            let mut parked = ParkedMark::resume(heap).expect("resume saved mark");
+            pause_at(&mut parked, owner.slot(), old_record);
+            let pending = pause_at(&mut parked, sentinel.slot(), sentinel_record);
+            assert_eq!(pending.owner, sentinel.slot());
+            assert!(parked.marked(owner), "the scanned owner is already marked");
+            assert!(!parked.marked(target) && !parked.marked(child));
+            let before = parked.meter();
+            parked.park()?;
+            assert_ordinary_utf8_hit(heap, owner.slot(), OLD, old_record);
+            let edges_before = (heap.stats().live_edges, heap.stats().edge_slots);
+            if !matches!(write, ExistingNamedWrite::Omitted) {
+                heap.set_named_edge(owner, OLD, target)?;
+                assert_eq!(heap.named_edge(owner, OLD)?, Some(target));
+            } else {
+                assert_eq!(heap.named_value(owner, OLD)?, Value::Bool(true));
+            }
+            assert_ordinary_utf8_hit(heap, owner.slot(), OLD, old_record);
+            assert_eq!(
+                heap.locate_named(owner.slot(), OLD).map(|(_, index)| index),
+                Some(old_record),
+                "the old key record index is unchanged"
+            );
+            assert_eq!(
+                (heap.stats().live_edges, heap.stats().edge_slots),
+                edges_before,
+                "the write does not change the edge count"
+            );
+            if !matches!(write, ExistingNamedWrite::Omitted) {
+                let stored = heap.edge_slots[old_record as usize]
+                    .edge
+                    .as_ref()
+                    .expect("replaced record");
+                assert!(matches!(
+                    stored.value,
+                    super::EdgeValue::Table { slot, generation }
+                        if slot == target.slot() && generation == target.generation()
+                ));
+            }
+            let parked = ParkedMark::resume(heap).expect("write kept the saved mark");
+            assert_eq!(parked.phase_name(), "gray");
+            let cursor = parked.pending().expect("sentinel still pending");
+            assert_eq!(
+                (cursor.owner, cursor.cursor),
+                (pending.owner, pending.cursor),
+                "the pending scan cursor is unchanged"
+            );
+            assert!(
+                !parked.marked(child),
+                "the write must not scan the child edge"
+            );
+            assert_eq!(
+                parked.marked(target),
+                retained,
+                "only a strong replacement enters the gray queue immediately"
+            );
+            let after = parked.meter();
+            assert_write_did_not_scan(&before, &after);
+            assert_eq!(after.parked_edge_writes, before.parked_edge_writes);
+            assert_eq!(
+                after.parked_barrier_marks - before.parked_barrier_marks,
+                u64::from(retained)
+            );
+            assert_eq!(
+                after.scratch.work_pushed - before.scratch.work_pushed,
+                u64::from(retained)
+            );
+            assert_eq!(
+                after.node_slot_visits - before.node_slot_visits,
+                u64::from(retained) * 2
+            );
+            parked.park()?;
+            Ok(old_record)
+        })
+        .expect("in-place replacement while Gray is parked");
+
+        let published = heap::step_fixed_frames(&mut host, 128).expect("publish saved mark");
+        assert!(
+            matches!(published, StepOutcome::Published { .. }),
+            "{published:?}"
+        );
+        assert_eq!(heap::stats(&mut host).expect("stats").collections, 0);
+        heap::with_heap(&mut host, |heap| {
+            assert_eq!(
+                heap.set_named_edge(owner, "blocked", sentinel),
+                Err(HeapError::SweepPending)
+            );
+            assert!(heap.locate_named(owner.slot(), "blocked").is_none());
+            if matches!(write, ExistingNamedWrite::WeakValue) {
+                assert_eq!(heap.named_value(owner, OLD)?, Value::Null);
+                let (_, index) = heap
+                    .locate_named(owner.slot(), OLD)
+                    .expect("a weak-value replacement leaves the cleared cursor");
+                assert_eq!(index, old_record);
+                let stored = heap.edge_slots[index as usize]
+                    .edge
+                    .as_ref()
+                    .expect("retained gap");
+                assert!(stored.value.is_cursor_gap());
+                assert!(matches!(&stored.key, super::EdgeKey::Utf8(text) if text == OLD));
+            }
+            if matches!(write, ExistingNamedWrite::Omitted) {
+                assert_eq!(heap.named_value(owner, OLD)?, Value::Bool(true));
+            }
+            Ok(())
+        })
+        .expect("read during publication");
+        let done = heap::step_fixed_frames(&mut host, 128).expect("finish saved tail");
+        assert!(matches!(done, StepOutcome::Completed(_)), "{done:?}");
+        assert!(heap::fixed_step_idle(&mut host).expect("idle"));
+        heap::with_heap(&mut host, |heap| {
+            assert_eq!(
+                heap.alive(target),
+                retained,
+                "an in-place strong UTF-8 replacement on a scanned owner must keep its target alive"
+            );
+            assert_eq!(
+                heap.alive(child),
+                retained,
+                "the child is reached only by the continued scan"
+            );
+            assert_eq!(heap.stats().collections, 1);
+            assert_eq!(heap.scan_meter().mark_passes, 1);
+            if matches!(write, ExistingNamedWrite::Omitted) {
+                assert_eq!(heap.named_value(owner, OLD)?, Value::Bool(true));
+            }
+            if retained {
+                let value = heap.named_value(owner, OLD)?;
+                assert_eq!(value, carrier);
+                assert_eq!(heap.guest_class(&value), GuestClass::Table(target));
+                assert_eq!(heap.named_edge(target, CHILD)?, Some(child));
+                heap.set_named_scalar(owner, OLD, Value::Null)?;
+            }
+            Ok(())
+        })
+        .expect("same-cycle reachability");
+        if retained {
+            heap::collect(&mut host).expect("next collection after removing the only strong edge");
+            heap::with_heap(&mut host, |heap| {
+                assert!(!heap.alive(target) && !heap.alive(child));
+                assert_eq!(heap.stats().collections, 2);
+                Ok(())
+            })
+            .expect("later reclamation");
+        }
+    });
+}
+
+#[test]
+fn gray_existing_utf8_strong_replacement_keeps_the_new_graph() {
+    existing_named_replacement_after_owner_scan(ExistingNamedWrite::Strong);
+}
+
+#[test]
+fn gray_existing_utf8_weak_replacement_clears_at_publication() {
+    existing_named_replacement_after_owner_scan(ExistingNamedWrite::WeakValue);
+}
+
+#[test]
+fn gray_existing_utf8_omitted_replacement_keeps_the_original_scalar() {
+    existing_named_replacement_after_owner_scan(ExistingNamedWrite::Omitted);
+}
+
 #[test]
 fn tail_slot_reuse_does_not_keep_the_new_target() {
     let mut heap = LuaHeap::new(limits(8, 2, 8));
