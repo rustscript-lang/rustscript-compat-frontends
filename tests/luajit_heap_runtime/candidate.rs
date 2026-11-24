@@ -31,6 +31,7 @@ const STEP_HAS_TAIL: &str = "lua_internal::step_has_tail";
 const GC_STOP: &str = "lua_internal::gc_stop";
 const GC_RESTART: &str = "lua_internal::gc_restart";
 const GC_IS_RUNNING: &str = "lua_internal::gc_is_running";
+const STEP_DATA: &str = "lua_internal::step_data";
 const COUNT: &str = "lua_internal::count";
 const OPEN_CELL: &str = "lua_internal::open_cell";
 const READ_CELL: &str = "lua_internal::read_cell";
@@ -91,6 +92,13 @@ pub(super) fn set_step_budgets(host: &mut vm::HostContext<'_>, budgets: &[NonZer
         .0 = budgets.iter().copied().collect();
 }
 
+/// Remaining fixture budgets. This read does not pop, step, or gather.
+pub(super) fn remaining_step_budgets(host: &mut vm::HostContext<'_>) -> Vec<u64> {
+    host.scope_state::<StepBudgets>()
+        .map(|budgets| budgets.0.iter().map(|budget| budget.get()).collect())
+        .unwrap_or_default()
+}
+
 /// Opt in to the fixture-budgeted guest step in this catalog only.
 pub(super) fn install_step_schemas(builder: &mut HostApiBuilder) {
     builder.function(HostFunctionSchema::with_return(
@@ -101,6 +109,11 @@ pub(super) fn install_step_schemas(builder: &mut HostApiBuilder) {
     builder.function(HostFunctionSchema::with_return(
         STEP,
         vec![HostParamSchema::value("roots", HostTypeSchema::Unknown)],
+        HostTypeSchema::Bool,
+    ));
+    builder.function(HostFunctionSchema::with_return(
+        STEP_DATA,
+        vec![HostParamSchema::value("data", HostTypeSchema::Unknown)],
         HostTypeSchema::Bool,
     ));
 }
@@ -296,6 +309,7 @@ pub(super) fn register(
         Op::GcStop,
         Op::GcRestart,
         Op::GcIsRunning,
+        Op::StepData,
         Op::Count,
         Op::EnterResult,
         Op::EnterCallee,
@@ -342,6 +356,7 @@ pub(super) fn register(
             Op::GcStop => GC_STOP,
             Op::GcRestart => GC_RESTART,
             Op::GcIsRunning => GC_IS_RUNNING,
+            Op::StepData => STEP_DATA,
             Op::Count => COUNT,
             Op::EnterResult => ENTER_RESULT,
             Op::EnterCallee => ENTER_CALLEE,
@@ -372,7 +387,12 @@ pub(super) fn register(
         };
         if matches!(
             op,
-            Op::Step | Op::StepHasTail | Op::GcStop | Op::GcRestart | Op::GcIsRunning
+            Op::Step
+                | Op::StepHasTail
+                | Op::GcStop
+                | Op::GcRestart
+                | Op::GcIsRunning
+                | Op::StepData
         ) && catalog.function(name).is_none()
         {
             continue;
@@ -405,6 +425,7 @@ enum Op {
     GcStop,
     GcRestart,
     GcIsRunning,
+    StepData,
     Count,
     EnterResult,
     EnterCallee,
@@ -602,6 +623,7 @@ impl HostOwnedFunction for Op {
             Self::GcStop => set_gc_running(&mut call.vm().host_context(), false)?,
             Self::GcRestart => set_gc_running(&mut call.vm().host_context(), true)?,
             Self::GcIsRunning => gc_is_running(&call.vm().host_context()),
+            Self::StepData => step_data_default(call)?,
             Self::Count => {
                 let kib =
                     heap::with_heap(&mut call.vm().host_context(), |heap| Ok(heap.logical_kib()))
@@ -1838,13 +1860,48 @@ fn gc_is_running(host: &vm::HostContext<'_>) -> Value {
 }
 
 fn restore_running_after_progress(host: &mut vm::HostContext<'_>) -> Result<(), VmError> {
-    // Only a completed explicit collect or omitted-data step reaches here.
+    // A successful explicit collect, or a successful step, reaches here.
+    // Success includes a partial step: Bool false does not record completion,
+    // but still restores running. Omitted data, a static default literal, and
+    // a runtime expression that already passed the data check share that step.
     // A refusal returns before this call, so it cannot record a completion or
     // skip the heap gate by flipping the switch.
     if let Some(control) = host.scope_state_mut::<GcRunControl>() {
         control.running = true;
     }
     Ok(())
+}
+
+fn step_data_default(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
+    // Category only. Do not pop a budget, read a tail, or gather.
+    // Static nil, the byte string "0", and the positive-zero number token
+    // never call this host; they take the explicit-default arm. An expression
+    // that expr() lowers arrives here as f64, and both zero sign bits compare
+    // equal. Source unary `-0` is not an expr(): lowering rejects it, so it
+    // never arrives. Source unary + is unsupported. Host Int is not a Lua
+    // number and is not normalized to zero.
+    let value = match call.args() {
+        [value] => value.clone(),
+        _ => {
+            return Err(VmError::HostError(
+                "step data is not the default".to_string(),
+            ));
+        }
+    };
+    let accepted = match &value {
+        Value::Null => true,
+        Value::Float(number) => *number == 0.0,
+        Value::String(text) => text.as_bytes() == b"0",
+        Value::Bytes(bytes) => bytes.as_ref() == b"0",
+        _ => false,
+    };
+    if accepted {
+        Ok(Value::Bool(true))
+    } else {
+        Err(VmError::HostError(
+            "step data is not the default".to_string(),
+        ))
+    }
 }
 
 fn step_at_safepoint(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
@@ -4124,8 +4181,9 @@ impl Lower<'_> {
                         return self.run_control_expr(bytes, expr.span());
                     }
                 }
-                // Explicit nil, parser +0, and the string "0" share the omitted step.
-                // Only those static literals; other expressions stay unsupported.
+                // Explicit nil, the parsed positive zero, and the byte string "0"
+                // share the omitted step. The number token is +0; source unary +
+                // is not supported.
                 if name.is("collectgarbage")
                     && !self.name_is_bound(name)
                     && self.catalog.function(STEP).is_some()
@@ -4133,6 +4191,16 @@ impl Lower<'_> {
                     && self.explicit_default_step_data(&args.exprs)
                 {
                     return self.step_expr(expr.span());
+                }
+                if name.is("collectgarbage")
+                    && !self.name_is_bound(name)
+                    && self.catalog.function(STEP).is_some()
+                    && self.catalog.function(STEP_HAS_TAIL).is_some()
+                    && self.catalog.function(STEP_DATA).is_some()
+                    && let [ast::Expr::String { bytes, .. }, data] = args.exprs.as_slice()
+                    && bytes == b"step"
+                {
+                    return self.step_with_runtime_data(expr.span(), data);
                 }
                 if name.is("copy_fields")
                     && let [arg] = args.exprs.as_slice()
@@ -4417,6 +4485,28 @@ impl Lower<'_> {
             ),
             _ => false,
         }
+    }
+
+    fn step_with_runtime_data(
+        &mut self,
+        span: ast::Span,
+        data: &ast::Expr,
+    ) -> Result<Expr, ParseError> {
+        // One ordinary evaluation, then the category host, then the reviewed
+        // step. A data fault stays; this path does not roll it back.
+        let value = self.expr(data)?;
+        let slot = self
+            .builder
+            .alloc_local_named(&format!("#step-data:{}", self.stmts.len()))?;
+        self.stmts.push(Stmt::Let {
+            index: slot,
+            declared_schema: None,
+            expr: value,
+            line: self.line(span),
+        });
+        let checked = self.call(STEP_DATA, vec![Expr::Var(slot)])?;
+        self.emit_ignored(checked, self.line(span))?;
+        self.step_expr(span)
     }
 
     fn step_expr(&mut self, span: ast::Span) -> Result<Expr, ParseError> {

@@ -116,6 +116,7 @@ struct Ran {
     collects: usize,
     returned: Option<heap::TableRef>,
     release_root: Option<candidate::ReleaseRootNote>,
+    budgets: Vec<u64>,
 }
 
 struct Plugin {
@@ -516,6 +517,7 @@ fn drive(source: &str, budgets: Option<&[u64]>, run_control: bool, nodes: Option
         .scope_state::<candidate::ReturnWitness>()
         .map(|witness| (witness.returned, witness.release_root.clone()))
         .unwrap_or((None, None));
+    let budgets = candidate::remaining_step_budgets(&mut vm.host_context());
     let stop = match status {
         Ok(VmStatus::Halted) => Stop::Halted,
         Err(VmError::HostError(message)) => Stop::HostError(message),
@@ -538,6 +540,7 @@ fn drive(source: &str, budgets: Option<&[u64]>, run_control: bool, nodes: Option
         collects,
         returned,
         release_root,
+        budgets,
     }
 }
 
@@ -867,21 +870,237 @@ fn guest_step_explicit_default_data_matches_omitted() {
 #[test]
 fn guest_step_explicit_default_data_rejects_other_shapes() {
     for source in [
-        "return collectgarbage(\"step\", 1)\n",
-        "return collectgarbage(\"step\", \"1\")\n",
-        "return collectgarbage(\"step\", \"0.0\")\n",
-        "return collectgarbage(\"step\", \"00\")\n",
         "return collectgarbage(\"step\", nil, nil)\n",
-        "local n = nil\nreturn collectgarbage(\"step\", n)\n",
-        "return collectgarbage(\"step\", (nil))\n",
+        "local opt = \"step\"\nreturn collectgarbage(opt, nil)\n",
+        // Unary minus is not an ordinary expression. The candidate's number
+        // token parses as positive zero; source unary + is also unsupported.
         "return collectgarbage(\"step\", -0)\n",
-        "local collectgarbage = type\nreturn collectgarbage(\"step\", nil)\n",
+        "local collectgarbage = nil\nreturn collectgarbage(\"step\", nil)\n",
+        "local function collectgarbage()\n  return nil\nend\nreturn collectgarbage(\"step\", nil)\n",
     ] {
         assert_step_source_rejected(source);
     }
     let ordinary = candidate::lower("return collectgarbage(\"step\", nil)\n", catalog(false))
         .expect_err("ordinary catalog accepted explicit step data");
     assert!(ordinary.message.contains("not lowered yet"), "{ordinary}");
+    let runtime = candidate::lower(
+        "local n = nil\nreturn collectgarbage(\"step\", n)\n",
+        catalog(false),
+    )
+    .expect_err("ordinary catalog accepted runtime step data");
+    assert!(runtime.message.contains("not lowered yet"), "{runtime}");
+}
+
+fn witness_chunk(body: &str) -> String {
+    format!("local function witness()\n{body}  return 1\nend\nwitness()\nreturn 1\n")
+}
+
+/// Runtime data of the same three categories uses the omitted step's bool,
+/// weak-clear timing, and single completion report. Literals stay on the
+/// reviewed arm above.
+#[test]
+fn guest_step_runtime_default_data_matches_omitted() {
+    for (label, data, prelude) in [
+        ("runtime-nil", "(nil)", ""),
+        ("runtime-zero", "0+0", ""),
+        ("runtime-string", "s", "  local s = \"0\"\n"),
+    ] {
+        let mut source = STEP_WITNESS.to_owned();
+        if !prelude.is_empty() {
+            source = source.replacen("-- tick 1", &format!("{prelude}  -- tick 1"), 1);
+        }
+        for tag in 1..=4 {
+            source = source.replace(
+                &format!("-- tick {tag}"),
+                &format!("bit({tag}, {})", collect_step_call(data)),
+            );
+        }
+        let ran = run_with_step_budgets(&source, Some(&[1, 10_000, 1, 10_000]));
+        assert_eq!(ran.stop, Stop::Halted, "{label}: {ran:#?}");
+        assert_eq!(ran.stack, [Value::Float(1.0)], "{label}");
+        assert_guest_step_cycle(&ran);
+        assert!(ran.budgets.is_empty(), "{label} left {:?}", ran.budgets);
+    }
+}
+
+/// The data call runs once, including when its value is not a default.
+#[test]
+fn guest_step_runtime_default_data_evaluates_once() {
+    let accepted = run_with_step_budgets(
+        &witness_chunk("  bit(1, collectgarbage(\"step\", note(7, 0)))\n"),
+        Some(&[1]),
+    );
+    assert_eq!(accepted.stop, Stop::Halted, "{accepted:#?}");
+    assert_eq!(accepted.trace.notes, [(7.0, 0.0)]);
+    assert_eq!(accepted.trace.bits.len(), 1, "{accepted:#?}");
+    assert_eq!(accepted.trace.bits[0].0, 1.0);
+    assert!(accepted.budgets.is_empty(), "{:?}", accepted.budgets);
+
+    let rejected = run_with_step_budgets(
+        &witness_chunk("  bit(1, collectgarbage(\"step\", note(8, 1)))\n"),
+        Some(&[1, 9]),
+    );
+    assert!(
+        matches!(rejected.stop, Stop::HostError(ref message) if message == "step data is not the default"),
+        "{rejected:#?}"
+    );
+    assert_eq!(
+        rejected.trace.notes,
+        [(8.0, 1.0)],
+        "the rejected call still evaluated once"
+    );
+    assert!(
+        rejected.trace.bits.is_empty(),
+        "bit did not run: {rejected:#?}"
+    );
+    assert_eq!(rejected.budgets, [1, 9]);
+    assert!(!rejected.tail);
+    assert_eq!(rejected.collects, 0);
+    assert_eq!(rejected.collections, 0);
+}
+
+/// A bool or non-default number is refused before any step or root gather.
+/// The live unissued value would make a mark gather fail with a different fault.
+#[test]
+fn guest_step_runtime_default_data_rejects_before_advance() {
+    let queued = [1_u64, 10_000];
+    for (label, data) in [
+        ("bool", "true"),
+        ("number", "1"),
+        ("text", "\"1\""),
+        // Parent lowering negatives. After the join they lower, then the
+        // category host refuses them before a step. They are not new data.
+        ("text-0.0", "\"0.0\""),
+        ("text-00", "\"00\""),
+    ] {
+        let ran = run_with_step_budgets(
+            &witness_chunk(&format!(
+                "  local unissued = external_shape()\n  bit(1, collectgarbage(\"step\", {data}))\n"
+            )),
+            Some(&queued),
+        );
+        assert!(
+            matches!(ran.stop, Stop::HostError(ref message) if message == "step data is not the default"),
+            "{label}: {ran:#?}"
+        );
+        assert_eq!(ran.budgets, queued, "{label}");
+        assert!(!ran.tail, "{label}");
+        assert_eq!(ran.collects, 0, "{label}");
+        assert_eq!(ran.collections, 0, "{label}");
+        assert!(ran.trace.bits.is_empty(), "{label}");
+        assert!(ran.trace.steps.is_empty(), "{label}");
+    }
+    let gathered = run_with_step_budgets(
+        &witness_chunk("  local unissued = external_shape()\n  bit(1, collectgarbage(\"step\"))\n"),
+        Some(&queued),
+    );
+    assert!(
+        matches!(
+            gathered.stop,
+            Stop::HostError(ref message) if message.contains("invalid private Lua root candidate")
+        ),
+        "mark gather control: {gathered:#?}"
+    );
+    assert_eq!(gathered.budgets, queued, "gather fails before a budget pop");
+    assert!(!gathered.tail);
+    assert_eq!(gathered.collects, 0);
+}
+
+/// An already-supported step inside the data call crosses publish. The outer
+/// step then reads that tail and does not gather the caller's unissued value.
+/// Cancelling the inner steps makes the same outer call gather and refuse.
+#[test]
+fn guest_step_runtime_data_reads_tail_after_nested_step() {
+    let stepped = r#"
+local function produce()
+  local w = {}
+  local mt = {}
+  mt.__mode = "v"
+  setmetatable(w, mt)
+  w[1] = {}
+  w[2] = {}
+  collectgarbage("step")
+  collectgarbage("step")
+  return nil
+end
+local unissued = external_shape()
+bit(1, collectgarbage("step", produce()))
+return 1
+"#;
+    let cancelled = r#"
+local function produce()
+  return nil
+end
+local unissued = external_shape()
+bit(1, collectgarbage("step", produce()))
+return 1
+"#;
+    let ran = run_with_step_budgets(stepped, Some(&[1, 10_000, 1]));
+    assert_eq!(ran.trace.bits, [(1.0, false)], "{ran:#?}");
+    assert_eq!(ran.trace.bit_cycle_state, [(true, 0)]);
+    assert!(ran.tail, "the outer step continued the saved tail");
+    assert!(ran.budgets.is_empty(), "{:?}", ran.budgets);
+    assert_eq!(ran.collects, 0);
+    assert_eq!(ran.collections, 0);
+    assert_sweep_pending(&ran, "chunk exit keeps the tail the outer step read");
+
+    let idle = run_with_step_budgets(cancelled, Some(&[1, 10_000, 1]));
+    assert!(
+        matches!(
+            idle.stop,
+            Stop::HostError(ref message) if message.contains("invalid private Lua root candidate")
+        ),
+        "cancelled inner step must gather, not step: {idle:#?}"
+    );
+    assert_eq!(idle.budgets, [1, 10_000, 1]);
+    assert!(!idle.tail);
+    assert_eq!(idle.collects, 0);
+    assert!(idle.trace.bits.is_empty());
+}
+
+/// A same-name function with arguments is the existing arity refusal. A local
+/// binding is the dedicated shadow path. Neither is the opt-in step.
+#[test]
+fn guest_step_same_name_function_is_not_the_shadow_path() {
+    let function = run_with_step_budgets(
+        "local function collectgarbage()\n  return nil\nend\nreturn collectgarbage()\n",
+        Some(&[1]),
+    );
+    assert_eq!(function.stop, Stop::Halted, "{function:#?}");
+    assert_eq!(function.stack, [Value::Null]);
+    assert_eq!(function.budgets, [1]);
+    assert!(function.trace.bits.is_empty());
+    assert!(!function.tail);
+
+    let arity = candidate::lower(
+        "local function collectgarbage()\n  return nil\nend\nreturn collectgarbage(\"step\", nil)\n",
+        catalog(true),
+    )
+    .expect_err("a same-name function accepted arguments");
+    assert!(arity.message.contains("not lowered yet"), "{arity}");
+    assert_eq!(arity.line, 4usize, "arity refusal is the call, got {arity}");
+
+    let shadow = candidate::lower(
+        "local collectgarbage = nil\nreturn collectgarbage(\"step\", nil)\n",
+        catalog(true),
+    )
+    .expect_err("a shadowed name became the step builtin");
+    assert!(shadow.message.contains("not lowered yet"), "{shadow}");
+    assert_eq!(
+        shadow.line, 2usize,
+        "shadow refusal is the call, got {shadow}"
+    );
+
+    let init = candidate::lower(
+        "local collectgarbage = type\nreturn collectgarbage(\"step\", nil)\n",
+        catalog(true),
+    )
+    .expect_err("an unbound value initializer was accepted");
+    assert!(init.message.contains("not lowered yet"), "{init}");
+    assert_eq!(
+        init.line, 1usize,
+        "this is the initializer, not the call shadow, got {init}"
+    );
 }
 
 const TEMPORARY_STEP: &str = r#"
