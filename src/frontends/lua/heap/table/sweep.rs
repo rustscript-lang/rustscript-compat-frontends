@@ -135,6 +135,52 @@ impl SweepTail {
     pub(super) fn note_late(&mut self) {
         self.late_nodes = self.late_nodes.saturating_add(1);
     }
+
+    /// Adjusts the saved cursor for one retiring top frame.
+    ///
+    /// Release keeps the dead cursor and the accumulated counts. Roots counts
+    /// `Some` tags in the scanned overlap of this frame, including duplicates,
+    /// then clamps the cursor downward. A cursor that has not entered the frame
+    /// is not sliced and is not moved forward. This does not read nodes or the
+    /// scan meter.
+    pub(super) fn retire_frame_prefix(
+        &mut self,
+        roots: &[Option<super::Rooted>],
+        start: usize,
+        width: usize,
+    ) -> super::FrameRetirement {
+        debug_assert!(
+            matches!(self.phase, TailPhase::Release | TailPhase::Roots),
+            "a saved tail is release or roots"
+        );
+        if matches!(self.phase, TailPhase::Release) {
+            return super::FrameRetirement {
+                release_phase: true,
+                prefix_slots: 0,
+                dropped_live: 0,
+            };
+        }
+        let index = self.index;
+        if index <= start {
+            self.index = index.min(start);
+            return super::FrameRetirement {
+                release_phase: false,
+                prefix_slots: 0,
+                dropped_live: 0,
+            };
+        }
+        let frame_end = start.saturating_add(width);
+        let slice_end = index.min(frame_end).min(roots.len());
+        let overlap = roots.get(start..slice_end).unwrap_or(&[]);
+        let dropped_live = overlap.iter().filter(|slot| slot.is_some()).count() as u32;
+        self.live_roots = self.live_roots.saturating_sub(dropped_live);
+        self.index = index.min(start);
+        super::FrameRetirement {
+            release_phase: false,
+            prefix_slots: overlap.len() as u32,
+            dropped_live,
+        }
+    }
 }
 
 /// One release, root, or uncharged transition. Callers share this with [`SweepSession`].

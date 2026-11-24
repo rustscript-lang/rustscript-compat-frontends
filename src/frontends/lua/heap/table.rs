@@ -182,6 +182,21 @@ pub struct CollectReport {
     pub live_roots: u32,
 }
 
+/// Accounting for one top frame removed during a saved published tail.
+///
+/// Each field is this retirement only. None of them is a scan unit, and none
+/// of them replaces the cycle report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct FrameRetirement {
+    /// The tail was still releasing dead slots, so the dead cursor stayed put.
+    pub(super) release_phase: bool,
+    /// Scanned slots of this frame. Zero in Release, and zero when the root
+    /// cursor has not entered the frame.
+    pub(super) prefix_slots: u32,
+    /// `Some` tags in that prefix. A repeated handle counts once per slot.
+    pub(super) dropped_live: u32,
+}
+
 /// Identity of one explicit root frame. Frames are a stack.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RootFrameId {
@@ -2107,6 +2122,37 @@ impl LuaHeap {
         Ok(())
     }
 
+    /// Drops the top frame while a published tail is saved.
+    ///
+    /// The frame is checked before the tail. No frame is [`HeapError::NoRootFrame`].
+    /// A frame that is not top, or an old generation, is [`HeapError::StaleFrame`].
+    /// A valid top frame with no tail is [`HeapError::SweepDenied`]. Refusal
+    /// does not change the cursor, counts, root vector, or frame stack.
+    ///
+    /// On success the tail adjusts its own prefix, then this truncates the root
+    /// vector to the frame start and pops the frame. It does not resume the sweep.
+    pub(super) fn retire_published_root_frame(
+        &mut self,
+        frame: RootFrameId,
+    ) -> Result<FrameRetirement, HeapError> {
+        let (start, width) = {
+            let top = self.frames.last().ok_or(HeapError::NoRootFrame)?;
+            if top.index != frame.index || top.generation != frame.generation {
+                return Err(HeapError::StaleFrame);
+            }
+            if self.sweep_tail.is_none() {
+                return Err(HeapError::SweepDenied);
+            }
+            (top.start as usize, top.width as usize)
+        };
+        let mut tail = self.sweep_tail.take().expect("published tail");
+        let retirement = tail.retire_frame_prefix(&self.roots, start, width);
+        self.sweep_tail = Some(tail);
+        self.roots.truncate(start);
+        self.frames.pop();
+        Ok(retirement)
+    }
+
     /// Records the typed token that owns `table`. The handle is not installed
     /// as a root.
     pub fn bind_token(&mut self, table: TableRef, raw: u64) -> Result<(), HeapError> {
@@ -2769,6 +2815,9 @@ mod published_late_allocation;
 #[cfg(test)]
 #[path = "../../../../tests/luajit_heap_runtime/published_refill.rs"]
 mod published_refill;
+#[cfg(test)]
+#[path = "../../../../tests/luajit_heap_runtime/published_root_frame_retirement.rs"]
+mod published_root_frame_retirement;
 #[cfg(test)]
 #[path = "../../../../tests/luajit_heap_runtime/published_sweep.rs"]
 mod published_sweep;

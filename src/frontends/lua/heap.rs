@@ -352,6 +352,28 @@ fn step_private_cycle(
     }
 }
 
+/// Drops the top root frame while this scope's published sweep tail is saved.
+///
+/// No heap is [`HeapError::SweepDenied`] and installs nothing. An installed
+/// heap checks the frame before the tail: no frame is [`HeapError::NoRootFrame`],
+/// a non-top or old generation is [`HeapError::StaleFrame`], and a valid top
+/// frame with no tail is [`HeapError::SweepDenied`]. Refusal does not move the
+/// cursor, counts, root vector, or frame stack.
+///
+/// Release keeps the dead cursor and the accumulated counts. Roots deducts
+/// `Some` tags already scanned in this frame, including duplicates, then clamps
+/// the root cursor downward. This does not look up nodes, rescan roots, advance
+/// the sweep, or roll back the scan meter. Not a guest `collectgarbage` step.
+fn retire_published_root_frame(
+    host: &mut HostContext,
+    frame: table::RootFrameId,
+) -> Result<table::FrameRetirement, HeapError> {
+    if host.scope_state::<LuaHeap>().is_none() {
+        return Err(HeapError::SweepDenied);
+    }
+    with_heap(host, |heap| heap.retire_published_root_frame(frame))
+}
+
 /// Deletes one ordinary UTF-8 named field while this scope's published sweep
 /// tail is saved. Does not install a heap and does not resume the tail.
 ///
