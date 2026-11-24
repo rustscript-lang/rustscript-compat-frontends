@@ -432,7 +432,7 @@ fn drive(source: &str, budgets: Option<&[u64]>, run_control: bool, nodes: Option
         .with_source_plugin(plugin)
         .with_host_api_catalog(Arc::clone(&catalog));
     let prepared = vm::compile_source_with_flavor_and_options(source, SourceFlavor::Lua, options)
-        .unwrap_or_else(|error| panic!("compile rejected the source: {error}"));
+        .unwrap_or_else(|error| panic!("compile rejected the source: {error}\n{source}"));
     let mut vm = prepared.into_vm().expect("create VM");
     assert_return_window(vm.program());
     let mut registry = HostFunctionRegistry::empty();
@@ -768,6 +768,41 @@ fn assert_final_weak_types(ran: &Ran, expected: &str) {
     assert_eq!(text_value(&ran.trace, 3.0), expected);
 }
 
+/// The opt-in slice only lets the guest spell the default data. An empty
+/// `data` is the already-supported omitted argument.
+fn collect_step_call(data: &str) -> String {
+    if data.is_empty() {
+        r#"collectgarbage("step")"#.to_string()
+    } else {
+        format!(r#"collectgarbage("step", {data})"#)
+    }
+}
+
+fn assert_guest_step_cycle(ran: &Ran) {
+    assert_eq!(weak_lengths(ran), [3.0, 3.0, 1.0, 1.0, 1.0]);
+    assert_eq!(
+        ran.trace.bits,
+        [(1.0, false), (2.0, false), (3.0, false), (4.0, true)]
+    );
+    assert_eq!(
+        ran.trace.bit_cycle_state,
+        [(false, 0), (true, 0), (true, 0), (false, 1)]
+    );
+    assert_final_weak_types(ran, "nil");
+    assert!(ran.trace.steps.is_empty(), "no private test step host ran");
+    assert_eq!(ran.collects, 1, "one completion report");
+    assert_eq!(ran.collections, 1, "one completed round");
+}
+
+fn assert_step_source_rejected(source: &str) {
+    let error = candidate::lower(source, catalog(true))
+        .expect_err("the opt-in step lowering accepted an unsupported shape");
+    assert!(
+        error.message.contains("not lowered yet"),
+        "expected the existing unsupported path for {source:?}, got {error}"
+    );
+}
+
 #[test]
 fn guest_step_reports_completion_after_visible_weak_clear() {
     let ran = run_step_witness(
@@ -802,6 +837,51 @@ fn guest_step_reports_completion_after_visible_weak_clear() {
     assert!(ran.trace.steps.is_empty(), "no private test step host ran");
     assert_eq!(ran.collects, 1);
     assert_eq!(ran.collections, 1);
+}
+
+#[test]
+fn guest_step_explicit_default_data_matches_omitted() {
+    for (label, data) in [
+        ("omitted", ""),
+        ("nil", "nil"),
+        ("zero", "0"),
+        ("string-zero", "\"0\""),
+    ] {
+        let calls: Vec<_> = (1..=4)
+            .map(|tag| format!("bit({tag}, {})", collect_step_call(data)))
+            .collect();
+        let ran = run_step_witness(
+            label,
+            [
+                calls[0].as_str(),
+                calls[1].as_str(),
+                calls[2].as_str(),
+                calls[3].as_str(),
+            ],
+            Some(&[1, 10_000, 1, 10_000]),
+        );
+        assert_guest_step_cycle(&ran);
+    }
+}
+
+#[test]
+fn guest_step_explicit_default_data_rejects_other_shapes() {
+    for source in [
+        "return collectgarbage(\"step\", 1)\n",
+        "return collectgarbage(\"step\", \"1\")\n",
+        "return collectgarbage(\"step\", \"0.0\")\n",
+        "return collectgarbage(\"step\", \"00\")\n",
+        "return collectgarbage(\"step\", nil, nil)\n",
+        "local n = nil\nreturn collectgarbage(\"step\", n)\n",
+        "return collectgarbage(\"step\", (nil))\n",
+        "return collectgarbage(\"step\", -0)\n",
+        "local collectgarbage = type\nreturn collectgarbage(\"step\", nil)\n",
+    ] {
+        assert_step_source_rejected(source);
+    }
+    let ordinary = candidate::lower("return collectgarbage(\"step\", nil)\n", catalog(false))
+        .expect_err("ordinary catalog accepted explicit step data");
+    assert!(ordinary.message.contains("not lowered yet"), "{ordinary}");
 }
 
 const TEMPORARY_STEP: &str = r#"

@@ -4124,6 +4124,16 @@ impl Lower<'_> {
                         return self.run_control_expr(bytes, expr.span());
                     }
                 }
+                // Explicit nil, parser +0, and the string "0" share the omitted step.
+                // Only those static literals; other expressions stay unsupported.
+                if name.is("collectgarbage")
+                    && !self.name_is_bound(name)
+                    && self.catalog.function(STEP).is_some()
+                    && self.catalog.function(STEP_HAS_TAIL).is_some()
+                    && self.explicit_default_step_data(&args.exprs)
+                {
+                    return self.step_expr(expr.span());
+                }
                 if name.is("copy_fields")
                     && let [arg] = args.exprs.as_slice()
                 {
@@ -4389,6 +4399,24 @@ impl Lower<'_> {
     fn collect_expr(&mut self, span: ast::Span) -> Result<Expr, ParseError> {
         let roots = self.gather_safepoint_roots(span)?;
         self.call(COLLECT, vec![roots])
+    }
+
+    fn explicit_default_step_data(&self, args: &[ast::Expr]) -> bool {
+        let [ast::Expr::String { bytes, .. }, data] = args else {
+            return false;
+        };
+        if bytes != b"step" {
+            return false;
+        }
+        match data {
+            ast::Expr::Nil { .. } => true,
+            ast::Expr::String { bytes, .. } => bytes == b"0",
+            ast::Expr::Number { raw, kind, span } => matches!(
+                self.proven_number(raw, *kind, *span),
+                Ok(Expr::Float(value)) if value.to_bits() == 0
+            ),
+            _ => false,
+        }
     }
 
     fn step_expr(&mut self, span: ast::Span) -> Result<Expr, ParseError> {
