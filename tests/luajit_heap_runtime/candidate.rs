@@ -1852,11 +1852,15 @@ fn set_gc_running(host: &mut vm::HostContext<'_>, running: bool) -> Result<Value
 }
 
 fn gc_is_running(host: &vm::HostContext<'_>) -> Value {
-    Value::Bool(
-        host.scope_state::<GcRunControl>()
-            .map(|control| control.running)
-            .unwrap_or(true),
-    )
+    Value::Bool(gc_running(host))
+}
+
+/// Read the guest switch after the VM has already stopped. A HostError cannot
+/// call `isrunning`. This read does not restart, step, or gather.
+pub(super) fn gc_running(host: &vm::HostContext<'_>) -> bool {
+    host.scope_state::<GcRunControl>()
+        .map(|control| control.running)
+        .unwrap_or(true)
 }
 
 fn restore_running_after_progress(host: &mut vm::HostContext<'_>) -> Result<(), VmError> {

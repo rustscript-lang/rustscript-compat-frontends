@@ -117,6 +117,7 @@ struct Ran {
     returned: Option<heap::TableRef>,
     release_root: Option<candidate::ReleaseRootNote>,
     budgets: Vec<u64>,
+    running: bool,
 }
 
 struct Plugin {
@@ -518,6 +519,7 @@ fn drive(source: &str, budgets: Option<&[u64]>, run_control: bool, nodes: Option
         .map(|witness| (witness.returned, witness.release_root.clone()))
         .unwrap_or((None, None));
     let budgets = candidate::remaining_step_budgets(&mut vm.host_context());
+    let running = candidate::gc_running(&vm.host_context());
     let stop = match status {
         Ok(VmStatus::Halted) => Stop::Halted,
         Err(VmError::HostError(message)) => Stop::HostError(message),
@@ -541,6 +543,7 @@ fn drive(source: &str, budgets: Option<&[u64]>, run_control: bool, nodes: Option
         returned,
         release_root,
         budgets,
+        running,
     }
 }
 
@@ -2924,4 +2927,229 @@ fn push_value_observe(
         "text({tag}, type(rawget({owner}, \"orphan\")))\n\
          note({tag}, same({value}, rawget({owner}, {key})))\n"
     ));
+}
+
+/// Stop, then a variable zero, enters a real partial step on the combined
+/// catalog. Bool false restores running and does not complete. A later literal
+/// `0` is the static default on that same catalog; the weak clear completes once.
+#[test]
+fn stopped_runtime_zero_steps_partial_then_completes_once() {
+    let variable = "local zero = 0\nreturn collectgarbage(\"step\", zero)\n";
+    let stop = "return collectgarbage(\"stop\")\n";
+    let ordinary = candidate::lower(variable, catalog(false))
+        .expect_err("ordinary catalog accepted runtime step data");
+    assert!(ordinary.message.contains("not lowered yet"), "{ordinary}");
+    let ordinary_stop =
+        candidate::lower(stop, catalog(false)).expect_err("ordinary catalog accepted stop");
+    assert!(
+        ordinary_stop.message.contains("not lowered yet"),
+        "{ordinary_stop}"
+    );
+    candidate::lower(variable, catalog(true)).expect("step catalog rejected runtime zero");
+    let step_stop =
+        candidate::lower(stop, catalog(true)).expect_err("step-only catalog accepted stop");
+    assert!(step_stop.message.contains("not lowered yet"), "{step_stop}");
+    candidate::lower(variable, catalog_for(true, true))
+        .expect("combined catalog rejected runtime zero");
+    candidate::lower(stop, catalog_for(true, true)).expect("combined catalog rejected stop");
+
+    let ran = run_control(
+        r#"
+local function witness()
+  local w = {}
+  local mt = {}
+  local t = {}
+  mt.__mode = "v"
+  setmetatable(w, mt)
+  w[1] = t
+  w[2] = {}
+  w[3] = {}
+  peek(t)
+  local zero = 0
+  note(1, collectgarbage("stop"))
+  bit(1, collectgarbage("isrunning"))
+  bit(2, collectgarbage("step", zero))
+  bit(3, collectgarbage("isrunning"))
+  note(11, rawlen(w))
+  bit(4, collectgarbage("step", 0))
+  note(12, rawlen(w))
+  bit(5, collectgarbage("step", zero))
+  bit(6, collectgarbage("step", 0))
+  note(14, rawlen(w))
+  text(2, type(rawget(w, 2)))
+  text(3, type(rawget(w, 3)))
+  note(20, same(t, rawget(w, 1)))
+  return 1
+end
+witness()
+return 1
+"#,
+        Some(&[1, 10_000, 1, 10_000]),
+    );
+    assert_eq!(ran.stop, Stop::Halted, "{ran:?}");
+    assert_eq!(note_value(&ran.trace, 1.0), 0.0);
+    assert!(!bit_value(&ran.trace, 1.0), "stop is observable");
+    assert!(
+        !bit_value(&ran.trace, 2.0),
+        "variable zero returns the real partial Bool false"
+    );
+    assert_eq!(
+        cycle_at(&ran.trace, 2.0),
+        (false, 0),
+        "the partial step does not publish a tail or a completion"
+    );
+    assert!(
+        bit_value(&ran.trace, 3.0),
+        "a false runtime step still restores running"
+    );
+    assert!(!bit_value(&ran.trace, 4.0));
+    assert!(!bit_value(&ran.trace, 5.0));
+    assert!(bit_value(&ran.trace, 6.0), "the cycle completes once");
+    assert_eq!(
+        [
+            cycle_at(&ran.trace, 4.0),
+            cycle_at(&ran.trace, 5.0),
+            cycle_at(&ran.trace, 6.0),
+        ],
+        [(true, 0), (true, 0), (false, 1)]
+    );
+    assert_eq!(note_value(&ran.trace, 11.0), 3.0);
+    assert_eq!(
+        note_value(&ran.trace, 12.0),
+        1.0,
+        "the independent weak items clear on the published tail"
+    );
+    assert_eq!(note_value(&ran.trace, 14.0), 1.0);
+    assert_eq!(text_value(&ran.trace, 2.0), "nil");
+    assert_eq!(text_value(&ran.trace, 3.0), "nil");
+    assert_eq!(note_value(&ran.trace, 20.0), 1.0);
+    assert!(
+        ran.running,
+        "the successful completion leaves the switch running"
+    );
+    assert!(ran.budgets.is_empty(), "{:?}", ran.budgets);
+    assert_eq!(ran.collects, 1);
+    assert_eq!(ran.collections, 1);
+    assert!(!ran.tail);
+}
+
+/// A published tail, then stop, then an evaluated non-default. The category
+/// host refuses before the next budget. Valid data still reads that tail and
+/// does not gather; without a tail the same data gathers and refuses.
+#[test]
+fn stopped_tail_rejects_evaluated_data_before_next_budget() {
+    let queued = [10_000_u64, 1, 10_000];
+    let refused = run_control(
+        r#"
+local function witness()
+  local w = {}
+  local mt = {}
+  local held = {}
+  mt.__mode = "v"
+  setmetatable(w, mt)
+  w[1] = held
+  w[2] = {}
+  peek(held)
+  bit(1, collectgarbage("step"))
+  note(1, collectgarbage("stop"))
+  bit(2, collectgarbage("isrunning"))
+  local unissued = external_shape()
+  collectgarbage("step", note(8, 1))
+  return 1
+end
+witness()
+return 1
+"#,
+        Some(&queued),
+    );
+    assert!(
+        matches!(refused.stop, Stop::HostError(ref message) if message == "step data is not the default"),
+        "category refusal, not lowering: {refused:?}"
+    );
+    assert_eq!(
+        refused.trace.notes,
+        [(1.0, 0.0), (8.0, 1.0)],
+        "stop and the rejected data expression both ran"
+    );
+    assert!(!bit_value(&refused.trace, 1.0));
+    assert_eq!(
+        cycle_at(&refused.trace, 1.0),
+        (true, 0),
+        "the refusal starts from a published tail"
+    );
+    assert!(
+        !bit_value(&refused.trace, 2.0),
+        "stop was visible before the refusal"
+    );
+    assert!(!refused.running, "the refusal does not restore running");
+    assert!(refused.tail, "the published tail remains");
+    assert_eq!(refused.collections, 0);
+    assert_eq!(refused.collects, 0);
+    assert_eq!(
+        refused.budgets,
+        [1, 10_000],
+        "the next budget segment was not consumed: {:?}",
+        refused.budgets
+    );
+    assert_eq!(refused.trace.bits.len(), 2, "{refused:?}");
+
+    let continued = run_control(
+        r#"
+local function witness()
+  local w = {}
+  local mt = {}
+  mt.__mode = "v"
+  setmetatable(w, mt)
+  w[1] = {}
+  w[2] = {}
+  bit(1, collectgarbage("step"))
+  local unissued = external_shape()
+  local zero = 0
+  bit(2, collectgarbage("step", zero))
+  return 1
+end
+witness()
+return 1
+"#,
+        Some(&[10_000, 1]),
+    );
+    assert_eq!(continued.stop, Stop::Halted, "{continued:?}");
+    assert!(!bit_value(&continued.trace, 1.0));
+    assert_eq!(cycle_at(&continued.trace, 1.0), (true, 0));
+    assert!(
+        !bit_value(&continued.trace, 2.0),
+        "valid runtime zero continues the saved tail"
+    );
+    assert_eq!(cycle_at(&continued.trace, 2.0), (true, 0));
+    assert!(continued.tail, "the unit budget still leaves the tail");
+    assert!(continued.running);
+    assert!(continued.budgets.is_empty(), "{:?}", continued.budgets);
+    assert_eq!(continued.collects, 0);
+    assert_eq!(continued.collections, 0);
+
+    let gathered = run_control(
+        r#"
+local function witness()
+  local unissued = external_shape()
+  local zero = 0
+  bit(1, collectgarbage("step", zero))
+  return 1
+end
+witness()
+return 1
+"#,
+        Some(&[1, 9]),
+    );
+    assert!(
+        matches!(
+            gathered.stop,
+            Stop::HostError(ref message) if message.contains("invalid private Lua root candidate")
+        ),
+        "no tail must gather, not accept the data and step: {gathered:?}"
+    );
+    assert_eq!(gathered.budgets, [1, 9], "gather fails before a budget pop");
+    assert!(!gathered.tail);
+    assert_eq!(gathered.collects, 0);
+    assert_eq!(gathered.collections, 0);
+    assert!(gathered.trace.bits.is_empty(), "{gathered:?}");
 }
