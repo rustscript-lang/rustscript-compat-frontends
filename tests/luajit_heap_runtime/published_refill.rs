@@ -4,6 +4,8 @@
 //! and `set_named_edge` are the host paths a production guest step or rawset
 //! would share; both still refuse while the tail is saved. `named_value` and
 //! `next_guest` are the private host's observation of the pre-issued carrier.
+//! The Roots witness reads the saved tail receipt and the scan meter. It does
+//! not build a tail.
 
 use vm::Value;
 
@@ -699,4 +701,375 @@ fn omitted_refill_keeps_the_gap_and_the_strong_target() {
         })
         .expect("omitted");
     });
+}
+
+/// Root slots charged before the refill. The rest of the frame stays pending.
+const ROOT_PREFIX: usize = 2;
+
+fn unmarked_slots(heap: &LuaHeap) -> Vec<u32> {
+    heap.slots
+        .iter()
+        .enumerate()
+        .filter_map(|(index, slot)| {
+            matches!(slot.state, SlotState::Live { marked: false }).then_some(index as u32)
+        })
+        .collect()
+}
+
+fn marked_slot_count(heap: &LuaHeap) -> u32 {
+    heap.slots
+        .iter()
+        .filter(|slot| matches!(slot.state, SlotState::Live { marked: true }))
+        .count() as u32
+}
+
+fn tail_receipt(phase: &str, index: usize, dead: &[u32], marked: u32, live_roots: u32) -> String {
+    format!(
+        "Some(SweepTail {{ phase: {phase}, index: {index}, dead: {dead:?}, \
+         marked_nodes: {marked}, live_roots: {live_roots} }})"
+    )
+}
+
+fn visits(nodes: u64, roots: u64) -> ScanMeter {
+    ScanMeter {
+        node_slot_visits: nodes,
+        root_slot_visits: roots,
+        ..ScanMeter::default()
+    }
+}
+
+struct RootsWitness {
+    prefix_receipt: String,
+    report: CollectReport,
+}
+
+fn resume_paused(host: &mut vm::HostContext<'_>, budget: u64) {
+    let resumed = heap::resume_published_sweep(host, budget).expect("saved tail");
+    assert!(
+        matches!(resumed, PublishedResume::Paused),
+        "the saved tail is not finished, got {resumed:?}"
+    );
+}
+
+/// Refill during a real Roots prefix, or omit it and keep the gap. Both arms
+/// release the published dead slots, scan the same prefix, then finish the
+/// remaining root slots once. `named_value` is the direct read a `rawget`
+/// candidate would use. The tail comes from `collect_until_published`.
+fn drive_roots_refill(refill: bool) -> RootsWitness {
+    crate::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        let graph = build_graph(&mut host);
+        let resources_before = host.resource_count();
+        publish_two_gaps(&mut host, &graph);
+        let _ = heap::take_scan_meter(&mut host).expect("clear publish meter");
+
+        let (dead, marked, root_slots) = heap::with_heap(&mut host, |heap| {
+            let dead = unmarked_slots(heap);
+            let mut expected = [graph.doomed_a.slot(), graph.doomed_b.slot()];
+            expected.sort_unstable();
+            assert_eq!(dead, expected, "the dead set is the two published orphans");
+            assert!(
+                heap.roots.iter().all(|root| root.is_some()),
+                "the frame has no hole to hide a skipped visit"
+            );
+            assert!(
+                heap.roots.len() > ROOT_PREFIX,
+                "a partial prefix needs a pending suffix"
+            );
+            Ok((dead, marked_slot_count(heap), heap.roots.len()))
+        })
+        .expect("dead set");
+        assert_eq!(
+            tail_text(&mut host),
+            tail_receipt("Release", 0, &dead, marked, 0),
+            "publish saved a real Release tail"
+        );
+
+        resume_paused(&mut host, dead.len() as u64);
+        assert_eq!(
+            heap::take_scan_meter(&mut host).expect("release meter"),
+            visits(dead.len() as u64, 0),
+            "release visits the dead slots and no root slot"
+        );
+        assert_eq!(
+            tail_text(&mut host),
+            tail_receipt("Release", dead.len(), &dead, marked, 0),
+            "the budget ended on the last release; Roots has not started"
+        );
+        heap::with_heap(&mut host, |heap| {
+            assert!(!heap.alive(graph.doomed_a));
+            assert!(!heap.alive(graph.doomed_b));
+            assert_ne!(
+                slot_generation(heap, graph.doomed_a),
+                graph.doomed_a.generation()
+            );
+            assert_ne!(
+                slot_generation(heap, graph.doomed_b),
+                graph.doomed_b.generation()
+            );
+            Ok(())
+        })
+        .expect("released");
+        assert!(!token_open(&mut host, graph.doomed_a_token));
+        assert!(!token_open(&mut host, graph.doomed_b_token));
+        assert_eq!(heap::stats(&mut host).expect("released").collections, 0);
+
+        resume_paused(&mut host, ROOT_PREFIX as u64);
+        assert_eq!(
+            heap::take_scan_meter(&mut host).expect("prefix meter"),
+            visits(ROOT_PREFIX as u64, ROOT_PREFIX as u64),
+            "the prefix is occupied root slots, not a call-count guess"
+        );
+        let prefix_receipt = tail_receipt("Roots", ROOT_PREFIX, &dead, marked, ROOT_PREFIX as u32);
+        assert_eq!(
+            tail_text(&mut host),
+            prefix_receipt,
+            "receipt shows Roots, a scanned prefix, and an unfinished tail"
+        );
+        assert_eq!(heap::stats(&mut host).expect("paused").collections, 0);
+        assert!(matches!(
+            heap::resume_published_sweep(&mut host, 0).expect("zero"),
+            PublishedResume::Paused
+        ));
+        assert_eq!(
+            tail_text(&mut host),
+            prefix_receipt,
+            "zero budget does not move the cursor"
+        );
+        assert_eq!(
+            heap::collect(&mut host).expect_err("production collect"),
+            HeapError::SweepPending
+        );
+        assert_eq!(
+            heap::take_scan_meter(&mut host).expect("clear incremental meter"),
+            ScanMeter::default()
+        );
+
+        let before = heap::stats(&mut host).expect("before");
+        let resources = host.resource_count();
+        let (weak_place, other_place, mode_edge, saved_cursor) =
+            heap::with_heap(&mut host, |heap| {
+                let saved_cursor = heap
+                    .next_guest(graph.weak, &Value::string("a"))?
+                    .expect("the cleaned key is a saved cursor");
+                Ok((
+                    place(heap, graph.weak, "a"),
+                    place(heap, graph.other, "gap"),
+                    heap.slots[graph.meta.slot() as usize].mode_edge,
+                    saved_cursor,
+                ))
+            })
+            .expect("places");
+        assert_eq!(saved_cursor.0, Value::string("after"));
+        assert_eq!(saved_cursor.1, graph.successor_carrier);
+
+        if refill {
+            assert_eq!(
+                heap::with_heap(&mut host, |heap| {
+                    heap.set_named_edge(graph.weak, "a", graph.target)
+                }),
+                Err(HeapError::SweepPending),
+                "ordinary writer still stops at the sweep gate"
+            );
+            assert_eq!(
+                heap::refill_published_gap(&mut host, graph.weak, "a", graph.target),
+                Ok(true)
+            );
+            heap::with_heap(&mut host, |heap| {
+                assert_eq!(place(heap, graph.weak, "a"), weak_place);
+                assert_eq!(place(heap, graph.other, "gap"), other_place);
+                assert_eq!(heap.slots[graph.meta.slot() as usize].mode_edge, mode_edge);
+                assert_original_carrier(
+                    heap,
+                    graph.weak,
+                    "a",
+                    graph.target,
+                    &graph.target_carrier,
+                )?;
+                assert_eq!(
+                    heap.next_guest(graph.weak, &Value::string("a"))?
+                        .expect("saved cursor unchanged"),
+                    saved_cursor.clone()
+                );
+                assert_eq!(
+                    heap.next_guest(graph.weak, &Value::Null)?
+                        .expect("refilled key is now visible"),
+                    (Value::string("a"), graph.target_carrier.clone())
+                );
+                assert_eq!(
+                    heap.next_guest(graph.other, &Value::string("gap"))?
+                        .expect("other gap cursor"),
+                    (Value::string("next"), graph.successor_carrier.clone())
+                );
+                assert!(utf8_gap(heap, graph.other, "gap"));
+                assert_eq!(heap.named_edge(graph.keeper, "hold")?, Some(graph.target));
+                assert_eq!(heap.live_edge_count, before.live_edges + 1);
+                Ok(())
+            })
+            .expect("refilled");
+            let mut expected = before;
+            expected.live_edges += 1;
+            assert_eq!(heap::stats(&mut host).expect("after"), expected);
+            assert_eq!(host.resource_count(), resources);
+            assert_eq!(
+                tail_text(&mut host),
+                prefix_receipt,
+                "refill does not move the cursor or collect another root"
+            );
+            assert_eq!(
+                heap::take_scan_meter(&mut host).expect("refill meter"),
+                ScanMeter::default(),
+                "refill does not continue the scan"
+            );
+            assert_eq!(
+                heap::with_heap(&mut host, |heap| {
+                    heap.set_named_edge(graph.weak, "solid", graph.successor)
+                }),
+                Err(HeapError::SweepPending),
+                "refill does not open the ordinary writer"
+            );
+            assert_eq!(tail_text(&mut host), prefix_receipt);
+            assert_eq!(
+                heap::take_scan_meter(&mut host).expect("writer refusal"),
+                ScanMeter::default()
+            );
+        } else {
+            heap::with_heap(&mut host, |heap| {
+                assert!(utf8_gap(heap, graph.weak, "a"));
+                assert_eq!(heap.named_value(graph.weak, "a")?, Value::Null);
+                assert_eq!(place(heap, graph.other, "gap"), other_place);
+                assert_eq!(
+                    heap.next_guest(graph.weak, &Value::string("a"))?
+                        .expect("omitted cursor"),
+                    saved_cursor.clone()
+                );
+                Ok(())
+            })
+            .expect("gap remains before the suffix");
+            assert_eq!(heap::stats(&mut host).expect("omitted"), before);
+            assert_eq!(host.resource_count(), resources);
+            assert_eq!(tail_text(&mut host), prefix_receipt);
+            assert_eq!(
+                heap::take_scan_meter(&mut host).expect("omission meter"),
+                ScanMeter::default()
+            );
+        }
+
+        let remaining = root_slots - ROOT_PREFIX;
+        resume_paused(&mut host, remaining as u64);
+        assert_eq!(
+            heap::take_scan_meter(&mut host).expect("suffix meter"),
+            visits(remaining as u64, remaining as u64),
+            "the same Roots phase scans the remaining slots"
+        );
+        assert_eq!(
+            tail_text(&mut host),
+            tail_receipt("Roots", root_slots, &dead, marked, root_slots as u32),
+            "the cursor is at the end of Roots and the cycle is not reported"
+        );
+        assert_eq!(heap::stats(&mut host).expect("suffix").collections, 0);
+
+        let resumed = heap::resume_published_sweep(&mut host, 1).expect("complete");
+        let PublishedResume::Completed(report) = resumed else {
+            panic!("the uncharged completion finishes once, got {resumed:?}");
+        };
+        assert_eq!(
+            heap::take_scan_meter(&mut host).expect("completion meter"),
+            ScanMeter::default(),
+            "completion does not scan another root"
+        );
+        assert_eq!(report.live_nodes, marked);
+        assert_eq!(report.marked_nodes, marked);
+        assert_eq!(report.live_roots, root_slots as u32);
+        assert_eq!(heap::stats(&mut host).expect("finished").collections, 1);
+        assert_eq!(
+            heap::resume_published_sweep(&mut host, 1).expect_err("tail is gone"),
+            HeapError::SweepDenied
+        );
+
+        if refill {
+            heap::with_heap(&mut host, |heap| {
+                assert_original_carrier(
+                    heap,
+                    graph.weak,
+                    "a",
+                    graph.target,
+                    &graph.target_carrier,
+                )?;
+                Ok(())
+            })
+            .expect("identity survives the rest of the root scan");
+            let kept = heap::collect(&mut host).expect("strong root retains the target");
+            assert_eq!(kept.live_nodes, marked);
+            assert!(token_open(&mut host, graph.target_token));
+            heap::with_heap(&mut host, |heap| {
+                assert_original_carrier(
+                    heap,
+                    graph.weak,
+                    "a",
+                    graph.target,
+                    &graph.target_carrier,
+                )?;
+                heap.set_named_scalar(graph.keeper, "hold", Value::Null)?;
+                Ok(())
+            })
+            .expect("drop the independent strong root");
+            let cleaned = heap::collect(&mut host).expect("next cycle");
+            assert_eq!(cleaned.live_nodes, marked - 1);
+            assert!(!token_open(&mut host, graph.target_token));
+            assert_eq!(host.resource_count(), resources_before - 3);
+            heap::with_heap(&mut host, |heap| {
+                assert!(!heap.alive(graph.target));
+                assert_ne!(
+                    slot_generation(heap, graph.target),
+                    graph.target.generation()
+                );
+                assert!(utf8_gap(heap, graph.weak, "a"));
+                assert!(utf8_gap(heap, graph.weak, "solid"));
+                assert_eq!(heap.named_value(graph.weak, "a")?, Value::Null);
+                assert!(heap.alive(graph.successor));
+                assert!(heap.alive(graph.keeper));
+                Ok(())
+            })
+            .expect("released after the strong root was cleared");
+        } else {
+            assert!(token_open(&mut host, graph.target_token));
+            heap::with_heap(&mut host, |heap| {
+                assert!(utf8_gap(heap, graph.weak, "a"), "omission keeps the gap");
+                assert_eq!(heap.named_value(graph.weak, "a")?, Value::Null);
+                assert!(heap.alive(graph.target));
+                assert_eq!(heap.named_edge(graph.keeper, "hold")?, Some(graph.target));
+                assert_eq!(
+                    heap.next_guest(graph.weak, &Value::string("a"))?
+                        .expect("cursor still continues"),
+                    saved_cursor
+                );
+                Ok(())
+            })
+            .expect("omission");
+        }
+
+        RootsWitness {
+            prefix_receipt,
+            report,
+        }
+    })
+}
+
+/// Roots partial prefix: the pre-issued carrier stays readable, the saved
+/// cursor and the other gap stay put, and the same phase finishes once.
+/// The omission run is the matching control.
+#[test]
+fn published_refill_during_partial_root_scan_keeps_the_carrier_and_resumes() {
+    let refilled = drive_roots_refill(true);
+    let omitted = drive_roots_refill(false);
+    assert_eq!(
+        refilled.prefix_receipt, omitted.prefix_receipt,
+        "both runs paused on the same Roots prefix"
+    );
+    assert_eq!(
+        refilled.report.live_roots, omitted.report.live_roots,
+        "finished root count matches the omission control"
+    );
+    assert_eq!(refilled.report, omitted.report);
 }
