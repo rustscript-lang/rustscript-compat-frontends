@@ -297,6 +297,35 @@ fn stored_len(len: usize) -> u64 {
     len as u64
 }
 
+/// A new table-object key, with a table value when the value is itself a table.
+/// A string value keeps `value` empty so the barrier follows only the key.
+struct NewTableKeyInsert {
+    key_slot: u32,
+    key_generation: u32,
+    value: Option<(u32, u32)>,
+}
+
+fn new_table_key_insert(key: &EdgeKey, value: &EdgeValue) -> Option<NewTableKeyInsert> {
+    let EdgeKey::Object {
+        slot,
+        generation,
+        kind: HandleKind::Table,
+    } = key
+    else {
+        return None;
+    };
+    let value = match value {
+        EdgeValue::Table { slot, generation } => Some((*slot, *generation)),
+        EdgeValue::Scalar(Value::String(_)) => None,
+        _ => return None,
+    };
+    Some(NewTableKeyInsert {
+        key_slot: *slot,
+        key_generation: *generation,
+        value,
+    })
+}
+
 fn key_payload(key: &EdgeKey) -> u64 {
     match key {
         EdgeKey::Utf8(text) => stored_len(text.len()),
@@ -1737,6 +1766,11 @@ impl LuaHeap {
         } else {
             None
         };
+        let table_key = if self.mark.is_some() {
+            new_table_key_insert(&key, &value)
+        } else {
+            None
+        };
         let added = key_payload(&key) + value_payload(&value);
         let index = self.take_edge_slot();
         self.edge_slots[index as usize].edge = Some(Edge { key, value });
@@ -1748,6 +1782,14 @@ impl LuaHeap {
         self.note_edge_peak();
         if let Some((slot, generation)) = barrier {
             self.barrier_strong_field(from_slot, slot, generation);
+        }
+        if let Some(insert) = table_key {
+            self.barrier_new_table_key(
+                from_slot,
+                insert.key_slot,
+                insert.key_generation,
+                insert.value,
+            );
         }
         Ok(())
     }

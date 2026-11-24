@@ -1084,6 +1084,29 @@ fn cached_values_weak(heap: &LuaHeap, state: &MarkState, owner: u32) -> bool {
         .is_some_and(|mode| mode.values)
 }
 
+/// Both weak bits from the same reset-time cache. No metatable follow and
+/// no scan counter. The values-only fast path above is unchanged.
+fn cached_owner_mode(heap: &LuaHeap, state: &MarkState, owner: u32) -> WeakMode {
+    if heap.metatable_edges == 0 {
+        return WeakMode::default();
+    }
+    let Some(stored) = heap.slots.get(owner as usize) else {
+        return WeakMode::default();
+    };
+    if stored.kind != HandleKind::Table {
+        return WeakMode::default();
+    }
+    let Some((meta_slot, _)) = stored.metatable else {
+        return WeakMode::default();
+    };
+    state
+        .modes
+        .as_ref()
+        .and_then(|modes| modes.get(meta_slot as usize))
+        .copied()
+        .unwrap_or_default()
+}
+
 /// Same visits as the old target follow. True when the slot matches, even
 /// if it was already marked. Only a newly marked slot joins the gray stack.
 fn follow_one(
@@ -1166,6 +1189,41 @@ impl LuaHeap {
             && !cached_values_weak(self, &state, owner)
         {
             enqueue_barrier_target(self, &mut state, slot, generation, HandleKind::Table);
+        }
+        self.mark = Some(state);
+    }
+
+    /// Enqueues a newly inserted table-object key, and a strong table value.
+    ///
+    /// A string value is not a table node. An owner that is not yet marked is
+    /// left for the continued scan. Successors stay on the gray queue. This
+    /// does not read a metatable or move the pending cursor.
+    pub(super) fn barrier_new_table_key(
+        &mut self,
+        owner: u32,
+        key_slot: u32,
+        key_generation: u32,
+        value: Option<(u32, u32)>,
+    ) {
+        let Some(mut state) = self.mark.take() else {
+            return;
+        };
+        if state.mutation_open() && discovered_table(self, owner) {
+            let mode = cached_owner_mode(self, &state, owner);
+            if !mode.keys {
+                enqueue_barrier_target(
+                    self,
+                    &mut state,
+                    key_slot,
+                    key_generation,
+                    HandleKind::Table,
+                );
+            }
+            if !mode.values
+                && let Some((slot, generation)) = value
+            {
+                enqueue_barrier_target(self, &mut state, slot, generation, HandleKind::Table);
+            }
         }
         self.mark = Some(state);
     }

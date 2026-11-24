@@ -3377,3 +3377,576 @@ fn raw_set_edge_on_an_unmarked_owner_waits_for_normal_discovery() {
     assert_eq!(heap.scan.parked_edge_writes, 0);
     assert_eq!(heap.scan.mark_passes, 1);
 }
+
+/// New table-object key inserted into an already scanned owner.
+///
+/// `midcycle-existing-object-key` is an old record and is not this slice.
+/// LuaJIT `evidence/lua52-gc-step/midcycle-reference-publication.lua` key/omit
+/// is only the external scalar-payload control for a new object key.
+enum NewTableKeyArm {
+    Strong,
+    WeakValue,
+    WeakKey,
+    WeakBoth,
+    StringValue,
+    SameTarget,
+    Omitted,
+}
+
+#[test]
+fn gray_new_table_key_strong_retains_both_ends() {
+    exercise_new_table_key(NewTableKeyArm::Strong);
+}
+
+#[test]
+fn gray_new_table_key_weak_values_follow_key_only() {
+    exercise_new_table_key(NewTableKeyArm::WeakValue);
+}
+
+#[test]
+fn gray_new_table_key_weak_keys_follow_value_only() {
+    exercise_new_table_key(NewTableKeyArm::WeakKey);
+}
+
+#[test]
+fn gray_new_table_key_weak_both_keeps_physical_rules() {
+    exercise_new_table_key(NewTableKeyArm::WeakBoth);
+}
+
+#[test]
+fn gray_new_table_key_string_value_follows_key_only() {
+    exercise_new_table_key(NewTableKeyArm::StringValue);
+}
+
+#[test]
+fn gray_new_table_key_same_target_pushes_once() {
+    exercise_new_table_key(NewTableKeyArm::SameTarget);
+}
+
+#[test]
+fn gray_new_table_key_omitted_collects_unmarked() {
+    exercise_new_table_key(NewTableKeyArm::Omitted);
+}
+
+fn exercise_new_table_key(arm: NewTableKeyArm) {
+    let mode = match arm {
+        NewTableKeyArm::WeakValue => Some("v"),
+        NewTableKeyArm::WeakKey => Some("k"),
+        NewTableKeyArm::WeakBoth => Some("kv"),
+        NewTableKeyArm::Strong
+        | NewTableKeyArm::StringValue
+        | NewTableKeyArm::SameTarget
+        | NewTableKeyArm::Omitted => None,
+    };
+    let pin_key = matches!(arm, NewTableKeyArm::WeakKey);
+    let string_value = matches!(arm, NewTableKeyArm::StringValue);
+    let same_target = matches!(arm, NewTableKeyArm::SameTarget);
+    let omitted = matches!(arm, NewTableKeyArm::Omitted);
+    crate::with_idle_vm(|vm| {
+        use crate::heap::{self, GuestClass, StepOutcome};
+
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits(16, 8, 16)).expect("install");
+        let planted = heap::with_heap(&mut host, |heap| {
+            let prior = heap.alloc()?;
+            let prior_slot = prior.slot();
+            let prior_generation = prior.generation();
+            heap.rollback(prior)?;
+            let key = heap.alloc()?;
+            assert_eq!(
+                key.slot(),
+                prior_slot,
+                "the new key reuses the released slot"
+            );
+            assert_ne!(
+                key.generation(),
+                prior_generation,
+                "the new key is a different generation"
+            );
+            let lookalike = heap.alloc()?;
+            assert_ne!(
+                lookalike.slot(),
+                key.slot(),
+                "lookalike is an independent key"
+            );
+            let key_child = heap.alloc()?;
+            let target = if string_value || same_target {
+                None
+            } else {
+                Some(heap.alloc()?)
+            };
+            let value_child = if target.is_some() {
+                Some(heap.alloc()?)
+            } else {
+                None
+            };
+            let owner = heap.alloc()?;
+            let sentinel = heap.alloc()?;
+            let closure = heap.alloc_closure()?;
+            let unrelated = heap.alloc()?;
+            heap.set_named_scalar(key, "tag", Value::string("key"))?;
+            heap.set_named_scalar(lookalike, "tag", Value::string("key"))?;
+            heap.set_named_edge(key, "next", key_child)?;
+            if let (Some(target), Some(child)) = (target, value_child) {
+                heap.set_named_edge(target, "next", child)?;
+            }
+            heap.set_named_scalar(owner, "old", Value::string("kept"))?;
+            heap.set_named_scalar(sentinel, "pending", Value::Bool(true))?;
+            if let Some(mode) = mode {
+                let meta = heap.alloc()?;
+                heap.set_mode_scalar(meta, Value::string(mode))?;
+                heap.set_metatable(owner, Some(meta))?;
+                assert_eq!(heap.named_value(meta, "__mode")?, Value::string(mode));
+            }
+            let stale = super::TableRef::table(heap.domain(), prior_slot, prior_generation);
+            let key_carrier = heap.issue_carrier(key)?;
+            assert_eq!(heap.guest_class(&key_carrier), GuestClass::Table(key));
+            let target_carrier = target.map(|table| heap.issue_carrier(table)).transpose()?;
+            if let (Some(table), Some(carrier)) = (target, target_carrier.as_ref()) {
+                assert_eq!(heap.guest_class(carrier), GuestClass::Table(table));
+            }
+            let frame = heap.enter_roots(4)?;
+            heap.write_root(frame, 0, sentinel)?;
+            heap.write_root(frame, 1, owner)?;
+            heap.write_closure_root(frame, 2, closure)?;
+            if pin_key {
+                heap.write_root(frame, 3, key)?;
+            }
+            Ok((
+                key,
+                lookalike,
+                key_child,
+                target,
+                value_child,
+                owner,
+                sentinel,
+                closure,
+                unrelated,
+                stale,
+                key_carrier,
+                target_carrier,
+            ))
+        })
+        .expect("plant");
+        let (
+            key,
+            lookalike,
+            key_child,
+            target,
+            value_child,
+            owner,
+            sentinel,
+            closure,
+            _unrelated,
+            stale,
+            key_carrier,
+            target_carrier,
+        ) = planted;
+        let _ = closure;
+        heap::open_fixed_step(&mut host).expect("open");
+        heap::with_heap(&mut host, |heap| {
+            let (_, old) = heap.locate_named(owner.slot(), "old").expect("old record");
+            let (_, sentinel_record) = heap
+                .locate_named(sentinel.slot(), "pending")
+                .expect("pending record");
+            let mut parked = ParkedMark::resume(heap).expect("resume");
+            pause_at(&mut parked, owner.slot(), old);
+            let before_owner = parked.meter().outgoing_edge_checks;
+            let pending = pause_at(&mut parked, sentinel.slot(), sentinel_record);
+            assert!(
+                parked.meter().outgoing_edge_checks > before_owner,
+                "the owner record was not scanned before the new key"
+            );
+            assert!(
+                parked.marked(owner),
+                "the owner color is from the scan, not the insert"
+            );
+            if pin_key {
+                assert!(
+                    parked.marked(key),
+                    "the pinned key was marked before the insert"
+                );
+            } else {
+                assert!(!parked.marked(key), "the new key starts unmarked");
+                assert!(
+                    !parked.marked(key_child),
+                    "the key successor starts unmarked"
+                );
+            }
+            if let Some(target) = target {
+                assert!(!parked.marked(target), "the new value starts unmarked");
+            }
+            let before = parked.meter();
+            parked.with_saved_heap(|heap| {
+                assert!(
+                    heap.find_key(owner.slot(), &super::EdgeKey::object(key))
+                        .is_none(),
+                    "the new key has no physical record"
+                );
+                assert!(
+                    heap.find_key(owner.slot(), &super::EdgeKey::object(lookalike))
+                        .is_none(),
+                    "the lookalike has no physical record"
+                );
+                assert!(
+                    heap.find_key(owner.slot(), &super::EdgeKey::object(stale))
+                        .is_none(),
+                    "the previous generation has no physical record"
+                );
+                if !omitted {
+                    if string_value {
+                        heap.set_object_scalar(owner, key, Value::string("标量"))?;
+                    } else if same_target {
+                        heap.set_object_edge(owner, key, key)?;
+                    } else if let Some(target) = target {
+                        heap.set_object_edge(owner, key, target)?;
+                    }
+                    let record = heap
+                        .find_key(owner.slot(), &super::EdgeKey::object(key))
+                        .expect("inserted record");
+                    assert!(
+                        heap.find_key(owner.slot(), &super::EdgeKey::object(lookalike))
+                            .is_none(),
+                        "same shape does not alias a different generation identity"
+                    );
+                    assert!(
+                        heap.find_key(owner.slot(), &super::EdgeKey::object(stale))
+                            .is_none(),
+                        "the previous generation does not alias the new key"
+                    );
+                    let edge = heap.edge_slots[record as usize]
+                        .edge
+                        .as_ref()
+                        .expect("occupied");
+                    assert_eq!(edge.key, super::EdgeKey::object(key));
+                    if string_value {
+                        assert_eq!(
+                            heap.object_value(owner, key)?,
+                            Value::string("标量"),
+                            "the scalar payload is stored"
+                        );
+                    } else if same_target {
+                        assert_eq!(heap.object_value(owner, key)?, key_carrier);
+                    } else if let Some(carrier) = target_carrier.clone() {
+                        assert_eq!(heap.object_value(owner, key)?, carrier);
+                    }
+                }
+                Ok(())
+            })?;
+            assert!(
+                same_pending(parked.pending(), Some(pending)),
+                "the pending cursor moved"
+            );
+            assert_eq!(
+                parked.scanning_owner(),
+                Some(sentinel.slot()),
+                "the write moved the gray owner"
+            );
+            assert_write_did_not_scan(&before, &parked.meter());
+            let after = parked.meter();
+            assert_eq!(after.metatable_edge_checks, before.metatable_edge_checks);
+            assert_eq!(after.weak_mode_lookups, before.weak_mode_lookups);
+            let visits = after.node_slot_visits - before.node_slot_visits;
+            let pushed = after.scratch.work_pushed - before.scratch.work_pushed;
+            let barriers = after.parked_barrier_marks - before.parked_barrier_marks;
+            match arm {
+                NewTableKeyArm::Strong => {
+                    let target = target.expect("strong value");
+                    let child = value_child.expect("value successor");
+                    assert!(parked.marked(key), "strong key is enqueued immediately");
+                    assert!(
+                        parked.marked(target),
+                        "strong value is enqueued immediately"
+                    );
+                    assert!(
+                        !parked.marked(key_child),
+                        "key successor waits for the continued scan"
+                    );
+                    assert!(
+                        !parked.marked(child),
+                        "value successor waits for the continued scan"
+                    );
+                    assert_eq!(visits, 4, "strong insert follows the key and the value");
+                    assert_eq!(pushed, 2, "strong insert pushes each unmarked end once");
+                    assert_eq!(barriers, 2);
+                }
+                NewTableKeyArm::WeakValue => {
+                    assert!(parked.marked(key), "weak values still enqueue the new key");
+                    assert!(
+                        !parked.marked(target.expect("weak value")),
+                        "weak values do not enqueue the value"
+                    );
+                    assert!(
+                        !parked.marked(key_child),
+                        "key successor waits for the continued scan"
+                    );
+                    assert_eq!(visits, 2, "weak values follow only the new key");
+                    assert_eq!(pushed, 1);
+                    assert_eq!(barriers, 1);
+                }
+                NewTableKeyArm::WeakKey => {
+                    assert!(parked.marked(key), "the pinned key was already marked");
+                    assert!(
+                        parked.marked(target.expect("weak-key value")),
+                        "weak keys still enqueue the unmarked value"
+                    );
+                    assert_eq!(visits, 2, "weak keys do not attempt to follow the key");
+                    assert_eq!(pushed, 1, "only the value is newly pushed");
+                    assert_eq!(barriers, 1);
+                }
+                NewTableKeyArm::WeakBoth => {
+                    assert!(!parked.marked(key), "weak keys are not enqueued");
+                    assert!(
+                        !parked.marked(target.expect("weak value")),
+                        "weak values are not enqueued"
+                    );
+                    assert_eq!(visits, 0, "kv does not follow either end");
+                    assert_eq!(pushed, 0);
+                    assert_eq!(barriers, 0);
+                }
+                NewTableKeyArm::StringValue => {
+                    assert!(
+                        parked.marked(key),
+                        "a string value still enqueues the new key"
+                    );
+                    assert!(
+                        !parked.marked(key_child),
+                        "key successor waits for the continued scan"
+                    );
+                    assert_eq!(visits, 2, "a string value follows only the new key");
+                    assert_eq!(pushed, 1);
+                    assert_eq!(barriers, 1);
+                }
+                NewTableKeyArm::SameTarget => {
+                    assert!(
+                        parked.marked(key),
+                        "the shared target is enqueued immediately"
+                    );
+                    assert!(
+                        !parked.marked(key_child),
+                        "the successor waits for the continued scan"
+                    );
+                    assert_eq!(visits, 4, "both ends are attempted");
+                    assert_eq!(pushed, 1, "the same target is pushed once");
+                    assert_eq!(barriers, 1);
+                }
+                NewTableKeyArm::Omitted => {
+                    assert!(!parked.marked(key), "omit does not mark the key");
+                    assert_eq!(visits, 0);
+                    assert_eq!(pushed, 0);
+                    assert_eq!(barriers, 0);
+                }
+            }
+            parked.park().expect("park");
+            Ok(())
+        })
+        .expect("write");
+        let published = heap::step_fixed_frames(&mut host, 128).expect("publish");
+        assert!(
+            matches!(published, StepOutcome::Published { .. }),
+            "{published:?}"
+        );
+        let done = heap::step_fixed_frames(&mut host, 128).expect("finish");
+        let StepOutcome::Completed(_report) = done else {
+            panic!("expected completion, got {done:?}");
+        };
+        heap::with_heap(&mut host, |heap| {
+            assert_eq!(
+                heap.named_value(owner, "old")?,
+                Value::string("kept"),
+                "the already scanned record stays"
+            );
+            assert_eq!(
+                heap.named_value(sentinel, "pending")?,
+                Value::Bool(true),
+                "the sentinel record stays"
+            );
+            assert!(!heap.alive(lookalike), "the lookalike was not rooted");
+            match arm {
+                NewTableKeyArm::Strong => {
+                    assert!(heap.alive(key), "new table key stays live this cycle");
+                    let target = target.expect("strong value");
+                    assert!(heap.alive(target), "new table value stays live this cycle");
+                    assert!(heap.alive(key_child), "key successor stays live this cycle");
+                    assert!(
+                        heap.alive(value_child.expect("value successor")),
+                        "value successor stays live this cycle"
+                    );
+                }
+                NewTableKeyArm::WeakValue => {
+                    assert!(
+                        heap.alive(key),
+                        "weak-value new table key stays live this cycle"
+                    );
+                    assert!(
+                        !heap.alive(target.expect("weak value")),
+                        "weak value is cleared this cycle"
+                    );
+                    assert!(heap.alive(key_child), "key successor stays live this cycle");
+                }
+                NewTableKeyArm::WeakKey => {
+                    assert!(heap.alive(key), "pinned weak key stays live");
+                    assert!(
+                        heap.alive(target.expect("weak-key value")),
+                        "unmarked table value stays live this cycle"
+                    );
+                    assert!(
+                        heap.alive(value_child.expect("value successor")),
+                        "value successor stays live this cycle"
+                    );
+                }
+                NewTableKeyArm::WeakBoth => {
+                    assert!(!heap.alive(key), "weak key is not kept by the table");
+                    assert!(
+                        !heap.alive(target.expect("weak value")),
+                        "weak value is not kept by the table"
+                    );
+                }
+                NewTableKeyArm::StringValue => {
+                    assert!(heap.alive(key), "string payload key stays live this cycle");
+                    assert!(
+                        heap.alive(key_child),
+                        "string payload key successor stays live this cycle"
+                    );
+                }
+                NewTableKeyArm::SameTarget => {
+                    assert!(heap.alive(key), "same target stays live this cycle");
+                    assert!(
+                        heap.alive(key_child),
+                        "same target successor stays live this cycle"
+                    );
+                }
+                NewTableKeyArm::Omitted => {
+                    assert!(!heap.alive(key), "omitted key is collected");
+                    assert!(
+                        !heap.alive(target.expect("omitted value")),
+                        "omitted value is collected"
+                    );
+                    assert!(
+                        heap.find_key(owner.slot(), &super::EdgeKey::object(key))
+                            .is_none(),
+                        "omit leaves no record"
+                    );
+                }
+            }
+            if matches!(
+                arm,
+                NewTableKeyArm::Strong
+                    | NewTableKeyArm::WeakValue
+                    | NewTableKeyArm::StringValue
+                    | NewTableKeyArm::SameTarget
+            ) {
+                heap.clear_object_edge(owner, key)?;
+                let _again = heap.collect();
+                assert!(!heap.alive(key), "deleting the new edge collects the key");
+                assert!(
+                    !heap.alive(key_child),
+                    "the key successor dies with the key"
+                );
+                if let Some(target) = target {
+                    assert!(
+                        !heap.alive(target),
+                        "deleting the new edge collects the value"
+                    );
+                }
+            }
+            Ok(())
+        })
+        .expect("cycle end");
+    });
+}
+
+#[test]
+fn gray_new_table_key_full_edges_refuse_without_gap() {
+    crate::with_idle_vm(|vm| {
+        use crate::heap;
+
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits(4, 2, 2)).expect("install");
+        let (owner, sentinel, key, target) = heap::with_heap(&mut host, |heap| {
+            let owner = heap.alloc()?;
+            let sentinel = heap.alloc()?;
+            let key = heap.alloc()?;
+            let target = heap.alloc()?;
+            heap.set_named_scalar(owner, "old", Value::string("kept"))?;
+            heap.set_named_scalar(sentinel, "pending", Value::Bool(true))?;
+            assert!(
+                !owner_chain_has_gap(heap, owner.slot()),
+                "the capacity arm starts with no recyclable gap"
+            );
+            let frame = heap.enter_roots(2)?;
+            heap.write_root(frame, 0, sentinel)?;
+            heap.write_root(frame, 1, owner)?;
+            Ok((owner, sentinel, key, target))
+        })
+        .expect("plant");
+        heap::open_fixed_step(&mut host).expect("open");
+        heap::with_heap(&mut host, |heap| {
+            let (_, old) = heap.locate_named(owner.slot(), "old").expect("old record");
+            let (_, sentinel_record) = heap
+                .locate_named(sentinel.slot(), "pending")
+                .expect("pending record");
+            let mut parked = ParkedMark::resume(heap).expect("resume");
+            pause_at(&mut parked, owner.slot(), old);
+            let pending = pause_at(&mut parked, sentinel.slot(), sentinel_record);
+            let before = parked.meter();
+            parked.with_saved_heap(|heap| {
+                assert!(!owner_chain_has_gap(heap, owner.slot()));
+                assert!(
+                    heap.find_key(owner.slot(), &super::EdgeKey::object(key))
+                        .is_none()
+                );
+                assert_eq!(
+                    heap.set_object_edge(owner, key, target),
+                    Err(HeapError::EdgeCapacity),
+                    "a full chain with no gap does not insert"
+                );
+                assert!(
+                    heap.find_key(owner.slot(), &super::EdgeKey::object(key))
+                        .is_none(),
+                    "capacity refusal leaves no record"
+                );
+                assert_eq!(heap.alloc(), Err(HeapError::NodeCapacity));
+                Ok(())
+            })?;
+            assert!(
+                !parked.marked(key),
+                "capacity refusal does not mark the key"
+            );
+            assert!(
+                !parked.marked(target),
+                "capacity refusal does not mark the value"
+            );
+            assert_eq!(
+                parked.meter().parked_barrier_marks,
+                before.parked_barrier_marks
+            );
+            assert_eq!(
+                parked.meter().node_slot_visits,
+                before.node_slot_visits,
+                "capacity refusal does not enqueue"
+            );
+            assert!(same_pending(parked.pending(), Some(pending)));
+            assert_write_did_not_scan(&before, &parked.meter());
+            parked.park().expect("park");
+            Ok(())
+        })
+        .expect("refuse");
+    });
+}
+
+fn owner_chain_has_gap(heap: &LuaHeap, owner: u32) -> bool {
+    let mut cursor = heap.slots[owner as usize].edge_head;
+    while let Some(index) = cursor {
+        let slot = &heap.edge_slots[index as usize];
+        if slot
+            .edge
+            .as_ref()
+            .is_some_and(|edge| edge.value.is_cursor_gap())
+        {
+            return true;
+        }
+        cursor = slot.next;
+    }
+    false
+}
