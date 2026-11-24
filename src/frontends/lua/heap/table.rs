@@ -2895,9 +2895,10 @@ fn edge_key_is_slot(key: &EdgeKey, slot: u32) -> bool {
     matches!(key, EdgeKey::Object { slot: key_slot, .. } if *key_slot == slot)
 }
 
-/// Ordinary non-gap field, UTF-8, or number key whose new value is a table.
-/// Reserved fields, object keys, gaps, and non-table values stay out of the
-/// gray queue.
+/// Ordinary non-gap field, UTF-8, number, or table-object key whose new value
+/// is a table. Reserved fields, closure and upvalue object keys, gaps, and
+/// non-table values stay out of the gray queue. The table-object key itself
+/// is not recolored; only the new table value is offered to the barrier.
 fn replaced_table_target(key: &EdgeKey, old_gap: bool, value: &EdgeValue) -> Option<(u32, u32)> {
     if old_gap {
         return None;
@@ -2905,6 +2906,10 @@ fn replaced_table_target(key: &EdgeKey, old_gap: bool, value: &EdgeValue) -> Opt
     let ordinary = match key {
         EdgeKey::Utf8(_) | EdgeKey::Number(_) => true,
         EdgeKey::Field(field) => *field != LuaHeap::MODE_FIELD && *field != CELL_EDGE,
+        EdgeKey::Object {
+            kind: HandleKind::Table,
+            ..
+        } => true,
         EdgeKey::Object { .. } => false,
     };
     if !ordinary {

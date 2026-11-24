@@ -919,6 +919,450 @@ fn gray_existing_number_omitted_replacement_keeps_the_original_string() {
 }
 
 #[derive(Clone, Copy)]
+enum ExistingObjectWrite {
+    Strong,
+    WeakValue,
+    /// Key mode `k`. The value stays strong. The key has its own root.
+    WeakKey,
+    Omitted,
+}
+
+const ORIGINAL_OBJECT_SCALAR: &str = "原值";
+const OBJECT_SHAPE: &str = "key";
+
+fn object_write_retains(write: ExistingObjectWrite) -> bool {
+    matches!(
+        write,
+        ExistingObjectWrite::Strong | ExistingObjectWrite::WeakKey
+    )
+}
+
+/// Replaces an already scanned table-object record in place.
+///
+/// The record is built with `set_object_scalar`, not a gap and not a new key.
+/// The key and a same-shape lookalike are both issued and independently rooted.
+/// An unmarked weak key is outside this slice.
+fn existing_object_replacement_after_owner_scan(write: ExistingObjectWrite) {
+    use crate::heap::{self, GuestClass, StepOutcome};
+
+    const CHILD: &str = "child";
+    let retained = object_write_retains(write);
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits(16, 8, 16)).expect("install");
+        let raw = crate::publish_raw(&mut host);
+        let target = crate::table_ref(&host, raw);
+        let (owner, sentinel, child, stale, key, other, closure, frame, meta, carrier) =
+            heap::with_heap(&mut host, |heap| {
+                let owner = heap.alloc()?;
+                let sentinel = heap.alloc()?;
+                let child = heap.alloc()?;
+                let unrelated = heap.alloc()?;
+                let stale = heap.alloc()?;
+                heap.rollback(stale)?;
+                let key = heap.alloc()?;
+                let other = heap.alloc()?;
+                let closure = heap.alloc_closure()?;
+                let meta = match write {
+                    ExistingObjectWrite::WeakValue | ExistingObjectWrite::WeakKey => {
+                        let meta = heap.alloc()?;
+                        let mode = match write {
+                            ExistingObjectWrite::WeakValue => "v",
+                            ExistingObjectWrite::WeakKey => "k",
+                            ExistingObjectWrite::Strong | ExistingObjectWrite::Omitted => {
+                                unreachable!("only the weak arms store a mode")
+                            }
+                        };
+                        heap.set_mode_scalar(meta, Value::string(mode))?;
+                        heap.set_metatable(owner, Some(meta))?;
+                        Some(meta)
+                    }
+                    ExistingObjectWrite::Strong | ExistingObjectWrite::Omitted => None,
+                };
+                let frame = heap.enter_roots(5)?;
+                // Pushed in order, popped in reverse. The owner is scanned
+                // before the sentinel. The key is already a root.
+                heap.write_root(frame, 0, sentinel)?;
+                heap.write_root(frame, 1, owner)?;
+                heap.write_root(frame, 2, key)?;
+                heap.write_root(frame, 3, other)?;
+                heap.write_closure_root(frame, 4, closure)?;
+                heap.set_named_scalar(key, "tag", Value::string(OBJECT_SHAPE))?;
+                heap.set_named_scalar(other, "tag", Value::string(OBJECT_SHAPE))?;
+                heap.set_object_scalar(owner, key, Value::string(ORIGINAL_OBJECT_SCALAR))?;
+                heap.set_named_scalar(sentinel, "pending", Value::Bool(true))?;
+                heap.set_named_edge(target, CHILD, unrelated)?;
+                heap.set_named_edge(target, CHILD, child)?;
+                assert_eq!(heap.named_edge(target, CHILD)?, Some(child));
+                assert_eq!(
+                    heap.named_value(key, "tag")?,
+                    heap.named_value(other, "tag")?
+                );
+                assert_ne!(key, other);
+                assert_eq!(
+                    heap.object_value(owner, key)?,
+                    Value::string(ORIGINAL_OBJECT_SCALAR)
+                );
+                assert_eq!(heap.object_value(owner, other)?, Value::Null);
+                let carrier = heap.issue_carrier(target)?;
+                let key_carrier = heap.issue_carrier(key)?;
+                let other_carrier = heap.issue_carrier(other)?;
+                assert_eq!(heap.guest_class(&key_carrier), GuestClass::Table(key));
+                assert_eq!(heap.guest_class(&other_carrier), GuestClass::Table(other));
+                assert_ne!(key_carrier, other_carrier);
+                Ok((
+                    owner, sentinel, child, stale, key, other, closure, frame, meta, carrier,
+                ))
+            })
+            .expect("graph");
+        heap::open_fixed_step(&mut host).expect("start a saved mark");
+        let old_record = heap::with_heap(&mut host, |heap| {
+            let object_key = super::EdgeKey::object(key);
+            let old_record = heap
+                .find_key(owner.slot(), &object_key)
+                .expect("existing object record");
+            let stored = heap.edge_slots[old_record as usize]
+                .edge
+                .as_ref()
+                .expect("occupied object record");
+            assert_eq!(&stored.key, &object_key);
+            assert!(matches!(
+                stored.key,
+                super::EdgeKey::Object {
+                    slot,
+                    generation,
+                    kind: super::HandleKind::Table,
+                } if slot == key.slot() && generation == key.generation()
+            ));
+            assert!(!stored.value.is_cursor_gap());
+            assert!(matches!(
+                stored.value,
+                super::EdgeValue::Scalar(Value::String(_))
+            ));
+            let (_, sentinel_record) = heap
+                .locate_named(sentinel.slot(), "pending")
+                .expect("sentinel field");
+            for slot in 0..4 {
+                let rooted = heap.rooted_table(frame, slot)?;
+                assert_ne!(rooted, Some(target), "target has no fixed root");
+                assert_ne!(rooted, Some(child), "child has no fixed root");
+            }
+            let values_weak = if let Some(meta) = meta {
+                let stored = heap.named_value(meta, "__mode")?;
+                let Value::String(text) = &stored else {
+                    panic!("stored mode is not a string: {stored:?}");
+                };
+                let expected = match write {
+                    ExistingObjectWrite::WeakValue => "v",
+                    ExistingObjectWrite::WeakKey => "k",
+                    ExistingObjectWrite::Strong | ExistingObjectWrite::Omitted => {
+                        unreachable!("a metatable is only stored for a weak arm")
+                    }
+                };
+                assert_eq!(
+                    text.as_str(),
+                    expected,
+                    "the barrier reads this stored mode"
+                );
+                text.as_bytes().contains(&b'v')
+            } else {
+                false
+            };
+            assert_eq!(
+                retained,
+                !matches!(write, ExistingObjectWrite::Omitted) && !values_weak,
+                "retention follows strong values, not weak keys"
+            );
+            let mut parked = ParkedMark::resume(heap).expect("resume saved mark");
+            assert_eq!(parked.meter().parked_root_batch_accepts, 0);
+            pause_at(&mut parked, owner.slot(), old_record);
+            assert!(
+                parked.marked(key),
+                "the independent root marked the key before this record was charged"
+            );
+            assert!(!parked.marked(target) && !parked.marked(child));
+            let checks_on_record = parked.meter().outgoing_edge_checks;
+            let pending = pause_at(&mut parked, sentinel.slot(), sentinel_record);
+            assert!(
+                parked.meter().outgoing_edge_checks > checks_on_record,
+                "the owner scan charged this object record"
+            );
+            assert_eq!(pending.owner, sentinel.slot());
+            assert_eq!(pending.cursor, sentinel_record);
+            assert!(parked.marked(owner), "the scanned owner is already marked");
+            assert!(parked.marked(key) && parked.marked(other));
+            let before = parked.meter();
+            parked.park()?;
+            let edges_before = (heap.stats().live_edges, heap.stats().edge_slots);
+            if !matches!(write, ExistingObjectWrite::Omitted) {
+                heap.set_object_edge(owner, key, target)?;
+                assert_eq!(heap.object_value(owner, key)?, carrier);
+                assert_eq!(heap.guest_class(&carrier), GuestClass::Table(target));
+                assert_eq!(heap.object_value(owner, other)?, Value::Null);
+            } else {
+                assert_eq!(
+                    heap.object_value(owner, key)?,
+                    Value::string(ORIGINAL_OBJECT_SCALAR)
+                );
+            }
+            assert_eq!(
+                heap.find_key(owner.slot(), &object_key),
+                Some(old_record),
+                "the old object record index is unchanged"
+            );
+            assert!(
+                heap.find_key(owner.slot(), &super::EdgeKey::object(other))
+                    .is_none()
+            );
+            assert_eq!(
+                (heap.stats().live_edges, heap.stats().edge_slots),
+                edges_before,
+                "the write does not change the edge count"
+            );
+            let stored = heap.edge_slots[old_record as usize]
+                .edge
+                .as_ref()
+                .expect("replaced record");
+            assert!(matches!(
+                stored.key,
+                super::EdgeKey::Object {
+                    slot,
+                    generation,
+                    kind: super::HandleKind::Table,
+                } if slot == key.slot() && generation == key.generation()
+            ));
+            if !matches!(write, ExistingObjectWrite::Omitted) {
+                assert!(matches!(
+                    stored.value,
+                    super::EdgeValue::Table { slot, generation }
+                        if slot == target.slot() && generation == target.generation()
+                ));
+            }
+            let parked = ParkedMark::resume(heap).expect("write kept the saved mark");
+            assert_eq!(parked.phase_name(), "gray");
+            let cursor = parked.pending().expect("sentinel still pending");
+            assert_eq!(
+                (cursor.owner, cursor.cursor),
+                (pending.owner, pending.cursor),
+                "the pending scan cursor is unchanged"
+            );
+            assert!(
+                parked.marked(key),
+                "the write must not recolor the existing object key"
+            );
+            assert!(
+                !parked.marked(child),
+                "the write must not scan the child edge"
+            );
+            assert_eq!(
+                parked.marked(target),
+                retained,
+                "only a strong object-key replacement enters the gray queue immediately"
+            );
+            let after = parked.meter();
+            assert_write_did_not_scan(&before, &after);
+            assert_eq!(after.parked_edge_writes, before.parked_edge_writes);
+            assert_eq!(
+                after.parked_root_batch_accepts,
+                before.parked_root_batch_accepts
+            );
+            assert_eq!(
+                after.parked_barrier_marks - before.parked_barrier_marks,
+                u64::from(retained)
+            );
+            assert_eq!(
+                after.scratch.work_pushed - before.scratch.work_pushed,
+                u64::from(retained)
+            );
+            assert_eq!(
+                after.node_slot_visits - before.node_slot_visits,
+                u64::from(retained) * 2,
+                "the barrier follows the table value, not the object key"
+            );
+            assert_eq!(after.metatable_edge_checks, before.metatable_edge_checks);
+            assert_eq!(after.weak_mode_lookups, before.weak_mode_lookups);
+            parked.park()?;
+            Ok(old_record)
+        })
+        .expect("in-place object replacement while Gray is parked");
+
+        let published = heap::step_fixed_frames(&mut host, 128).expect("publish saved mark");
+        assert!(
+            matches!(published, StepOutcome::Published { .. }),
+            "{published:?}"
+        );
+        assert_eq!(heap::stats(&mut host).expect("stats").collections, 0);
+        heap::with_heap(&mut host, |heap| {
+            let before_refuse = heap.object_value(owner, key)?;
+            let forged =
+                super::TableRef::table(heap.domain(), closure.slot(), closure.generation());
+            assert!(
+                heap.closure_alive(closure),
+                "the closure key control is still live"
+            );
+            assert_eq!(
+                heap.set_object_edge(stale, forged, sentinel),
+                Err(HeapError::WrongKind),
+                "object-key kind is checked before the owner and the sweep tail"
+            );
+            assert_eq!(
+                heap.set_object_edge(owner, stale, sentinel),
+                Err(HeapError::StaleHandle),
+                "a stale object key is refused before the sweep tail"
+            );
+            assert_eq!(
+                heap.set_object_edge(stale, key, sentinel),
+                Err(HeapError::StaleHandle),
+                "the owner is checked after the key and before the sweep tail"
+            );
+            assert_eq!(
+                heap.set_object_edge(owner, key, stale),
+                Err(HeapError::StaleHandle),
+                "the value is checked after the key and owner"
+            );
+            assert_eq!(
+                heap.set_object_edge(owner, key, forged),
+                Err(HeapError::WrongKind),
+                "a closure-shaped value is not a table edge"
+            );
+            assert_eq!(
+                heap.set_object_edge(owner, key, sentinel),
+                Err(HeapError::SweepPending),
+                "a live in-place object replacement still stops at the saved tail"
+            );
+            assert_eq!(
+                heap.set_object_edge(owner, other, sentinel),
+                Err(HeapError::SweepPending)
+            );
+            assert!(
+                heap.find_key(owner.slot(), &super::EdgeKey::object(other))
+                    .is_none()
+            );
+            assert_eq!(
+                heap.clear_object_edge(stale, key),
+                Err(HeapError::StaleHandle)
+            );
+            assert_eq!(
+                heap.clear_object_edge(owner, forged),
+                Err(HeapError::WrongKind),
+                "clear checks the owner, then the key kind"
+            );
+            assert_eq!(
+                heap.clear_object_edge(owner, key),
+                Err(HeapError::SweepPending)
+            );
+            assert_eq!(heap.object_value(owner, key)?, before_refuse);
+            assert_eq!(
+                heap.find_key(owner.slot(), &super::EdgeKey::object(key)),
+                Some(old_record)
+            );
+            if matches!(write, ExistingObjectWrite::WeakValue) {
+                assert_eq!(
+                    heap.object_value(owner, key)?,
+                    Value::Null,
+                    "a weak object replacement publishes nil"
+                );
+                let index = heap
+                    .find_key(owner.slot(), &super::EdgeKey::object(key))
+                    .expect("a weak-value replacement leaves the cleared cursor");
+                assert_eq!(index, old_record);
+                let stored = heap.edge_slots[index as usize]
+                    .edge
+                    .as_ref()
+                    .expect("retained gap");
+                assert!(stored.value.is_cursor_gap());
+                assert!(matches!(
+                    stored.key,
+                    super::EdgeKey::Object {
+                        slot,
+                        generation,
+                        kind: super::HandleKind::Table,
+                    } if slot == key.slot() && generation == key.generation()
+                ));
+            }
+            if matches!(write, ExistingObjectWrite::Omitted) {
+                assert_eq!(
+                    heap.object_value(owner, key)?,
+                    Value::string(ORIGINAL_OBJECT_SCALAR)
+                );
+            }
+            if retained {
+                assert_eq!(heap.object_value(owner, key)?, carrier);
+                assert_eq!(heap.guest_class(&carrier), GuestClass::Table(target));
+            }
+            assert_eq!(heap.object_value(owner, other)?, Value::Null);
+            Ok(())
+        })
+        .expect("read during publication");
+        let done = heap::step_fixed_frames(&mut host, 128).expect("finish saved tail");
+        assert!(matches!(done, StepOutcome::Completed(_)), "{done:?}");
+        assert!(heap::fixed_step_idle(&mut host).expect("idle"));
+        heap::with_heap(&mut host, |heap| {
+            assert_eq!(
+                heap.alive(target),
+                retained,
+                "an in-place strong object replacement on a scanned owner must keep its target alive"
+            );
+            assert_eq!(
+                heap.alive(child),
+                retained,
+                "the child is reached only by the continued scan"
+            );
+            assert!(heap.alive(key) && heap.alive(other));
+            assert_eq!(heap.stats().collections, 1);
+            assert_eq!(heap.scan_meter().mark_passes, 1);
+            if matches!(write, ExistingObjectWrite::Omitted) {
+                assert_eq!(
+                    heap.object_value(owner, key)?,
+                    Value::string(ORIGINAL_OBJECT_SCALAR),
+                    "an omitted object replacement keeps the original string"
+                );
+            }
+            if retained {
+                let value = heap.object_value(owner, key)?;
+                assert_eq!(value, carrier);
+                assert_eq!(heap.guest_class(&value), GuestClass::Table(target));
+                assert_eq!(heap.named_edge(target, CHILD)?, Some(child));
+                heap.clear_object_edge(owner, key)?;
+            }
+            Ok(())
+        })
+        .expect("same-cycle reachability");
+        if retained {
+            heap::collect(&mut host).expect("next collection after removing the only strong edge");
+            heap::with_heap(&mut host, |heap| {
+                assert!(!heap.alive(target) && !heap.alive(child));
+                assert!(heap.alive(key) && heap.alive(other));
+                assert_eq!(heap.object_value(owner, key)?, Value::Null);
+                assert_eq!(heap.stats().collections, 2);
+                Ok(())
+            })
+            .expect("later reclamation");
+        }
+    });
+}
+
+#[test]
+fn gray_existing_object_strong_replacement_keeps_the_new_graph() {
+    existing_object_replacement_after_owner_scan(ExistingObjectWrite::Strong);
+}
+
+#[test]
+fn gray_existing_object_weak_replacement_clears_at_publication() {
+    existing_object_replacement_after_owner_scan(ExistingObjectWrite::WeakValue);
+}
+
+#[test]
+fn gray_existing_object_weak_key_strong_value_keeps_the_new_graph() {
+    existing_object_replacement_after_owner_scan(ExistingObjectWrite::WeakKey);
+}
+
+#[test]
+fn gray_existing_object_omitted_replacement_keeps_the_original_string() {
+    existing_object_replacement_after_owner_scan(ExistingObjectWrite::Omitted);
+}
+
+#[derive(Clone, Copy)]
 enum NewNumberWrite {
     Strong,
     WeakValue,
