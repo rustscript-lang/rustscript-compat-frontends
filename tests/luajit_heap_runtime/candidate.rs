@@ -17,7 +17,7 @@ const NEW_TABLE: &str = "lua_internal::new_table";
 const TYPE: &str = "lua_internal::type_of";
 const ADD: &str = "lua_internal::add";
 pub(super) const STRING_BYTE_LEN: &str = "lua_internal::string_byte_len";
-const RAW_LEN: &str = "lua_internal::raw_len";
+pub(super) const RAW_LEN: &str = "lua_internal::raw_len";
 const RETURN_SCALAR: &str = "lua_internal::return_scalar";
 
 const TABLE_ARG: &str = "lua_internal::table_arg";
@@ -768,6 +768,7 @@ fn raw_len(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
         }
     };
     if let Some(len) = byte_len_of(&value) {
+        note_raw_len(call)?;
         return Ok(Value::Float(len as f64));
     }
     let table = match classify(&mut call.vm().host_context(), &value)? {
@@ -780,7 +781,19 @@ fn raw_len(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
         heap.raw_sequence_len(table)
     })
     .map_err(heap_error)?;
+    note_raw_len(call)?;
     Ok(Value::Float(len))
+}
+
+fn note_raw_len(call: &mut OwnedHostCall<'_>) -> Result<(), VmError> {
+    let frame = heap::with_heap(&mut call.vm().host_context(), |heap| {
+        Ok(heap.current_frame().map(|frame| frame.parts()))
+    })
+    .map_err(heap_error)?;
+    with_witness(call.vm(), |witness| {
+        witness.host_steps.push(HostStep::RawLen { frame });
+    })?;
+    Ok(())
 }
 
 fn skip_parens(expr: &ast::Expr) -> &ast::Expr {
@@ -1306,6 +1319,9 @@ fn finish_return(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
             returned_edge,
             discarded_edge,
         });
+        witness.host_steps.push(HostStep::FinishReturn {
+            frame_alive: lua_frame_alive,
+        });
     })?;
     Ok(transport)
 }
@@ -1418,6 +1434,7 @@ fn retire_callee(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
         Some(decode_frame(call, &frame_token)?)
     };
     let mut left = false;
+    let mut retired = None;
     if flag {
         let callee = heap::with_heap(&mut call.vm().host_context(), |heap| {
             heap.current_frame().ok_or(heap::HeapError::StaleFrame)
@@ -1426,6 +1443,7 @@ fn retire_callee(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
         if caller == Some(callee) {
             return Err(host_fault("would retire the caller result frame"));
         }
+        retired = Some(callee.parts());
         let tail = heap::saved_sweep_tail(&mut call.vm().host_context()).map_err(heap_error)?;
         if tail {
             heap::retire_saved_tail_frame(&mut call.vm().host_context(), callee)
@@ -1438,8 +1456,11 @@ fn retire_callee(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
         }
         left = true;
     }
-    let top_is_caller = heap::with_heap(&mut call.vm().host_context(), |heap| {
-        Ok(caller.is_some() && heap.current_frame() == caller)
+    let (top_is_caller, frame_after) = heap::with_heap(&mut call.vm().host_context(), |heap| {
+        Ok((
+            caller.is_some() && heap.current_frame() == caller,
+            heap.current_frame().map(|frame| frame.parts()),
+        ))
     })
     .map_err(heap_error)?;
     with_witness(call.vm(), |witness| {
@@ -1449,6 +1470,11 @@ fn retire_callee(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
             last.callee_left = left;
             last.top_is_caller_after_handoff = top_is_caller;
         }
+        witness.host_steps.push(HostStep::RetireCallee {
+            left,
+            retired,
+            frame_after,
+        });
     })?;
     Ok(Value::Float(0.0))
 }
@@ -4319,11 +4345,49 @@ impl Lower<'_> {
     }
 
     fn pack_return(&mut self, values: &[ast::Expr]) -> Result<Expr, ParseError> {
+        if let [only] = values
+            && let Some(value) = self.tail_rawlen(only)?
+        {
+            return Ok(pack_array(vec![value]));
+        }
         let mut packed = Vec::with_capacity(values.len());
         for value in values {
             packed.push(self.return_value(value)?);
         }
         Ok(pack_array(packed))
+    }
+
+    /// One unbound builtin `rawlen` call at a function tail, including
+    /// parentheses around the whole call. A lexically bound name uses the
+    /// existing unsupported branch and is not called.
+    fn tail_rawlen(&mut self, expr: &ast::Expr) -> Result<Option<Expr>, ParseError> {
+        let expr = skip_parens(expr);
+        let ast::Expr::SuffixChain { base, steps, .. } = expr else {
+            return Ok(None);
+        };
+        let ast::Expr::Name { name, .. } = base.as_ref() else {
+            return Ok(None);
+        };
+        if !name.is("rawlen") {
+            return Ok(None);
+        }
+        let [
+            ast::Suffix::Call {
+                args: ast::Args::List(args),
+                nav: false,
+                ..
+            },
+        ] = steps.as_slice()
+        else {
+            return Ok(None);
+        };
+        let [arg] = args.exprs.as_slice() else {
+            return Ok(None);
+        };
+        if self.name_is_bound(name) || self.locals.contains_key(&name.bytes) {
+            return Err(self.unsupported(expr.span()));
+        }
+        Ok(Some(self.rawlen_expr(arg, expr.span())?))
     }
 
     fn return_value(&mut self, expr: &ast::Expr) -> Result<Expr, ParseError> {
@@ -5284,6 +5348,21 @@ pub(super) struct VisitSamples {
     pub visits: Vec<u64>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum HostStep {
+    RawLen {
+        frame: Option<(u32, u32)>,
+    },
+    FinishReturn {
+        frame_alive: bool,
+    },
+    RetireCallee {
+        left: bool,
+        retired: Option<(u32, u32)>,
+        frame_after: Option<(u32, u32)>,
+    },
+}
+
 #[derive(Clone, Debug, Default)]
 pub(super) struct ReturnWitness {
     pub callee_depth: Option<usize>,
@@ -5305,6 +5384,8 @@ pub(super) struct ReturnWitness {
     pub collects: Vec<CollectNote>,
     pub release: Option<ReleaseNote>,
     pub handoffs: Vec<Handoff>,
+    /// Read-only host order. It does not change guest values or collection.
+    pub host_steps: Vec<HostStep>,
     /// Every table rooted by `root_issued`, in activation order.
     pub issued: Vec<heap::TableRef>,
     /// Whether the latest issued table was still alive at each guest collect.
