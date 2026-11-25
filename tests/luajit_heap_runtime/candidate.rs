@@ -328,6 +328,18 @@ pub(super) fn register(
     registry: &mut HostFunctionRegistry,
     catalog: &HostApiCatalog,
 ) -> Result<(), VmError> {
+    register_except(registry, catalog, None)
+}
+
+/// Binds the same exact catalog bodies as [`register`], omitting one name.
+///
+/// The omitted name stays in the catalog the lowerer saw. A later bind fails
+/// closed on that import. This does not install a loose fallback.
+pub(super) fn register_except(
+    registry: &mut HostFunctionRegistry,
+    catalog: &HostApiCatalog,
+    skip: Option<&str>,
+) -> Result<(), VmError> {
     for op in [
         Op::NewTable,
         Op::Type,
@@ -426,6 +438,9 @@ pub(super) fn register(
             Op::WriteCell => WRITE_CELL,
             Op::TrackClosure => TRACK_CLOSURE,
         };
+        if skip == Some(name) {
+            continue;
+        }
         if matches!(
             op,
             Op::Step
