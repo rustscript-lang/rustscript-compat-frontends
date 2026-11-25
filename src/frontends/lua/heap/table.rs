@@ -266,6 +266,16 @@ struct Slot {
     /// Direct `__mode` edge of a table, if that field is stored. Not a parsed
     /// mode, and not set for field 0 on a closure or cell.
     mode_edge: Option<u32>,
+    /// Mark epoch in which this owner's ordinary scan opened a weak side.
+    /// Zero means no current-cycle weak start; an older epoch is inert. Set on
+    /// the target slot only, so a grown slot needs no vector entry.
+    rescan_epoch: u64,
+    /// This owner is linked in the current mark's rescan queue.
+    rescan_queued: bool,
+    /// Previous rescan-queue node. `None` at the head or when not queued.
+    rescan_prev: Option<u32>,
+    /// Next rescan-queue node. `None` at the tail or when not queued.
+    rescan_next: Option<u32>,
 }
 
 /// Empty slot reserved for one late table. It is not a handle and cannot be
@@ -697,12 +707,13 @@ pub struct ScanScratch {
     /// Not a collective zero-fill. 0 when every live node is marked and the
     /// filter is skipped.
     pub sweep_bitmap_inited: u64,
-    /// Slot-indexed rescan bits zeroed once per mark plus any suffix extended
-    /// for slots grown during the mark. Bounded by the node limit. 0 when this
-    /// cycle never started a weak-value owner scan.
+    /// Slot state entries initialized for this mark's rescan bookkeeping: one
+    /// per weak owner's first start, tagged on that target slot. A repeat or a
+    /// setter reuses the tag and does not count another. Bounded by the node
+    /// limit. 0 when this cycle never started a weak owner scan.
     pub owner_rescan_inited: u64,
-    /// Owners appended to the rescan queue. One per owner per mark. A repeat
-    /// setter does not append and does not increment this.
+    /// Owners linked into the rescan queue. One per owner per mark. A repeat
+    /// setter does not link again and does not increment this.
     pub owner_rescan_pushed: u64,
 }
 
@@ -781,6 +792,9 @@ pub struct LuaHeap {
     /// Mark progress saved between pulses. Absent unless a session or the
     /// parked driver is active. Done is not stored for the parked caller.
     mark: Option<mark::MarkState>,
+    /// Source of the per-mark rescan epoch stored on slot records. It never
+    /// returns to zero, so an old tag cannot match a new mark after reuse.
+    rescan_epoch: u64,
     /// Release/root continuation after a published sweep. Absent unless publish
     /// stopped with a dead slot. Done is not stored.
     sweep_tail: Option<sweep::SweepTail>,
@@ -857,6 +871,7 @@ impl LuaHeap {
             peak_edges: 0,
             scan: ScanMeter::default(),
             mark: None,
+            rescan_epoch: 0,
             sweep_tail: None,
             payload_bytes: 0,
         }
@@ -939,6 +954,10 @@ impl LuaHeap {
         slot.edge_head = None;
         slot.edge_tail = None;
         slot.mode_edge = None;
+        slot.rescan_epoch = 0;
+        slot.rescan_queued = false;
+        slot.rescan_prev = None;
+        slot.rescan_next = None;
         Ok((index, slot.generation))
     }
 
@@ -954,6 +973,10 @@ impl LuaHeap {
             edge_head: None,
             edge_tail: None,
             mode_edge: None,
+            rescan_epoch: 0,
+            rescan_queued: false,
+            rescan_prev: None,
+            rescan_next: None,
         });
         self.note_node_peak();
         Ok((index, 1))
@@ -2735,6 +2758,17 @@ impl LuaHeap {
         self.domain
     }
 
+    /// Next nonzero epoch for slot weak-start and rescan-queue tags. Wrapping
+    /// skips zero, so a new mark never accepts a stale tag.
+    fn advance_rescan_epoch(&mut self) -> u64 {
+        loop {
+            self.rescan_epoch = self.rescan_epoch.wrapping_add(1);
+            if self.rescan_epoch != 0 {
+                return self.rescan_epoch;
+            }
+        }
+    }
+
     /// A saved tail owns the graph. Checked after handle and capacity validation,
     /// and before the first write or chain walk of a commit.
     fn ensure_sweep_open(&self) -> Result<(), HeapError> {
@@ -3053,6 +3087,8 @@ impl LuaHeap {
                 && self.slots[index as usize].edge_tail.is_none(),
             "owner chain must already be unlinked; release does not scan edges"
         );
+        let mark = self.mark.as_mut();
+        mark::release_rescan_slot(mark, &mut self.slots, index);
         if self.slots[index as usize].metatable.take().is_some() {
             self.metatable_edges = self.metatable_edges.saturating_sub(1);
         }

@@ -8145,10 +8145,29 @@ fn plant_slot_growth_graph(heap: &mut LuaHeap) -> Result<SlotGrowthGraph, HeapEr
 }
 
 fn open_slot_growth_graph(host: &mut vm::HostContext<'_>) -> SlotGrowthGraph {
-    heap::install(host, limits(16, 8, 16)).expect("install");
+    open_slot_growth_graph_with(host, 16)
+}
+
+fn open_slot_growth_graph_with(host: &mut vm::HostContext<'_>, nodes: u32) -> SlotGrowthGraph {
+    heap::install(host, limits(nodes, 8, 32)).expect("install");
     let graph = heap::with_heap(host, plant_slot_growth_graph).expect("plant");
     heap::open_fixed_step(host).expect("open");
     graph
+}
+
+/// Grows the live slot vector by real table allocations. The returned handles
+/// stay unrooted, so these slots are unrelated filler: they must not be
+/// traversed, tagged, or copied by a weak-start or setter call.
+fn grow_plain_slots(parked: &mut ParkedMark<'_>, count: u32) -> Vec<TableRef> {
+    let mut grown = Vec::new();
+    for _ in 0..count {
+        grown.push(
+            parked
+                .with_saved_heap(|heap| heap.alloc())
+                .expect("a real allocation grows the slot vector"),
+        );
+    }
+    grown
 }
 
 fn grown_white(graph: &SlotGrowthGraph) -> [TableRef; 6] {
@@ -8190,9 +8209,8 @@ fn run_grown_arm(arm: GrownArm) {
             old_slots = before_alloc.node_slots;
             initial_bits = parked.meter().scratch.owner_rescan_inited;
             assert_eq!(
-                initial_bits,
-                u64::from(old_slots),
-                "the first weak owner sizes the rescan bitmaps to the old slots"
+                initial_bits, 1,
+                "the first weak owner tags only its own target slot"
             );
             let watch = parked
                 .with_saved_heap(|heap| heap.saved_mark_watch())
@@ -8408,11 +8426,11 @@ fn run_grown_arm(arm: GrownArm) {
         .expect("this cycle");
 
         if keep {
-            assert_eq!(initial_bits, u64::from(old_slots));
+            assert_eq!(initial_bits, 1);
             assert_eq!(
                 bits_at_scan,
-                u64::from(old_slots + 1),
-                "the new slot's weak start must extend the rescan bitmaps"
+                initial_bits + 1,
+                "the new slot's weak start tags exactly one more slot"
             );
             assert_eq!(schedules, 1, "exactly one owner rescan is requested");
             assert_eq!(pushes, 1, "one queue entry, no duplicate");
@@ -8509,9 +8527,8 @@ fn gray_precycle_weak_owner_swap_keeps_value_and_successor() {
             slots = parked.stats().node_slots;
             initial_bits = parked.meter().scratch.owner_rescan_inited;
             assert_eq!(
-                initial_bits,
-                u64::from(slots),
-                "the pre-cycle owner is inside the first bitmap"
+                initial_bits, 1,
+                "the pre-cycle owner tags only its own slot"
             );
             let pending = parked.pending();
             let before = parked.meter();
@@ -8568,7 +8585,7 @@ fn gray_precycle_weak_owner_swap_keeps_value_and_successor() {
         assert_eq!(schedules, 1);
         assert_eq!(meter.owner_rescan_heads, 1);
         assert_eq!(meter.scratch.owner_rescan_pushed, 1);
-        assert_eq!(initial_bits, u64::from(slots));
+        assert_eq!(initial_bits, 1);
         let slots_after = heap::with_heap(&mut host, |heap| -> Result<u32, HeapError> {
             Ok(heap.stats().node_slots)
         })
@@ -8589,4 +8606,656 @@ fn gray_precycle_weak_owner_swap_keeps_value_and_successor() {
         })
         .expect("released");
     });
+}
+
+/// A: stop immediately before a new weak owner opens, then spend exactly one
+/// pulse unit on that head. The pulse may initialize state for that one target
+/// slot; it must not initialize the whole grown suffix. `delta` is the number
+/// of unrelated real slot allocations made after the first weak owner started.
+fn run_weak_start_budget(delta: u32) {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        let graph = open_slot_growth_graph_with(&mut host, 16 + delta);
+        let mut grown_owner = None;
+        let mut owner_slot = u32::MAX;
+        let mut old_slots = 0;
+        let mut before = ScanMeter::default();
+        let mut after = ScanMeter::default();
+        let mut inited_delta = 0u64;
+        let mut roots_before = 0;
+        resume_weak(&mut host, |parked| {
+            let white = grown_white(&graph);
+            charge_white(parked, graph.left.slot(), graph.left_record, &white);
+            old_slots = parked.stats().node_slots;
+            assert!(
+                parked.with_saved_heap(|heap| heap.table_in_gray(graph.sentinel)),
+                "the independent sentinel must still be on the gray stack"
+            );
+            assert!(
+                parked.with_saved_heap(|heap| heap.free_list.is_empty()),
+                "a free slot would hide a real slot growth"
+            );
+
+            let fillers = grow_plain_slots(parked, delta);
+            assert_eq!(
+                u32::try_from(fillers.len()).expect("delta fits u32"),
+                delta,
+                "every filler is a real allocation"
+            );
+            let grown = parked
+                .with_saved_heap(|heap| heap.alloc())
+                .expect("the new weak owner is a real allocation");
+            owner_slot = grown.slot();
+            grown_owner = Some(grown);
+            assert_eq!(
+                owner_slot,
+                old_slots + delta,
+                "the owner is the last grown slot"
+            );
+            assert_eq!(parked.stats().node_slots, old_slots + delta + 1);
+
+            parked
+                .with_saved_heap(|heap| -> Result<(), HeapError> {
+                    heap.set_metatable(grown, Some(graph.old_mt))?;
+                    heap.set_named_edge(grown, GROWN_ITEM, graph.value)?;
+                    heap.set_named_edge(graph.value, "next", graph.successor)?;
+                    Ok(())
+                })
+                .expect("mount the cached weak metatable and weak value");
+            assert!(!parked.marked(grown), "the new owner is not scanned yet");
+            assert_still_white(parked, &[graph.value, graph.successor]);
+            let record = parked
+                .with_saved_heap(|heap| {
+                    heap.find_key(grown.slot(), &super::EdgeKey::named(GROWN_ITEM))
+                })
+                .expect("grown owner item record");
+
+            parked
+                .write_table_root(graph.frame, GROWN_ROOT_SLOT, grown)
+                .expect("root the grown owner into the current gray");
+            assert!(parked.marked(grown));
+            assert!(
+                parked.with_saved_heap(|heap| heap.table_in_gray(grown)),
+                "the grown owner is the last gray entry pushed"
+            );
+            assert!(
+                parked.pending().is_none(),
+                "the first weak owner's last record is already charged"
+            );
+
+            roots_before = parked.stats().live_roots;
+            before = parked.meter();
+            let view = parked.pulse(1);
+            after = parked.meter();
+            inited_delta = after
+                .scratch
+                .owner_rescan_inited
+                .saturating_sub(before.scratch.owner_rescan_inited);
+            assert!(!view.finished, "one head unit must not finish the mark");
+            assert_eq!(
+                after.owner_head_checks,
+                before.owner_head_checks + 1,
+                "opening the new weak owner must spend exactly one head unit"
+            );
+            assert_eq!(
+                after.outgoing_edge_checks, before.outgoing_edge_checks,
+                "a head unit must not charge an edge"
+            );
+            assert_eq!(after.outgoing_gap_checks, before.outgoing_gap_checks);
+            assert_eq!(after.root_slot_visits, before.root_slot_visits);
+            assert_eq!(parked.stats().live_roots, roots_before);
+            let pending = parked
+                .pending()
+                .expect("the new weak owner must be the owner just opened");
+            assert_eq!(pending.owner, owner_slot);
+            assert_eq!(pending.cursor, record);
+            assert!(
+                parked.with_saved_heap(|heap| heap.table_in_gray(graph.sentinel)),
+                "the independent sentinel is still queued after the pulse"
+            );
+            assert_still_white(parked, &[graph.value, graph.successor]);
+            assert!(
+                inited_delta <= 1,
+                "one weak-start pulse initialized {inited_delta} logical slots; \
+                 delta={delta} old_slots={old_slots} owner_slot={owner_slot} \
+                 before={before:?} after={after:?}"
+            );
+
+            let setter_before = parked.meter();
+            write_metatable(parked, grown, Some(graph.strong_mt))
+                .expect("strengthen the grown owner on its pending item record");
+            assert_setter_reserved(parked, Some(pending), &setter_before, roots_before);
+            assert_still_white(parked, &[graph.value, graph.successor]);
+            assert_eq!(
+                parked.meter().owner_rescan_schedules,
+                setter_before.owner_rescan_schedules + 1
+            );
+            assert_eq!(
+                parked.meter().scratch.owner_rescan_pushed,
+                setter_before.scratch.owner_rescan_pushed + 1
+            );
+        });
+
+        let done = finish_fixed_cycle(&mut host);
+        assert!(
+            matches!(done, crate::heap::StepOutcome::Completed(_)),
+            "{done:?}"
+        );
+        let owner = grown_owner.expect("the grown owner");
+        let meter = heap::take_scan_meter(&mut host).expect("meter");
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            assert!(heap.alive(owner), "the rooted grown owner survives");
+            assert!(heap.alive(graph.sentinel));
+            assert!(heap.alive(graph.left));
+            assert!(heap.alive(graph.peer));
+            assert!(heap.alive(graph.witness));
+            assert!(heap.alive(graph.old_mt));
+            assert!(heap.alive(graph.strong_mt));
+            assert!(
+                heap.alive(graph.value),
+                "the strengthened grown value survives (delta={delta})"
+            );
+            assert!(
+                heap.alive(graph.successor),
+                "its strong successor survives (delta={delta})"
+            );
+            assert_eq!(heap.named_edge(owner, GROWN_ITEM)?, Some(graph.value));
+            assert_eq!(heap.named_edge(graph.value, "next")?, Some(graph.successor));
+            let carrier = heap.issued_value(graph.value)?;
+            let mut cursor = Value::Null;
+            let mut saw = false;
+            while let Some((key, next_value)) = heap.next_guest(owner, &cursor)? {
+                if key == Value::string(GROWN_ITEM) && next_value == carrier {
+                    saw = true;
+                }
+                cursor = key;
+            }
+            assert!(saw, "iteration returns the original grown value carrier");
+            assert!(!heap.alive(graph.left_value));
+            assert!(!heap.alive(graph.left_successor));
+            assert!(!heap.alive(graph.peer_value), "the weak peer value clears");
+            assert!(!heap.alive(graph.orphan), "the weak orphan clears");
+            assert!(!heap.alive(graph.dust));
+            assert_eq!(heap.named_edge(graph.peer, GROWN_ITEM)?, None);
+            assert_eq!(heap.named_edge(graph.witness, "orphan")?, None);
+            Ok(())
+        })
+        .expect("this cycle");
+        assert_eq!(meter.owner_rescan_heads, 1, "delta={delta}");
+        assert_eq!(meter.scratch.owner_rescan_pushed, 1, "delta={delta}");
+
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            heap.set_metatable(owner, Some(graph.old_mt))?;
+            Ok(())
+        })
+        .expect("restore v");
+        heap::collect(&mut host).expect("next cycle");
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            assert!(
+                !heap.alive(graph.value),
+                "the restored weak value is released (delta={delta})"
+            );
+            assert!(
+                !heap.alive(graph.successor),
+                "the restored successor is released (delta={delta})"
+            );
+            assert_eq!(heap.named_edge(owner, GROWN_ITEM)?, None);
+            assert!(heap.alive(owner));
+            Ok(())
+        })
+        .expect("released");
+    });
+}
+
+/// B: the old owner already started a weak-value scan. Every grown slot is
+/// still unscanned. A real metatable swap must only register that old owner:
+/// no pulse, no traversal, no initialization of the unrelated suffix, and no
+/// immediate recursion along the old weak value.
+fn run_old_owner_setter_budget(delta: u32) {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        let graph = open_slot_growth_graph_with(&mut host, 16 + delta);
+        let mut old_slots = 0;
+        let mut before = ScanMeter::default();
+        let mut after = ScanMeter::default();
+        let mut inited_delta = 0u64;
+        let mut schedules = 0u64;
+        let mut pushes = 0u64;
+        resume_weak(&mut host, |parked| {
+            let white = grown_white(&graph);
+            charge_white(parked, graph.left.slot(), graph.left_record, &white);
+            old_slots = parked.stats().node_slots;
+            let fillers = grow_plain_slots(parked, delta);
+            assert_eq!(u32::try_from(fillers.len()).expect("delta fits u32"), delta);
+            assert_eq!(parked.stats().node_slots, old_slots + delta);
+            assert!(
+                parked.with_saved_heap(|heap| heap.table_in_gray(graph.sentinel)),
+                "the independent sentinel must still be on the gray stack"
+            );
+            assert!(
+                parked.pending().is_none(),
+                "the old owner's ordinary cursor is exhausted before the setter"
+            );
+            let pending_before = parked.pending();
+            let roots_before = parked.stats().live_roots;
+            before = parked.meter();
+            write_metatable(parked, graph.left, Some(graph.strong_mt))
+                .expect("strengthen the already scanned old owner");
+            after = parked.meter();
+            schedules = after
+                .owner_rescan_schedules
+                .saturating_sub(before.owner_rescan_schedules);
+            pushes = after
+                .scratch
+                .owner_rescan_pushed
+                .saturating_sub(before.scratch.owner_rescan_pushed);
+            inited_delta = after
+                .scratch
+                .owner_rescan_inited
+                .saturating_sub(before.scratch.owner_rescan_inited);
+            assert_setter_reserved(parked, pending_before, &before, roots_before);
+            assert_eq!(schedules, 1, "one request for the old owner");
+            assert_eq!(pushes, 1, "one queue entry, no duplicate");
+            assert!(
+                parked.pending_rescan().is_none(),
+                "the setter must not open the rescan inside its own call"
+            );
+            assert_still_white(
+                parked,
+                &[
+                    graph.left_value,
+                    graph.left_successor,
+                    graph.value,
+                    graph.successor,
+                ],
+            );
+            assert!(
+                parked.with_saved_heap(|heap| heap.table_in_gray(graph.sentinel)),
+                "the sentinel is still queued after the setter"
+            );
+            assert!(
+                inited_delta == 0,
+                "setter initialized {inited_delta} unrelated rescan slots; \
+                 delta={delta} old_slots={old_slots} before={before:?} after={after:?}"
+            );
+        });
+
+        let done = finish_fixed_cycle(&mut host);
+        assert!(
+            matches!(done, crate::heap::StepOutcome::Completed(_)),
+            "{done:?}"
+        );
+        let meter = heap::take_scan_meter(&mut host).expect("meter");
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            assert!(heap.alive(graph.sentinel));
+            assert!(heap.alive(graph.left));
+            assert!(
+                heap.alive(graph.left_value),
+                "the rescanned old owner keeps its value (delta={delta})"
+            );
+            assert!(
+                heap.alive(graph.left_successor),
+                "and its strong successor (delta={delta})"
+            );
+            assert_eq!(
+                heap.named_edge(graph.left, GROWN_ITEM)?,
+                Some(graph.left_value)
+            );
+            assert_eq!(
+                heap.named_edge(graph.left_value, "next")?,
+                Some(graph.left_successor)
+            );
+            let carrier = heap.issued_value(graph.left_value)?;
+            let mut cursor = Value::Null;
+            let mut saw = false;
+            while let Some((key, value)) = heap.next_guest(graph.left, &cursor)? {
+                if key == Value::string(GROWN_ITEM) && value == carrier {
+                    saw = true;
+                }
+                cursor = key;
+            }
+            assert!(saw, "iteration returns the original value carrier");
+            assert!(!heap.alive(graph.peer_value), "the weak peer value clears");
+            assert!(!heap.alive(graph.orphan), "the weak orphan clears");
+            assert!(!heap.alive(graph.value));
+            assert!(!heap.alive(graph.successor));
+            assert!(!heap.alive(graph.dust));
+            assert_eq!(heap.named_edge(graph.peer, GROWN_ITEM)?, None);
+            assert_eq!(heap.named_edge(graph.witness, "orphan")?, None);
+            Ok(())
+        })
+        .expect("this cycle");
+        assert_eq!(meter.owner_rescan_heads, 1, "delta={delta}");
+        assert_eq!(meter.scratch.owner_rescan_pushed, 1, "delta={delta}");
+
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            heap.set_metatable(graph.left, Some(graph.old_mt))?;
+            Ok(())
+        })
+        .expect("restore v");
+        heap::collect(&mut host).expect("next cycle");
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            assert!(
+                !heap.alive(graph.left_value),
+                "the restored weak value is released (delta={delta})"
+            );
+            assert!(
+                !heap.alive(graph.left_successor),
+                "the restored successor is released (delta={delta})"
+            );
+            assert!(heap.alive(graph.left));
+            Ok(())
+        })
+        .expect("released");
+    });
+}
+
+#[test]
+fn budget_gray_multiple_grown_slots_weak_start_spends_one_head_unit() {
+    run_weak_start_budget(4);
+}
+
+#[test]
+fn budget_gray_no_filler_slot_weak_start_spends_one_head_unit() {
+    run_weak_start_budget(0);
+}
+
+/// The grown suffix is far past the 13-slot vectors the old path sized once.
+/// The fixed path keeps no slot-indexed rescan vector, so there is no capacity
+/// boundary whose copy could hide inside this pulse; this arm exercises the
+/// long suffix without claiming a reallocation measurement.
+#[test]
+fn budget_gray_large_grown_suffix_weak_start_spends_one_head_unit() {
+    run_weak_start_budget(57);
+}
+
+#[test]
+fn budget_gray_multiple_unscanned_slots_setter_registers_only_owner() {
+    run_old_owner_setter_budget(5);
+}
+
+#[test]
+fn budget_gray_no_growth_setter_registers_only_owner() {
+    run_old_owner_setter_budget(0);
+}
+
+const QUEUE_ITEM: &str = "held";
+const QUEUE_ROOTS: u32 = 4;
+
+struct QueueGraph {
+    frame: RootFrameId,
+    weak_mt: TableRef,
+    strong_mt: TableRef,
+    a: TableRef,
+    b: TableRef,
+    c: TableRef,
+    va: TableRef,
+    vb: TableRef,
+    vc: TableRef,
+    dust: TableRef,
+    a_record: u32,
+    b_record: u32,
+    c_record: u32,
+}
+
+fn plant_queue_graph(heap: &mut LuaHeap) -> Result<QueueGraph, HeapError> {
+    let weak_mt = heap.alloc()?;
+    let strong_mt = heap.alloc()?;
+    let a = heap.alloc()?;
+    let b = heap.alloc()?;
+    let c = heap.alloc()?;
+    let va = heap.alloc()?;
+    let vb = heap.alloc()?;
+    let vc = heap.alloc()?;
+    let dust = heap.alloc()?;
+    heap.set_mode_scalar(weak_mt, Value::string("v"))?;
+    for (owner, value) in [(a, va), (b, vb), (c, vc)] {
+        heap.set_metatable(owner, Some(weak_mt))?;
+        heap.set_named_edge(owner, QUEUE_ITEM, value)?;
+    }
+    let a_record = heap
+        .find_key(a.slot(), &super::EdgeKey::named(QUEUE_ITEM))
+        .expect("A record");
+    let b_record = heap
+        .find_key(b.slot(), &super::EdgeKey::named(QUEUE_ITEM))
+        .expect("B record");
+    let c_record = heap
+        .find_key(c.slot(), &super::EdgeKey::named(QUEUE_ITEM))
+        .expect("C record");
+    let frame = heap.enter_roots(QUEUE_ROOTS)?;
+    // Write order is gray push order; C is popped first. The charge order below
+    // therefore starts at A and ends at C, leaving each pending record visible.
+    heap.write_root(frame, 0, c)?;
+    heap.write_root(frame, 1, b)?;
+    heap.write_root(frame, 2, a)?;
+    Ok(QueueGraph {
+        frame,
+        weak_mt,
+        strong_mt,
+        a,
+        b,
+        c,
+        va,
+        vb,
+        vc,
+        dust,
+        a_record,
+        b_record,
+        c_record,
+    })
+}
+
+#[derive(Clone, Copy)]
+enum QueueArm {
+    Head,
+    Middle,
+    Tail,
+}
+
+fn run_queue_release(arm: QueueArm) {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits(16, 8, 16)).expect("install");
+        let graph = heap::with_heap(&mut host, plant_queue_graph).expect("plant");
+        heap::open_fixed_step(&mut host).expect("open");
+        let (removed, root_slot, kept, dead_value) = match arm {
+            QueueArm::Head => (
+                graph.c,
+                0u32,
+                (graph.a, graph.b, graph.va, graph.vb),
+                graph.vc,
+            ),
+            QueueArm::Middle => (graph.b, 1, (graph.a, graph.c, graph.va, graph.vc), graph.vb),
+            QueueArm::Tail => (graph.a, 2, (graph.b, graph.c, graph.vb, graph.vc), graph.va),
+        };
+        let (kept_left, kept_right, kept_left_value, kept_right_value) = kept;
+        let mut revived = None;
+        let mut revived_value = None;
+        resume_weak(&mut host, |parked| {
+            charge_white(
+                parked,
+                graph.a.slot(),
+                graph.a_record,
+                &[graph.va, graph.vb, graph.vc],
+            );
+            charge_white(
+                parked,
+                graph.b.slot(),
+                graph.b_record,
+                &[graph.va, graph.vb, graph.vc],
+            );
+            charge_white(
+                parked,
+                graph.c.slot(),
+                graph.c_record,
+                &[graph.va, graph.vb, graph.vc],
+            );
+            for owner in [graph.a, graph.b, graph.c] {
+                write_metatable(parked, owner, Some(graph.strong_mt))
+                    .expect("queue the already scanned owner");
+            }
+            assert_eq!(
+                parked.meter().scratch.owner_rescan_pushed,
+                3,
+                "three weak owners are linked before the release"
+            );
+
+            // The removed owner is the middle, head, or tail of [C, B, A].
+            let released_slot = removed.slot();
+            let released_generation = removed.generation();
+            parked
+                .with_saved_heap(|heap| heap.rollback(removed))
+                .expect("rollback the queued owner");
+            assert!(
+                !parked.with_saved_heap(|heap| heap.alive(removed)),
+                "the queued owner was released"
+            );
+            assert!(
+                parked.with_saved_heap(|heap| !heap.free_list.is_empty()),
+                "the released slot is reusable"
+            );
+
+            // Reuse the same physical slot for a new generation. Mounting the
+            // weak metatable must not look like an inherited weak start, and
+            // strengthening it after its own scan must enqueue it once.
+            let fresh = parked
+                .with_saved_heap(|heap| heap.alloc())
+                .expect("reuse the released slot");
+            assert_eq!(
+                fresh.slot(),
+                released_slot,
+                "the free slot is reused in place"
+            );
+            assert_ne!(
+                fresh.generation(),
+                released_generation,
+                "the reused slot has a new generation"
+            );
+            let value = parked
+                .with_saved_heap(|heap| heap.alloc())
+                .expect("a fresh weak value");
+            let schedules_before = parked.meter().owner_rescan_schedules;
+            let pushes_before = parked.meter().scratch.owner_rescan_pushed;
+            parked
+                .with_saved_heap(|heap| -> Result<(), HeapError> {
+                    heap.set_metatable(fresh, Some(graph.weak_mt))?;
+                    heap.set_named_edge(fresh, QUEUE_ITEM, value)?;
+                    Ok(())
+                })
+                .expect("mount the fresh weak owner");
+            assert!(!parked.marked(fresh), "the fresh owner is not scanned yet");
+            assert_eq!(
+                parked.meter().owner_rescan_schedules,
+                schedules_before,
+                "the fresh unmarked owner inherits no weak-start tag"
+            );
+            assert_eq!(
+                parked.meter().scratch.owner_rescan_pushed,
+                pushes_before,
+                "the fresh unmarked owner inherits no queue membership"
+            );
+            let value_record = parked
+                .with_saved_heap(|heap| {
+                    heap.find_key(fresh.slot(), &super::EdgeKey::named(QUEUE_ITEM))
+                })
+                .expect("fresh owner record");
+            parked
+                .write_table_root(graph.frame, root_slot, fresh)
+                .expect("root the reused owner");
+            assert!(parked.marked(fresh));
+            charge_white(parked, fresh.slot(), value_record, &[value]);
+            let strengthen_before = parked.meter();
+            write_metatable(parked, fresh, Some(graph.strong_mt))
+                .expect("strengthen the reused owner");
+            assert_eq!(
+                parked.meter().owner_rescan_schedules,
+                strengthen_before.owner_rescan_schedules + 1,
+                "the reused owner gets its own queue entry"
+            );
+            assert_eq!(
+                parked.meter().scratch.owner_rescan_pushed,
+                strengthen_before.scratch.owner_rescan_pushed + 1
+            );
+            assert!(
+                !parked.marked(value),
+                "the setter does not recurse along the old value"
+            );
+            revived = Some(fresh);
+            revived_value = Some(value);
+        });
+
+        let done = finish_fixed_cycle(&mut host);
+        assert!(
+            matches!(done, crate::heap::StepOutcome::Completed(_)),
+            "{done:?}"
+        );
+        let meter = heap::take_scan_meter(&mut host).expect("meter");
+        let revived = revived.expect("the reused owner");
+        let revived_value = revived_value.expect("the reused value");
+        assert_eq!(
+            meter.owner_rescan_heads, 3,
+            "the three surviving queue entries are all rescanned"
+        );
+        assert_eq!(
+            meter.scratch.owner_rescan_pushed, 4,
+            "the released entry is gone; the reused owner is a new push"
+        );
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            assert!(heap.alive(graph.weak_mt));
+            assert!(heap.alive(graph.strong_mt));
+            assert!(heap.alive(kept_left));
+            assert!(heap.alive(kept_right));
+            assert!(heap.alive(revived));
+            assert_eq!(
+                heap.named_edge(kept_left, QUEUE_ITEM)?,
+                Some(kept_left_value)
+            );
+            assert_eq!(
+                heap.named_edge(kept_right, QUEUE_ITEM)?,
+                Some(kept_right_value)
+            );
+            assert_eq!(heap.named_edge(revived, QUEUE_ITEM)?, Some(revived_value));
+            assert!(
+                !heap.alive(dead_value),
+                "the released owner's value is swept"
+            );
+            assert!(!heap.alive(graph.dust));
+            Ok(())
+        })
+        .expect("this cycle");
+
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            heap.set_metatable(kept_left, Some(graph.weak_mt))?;
+            heap.set_metatable(kept_right, Some(graph.weak_mt))?;
+            heap.set_metatable(revived, Some(graph.weak_mt))?;
+            Ok(())
+        })
+        .expect("restore v");
+        heap::collect(&mut host).expect("next cycle");
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            assert!(!heap.alive(kept_left_value));
+            assert!(!heap.alive(kept_right_value));
+            assert!(!heap.alive(revived_value));
+            assert!(heap.alive(kept_left));
+            assert!(heap.alive(kept_right));
+            assert!(heap.alive(revived));
+            Ok(())
+        })
+        .expect("released");
+    });
+}
+
+#[test]
+fn queue_release_head_keeps_the_suffix_and_reuse_is_clean() {
+    run_queue_release(QueueArm::Head);
+}
+
+#[test]
+fn queue_release_middle_keeps_both_sides_and_reuse_is_clean() {
+    run_queue_release(QueueArm::Middle);
+}
+
+#[test]
+fn queue_release_tail_keeps_the_prefix_and_reuse_is_clean() {
+    run_queue_release(QueueArm::Tail);
 }

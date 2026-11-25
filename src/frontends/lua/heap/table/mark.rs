@@ -48,7 +48,7 @@
 
 use super::{
     ClosureRef, CollectReport, EdgeKey, EdgeValue, HandleKind, HeapError, HeapStats, LuaHeap,
-    MarkSnapshot, RootFrameId, Rooted, SlotState, TableRef, UpvalueRef, WeakMode,
+    MarkSnapshot, RootFrameId, Rooted, Slot, SlotState, TableRef, UpvalueRef, WeakMode,
 };
 use vm::Value;
 
@@ -66,18 +66,16 @@ pub(super) struct MarkState {
     pub(super) cursor: Option<u32>,
     owner_kind: HandleKind,
     owner_mode: WeakMode,
-    /// Slot-indexed. True after this mark's ordinary scan has opened the
-    /// owner with weak values. Bounded by the node limit. Dropped with the mark.
-    weak_started: Vec<bool>,
-    /// Dedup bit for `rescan`. A repeat setter reads this and does not walk
-    /// the queue, the owner chain, or the gray stack.
-    rescan_queued: Vec<bool>,
-    /// Owners waiting for a chain-head rescan. At most one entry each.
-    rescan: Vec<u32>,
+    /// First node of this mark's rescan queue. The links live on the slots, so
+    /// a push or a release-time unlink is constant work and allocates nothing.
+    rescan_head: Option<u32>,
+    /// Identifies this mark's weak-start and queue tags on slot records. A new
+    /// mark gets a new value; a slot tag from an older mark is inert without a
+    /// whole-slot clear, including after an abandoned mark.
+    rescan_epoch: u64,
     rescan_owner: Option<u32>,
     rescan_cursor: Option<u32>,
     rescan_mode: WeakMode,
-    rescan_ready: bool,
 }
 
 enum MarkPhase {
@@ -131,7 +129,7 @@ pub(super) struct ParkedMark<'a> {
 }
 
 impl MarkState {
-    fn new() -> Self {
+    fn new(rescan_epoch: u64) -> Self {
         Self {
             phase: MarkPhase::Start,
             gray: Vec::new(),
@@ -146,13 +144,11 @@ impl MarkState {
             cursor: None,
             owner_kind: HandleKind::Table,
             owner_mode: WeakMode::default(),
-            weak_started: Vec::new(),
-            rescan_queued: Vec::new(),
-            rescan: Vec::new(),
+            rescan_head: None,
+            rescan_epoch,
             rescan_owner: None,
             rescan_cursor: None,
             rescan_mode: WeakMode::default(),
-            rescan_ready: false,
         }
     }
 
@@ -181,7 +177,8 @@ impl<'a> MarkSession<'a> {
             !heap.has_sweep_tail(),
             "a published sweep tail and a mark session cannot coexist"
         );
-        heap.mark = Some(MarkState::new());
+        let rescan_epoch = heap.advance_rescan_epoch();
+        heap.mark = Some(MarkState::new(rescan_epoch));
         Self { heap }
     }
 
@@ -240,7 +237,8 @@ impl<'a> ParkedMark<'a> {
         if heap.has_sweep_tail() {
             return Err(HeapError::SweepPending);
         }
-        heap.mark = Some(MarkState::new());
+        let rescan_epoch = heap.advance_rescan_epoch();
+        heap.mark = Some(MarkState::new(rescan_epoch));
         Ok(Self {
             heap,
             done: None,
@@ -970,7 +968,7 @@ fn step_gray(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
         state.rescan_owner = None;
         return false;
     }
-    if let Some(slot) = state.rescan.pop() {
+    if let Some(slot) = pop_rescan(heap, state) {
         return open_rescan(heap, state, slot);
     }
     state.phase = MarkPhase::Done;
@@ -1039,10 +1037,84 @@ fn charge_rescan(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
     true
 }
 
-fn open_rescan(heap: &mut LuaHeap, state: &mut MarkState, slot: u32) -> bool {
-    if let Some(queued) = state.rescan_queued.get_mut(slot as usize) {
-        *queued = false;
+fn pop_rescan(heap: &mut LuaHeap, state: &mut MarkState) -> Option<u32> {
+    let slot = state.rescan_head?;
+    let next = {
+        let stored = heap.slots.get_mut(slot as usize)?;
+        debug_assert_eq!(
+            stored.rescan_epoch, state.rescan_epoch,
+            "rescan head belongs to an older cycle"
+        );
+        debug_assert!(stored.rescan_queued, "rescan head is not queued");
+        stored.rescan_queued = false;
+        stored.rescan_prev = None;
+        stored.rescan_next.take()
+    };
+    state.rescan_head = next;
+    if let Some(next) = next
+        && let Some(stored) = heap.slots.get_mut(next as usize)
+    {
+        stored.rescan_prev = None;
     }
+    Some(slot)
+}
+
+fn push_rescan(heap: &mut LuaHeap, state: &mut MarkState, owner: u32) {
+    {
+        let stored = &mut heap.slots[owner as usize];
+        stored.rescan_queued = true;
+        stored.rescan_prev = None;
+        stored.rescan_next = state.rescan_head;
+    }
+    if let Some(head) = state.rescan_head {
+        heap.slots[head as usize].rescan_prev = Some(owner);
+    }
+    state.rescan_head = Some(owner);
+}
+
+/// Removes a slot being released from this mark's rescan list before its state
+/// becomes Free. The links are on the slot, so this is constant work and does
+/// not walk the queue. A tag from an older epoch is not in the current list;
+/// it is cleared without touching the current head. A released slot must never
+/// stay queued: reuse would otherwise inherit queue membership.
+pub(super) fn release_rescan_slot(
+    mut state: Option<&mut MarkState>,
+    slots: &mut [Slot],
+    index: u32,
+) {
+    let Some(stored) = slots.get(index as usize) else {
+        return;
+    };
+    let epoch = stored.rescan_epoch;
+    let queued = stored.rescan_queued;
+    let prev = stored.rescan_prev;
+    let next = stored.rescan_next;
+    let same_cycle = state
+        .as_ref()
+        .is_some_and(|state| state.rescan_epoch == epoch);
+    if same_cycle && queued {
+        if let Some(prev) = prev {
+            if let Some(prev_slot) = slots.get_mut(prev as usize) {
+                prev_slot.rescan_next = next;
+            }
+        } else if let Some(state) = state.as_mut() {
+            state.rescan_head = next;
+        }
+        if let Some(next) = next
+            && let Some(next_slot) = slots.get_mut(next as usize)
+        {
+            next_slot.rescan_prev = prev;
+        }
+    }
+    if let Some(stored) = slots.get_mut(index as usize) {
+        stored.rescan_epoch = 0;
+        stored.rescan_queued = false;
+        stored.rescan_prev = None;
+        stored.rescan_next = None;
+    }
+}
+
+fn open_rescan(heap: &mut LuaHeap, state: &mut MarkState, slot: u32) -> bool {
     let Some(stored) = heap.slots.get(slot as usize) else {
         return false;
     };
@@ -1144,41 +1216,30 @@ fn follow_edge_ends(heap: &mut LuaHeap, state: &mut MarkState, cursor: u32) {
     }
 }
 
+/// Tags the target slot when its ordinary scan opens a weak side. The tag is
+/// the slot's own epoch, so a grown slot needs no vector entry and no suffix
+/// initialization. The first tag for a slot in a mark is one initialized slot
+/// state; a repeat is a no-op. An older epoch is inert and is replaced here.
 fn note_weak_started(heap: &mut LuaHeap, state: &mut MarkState, slot: u32) {
-    ensure_rescan_bits(heap, state);
-    if let Some(started) = state.weak_started.get_mut(slot as usize) {
-        *started = true;
-    }
-}
-
-/// Sizes the slot-indexed rescan bits before a weak owner starts or a
-/// strengthening request is queued. A slot grown by a mid-cycle allocation is
-/// outside the first bitmap, so the next request extends both bit vectors by
-/// the new suffix. The extension runs inside the same weak-start or setter
-/// request that needs it, zero-fills only the suffix, and is recorded in
-/// `owner_rescan_inited`. `Vec` growth doubles capacity, so the extension is
-/// amortized O(1) per added slot; it does not walk the heap or an owner chain.
-fn ensure_rescan_bits(heap: &mut LuaHeap, state: &mut MarkState) {
-    let len = heap.slots.len();
-    if state.rescan_ready {
-        if state.weak_started.len() >= len {
+    let epoch = state.rescan_epoch;
+    let first = {
+        let Some(stored) = heap.slots.get_mut(slot as usize) else {
             return;
+        };
+        if stored.rescan_epoch == epoch {
+            false
+        } else {
+            stored.rescan_epoch = epoch;
+            stored.rescan_queued = false;
+            stored.rescan_prev = None;
+            stored.rescan_next = None;
+            true
         }
-        let grown = len - state.weak_started.len();
-        state.weak_started.resize(len, false);
-        state.rescan_queued.resize(len, false);
-        heap.scan.scratch.owner_rescan_inited = heap
-            .scan
-            .scratch
-            .owner_rescan_inited
-            .saturating_add(u64::try_from(grown).unwrap_or(u64::MAX));
-        return;
+    };
+    if first {
+        heap.scan.scratch.owner_rescan_inited =
+            heap.scan.scratch.owner_rescan_inited.saturating_add(1);
     }
-    state.weak_started = vec![false; len];
-    state.rescan_queued = vec![false; len];
-    state.rescan = Vec::with_capacity(len);
-    heap.scan.scratch.owner_rescan_inited = u64::try_from(len).unwrap_or(u64::MAX);
-    state.rescan_ready = true;
 }
 
 fn mode_of_tuple(state: &MarkState, tuple: Option<(u32, u32)>) -> WeakMode {
@@ -1353,7 +1414,7 @@ impl LuaHeap {
                 || state.cursor.is_some()
                 || state.rescan_owner.is_some()
                 || state.rescan_cursor.is_some()
-                || !state.rescan.is_empty(),
+                || state.rescan_head.is_some(),
         ))
     }
 
@@ -1499,35 +1560,29 @@ impl LuaHeap {
         if !((old_mode.keys && !new_mode.keys) || (old_mode.values && !new_mode.values)) {
             return false;
         }
-        state
-            .weak_started
+        self.slots
             .get(owner as usize)
-            .copied()
-            .unwrap_or(false)
+            .is_some_and(|slot| slot.rescan_epoch == state.rescan_epoch)
     }
 
     /// Queues one chain-head rescan for an owner that already started a weak
-    /// scan. A repeat reads the slot bit and does not walk the queue. This
-    /// does not scan the owner, reset a mark, or move the ordinary cursor.
+    /// scan. A repeat reads the slot tag and does not walk the queue. This
+    /// does not scan the owner, reset a mark, initialize an unrelated slot,
+    /// allocate a queue buffer, or move the ordinary cursor.
     pub(super) fn schedule_owner_rescan(&mut self, owner: u32) {
         let Some(mut state) = self.mark.take() else {
             return;
         };
-        if state.mutation_open() {
-            ensure_rescan_bits(self, &mut state);
-            if let Some(queued) = state.rescan_queued.get_mut(owner as usize)
-                && !*queued
-                && state
-                    .weak_started
-                    .get(owner as usize)
-                    .copied()
-                    .unwrap_or(false)
-            {
-                *queued = true;
-                state.rescan.push(owner);
-                self.scan.scratch.owner_rescan_pushed += 1;
-                self.scan.owner_rescan_schedules += 1;
-            }
+        if state.mutation_open()
+            && self
+                .slots
+                .get(owner as usize)
+                .is_some_and(|slot| slot.rescan_epoch == state.rescan_epoch)
+            && !self.slots[owner as usize].rescan_queued
+        {
+            push_rescan(self, &mut state, owner);
+            self.scan.scratch.owner_rescan_pushed += 1;
+            self.scan.owner_rescan_schedules += 1;
         }
         self.mark = Some(state);
     }
