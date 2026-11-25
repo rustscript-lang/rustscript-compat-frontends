@@ -768,7 +768,7 @@ fn raw_len(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
         }
     };
     if let Some(len) = byte_len_of(&value) {
-        note_raw_len(call)?;
+        note_raw_len(call);
         return Ok(Value::Float(len as f64));
     }
     let table = match classify(&mut call.vm().host_context(), &value)? {
@@ -781,19 +781,33 @@ fn raw_len(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
         heap.raw_sequence_len(table)
     })
     .map_err(heap_error)?;
-    note_raw_len(call)?;
+    note_raw_len(call);
     Ok(Value::Float(len))
 }
 
-fn note_raw_len(call: &mut OwnedHostCall<'_>) -> Result<(), VmError> {
-    let frame = heap::with_heap(&mut call.vm().host_context(), |heap| {
-        Ok(heap.current_frame().map(|frame| frame.parts()))
-    })
-    .map_err(heap_error)?;
-    with_witness(call.vm(), |witness| {
-        witness.host_steps.push(HostStep::RawLen { frame });
-    })?;
-    Ok(())
+fn note_raw_len(call: &mut OwnedHostCall<'_>) {
+    // Read a frame only when a heap is already installed. `with_heap` would
+    // create one, and `with_witness` would create a `ReturnWitness`.
+    let frame = call
+        .vm()
+        .host_context()
+        .scope_state::<heap::LuaHeap>()
+        .and_then(heap::LuaHeap::current_frame)
+        .map(|frame| frame.parts());
+    note_host_step(call.vm(), HostStep::RawLen { frame });
+}
+
+/// Shared recorder for `RawLen`, `FinishReturn`, and `RetireCallee`.
+///
+/// Missing trace returns immediately. The write is an array slot and two
+/// counters: no allocation, error, evaluation, heap write, root write, or
+/// resource. `scope_state_mut` only looks up an existing value.
+fn note_host_step(vm: &mut vm::Vm, step: HostStep) {
+    let mut host = vm.host_context();
+    let Some(trace) = host.scope_state_mut::<HostStepTrace>() else {
+        return;
+    };
+    trace.record(step);
 }
 
 fn skip_parens(expr: &ast::Expr) -> &ast::Expr {
@@ -1319,10 +1333,13 @@ fn finish_return(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
             returned_edge,
             discarded_edge,
         });
-        witness.host_steps.push(HostStep::FinishReturn {
-            frame_alive: lua_frame_alive,
-        });
     })?;
+    note_host_step(
+        call.vm(),
+        HostStep::FinishReturn {
+            frame_alive: lua_frame_alive,
+        },
+    );
     Ok(transport)
 }
 
@@ -1470,12 +1487,15 @@ fn retire_callee(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
             last.callee_left = left;
             last.top_is_caller_after_handoff = top_is_caller;
         }
-        witness.host_steps.push(HostStep::RetireCallee {
+    })?;
+    note_host_step(
+        call.vm(),
+        HostStep::RetireCallee {
             left,
             retired,
             frame_after,
-        });
-    })?;
+        },
+    );
     Ok(Value::Float(0.0))
 }
 
@@ -5363,6 +5383,32 @@ pub(super) enum HostStep {
     },
 }
 
+/// Fixed observation buffer for the three host steps above.
+///
+/// Tests install it with `scope_state_or_insert_with`. Host code only records
+/// into an existing value. A full buffer keeps the prefix, sets `truncated`,
+/// and drops the rest without allocating.
+pub(super) const HOST_STEP_TRACE_CAP: usize = 8;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct HostStepTrace {
+    pub(super) steps: [Option<HostStep>; HOST_STEP_TRACE_CAP],
+    pub(super) len: u8,
+    pub(super) truncated: bool,
+}
+
+impl HostStepTrace {
+    fn record(&mut self, step: HostStep) {
+        let index = usize::from(self.len);
+        if index < HOST_STEP_TRACE_CAP {
+            self.steps[index] = Some(step);
+            self.len += 1;
+        } else {
+            self.truncated = true;
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub(super) struct ReturnWitness {
     pub callee_depth: Option<usize>,
@@ -5384,7 +5430,9 @@ pub(super) struct ReturnWitness {
     pub collects: Vec<CollectNote>,
     pub release: Option<ReleaseNote>,
     pub handoffs: Vec<Handoff>,
-    /// Read-only host order. It does not change guest values or collection.
+    /// Read-only host order from before the opt-in trace. The three events no
+    /// longer push here. Collect notes, issued tables, and handoffs on this
+    /// witness are a different record and are not isolated by that trace.
     pub host_steps: Vec<HostStep>,
     /// Every table rooted by `root_issued`, in activation order.
     pub issued: Vec<heap::TableRef>,
