@@ -1129,11 +1129,16 @@ impl LuaHeap {
             cell.generation(),
             table.slot(),
             table.generation(),
+            mark::ClosedCellTarget::Table,
         );
         Ok(())
     }
 
     /// Replaces the current edge with a closure. Same record as a table write.
+    ///
+    /// After the write commits, an already discovered cell shades only that
+    /// direct closure. The capture and its table wait for the continued scan.
+    /// The published tail is still refused inside the write, before any barrier.
     pub fn write_closure_upvalue(
         &mut self,
         cell: UpvalueRef,
@@ -1148,7 +1153,15 @@ impl LuaHeap {
                 slot: closure.slot(),
                 generation: closure.generation(),
             },
-        )
+        )?;
+        self.barrier_strong_closed_cell(
+            cell.slot(),
+            cell.generation(),
+            closure.slot(),
+            closure.generation(),
+            mark::ClosedCellTarget::Closure,
+        );
+        Ok(())
     }
 
     /// Replaces the current edge with a boolean, binary64, string, or bytes scalar.

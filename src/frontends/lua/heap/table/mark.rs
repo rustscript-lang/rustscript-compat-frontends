@@ -1153,6 +1153,15 @@ fn mode_string_byte(heap: &LuaHeap, edge_index: u32, at: usize) -> Option<u8> {
     }
 }
 
+/// The direct object a closed-cell write just stored.
+///
+/// Only these two carriers use the current edge. The write names which one it
+/// stored; the barrier does not inspect the record again.
+pub(super) enum ClosedCellTarget {
+    Table,
+    Closure,
+}
+
 impl LuaHeap {
     /// Phase and whether a gray edge or queued owner is still unscanned.
     /// Does not take the mark, scan, or write.
@@ -1300,26 +1309,32 @@ impl LuaHeap {
         self.mark = Some(state);
     }
 
-    /// Enqueues a table stored through an already discovered closed cell.
+    /// Enqueues the direct object stored through an already discovered closed cell.
     ///
     /// The current edge is strong: a cell is not a table entry, so weak values
-    /// do not apply. Only the direct table is queued; its child waits for the
-    /// continued scan. The cell itself is not rescanned. This does not add a
-    /// root, read `__mode`, or move either cursor. An owner that is not this
-    /// upvalue generation, or is not yet marked, is left for the continued
-    /// scan. A published tail never reaches here.
+    /// do not apply. The caller names the stored table or closure. Only that
+    /// object is queued; a closure's capture waits for the continued scan. The
+    /// cell itself is not rescanned. This does not add a root, read `__mode`,
+    /// or move either cursor. An owner that is not this upvalue generation, or
+    /// is not yet marked, is left for the continued scan. A published tail
+    /// never reaches here.
     pub(super) fn barrier_strong_closed_cell(
         &mut self,
         owner: u32,
         owner_generation: u32,
         slot: u32,
         generation: u32,
+        target: ClosedCellTarget,
     ) {
         let Some(mut state) = self.mark.take() else {
             return;
         };
         if state.mutation_open() && discovered_upvalue(self, owner, owner_generation) {
-            enqueue_barrier_target(self, &mut state, slot, generation, HandleKind::Table);
+            let kind = match target {
+                ClosedCellTarget::Table => HandleKind::Table,
+                ClosedCellTarget::Closure => HandleKind::Closure,
+            };
+            enqueue_barrier_target(self, &mut state, slot, generation, kind);
         }
         self.mark = Some(state);
     }
