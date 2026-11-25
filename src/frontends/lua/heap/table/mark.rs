@@ -1369,6 +1369,23 @@ fn mode_of_tuple(state: &MarkState, tuple: Option<(u32, u32)>) -> WeakMode {
         .unwrap_or_default()
 }
 
+/// The value-weak mode a tuple had before a direct `__mode` unlink replaced
+/// the cache entry with the missing-field mode. The discovery stamp recorded
+/// the same metatable generation, so a setter moving an already-started owner
+/// away still sees the old weak side. Only the value bit returns: the delete
+/// path arms on value-weak, key-strong entries.
+fn mode_before_direct_delete(state: &MarkState, tuple: Option<(u32, u32)>) -> Option<WeakMode> {
+    let (slot, generation) = tuple?;
+    let stamp = state.discover_marks.get(slot as usize)?;
+    if stamp.batch == 0 || stamp.generation != generation {
+        return None;
+    }
+    Some(WeakMode {
+        keys: false,
+        values: true,
+    })
+}
+
 fn owner_mode(heap: &mut LuaHeap, state: &mut MarkState, slot: u32) -> WeakMode {
     let Some(stored) = heap.slots.get(slot as usize) else {
         return WeakMode::default();
@@ -1657,8 +1674,11 @@ impl LuaHeap {
     /// Checks whether either weak side becomes strong using the tuples captured
     /// before the slot write. The old mode comes from this cycle's cache and
     /// that tuple, not from the edge count, so clearing the last metatable
-    /// edge cannot make the old mode look strong. A not-yet-started owner is
-    /// left for the ordinary scan. This does not enqueue, scan, or move a cursor.
+    /// edge cannot make the old mode look strong. A direct value-weak delete
+    /// already replaced that cache entry with the missing-field mode; its
+    /// discovery stamp restores the pre-delete value bit for an owner that
+    /// started under the same metatable. A not-yet-started owner is left for
+    /// the ordinary scan. This does not enqueue, scan, or move a cursor.
     pub(super) fn needs_owner_rescan(
         &self,
         owner: u32,
@@ -1671,7 +1691,8 @@ impl LuaHeap {
         if !state.mutation_open() {
             return false;
         }
-        let old_mode = mode_of_tuple(state, old_tuple);
+        let old_mode = mode_before_direct_delete(state, old_tuple)
+            .unwrap_or_else(|| mode_of_tuple(state, old_tuple));
         let new_mode = mode_of_tuple(state, new_tuple);
         if !((old_mode.keys && !new_mode.keys) || (old_mode.values && !new_mode.values)) {
             return false;

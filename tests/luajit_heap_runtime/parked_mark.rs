@@ -10412,9 +10412,7 @@ fn check_shared_mode_left_replacement(
         })
         .expect("plant");
         let new_mt = match replacement {
-            SharedModeReplacement::Strong | SharedModeReplacement::Mode(_) => {
-                Some(graph.strong_mt)
-            }
+            SharedModeReplacement::Strong | SharedModeReplacement::Mode(_) => Some(graph.strong_mt),
             SharedModeReplacement::Clear => None,
         };
         heap::open_fixed_step(&mut host).expect("open");
@@ -10445,7 +10443,8 @@ fn check_shared_mode_left_replacement(
                 setter_schedule_delta: parked.meter().owner_rescan_schedules - schedules_before,
                 pending_before,
                 pending_after: parked.pending(),
-                left_still_white: !parked.marked(graph.left_value) && !parked.marked(graph.left_child),
+                left_still_white: !parked.marked(graph.left_value)
+                    && !parked.marked(graph.left_child),
             };
             if delete_shared {
                 assert!(
@@ -10543,4 +10542,270 @@ fn shared_mode_scalar_delete_then_replace_kv_clears_left_graph() {
 #[test]
 fn shared_mode_scalar_left_clear_keeps_only_left() {
     check_shared_mode_left_replacement(false, SharedModeReplacement::Clear, (true, false));
+}
+
+// ---------------------------------------------------------------------------
+// Gray slot growth + shared direct-mode delete witness.
+// ---------------------------------------------------------------------------
+
+/// Allocates one real table during a saved Gray mark. Its slot is the next
+/// physical slot, past the slot-vector length that sized the ModeInit sidecar.
+fn grow_one_table(parked: &mut ParkedMark<'_>) -> TableRef {
+    parked
+        .with_saved_heap(|heap| heap.alloc())
+        .expect("a real allocation grows the slot vector")
+}
+
+/// A metatable allocated after ModeInit has no entry in the slot-indexed mode
+/// cache or in the discovery sidecar. Writing a real `v` field and connecting
+/// both owners is accepted; deleting that field in place unlinks the record but
+/// cannot arm the indexed walk. The owners were already weakly scanned, so the
+/// setter's weak-to-strong rescan (the grown metatable reads as strong) is what
+/// keeps their original values and successors.
+#[test]
+fn shared_mode_delete_grown_metatable_stays_outside_sidecar() {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        let graph = open_shared_mode_graph(&mut host);
+        let mut grown_slot = 0u32;
+        let mut old_slots = 0u32;
+        resume_weak(&mut host, |parked| {
+            pause_after_both_weak_edges(parked, &graph);
+            old_slots = parked.stats().node_slots;
+            let before = parked.meter();
+            let mt = grow_one_table(parked);
+            grown_slot = mt.slot();
+            assert_eq!(
+                grown_slot, old_slots,
+                "the new metatable is the next physical slot"
+            );
+            assert_eq!(parked.stats().node_slots, old_slots + 1);
+            parked
+                .with_saved_heap(|heap| -> Result<(), HeapError> {
+                    heap.set_mode_scalar(mt, Value::string("v"))?;
+                    heap.set_metatable(graph.left, Some(mt))?;
+                    heap.set_metatable(graph.right, Some(mt))?;
+                    Ok(())
+                })
+                .expect("write the grown direct mode and connect both owners");
+            assert_eq!(
+                parked.with_saved_heap(|heap| heap.named_value(mt, "__mode")),
+                Ok(Value::string("v"))
+            );
+            assert_eq!(parked.metatable(graph.left), Ok(Some(mt)));
+            assert_eq!(parked.metatable(graph.right), Ok(Some(mt)));
+            assert_eq!(
+                parked.meter().scratch.mode_discover_inited,
+                u64::from(old_slots),
+                "the sidecar was sized from the pre-growth slot vector"
+            );
+            parked
+                .with_saved_heap(|heap| heap.set_named_scalar(mt, "__mode", Value::Null))
+                .expect("delete the grown direct mode in place");
+            assert!(
+                parked.with_saved_heap(|heap| heap.locate_named(mt.slot(), "__mode").is_none()),
+                "the grown mode record is unlinked, not left as a gap"
+            );
+            assert_eq!(
+                parked.discovery_slot(),
+                None,
+                "a grown metatable has no sidecar entry to arm"
+            );
+            assert_eq!(
+                parked.meter().mode_cache_updates,
+                before.mode_cache_updates,
+                "the missing cache entry refuses the direct-delete update"
+            );
+            assert!(!parked.marked(graph.left_value));
+            assert!(!parked.marked(graph.left_child));
+            assert!(!parked.marked(graph.right_value));
+            assert!(!parked.marked(graph.right_child));
+        });
+        finish_shared_mode_cycle(&mut host);
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            assert_eq!(heap.slots.len() as u32, old_slots + 1);
+            assert!(heap.alive(graph.left_value));
+            assert!(heap.alive(graph.left_child));
+            assert!(heap.alive(graph.right_value));
+            assert!(heap.alive(graph.right_child));
+            assert_eq!(heap.named_edge(graph.left, "subj")?, Some(graph.left_value));
+            assert_eq!(
+                heap.named_edge(graph.right, "subj")?,
+                Some(graph.right_value)
+            );
+            assert!(!heap.alive(graph.orphan));
+            assert!(!heap.alive(graph.dust));
+            Ok(())
+        })
+        .expect("grown metatable");
+    });
+}
+
+/// Same shape as the growth arm, but the replacement metatable exists before
+/// ModeInit. Its `v` entry is therefore in the same slot-indexed domain as the
+/// discovery sidecar. Deleting the field in place arms the probe at slot 0, and
+/// the two already-started owners are found and rescanned as strong.
+#[test]
+fn shared_mode_delete_preallocated_weak_metatable_arms_sidecar() {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits(16, 8, 24)).expect("install");
+        let graph = heap::with_heap(&mut host, |heap| -> Result<SharedModeGraph, HeapError> {
+            let graph = plant_shared_mode_graph(heap)?;
+            heap.set_mode_scalar(graph.strong_mt, Value::string("v"))?;
+            Ok(graph)
+        })
+        .expect("plant");
+        heap::open_fixed_step(&mut host).expect("open");
+        let mut old_slots = 0u32;
+        resume_weak(&mut host, |parked| {
+            pause_after_both_weak_edges(parked, &graph);
+            old_slots = parked.stats().node_slots;
+            assert!(graph.strong_mt.slot() < old_slots);
+            parked
+                .with_saved_heap(|heap| -> Result<(), HeapError> {
+                    heap.set_metatable(graph.left, Some(graph.strong_mt))?;
+                    heap.set_metatable(graph.right, Some(graph.strong_mt))?;
+                    Ok(())
+                })
+                .expect("switch both owners to the prebuilt weak metatable");
+            let before = parked.meter();
+            parked
+                .with_saved_heap(|heap| {
+                    heap.set_named_scalar(graph.strong_mt, "__mode", Value::Null)
+                })
+                .expect("delete the prebuilt direct mode in place");
+            assert_eq!(
+                parked.meter().mode_cache_updates,
+                before.mode_cache_updates + 1
+            );
+            assert_eq!(
+                parked.meter().mode_discover_writes,
+                before.mode_discover_writes + 1,
+                "the in-domain metatable stamps its sidecar entry"
+            );
+            assert_eq!(
+                parked.meter().scratch.mode_discover_inited,
+                u64::from(old_slots)
+            );
+            assert_eq!(parked.discovery_slot(), Some(0));
+            assert!(!parked.marked(graph.left_value));
+            assert!(!parked.marked(graph.left_child));
+        });
+        finish_shared_mode_cycle(&mut host);
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            assert!(heap.alive(graph.left_value));
+            assert!(heap.alive(graph.right_value));
+            assert!(heap.alive(graph.left_child));
+            assert!(heap.alive(graph.right_child));
+            assert_eq!(heap.named_edge(graph.left, "subj")?, Some(graph.left_value));
+            assert_eq!(
+                heap.named_edge(graph.right, "subj")?,
+                Some(graph.right_value)
+            );
+            assert!(!heap.alive(graph.orphan));
+            assert!(!heap.alive(graph.dust));
+            Ok(())
+        })
+        .expect("preallocated metatable");
+    });
+}
+
+/// The metatable exists before ModeInit but the second owner is allocated after
+/// both original owners were weakly scanned. The discovery walk reads the live
+/// slot vector, so it must reach the grown owner slot and queue that owner too.
+#[test]
+fn shared_mode_delete_original_metatable_walks_grown_owner_slots() {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        let graph = open_slot_growth_graph(&mut host);
+        let mut old_slots = 0u32;
+        let mut grown_owner = None;
+        resume_weak(&mut host, |parked| {
+            let white = [
+                graph.left_value,
+                graph.left_successor,
+                graph.peer_value,
+                graph.orphan,
+                graph.value,
+                graph.successor,
+            ];
+            charge_white(parked, graph.left.slot(), graph.left_record, &white);
+            charge_white(parked, graph.peer.slot(), graph.peer_record, &white);
+            old_slots = parked.stats().node_slots;
+            let owner = grow_one_table(parked);
+            grown_owner = Some(owner);
+            assert_eq!(owner.slot(), old_slots);
+            parked
+                .with_saved_heap(|heap| -> Result<(), HeapError> {
+                    heap.set_metatable(owner, Some(graph.old_mt))?;
+                    heap.set_named_edge(owner, GROWN_ITEM, graph.value)?;
+                    heap.set_named_edge(graph.value, "next", graph.successor)?;
+                    Ok(())
+                })
+                .expect("mount the in-domain metatable on the grown owner");
+            let record = parked
+                .with_saved_heap(|heap| {
+                    heap.find_key(owner.slot(), &super::EdgeKey::named(GROWN_ITEM))
+                })
+                .expect("grown owner item record");
+            parked
+                .write_table_root(graph.frame, GROWN_ROOT_SLOT, owner)
+                .expect("root the grown owner into the current gray");
+            assert!(parked.marked(owner));
+            charge_white(
+                parked,
+                owner.slot(),
+                record,
+                &[graph.value, graph.successor],
+            );
+            let before = parked.meter();
+            parked
+                .with_saved_heap(|heap| heap.set_named_scalar(graph.old_mt, "__mode", Value::Null))
+                .expect("delete the original direct mode in place");
+            assert_eq!(
+                parked.meter().mode_cache_updates,
+                before.mode_cache_updates + 1
+            );
+            assert_eq!(parked.discovery_slot(), Some(0));
+            let mut reached = false;
+            for _ in 0..512 {
+                if parked.discovery_slot().is_some_and(|slot| slot > old_slots) {
+                    reached = true;
+                    break;
+                }
+                assert!(!parked.pulse(1).finished);
+            }
+            assert!(
+                reached,
+                "the probe must read the slot allocated after ModeInit"
+            );
+        });
+        finish_shared_mode_cycle(&mut host);
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            let owner = grown_owner.expect("grown owner");
+            assert_eq!(heap.slots.len() as u32, old_slots + 1);
+            assert!(heap.alive(owner));
+            assert_eq!(heap.named_edge(owner, GROWN_ITEM)?, Some(graph.value));
+            assert!(
+                heap.alive(graph.value),
+                "the grown owner's weak value follows the rescan, not the setter"
+            );
+            assert!(heap.alive(graph.successor));
+            assert!(heap.alive(graph.left_value));
+            assert!(heap.alive(graph.left_successor));
+            assert!(heap.alive(graph.peer_value));
+            assert!(
+                heap.alive(graph.orphan),
+                "the witness shares the deleted metatable and becomes strong"
+            );
+            assert_eq!(
+                heap.named_edge(graph.witness, "orphan")?,
+                Some(graph.orphan)
+            );
+            assert!(!heap.alive(graph.dust));
+            Ok(())
+        })
+        .expect("grown owner slots");
+    });
 }
