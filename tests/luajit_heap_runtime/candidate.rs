@@ -5433,6 +5433,10 @@ pub(super) struct ReturnWitness {
     /// Read-only host order from before the opt-in trace. The three events no
     /// longer push here. Collect notes, issued tables, and handoffs on this
     /// witness are a different record and are not isolated by that trace.
+    /// The compiler file-entry tests read it through a separate include. This
+    /// heap test crate does not, so the unread-field warning is local to that
+    /// crate and is not a removed observation.
+    #[allow(dead_code)]
     pub host_steps: Vec<HostStep>,
     /// Every table rooted by `root_issued`, in activation order.
     pub issued: Vec<heap::TableRef>,
