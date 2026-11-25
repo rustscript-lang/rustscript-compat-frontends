@@ -682,6 +682,22 @@ pub struct ScanMeter {
     /// Setter requests that recorded one such owner. A repeat does not
     /// increment this. Not an outgoing edge visit and not a pulse unit.
     pub owner_rescan_schedules: u64,
+    /// One capacity-slot read while looking for an owner of a metatable whose
+    /// direct value-weak `__mode` was deleted. Free and retired slots count.
+    /// This is not a live-node walk. The setter does not increment this.
+    /// One probe is one pulse unit.
+    pub mode_owner_probes: u64,
+    /// Comparisons with an indexed deleted-mode stamp: at most one per
+    /// capacity-slot probe. The setter does not compare stamps. Not a pulse
+    /// unit in addition to the probe.
+    pub mode_discover_compares: u64,
+    /// Deleted-mode identity records written outside mode-cache init.
+    /// Scalar cursor and batch changes do not write a record. Not a pulse unit.
+    pub mode_discover_writes: u64,
+    /// Matching direct `__mode` deletes that replaced this cycle's value-weak,
+    /// key-strong cache with the missing-field mode. One per real unlink, not
+    /// a slot walk and not a pulse unit.
+    pub mode_cache_updates: u64,
     pub scratch: ScanScratch,
 }
 
@@ -711,7 +727,14 @@ pub struct ScanScratch {
     /// per weak owner's first start, tagged on that target slot. A repeat or a
     /// setter reuses the tag and does not count another. Bounded by the node
     /// limit. 0 when this cycle never started a weak owner scan.
+    /// Not the deleted-mode sidecar: that one is `mode_discover_inited`.
     pub owner_rescan_inited: u64,
+    /// Deleted-mode sidecar slots pushed during mode-cache init. One per
+    /// `step_mode_init` unit, and the same capacity as that wave's
+    /// `weak_modes_inited`. A setter and a gray probe do not push. This is
+    /// not `owner_rescan_inited`, which is a separate all-at-once zero of
+    /// rescan bits.
+    pub mode_discover_inited: u64,
     /// Owners linked into the rescan queue. One per owner per mark. A repeat
     /// setter does not link again and does not increment this.
     pub owner_rescan_pushed: u64,
@@ -3252,6 +3275,7 @@ impl LuaHeap {
 
     fn unlink_at(&mut self, owner: u32, prev: Option<u32>, index: u32) {
         let next = self.edge_slots[index as usize].next;
+        let cleared_mode = self.slots[owner as usize].mode_edge == Some(index);
         self.repair_parked_cursor(owner, index, next);
         match prev {
             Some(prev) => self.edge_slots[prev as usize].next = next,
@@ -3260,10 +3284,13 @@ impl LuaHeap {
         if self.slots[owner as usize].edge_tail == Some(index) {
             self.slots[owner as usize].edge_tail = prev;
         }
-        if self.slots[owner as usize].mode_edge == Some(index) {
+        if cleared_mode {
             self.slots[owner as usize].mode_edge = None;
         }
         self.free_edge_record(index);
+        if cleared_mode {
+            self.note_direct_mode_deleted(owner);
+        }
     }
 
     fn free_edge_record(&mut self, index: u32) {

@@ -9259,3 +9259,1288 @@ fn queue_release_middle_keeps_both_sides_and_reuse_is_clean() {
 fn queue_release_tail_keeps_the_prefix_and_reuse_is_clean() {
     run_queue_release(QueueArm::Tail);
 }
+
+/// Two owners share one direct `v` metatable. Each value and its strong child
+/// is reachable only through that owner's edge and an independent weak witness.
+/// The witness has its own weak metatable, so deleting the shared field cannot
+/// keep the orphan. `strong_mt` is allocated before the cycle and is not attached.
+struct SharedModeGraph {
+    sentinel: TableRef,
+    left: TableRef,
+    right: TableRef,
+    shared: TableRef,
+    witness: TableRef,
+    witness_mt: TableRef,
+    strong_mt: TableRef,
+    left_value: TableRef,
+    left_child: TableRef,
+    right_value: TableRef,
+    right_child: TableRef,
+    orphan: TableRef,
+    dust: TableRef,
+    sentinel_record: u32,
+    left_value_record: u32,
+    right_value_record: u32,
+}
+
+fn plant_shared_mode_graph(heap: &mut LuaHeap) -> Result<SharedModeGraph, HeapError> {
+    let sentinel = heap.alloc()?;
+    let left = heap.alloc()?;
+    let right = heap.alloc()?;
+    let shared = heap.alloc()?;
+    let witness = heap.alloc()?;
+    let witness_mt = heap.alloc()?;
+    let strong_mt = heap.alloc()?;
+    let left_value = heap.alloc()?;
+    let left_child = heap.alloc()?;
+    let right_value = heap.alloc()?;
+    let right_child = heap.alloc()?;
+    let orphan = heap.alloc()?;
+    let dust = heap.alloc()?;
+    heap.set_mode_scalar(shared, Value::string("v"))?;
+    heap.set_mode_scalar(witness_mt, Value::string("v"))?;
+    heap.set_metatable(left, Some(shared))?;
+    heap.set_metatable(right, Some(shared))?;
+    heap.set_metatable(witness, Some(witness_mt))?;
+    heap.set_named_scalar(sentinel, "pending", Value::Bool(true))?;
+    heap.set_named_scalar(left, "charged", Value::Bool(true))?;
+    heap.set_named_edge(left, "subj", left_value)?;
+    heap.set_named_edge(left_value, "next", left_child)?;
+    heap.set_named_scalar(right, "charged", Value::Bool(true))?;
+    heap.set_named_edge(right, "subj", right_value)?;
+    heap.set_named_edge(right_value, "next", right_child)?;
+    heap.set_named_edge(witness, "lv", left_value)?;
+    heap.set_named_edge(witness, "lc", left_child)?;
+    heap.set_named_edge(witness, "rv", right_value)?;
+    heap.set_named_edge(witness, "rc", right_child)?;
+    heap.set_named_edge(witness, "orphan", orphan)?;
+    heap.issue_carrier(left_value)?;
+    heap.issue_carrier(left_child)?;
+    heap.issue_carrier(right_value)?;
+    heap.issue_carrier(right_child)?;
+    let frame = heap.enter_roots(5)?;
+    // Last written root is popped first: left, strong_mt, right, witness, sentinel.
+    heap.write_root(frame, 0, sentinel)?;
+    heap.write_root(frame, 1, witness)?;
+    heap.write_root(frame, 2, right)?;
+    heap.write_root(frame, 3, strong_mt)?;
+    heap.write_root(frame, 4, left)?;
+    let (_, sentinel_record) = heap
+        .locate_named(sentinel.slot(), "pending")
+        .expect("sentinel record");
+    let (_, left_value_record) = heap
+        .locate_named(left.slot(), "subj")
+        .expect("left value record");
+    let (_, right_value_record) = heap
+        .locate_named(right.slot(), "subj")
+        .expect("right value record");
+    assert_ne!(left_value_record, right_value_record);
+    assert_ne!(left_value_record, sentinel_record);
+    let _ = dust;
+    let _ = frame;
+    Ok(SharedModeGraph {
+        sentinel,
+        left,
+        right,
+        shared,
+        witness,
+        witness_mt,
+        strong_mt,
+        left_value,
+        left_child,
+        right_value,
+        right_child,
+        orphan,
+        dust,
+        sentinel_record,
+        left_value_record,
+        right_value_record,
+    })
+}
+
+fn open_shared_mode_graph(host: &mut vm::HostContext<'_>) -> SharedModeGraph {
+    heap::install(host, limits(16, 8, 24)).expect("install");
+    let graph = heap::with_heap(host, plant_shared_mode_graph).expect("plant");
+    heap::open_fixed_step(host).expect("open");
+    graph
+}
+
+fn assert_owners_share_metatable(parked: &ParkedMark<'_>, graph: &SharedModeGraph) {
+    for owner in [graph.left, graph.right] {
+        let mt = parked
+            .metatable(owner)
+            .expect("metatable")
+            .expect("owner metatable");
+        assert_eq!(mt.slot(), graph.shared.slot());
+        assert_eq!(
+            mt.generation(),
+            graph.shared.generation(),
+            "both owners still point at the original shared metatable"
+        );
+    }
+}
+
+/// Charges one already-pending weak value record. The value stays white.
+fn charge_pending_weak_value(
+    parked: &mut ParkedMark<'_>,
+    owner: TableRef,
+    record: u32,
+    value: TableRef,
+) {
+    let pending = pause_at(parked, owner.slot(), record);
+    assert_eq!(pending.owner, owner.slot());
+    assert_eq!(pending.cursor, record);
+    assert!(
+        !parked.marked(value),
+        "the weak edge has not charged this value"
+    );
+    let checks = parked.meter().outgoing_edge_checks;
+    let view = parked.pulse(1);
+    assert!(
+        !view.finished,
+        "charging one weak edge does not finish the mark"
+    );
+    assert_eq!(view.meter.sweep_edge_checks, 0, "a pulse must not sweep");
+    assert_eq!(
+        view.meter.outgoing_edge_checks,
+        checks + 1,
+        "the pending weak record advanced by one edge charge"
+    );
+    assert!(!parked.marked(value), "the weak scan left the value white");
+    assert_ne!(
+        parked.pending().map(|scan| (scan.owner, scan.cursor)),
+        Some((owner.slot(), record)),
+        "the cursor left this weak record"
+    );
+}
+
+/// Both owner value records have advanced. Stop on the sentinel's real record.
+/// Mark-state mode bits are not visible here; this is the read-only substitute.
+fn pause_after_both_weak_edges(
+    parked: &mut ParkedMark<'_>,
+    graph: &SharedModeGraph,
+) -> PendingScan {
+    let roots = parked.stats().live_roots;
+    charge_pending_weak_value(
+        parked,
+        graph.left,
+        graph.left_value_record,
+        graph.left_value,
+    );
+    assert!(
+        !parked.marked(graph.left_child),
+        "the left successor has no independent strong root"
+    );
+    charge_pending_weak_value(
+        parked,
+        graph.right,
+        graph.right_value_record,
+        graph.right_value,
+    );
+    assert!(
+        !parked.marked(graph.left_value),
+        "the left value stayed white after its record advanced"
+    );
+    assert!(
+        !parked.marked(graph.right_child),
+        "the right successor has no independent strong root"
+    );
+    let witness_mt = parked
+        .metatable(graph.witness)
+        .expect("witness metatable")
+        .expect("witness has a metatable");
+    assert_eq!(witness_mt.slot(), graph.witness_mt.slot());
+    assert_eq!(witness_mt.generation(), graph.witness_mt.generation());
+    assert_ne!(
+        witness_mt.slot(),
+        graph.shared.slot(),
+        "the observer does not share the owners' metatable"
+    );
+    assert_owners_share_metatable(parked, graph);
+    let pending = pause_at(parked, graph.sentinel.slot(), graph.sentinel_record);
+    assert_eq!(pending.owner, graph.sentinel.slot());
+    assert_eq!(pending.cursor, graph.sentinel_record);
+    assert_ne!(pending.owner, graph.left.slot());
+    assert_ne!(pending.owner, graph.right.slot());
+    assert!(!parked.marked(graph.left_value));
+    assert!(!parked.marked(graph.right_value));
+    assert!(!parked.marked(graph.left_child));
+    assert!(!parked.marked(graph.right_child));
+    assert!(!parked.marked(graph.orphan));
+    assert!(!parked.marked(graph.dust));
+    assert_eq!(parked.stats().live_roots, roots, "the stop adds no root");
+    assert!(parked.meter().outgoing_edge_checks > 0);
+    assert_eq!(parked.meter().sweep_edge_checks, 0);
+    pending
+}
+
+struct SharedModeOutcome {
+    left_value: bool,
+    right_value: bool,
+    left_child: bool,
+    right_child: bool,
+    orphan: bool,
+    dust: bool,
+    left_edge: Option<TableRef>,
+    right_edge: Option<TableRef>,
+    witness_left: Option<TableRef>,
+    witness_right: Option<TableRef>,
+    witness_orphan: Option<TableRef>,
+}
+
+fn read_shared_mode_outcome(
+    heap: &LuaHeap,
+    graph: &SharedModeGraph,
+) -> Result<SharedModeOutcome, HeapError> {
+    Ok(SharedModeOutcome {
+        left_value: heap.alive(graph.left_value),
+        right_value: heap.alive(graph.right_value),
+        left_child: heap.alive(graph.left_child),
+        right_child: heap.alive(graph.right_child),
+        orphan: heap.alive(graph.orphan),
+        dust: heap.alive(graph.dust),
+        left_edge: heap.named_edge(graph.left, "subj")?,
+        right_edge: heap.named_edge(graph.right, "subj")?,
+        witness_left: heap.named_edge(graph.witness, "lv")?,
+        witness_right: heap.named_edge(graph.witness, "rv")?,
+        witness_orphan: heap.named_edge(graph.witness, "orphan")?,
+    })
+}
+
+fn chain_yields(heap: &LuaHeap, owner: TableRef, target: TableRef) -> Result<bool, HeapError> {
+    let carrier = heap.issued_value(target)?;
+    let mut cursor = Value::Null;
+    let mut saw = false;
+    while let Some((key, value)) = heap.next_guest(owner, &cursor)? {
+        if value == carrier {
+            saw = true;
+        }
+        cursor = key;
+    }
+    Ok(saw)
+}
+
+fn finish_shared_mode_cycle(host: &mut vm::HostContext<'_>) {
+    let done = finish_fixed_cycle(host);
+    assert!(
+        matches!(done, crate::heap::StepOutcome::Completed(_)),
+        "{done:?}"
+    );
+    assert!(heap::fixed_step_idle(host).expect("idle"));
+}
+
+#[test]
+fn shared_mode_scalar_delete_keeps_both_graphs() {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        let graph = open_shared_mode_graph(&mut host);
+        let mut schedules_before = 0u64;
+        let mut schedules_after = 0u64;
+        let mut lookups_before = 0u64;
+        let mut lookups_after = 0u64;
+        let mut heads_after = 0u64;
+        let mut still_white = false;
+        let mut pending_same = false;
+        resume_weak(&mut host, |parked| {
+            let pending = pause_after_both_weak_edges(parked, &graph);
+            let before_mode = parked
+                .with_saved_heap(|heap| heap.named_value(graph.shared, "__mode"))
+                .expect("read mode");
+            assert_eq!(
+                before_mode,
+                Value::string("v"),
+                "the shared direct field is v before the delete"
+            );
+            schedules_before = parked.meter().owner_rescan_schedules;
+            lookups_before = parked.meter().weak_mode_lookups;
+            let deleted = parked
+                .with_saved_heap(|heap| heap.set_named_scalar(graph.shared, "__mode", Value::Null));
+            assert!(
+                deleted.is_ok(),
+                "saved-mark direct __mode delete succeeds, got {deleted:?}"
+            );
+            let cleared = parked
+                .with_saved_heap(|heap| heap.named_value(graph.shared, "__mode"))
+                .expect("read cleared mode");
+            assert_eq!(
+                cleared,
+                Value::Null,
+                "the direct __mode field is cleared, got {cleared:?}"
+            );
+            assert_owners_share_metatable(parked, &graph);
+            pending_same = same_pending(Some(pending), parked.pending());
+            schedules_after = parked.meter().owner_rescan_schedules;
+            lookups_after = parked.meter().weak_mode_lookups;
+            heads_after = parked.meter().owner_rescan_heads;
+            still_white = !parked.marked(graph.left_value)
+                && !parked.marked(graph.left_child)
+                && !parked.marked(graph.right_value)
+                && !parked.marked(graph.right_child);
+        });
+        finish_shared_mode_cycle(&mut host);
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            let seen = read_shared_mode_outcome(heap, &graph)?;
+            eprintln!(
+                "shared_mode_scalar_delete observation: left_value={} right_value={} left_child={} right_child={} orphan={} dust={} left_edge={:?} right_edge={:?} witness_left={:?} witness_right={:?} witness_orphan={:?} still_white_after_write={} pending_same={} rescan_schedules {}->{} weak_mode_lookups {}->{} owner_rescan_heads={} mode_cache_field_visible=false",
+                seen.left_value,
+                seen.right_value,
+                seen.left_child,
+                seen.right_child,
+                seen.orphan,
+                seen.dust,
+                seen.left_edge,
+                seen.right_edge,
+                seen.witness_left,
+                seen.witness_right,
+                seen.witness_orphan,
+                still_white,
+                pending_same,
+                schedules_before,
+                schedules_after,
+                lookups_before,
+                lookups_after,
+                heads_after
+            );
+            assert!(
+                seen.left_value && seen.right_value && seen.left_child && seen.right_child,
+                "shared __mode delete before weak clear keeps both owner graphs and their strong successors; left_value={} right_value={} left_child={} right_child={} orphan={} dust={} left_edge={:?} right_edge={:?} witness_left={:?} witness_right={:?} witness_orphan={:?} still_white_after_write={} pending_same={} rescan_schedules {}->{} weak_mode_lookups {}->{} owner_rescan_heads={} mode_cache_not_visible",
+                seen.left_value,
+                seen.right_value,
+                seen.left_child,
+                seen.right_child,
+                seen.orphan,
+                seen.dust,
+                seen.left_edge,
+                seen.right_edge,
+                seen.witness_left,
+                seen.witness_right,
+                seen.witness_orphan,
+                still_white,
+                pending_same,
+                schedules_before,
+                schedules_after,
+                lookups_before,
+                lookups_after,
+                heads_after
+            );
+            assert!(
+                !seen.orphan,
+                "the independent weak orphan proves this cycle released nodes"
+            );
+            assert!(!seen.dust, "an unrooted node was released");
+            assert_eq!(seen.left_edge, Some(graph.left_value));
+            assert_eq!(seen.right_edge, Some(graph.right_value));
+            assert_eq!(seen.witness_left, Some(graph.left_value));
+            assert_eq!(seen.witness_right, Some(graph.right_value));
+            assert_eq!(seen.witness_orphan, None);
+            assert!(
+                chain_yields(heap, graph.left, graph.left_value)?,
+                "next still yields the original left value"
+            );
+            assert!(
+                chain_yields(heap, graph.right, graph.right_value)?,
+                "next still yields the original right value"
+            );
+            assert!(
+                chain_yields(heap, graph.left_value, graph.left_child)?,
+                "the left successor keeps its identity"
+            );
+            assert!(
+                chain_yields(heap, graph.right_value, graph.right_child)?,
+                "the right successor keeps its identity"
+            );
+            heap.set_named_scalar(graph.shared, "__mode", Value::string("v"))?;
+            Ok(())
+        })
+        .expect("this cycle");
+        heap::collect(&mut host).expect("next cycle after weak mode is restored");
+        heap::with_heap(&mut host, |heap| {
+            assert!(
+                !heap.alive(graph.left_value),
+                "restoring direct v clears the left value on the next collect"
+            );
+            assert!(
+                !heap.alive(graph.right_value),
+                "restoring direct v clears the right value on the next collect"
+            );
+            assert!(!heap.alive(graph.left_child));
+            assert!(!heap.alive(graph.right_child));
+            Ok(())
+        })
+        .expect("next cycle");
+    });
+}
+
+#[test]
+fn shared_mode_scalar_left_swap_keeps_only_left() {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        let graph = open_shared_mode_graph(&mut host);
+        resume_weak(&mut host, |parked| {
+            pause_after_both_weak_edges(parked, &graph);
+            write_metatable(parked, graph.left, Some(graph.strong_mt))
+                .expect("replace only the left metatable with the preallocated strong table");
+            let left_mt = parked
+                .metatable(graph.left)
+                .expect("left metatable")
+                .expect("left has a metatable");
+            assert_eq!(left_mt.slot(), graph.strong_mt.slot());
+            assert_eq!(left_mt.generation(), graph.strong_mt.generation());
+            let right_mt = parked
+                .metatable(graph.right)
+                .expect("right metatable")
+                .expect("right has a metatable");
+            assert_eq!(right_mt.slot(), graph.shared.slot());
+            assert_eq!(right_mt.generation(), graph.shared.generation());
+            let mode = parked
+                .with_saved_heap(|heap| heap.named_value(graph.shared, "__mode"))
+                .expect("read shared mode");
+            assert_eq!(mode, Value::string("v"), "the shared field stays v");
+        });
+        finish_shared_mode_cycle(&mut host);
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            let seen = read_shared_mode_outcome(heap, &graph)?;
+            assert!(
+                seen.left_value && seen.left_child && !seen.right_value && !seen.right_child,
+                "replacing only the left metatable keeps the left graph and clears the right graph; left_value={} right_value={} left_child={} right_child={} orphan={} left_edge={:?} right_edge={:?} witness_left={:?} witness_right={:?}",
+                seen.left_value,
+                seen.right_value,
+                seen.left_child,
+                seen.right_child,
+                seen.orphan,
+                seen.left_edge,
+                seen.right_edge,
+                seen.witness_left,
+                seen.witness_right
+            );
+            assert!(
+                !seen.orphan,
+                "the independent weak orphan proves this cycle released nodes"
+            );
+            assert!(!seen.dust, "an unrooted node was released");
+            assert_eq!(seen.left_edge, Some(graph.left_value));
+            assert_eq!(seen.right_edge, None);
+            assert_eq!(seen.witness_left, Some(graph.left_value));
+            assert_eq!(seen.witness_right, None);
+            assert!(
+                chain_yields(heap, graph.left, graph.left_value)?,
+                "next still yields the original left value"
+            );
+            assert!(
+                chain_yields(heap, graph.left_value, graph.left_child)?,
+                "the left successor keeps its identity"
+            );
+            heap.set_metatable(graph.left, Some(graph.shared))?;
+            Ok(())
+        })
+        .expect("this cycle");
+        heap::collect(&mut host).expect("next cycle after the left owner is weak again");
+        heap::with_heap(&mut host, |heap| {
+            assert!(
+                !heap.alive(graph.left_value),
+                "putting the left owner back on the shared weak metatable clears its value"
+            );
+            assert!(!heap.alive(graph.left_child));
+            assert!(!heap.alive(graph.right_value));
+            Ok(())
+        })
+        .expect("next cycle");
+    });
+}
+
+#[test]
+fn shared_mode_scalar_omitted_clears_both() {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        let graph = open_shared_mode_graph(&mut host);
+        resume_weak(&mut host, |parked| {
+            pause_after_both_weak_edges(parked, &graph);
+            assert_owners_share_metatable(parked, &graph);
+            let mode = parked
+                .with_saved_heap(|heap| heap.named_value(graph.shared, "__mode"))
+                .expect("read mode");
+            assert_eq!(mode, Value::string("v"));
+        });
+        finish_shared_mode_cycle(&mut host);
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            let seen = read_shared_mode_outcome(heap, &graph)?;
+            assert!(
+                !seen.left_value && !seen.right_value && !seen.left_child && !seen.right_child,
+                "omitting the shared __mode delete clears both owner graphs; left_value={} right_value={} left_child={} right_child={} orphan={} dust={}",
+                seen.left_value,
+                seen.right_value,
+                seen.left_child,
+                seen.right_child,
+                seen.orphan,
+                seen.dust
+            );
+            assert!(
+                !seen.orphan,
+                "the independent weak orphan proves this cycle released nodes"
+            );
+            assert!(!seen.dust, "an unrooted node was released");
+            assert_eq!(seen.left_edge, None);
+            assert_eq!(seen.right_edge, None);
+            assert_eq!(seen.witness_left, None);
+            assert_eq!(seen.witness_right, None);
+            assert_eq!(seen.witness_orphan, None);
+            Ok(())
+        })
+        .expect("omitted");
+    });
+}
+
+#[test]
+fn shared_mode_scalar_published_tail_refuses_delete() {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        let graph = open_shared_mode_graph(&mut host);
+        let published = heap::step_fixed_frames(&mut host, 128).expect("publish");
+        assert!(
+            matches!(published, crate::heap::StepOutcome::Published { .. }),
+            "{published:?}"
+        );
+        let before_tail = heap::saved_tail_state(&mut host)
+            .expect("tail read")
+            .expect("published tail");
+        let refused = heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            let before_mode = heap.named_value(graph.shared, "__mode")?;
+            assert_eq!(before_mode, Value::string("v"));
+            let write = heap.set_named_scalar(graph.shared, "__mode", Value::Null);
+            assert!(
+                matches!(write, Err(HeapError::SweepPending)),
+                "the existing published tail refuses this delete, got {write:?}"
+            );
+            assert_eq!(
+                heap.named_value(graph.shared, "__mode")?,
+                Value::string("v")
+            );
+            let left_mt = heap.metatable(graph.left)?.expect("left metatable");
+            let right_mt = heap.metatable(graph.right)?.expect("right metatable");
+            assert_eq!(left_mt.slot(), graph.shared.slot());
+            assert_eq!(left_mt.generation(), graph.shared.generation());
+            assert_eq!(right_mt.slot(), graph.shared.slot());
+            assert_eq!(right_mt.generation(), graph.shared.generation());
+            heap.set_named_scalar(graph.shared, "__mode", Value::Null)
+        });
+        assert!(
+            matches!(refused, Err(HeapError::SweepPending)),
+            "the tail gate is the refusal, got {refused:?}"
+        );
+        let after_tail = heap::saved_tail_state(&mut host)
+            .expect("tail read")
+            .expect("tail still saved");
+        assert_eq!(before_tail.phase, after_tail.phase);
+        assert_eq!(before_tail.cursor, after_tail.cursor);
+        assert_eq!(before_tail.live_roots, after_tail.live_roots);
+        assert_eq!(before_tail.dead_len, after_tail.dead_len);
+    });
+}
+
+struct ModeProbePeer {
+    peer: TableRef,
+    peer_mt: TableRef,
+    peer_value: TableRef,
+    peer_child: TableRef,
+    peer_value_record: u32,
+}
+
+fn attach_mode_probe_peer(
+    heap: &mut LuaHeap,
+    graph: &SharedModeGraph,
+) -> Result<ModeProbePeer, HeapError> {
+    let peer = heap.alloc()?;
+    let peer_mt = heap.alloc()?;
+    let peer_value = heap.alloc()?;
+    let peer_child = heap.alloc()?;
+    heap.set_mode_scalar(peer_mt, Value::string("v"))?;
+    heap.set_metatable(peer, Some(peer_mt))?;
+    heap.set_named_edge(peer, "subj", peer_value)?;
+    heap.set_named_edge(peer_value, "next", peer_child)?;
+    heap.set_named_edge(graph.sentinel, "peer", peer)?;
+    heap.issue_carrier(peer_value)?;
+    heap.issue_carrier(peer_child)?;
+    let (_, peer_value_record) = heap
+        .locate_named(peer.slot(), "subj")
+        .expect("peer value record");
+    Ok(ModeProbePeer {
+        peer,
+        peer_mt,
+        peer_value,
+        peer_child,
+        peer_value_record,
+    })
+}
+
+fn open_shared_mode_with_peer(host: &mut vm::HostContext<'_>) -> (SharedModeGraph, ModeProbePeer) {
+    heap::install(host, limits(24, 8, 32)).expect("install");
+    let planted = heap::with_heap(host, |heap| -> Result<_, HeapError> {
+        let graph = plant_shared_mode_graph(heap)?;
+        let peer = attach_mode_probe_peer(heap, &graph)?;
+        Ok((graph, peer))
+    })
+    .expect("plant");
+    heap::open_fixed_step(host).expect("open");
+    planted
+}
+
+fn assert_delete_does_not_walk(before: &ScanMeter, after: &ScanMeter) {
+    assert_eq!(after.mode_owner_probes, before.mode_owner_probes);
+    assert!(after.mode_discover_compares - before.mode_discover_compares <= 1);
+    assert_eq!(after.mode_discover_writes, before.mode_discover_writes + 1);
+    assert_eq!(
+        after.scratch.mode_discover_inited,
+        before.scratch.mode_discover_inited
+    );
+    assert_eq!(after.node_slot_visits, before.node_slot_visits);
+    assert_eq!(after.root_slot_visits, before.root_slot_visits);
+    assert_eq!(after.owner_rescan_schedules, before.owner_rescan_schedules);
+    assert_eq!(
+        after.scratch.owner_rescan_inited,
+        before.scratch.owner_rescan_inited
+    );
+    assert_eq!(
+        after.scratch.owner_rescan_pushed,
+        before.scratch.owner_rescan_pushed
+    );
+    assert_eq!(
+        after.scratch.weak_modes_inited,
+        before.scratch.weak_modes_inited
+    );
+    assert_eq!(after.outgoing_edge_checks, before.outgoing_edge_checks);
+    assert_eq!(after.mark_passes, before.mark_passes);
+    assert_eq!(after.mode_cache_updates, before.mode_cache_updates + 1);
+}
+
+/// The slot this probe unit actually read. A pass boundary spends the unit on
+/// slot 0 after a non-counting finish, so the cursor is not simply previous+1.
+fn probed_slot(before: Option<u32>, after: Option<u32>) -> u32 {
+    match (before, after) {
+        (Some(start), Some(end)) if end == start + 1 => start,
+        (Some(start), Some(1)) if start > 1 => 0,
+        other => panic!("one budget unit did not read one slot, got {other:?}"),
+    }
+}
+
+#[test]
+fn shared_mode_scalar_delete_probes_one_slot_per_step() {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        let (graph, peer) = open_shared_mode_with_peer(&mut host);
+        resume_weak(&mut host, |parked| {
+            pause_after_both_weak_edges(parked, &graph);
+            let opened = pause_at(parked, peer.peer.slot(), peer.peer_value_record);
+            assert_eq!(opened.owner, peer.peer.slot());
+            assert_eq!(opened.cursor, peer.peer_value_record);
+            assert!(!parked.marked(peer.peer_value));
+            let before_swap = parked.meter().owner_rescan_schedules;
+            write_metatable(parked, peer.peer, Some(graph.strong_mt)).expect("swap peer");
+            assert_eq!(
+                parked.meter().owner_rescan_schedules,
+                before_swap + 1,
+                "the existing single-table rescan is recorded before the shared delete"
+            );
+            let pending = parked.pending();
+            let before = parked.meter();
+            assert_eq!(parked.discovery_slot(), None);
+            let deleted = parked
+                .with_saved_heap(|heap| heap.set_named_scalar(graph.shared, "__mode", Value::Null));
+            assert!(deleted.is_ok(), "direct delete succeeds, got {deleted:?}");
+            assert_delete_does_not_walk(&before, &parked.meter());
+            assert!(same_pending(pending, parked.pending()));
+            assert_eq!(parked.discovery_slot(), Some(0));
+            assert_eq!(parked.phase_name(), "gray");
+            assert!(!parked.marked(graph.left_value));
+            assert!(!parked.marked(graph.right_value));
+            let mut left_step = None;
+            let mut right_step = None;
+            let mut probe_steps = 0u32;
+            let mut saw_peer_head = false;
+            let mut left_marked_on_edge = false;
+            let mut right_marked_on_edge = false;
+            for _ in 0..512 {
+                let before_step = parked.meter();
+                let before_slot = parked.discovery_slot();
+                let before_pending = parked.pending();
+                let before_rescan = parked.pending_rescan();
+                let left_was_white = !parked.marked(graph.left_value);
+                let right_was_white = !parked.marked(graph.right_value);
+                let view = parked.pulse(1);
+                assert_eq!(
+                    parked.meter().mark_passes,
+                    1,
+                    "discovery must not restart mark"
+                );
+                assert_eq!(parked.phase_name(), "gray");
+                assert!(!view.finished);
+                let after_step = parked.meter();
+                if after_step.owner_rescan_heads > before_step.owner_rescan_heads && !saw_peer_head
+                {
+                    assert_eq!(
+                        before_step.mode_owner_probes, 0,
+                        "the existing rescan opens before any deleted-mode probe"
+                    );
+                    assert_eq!(
+                        parked.pending_rescan().map(|scan| scan.owner),
+                        Some(peer.peer.slot())
+                    );
+                    saw_peer_head = true;
+                }
+                if after_step.mode_owner_probes != before_step.mode_owner_probes {
+                    assert_eq!(
+                        after_step.mode_owner_probes,
+                        before_step.mode_owner_probes + 1
+                    );
+                    assert!(same_pending(before_pending, parked.pending()));
+                    assert_eq!(
+                        parked
+                            .pending_rescan()
+                            .map(|scan| (scan.owner, scan.cursor)),
+                        before_rescan.map(|scan| (scan.owner, scan.cursor))
+                    );
+                    let read = probed_slot(before_slot, parked.discovery_slot());
+                    let scheduled =
+                        after_step.owner_rescan_schedules - before_step.owner_rescan_schedules;
+                    assert!(scheduled <= 1, "one probe reserves at most one owner");
+                    probe_steps += 1;
+                    if read == graph.left.slot() {
+                        assert_eq!(scheduled, 1);
+                        left_step = Some(probe_steps);
+                        assert!(!parked.marked(graph.left_value));
+                    } else if read == graph.right.slot() {
+                        assert_eq!(scheduled, 1);
+                        right_step = Some(probe_steps);
+                        assert!(!parked.marked(graph.right_value));
+                    } else {
+                        assert_eq!(scheduled, 0, "a non-owner slot does not reserve anyone");
+                    }
+                }
+                if left_was_white && parked.marked(graph.left_value) {
+                    assert!(
+                        parked.meter().outgoing_edge_checks > before_step.outgoing_edge_checks,
+                        "the left value is marked by a charged edge, not by the setter"
+                    );
+                    left_marked_on_edge = true;
+                }
+                if right_was_white && parked.marked(graph.right_value) {
+                    assert!(
+                        parked.meter().outgoing_edge_checks > before_step.outgoing_edge_checks,
+                        "the right value is marked by a charged edge, not by the setter"
+                    );
+                    right_marked_on_edge = true;
+                }
+                if left_step.is_some()
+                    && right_step.is_some()
+                    && saw_peer_head
+                    && left_marked_on_edge
+                    && right_marked_on_edge
+                {
+                    break;
+                }
+            }
+            assert_ne!(
+                left_step, right_step,
+                "the two owners are reserved on different steps"
+            );
+            assert!(left_step.is_some() && right_step.is_some());
+            assert!(saw_peer_head, "the existing rescan was not swallowed");
+            assert!(left_marked_on_edge && right_marked_on_edge);
+        });
+        finish_shared_mode_cycle(&mut host);
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            let seen = read_shared_mode_outcome(heap, &graph)?;
+            assert!(seen.left_value && seen.right_value);
+            assert!(seen.left_child && seen.right_child);
+            assert!(!seen.orphan, "the independent weak orphan still clears");
+            assert!(!seen.dust);
+            assert!(
+                heap.alive(peer.peer_value),
+                "the pre-existing rescan kept its value"
+            );
+            assert!(heap.alive(peer.peer_child));
+            assert!(chain_yields(heap, graph.left, graph.left_value)?);
+            assert!(chain_yields(heap, graph.right, graph.right_value)?);
+            Ok(())
+        })
+        .expect("budget cycle");
+    });
+}
+
+#[test]
+fn shared_mode_scalar_delete_same_batch_has_bounded_slot_work() {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        let (graph, peer) = open_shared_mode_with_peer(&mut host);
+        let capacity = heap::with_heap(&mut host, |heap| Ok(heap.slots.len())).expect("capacity");
+        resume_weak(&mut host, |parked| {
+            pause_after_both_weak_edges(parked, &graph);
+            pause_at(parked, peer.peer.slot(), peer.peer_value_record);
+            let pending = parked.pending();
+            for meta in [graph.shared, peer.peer_mt] {
+                let before = parked.meter();
+                parked
+                    .with_saved_heap(|heap| heap.set_named_scalar(meta, "__mode", Value::Null))
+                    .expect("delete before first probe");
+                assert_delete_does_not_walk(&before, &parked.meter());
+                assert!(same_pending(pending, parked.pending()));
+                assert_eq!(parked.discovery_slot(), Some(0));
+            }
+            let mut scheduled = Vec::new();
+            let mut next_slot = 0;
+            for _ in 0..512 {
+                let before = parked.meter();
+                let cursor = parked.discovery_slot();
+                assert!(!parked.pulse(1).finished);
+                let after = parked.meter();
+                let probes = after.mode_owner_probes - before.mode_owner_probes;
+                assert!(probes <= 1);
+                assert!(
+                    after.mode_discover_compares - before.mode_discover_compares <= probes,
+                    "one capacity-slot probe must not walk the pending identities (cursor {cursor:?})"
+                );
+                assert_eq!(after.mode_discover_writes, before.mode_discover_writes);
+                assert_eq!(
+                    after.scratch.mode_discover_inited,
+                    before.scratch.mode_discover_inited
+                );
+                if probes == 1 {
+                    let read = probed_slot(cursor, parked.discovery_slot());
+                    assert_eq!(
+                        read as usize, next_slot,
+                        "both deletes belong to the first pass"
+                    );
+                    next_slot += 1;
+                    let added = after.owner_rescan_schedules - before.owner_rescan_schedules;
+                    assert!(added <= 1);
+                    if added == 1 {
+                        scheduled.push(read);
+                    }
+                }
+                if next_slot == capacity {
+                    break;
+                }
+            }
+            assert_eq!(next_slot, capacity);
+            assert_eq!(parked.discovery_slot(), Some(capacity as u32));
+            assert_eq!(
+                scheduled,
+                [graph.left.slot(), graph.right.slot(), peer.peer.slot()]
+            );
+        });
+        finish_shared_mode_cycle(&mut host);
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            let seen = read_shared_mode_outcome(heap, &graph)?;
+            assert!(seen.left_value && seen.left_child && seen.right_value && seen.right_child);
+            assert!(heap.alive(peer.peer_value) && heap.alive(peer.peer_child));
+            assert!(!seen.orphan && !seen.dust);
+            Ok(())
+        })
+        .expect("same batch");
+    });
+}
+
+#[test]
+fn shared_mode_scalar_delete_second_metatable_is_not_missed() {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        let (graph, peer) = open_shared_mode_with_peer(&mut host);
+        resume_weak(&mut host, |parked| {
+            pause_after_both_weak_edges(parked, &graph);
+            pause_at(parked, peer.peer.slot(), peer.peer_value_record);
+            let deleted = parked
+                .with_saved_heap(|heap| heap.set_named_scalar(graph.shared, "__mode", Value::Null));
+            assert!(deleted.is_ok(), "{deleted:?}");
+            assert_eq!(parked.meter().mode_cache_updates, 1);
+            let mut peer_visits = 0u32;
+            let mut left_seen = false;
+            let mut right_seen = false;
+            for _ in 0..512 {
+                let before = parked.meter();
+                let slot = parked.discovery_slot();
+                let view = parked.pulse(1);
+                let after = parked.meter();
+                assert_eq!(after.mark_passes, 1);
+                assert_eq!(
+                    after.mode_discover_writes, before.mode_discover_writes,
+                    "the next pass must start without moving a batch of identities"
+                );
+                assert!(!view.finished, "discovery must finish before Done");
+                if after.mode_owner_probes != before.mode_owner_probes {
+                    let read = probed_slot(slot, parked.discovery_slot());
+                    let scheduled =
+                        parked.meter().owner_rescan_schedules - before.owner_rescan_schedules;
+                    if read == graph.left.slot() && scheduled == 1 {
+                        left_seen = true;
+                    }
+                    if read == graph.right.slot() && scheduled == 1 {
+                        right_seen = true;
+                    }
+                    if read == peer.peer.slot() {
+                        peer_visits += 1;
+                        if peer_visits == 1 {
+                            assert_eq!(scheduled, 0);
+                            assert!(left_seen && right_seen);
+                            let cursor = parked.discovery_slot();
+                            let second = parked.with_saved_heap(|heap| {
+                                heap.set_named_scalar(peer.peer_mt, "__mode", Value::Null)
+                            });
+                            assert!(second.is_ok(), "{second:?}");
+                            assert_eq!(parked.meter().mode_cache_updates, 2);
+                            let again = parked.with_saved_heap(|heap| {
+                                heap.set_named_scalar(graph.shared, "__mode", Value::Null)
+                            });
+                            assert!(again.is_ok(), "a missing field delete is not refused");
+                            assert_eq!(parked.meter().mode_cache_updates, 2);
+                            assert_eq!(parked.discovery_slot(), cursor);
+                            assert_eq!(parked.phase_name(), "gray");
+                        }
+                        if peer_visits == 2 {
+                            assert_eq!(scheduled, 1);
+                            assert!(!parked.marked(peer.peer_value));
+                            break;
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                peer_visits, 2,
+                "the later metatable waits for the next pass"
+            );
+        });
+        finish_shared_mode_cycle(&mut host);
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            assert!(heap.alive(graph.left_value));
+            assert!(heap.alive(graph.right_value));
+            assert!(
+                heap.alive(peer.peer_value),
+                "the second pass kept the later owner"
+            );
+            assert!(heap.alive(peer.peer_child));
+            assert!(!heap.alive(graph.orphan));
+            assert_eq!(heap.scan_meter().mode_cache_updates, 2);
+            assert_eq!(heap.scan_meter().owner_rescan_schedules, 3);
+            Ok(())
+        })
+        .expect("second metatable");
+    });
+}
+
+/// Same-cycle reinsertion of `v` is accepted and does not restart mark. This
+/// narrow cache stays missing-field until the next collect reads the field.
+#[test]
+fn shared_mode_scalar_reinsert_stays_strong_until_next_collect() {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        let graph = open_shared_mode_graph(&mut host);
+        resume_weak(&mut host, |parked| {
+            let pending = pause_after_both_weak_edges(parked, &graph);
+            let deleted = parked
+                .with_saved_heap(|heap| heap.set_named_scalar(graph.shared, "__mode", Value::Null));
+            assert!(deleted.is_ok(), "{deleted:?}");
+            let before = parked.meter();
+            let restored = parked.with_saved_heap(|heap| {
+                heap.set_named_scalar(graph.shared, "__mode", Value::string("v"))
+            });
+            assert!(
+                restored.is_ok(),
+                "reinsertion is not refused, got {restored:?}"
+            );
+            assert_eq!(parked.meter().mode_owner_probes, before.mode_owner_probes);
+            assert_eq!(parked.meter().mark_passes, 1);
+            assert_eq!(parked.meter().mode_cache_updates, 1);
+            assert!(same_pending(Some(pending), parked.pending()));
+            assert_eq!(parked.discovery_slot(), Some(0));
+            assert_eq!(parked.phase_name(), "gray");
+            assert!(!parked.marked(graph.left_value));
+            assert!(!parked.marked(graph.right_value));
+            let again = parked
+                .with_saved_heap(|heap| heap.set_named_scalar(graph.shared, "__mode", Value::Null));
+            assert!(again.is_ok(), "{again:?}");
+            assert_eq!(parked.meter().mode_cache_updates, 1);
+            assert_eq!(parked.discovery_slot(), Some(0));
+            let rewritten = parked.with_saved_heap(|heap| {
+                heap.set_named_scalar(graph.shared, "__mode", Value::string("v"))
+            });
+            assert!(rewritten.is_ok(), "{rewritten:?}");
+        });
+        finish_shared_mode_cycle(&mut host);
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            assert!(heap.alive(graph.left_value));
+            assert!(heap.alive(graph.right_value));
+            assert_eq!(
+                heap.named_value(graph.shared, "__mode")?,
+                Value::string("v")
+            );
+            assert!(!heap.alive(graph.orphan));
+            Ok(())
+        })
+        .expect("this cycle stays strong");
+        heap::collect(&mut host).expect("next collect reads the restored field");
+        heap::with_heap(&mut host, |heap| {
+            assert!(!heap.alive(graph.left_value));
+            assert!(!heap.alive(graph.right_value));
+            Ok(())
+        })
+        .expect("next cycle");
+    });
+}
+
+#[test]
+fn shared_mode_scalar_key_and_value_delete_does_not_arm_probe() {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits(8, 4, 8)).expect("install");
+        let (owner, mt, record) = heap::with_heap(&mut host, |heap| -> Result<_, HeapError> {
+            let owner = heap.alloc()?;
+            let mt = heap.alloc()?;
+            let sentinel = heap.alloc()?;
+            heap.set_mode_scalar(mt, Value::string("kv"))?;
+            heap.set_metatable(owner, Some(mt))?;
+            heap.set_named_scalar(owner, "charged", Value::Bool(true))?;
+            heap.set_named_scalar(sentinel, "pending", Value::Bool(true))?;
+            let frame = heap.enter_roots(2)?;
+            heap.write_root(frame, 0, sentinel)?;
+            heap.write_root(frame, 1, owner)?;
+            let (_, record) = heap.locate_named(owner.slot(), "charged").expect("record");
+            Ok((owner, mt, record))
+        })
+        .expect("plant");
+        heap::open_fixed_step(&mut host).expect("open");
+        resume_weak(&mut host, |parked| {
+            pause_at(parked, owner.slot(), record);
+            let before = parked.meter();
+            let deleted =
+                parked.with_saved_heap(|heap| heap.set_named_scalar(mt, "__mode", Value::Null));
+            assert!(deleted.is_ok(), "{deleted:?}");
+            assert_eq!(parked.meter().mode_cache_updates, before.mode_cache_updates);
+            assert_eq!(parked.meter().mode_owner_probes, before.mode_owner_probes);
+            assert_eq!(parked.discovery_slot(), None);
+            assert_eq!(parked.phase_name(), "gray");
+        });
+        finish_shared_mode_cycle(&mut host);
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| Ok(heap.scan_meter().mode_owner_probes))
+                .expect("meter"),
+            0
+        );
+    });
+}
+
+#[derive(Debug)]
+enum SharedModeReplacement {
+    Strong,
+    Clear,
+    Mode(&'static str),
+}
+
+#[derive(Debug)]
+struct SharedModeSwitchObservation {
+    old_left_mt: Option<TableRef>,
+    new_left_mt: Option<TableRef>,
+    discovery_after_delete: Option<u32>,
+    probe_delta: u64,
+    setter_schedule_delta: u64,
+    pending_before: PendingScan,
+    pending_after: Option<PendingScan>,
+    left_still_white: bool,
+}
+
+fn assert_shared_mode_side(
+    heap: &LuaHeap,
+    side: &str,
+    (owner, value, child): (TableRef, TableRef, TableRef),
+    keep: bool,
+    observation: &SharedModeSwitchObservation,
+) -> Result<(), HeapError> {
+    let value_alive = heap.alive(value);
+    let child_alive = heap.alive(child);
+    let subject = heap.named_edge(owner, "subj")?;
+    let successor = if value_alive {
+        heap.named_edge(value, "next")?
+    } else {
+        None
+    };
+    assert_eq!(
+        (subject, successor, value_alive, child_alive),
+        (keep.then_some(value), keep.then_some(child), keep, keep),
+        "{side}: this cycle must preserve or clear the original value and its successor together (keep={keep})\n\
+         mutation diagnostics: {observation:?}"
+    );
+    if keep {
+        assert!(chain_yields(heap, owner, value)?, "next: {side} value");
+        assert!(chain_yields(heap, value, child)?, "next: {side} successor");
+    } else {
+        assert_eq!(heap.named_value(owner, "subj")?, Value::Null);
+    }
+    Ok(())
+}
+
+fn assert_shared_mode_witness(
+    heap: &LuaHeap,
+    graph: &SharedModeGraph,
+    (keep_left, keep_right): (bool, bool),
+) -> Result<(), HeapError> {
+    for (name, expected) in [
+        ("lv", keep_left.then_some(graph.left_value)),
+        ("lc", keep_left.then_some(graph.left_child)),
+        ("rv", keep_right.then_some(graph.right_value)),
+        ("rc", keep_right.then_some(graph.right_child)),
+        ("orphan", None),
+    ] {
+        assert_eq!(heap.named_edge(graph.witness, name)?, expected, "{name}");
+    }
+    assert!(!heap.alive(graph.orphan), "independent weak orphan cleared");
+    Ok(())
+}
+
+fn check_shared_mode_left_replacement(
+    delete_shared: bool,
+    replacement: SharedModeReplacement,
+    expected: (bool, bool),
+) {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits(16, 8, 24)).expect("install");
+        let graph = heap::with_heap(&mut host, |heap| {
+            let graph = plant_shared_mode_graph(heap)?;
+            // The fixture's spare metatable is already rooted. Set its direct
+            // mode before opening the cycle so ModeInit sees the replacement.
+            if let SharedModeReplacement::Mode(mode) = replacement {
+                heap.set_mode_scalar(graph.strong_mt, Value::string(mode))?;
+            }
+            Ok(graph)
+        })
+        .expect("plant");
+        let new_mt = match replacement {
+            SharedModeReplacement::Strong | SharedModeReplacement::Mode(_) => {
+                Some(graph.strong_mt)
+            }
+            SharedModeReplacement::Clear => None,
+        };
+        heap::open_fixed_step(&mut host).expect("open");
+
+        let observation = heap::with_heap(&mut host, |heap| {
+            let mut parked = ParkedMark::resume(heap).expect("resume saved mark");
+            let pending_before = pause_after_both_weak_edges(&mut parked, &graph);
+            let old_left_mt = parked.metatable(graph.left)?;
+            assert_eq!(
+                parked.with_saved_heap(|heap| heap.named_value(graph.shared, "__mode"))?,
+                Value::string("v")
+            );
+            let probes_before = parked.meter().mode_owner_probes;
+            if delete_shared {
+                parked.with_saved_heap(|heap| {
+                    heap.set_named_scalar(graph.shared, "__mode", Value::Null)
+                })?;
+            }
+            // Only read counters/cursor between the real unlink and setter.
+            let discovery_after_delete = parked.discovery_slot();
+            let schedules_before = parked.meter().owner_rescan_schedules;
+            write_metatable(&mut parked, graph.left, new_mt)?;
+            let observation = SharedModeSwitchObservation {
+                old_left_mt,
+                new_left_mt: parked.metatable(graph.left)?,
+                discovery_after_delete,
+                probe_delta: parked.meter().mode_owner_probes - probes_before,
+                setter_schedule_delta: parked.meter().owner_rescan_schedules - schedules_before,
+                pending_before,
+                pending_after: parked.pending(),
+                left_still_white: !parked.marked(graph.left_value) && !parked.marked(graph.left_child),
+            };
+            if delete_shared {
+                assert!(
+                    parked.with_saved_heap(|heap| {
+                        heap.locate_named(graph.shared.slot(), "__mode").is_none()
+                    }),
+                    "the shared mode record must be unlinked, not left as a gap"
+                );
+            }
+            assert_eq!(parked.metatable(graph.right)?, Some(graph.shared));
+            parked.park()?;
+            Ok(observation)
+        })
+        .expect("mutate while parked in Gray");
+
+        finish_shared_mode_cycle(&mut host);
+        let left = (graph.left, graph.left_value, graph.left_child);
+        let right = (graph.right, graph.right_value, graph.right_child);
+        heap::with_heap(&mut host, |heap| {
+            assert_shared_mode_side(heap, "left", left, expected.0, &observation)?;
+            assert_shared_mode_side(heap, "right", right, expected.1, &observation)?;
+            assert_shared_mode_witness(heap, &graph, expected)?;
+
+            // Assert the fixture window only after checking the business result.
+            // Scheduling is diagnostic; a correct repair need not use a setter queue.
+            eprintln!(
+                "mutation diagnostics: setter rescan schedule delta={}, pending {:?} -> {:?}, discovery at unlink {:?}, left metatable {:?} -> {:?}",
+                observation.setter_schedule_delta,
+                observation.pending_before,
+                observation.pending_after,
+                observation.discovery_after_delete,
+                observation.old_left_mt,
+                observation.new_left_mt
+            );
+            assert_eq!(observation.old_left_mt, Some(graph.shared));
+            assert_eq!(observation.new_left_mt, new_mt);
+            assert_eq!(observation.probe_delta, 0);
+            if delete_shared {
+                assert!(
+                    observation
+                        .discovery_after_delete
+                        .is_some_and(|slot| slot <= graph.left.slot()),
+                    "deleted-mode discovery is armed before the left slot"
+                );
+            }
+            assert!(same_pending(
+                Some(observation.pending_before),
+                observation.pending_after
+            ));
+            assert!(
+                observation.left_still_white,
+                "setter must not trace the left graph inline"
+            );
+
+            heap.set_mode_scalar(graph.shared, Value::string("v"))?;
+            heap.set_metatable(graph.left, Some(graph.shared))?;
+            Ok(())
+        })
+        .expect("this cycle");
+        heap::collect(&mut host).expect("collect after restoring shared v");
+        heap::with_heap(&mut host, |heap| {
+            assert_shared_mode_side(heap, "left after restoring v", left, false, &observation)?;
+            assert_shared_mode_side(heap, "right after restoring v", right, false, &observation)?;
+            assert_shared_mode_witness(heap, &graph, (false, false))
+        })
+        .expect("next cycle");
+    });
+}
+
+#[test]
+fn shared_mode_scalar_delete_then_switch_strong_keeps_both_graphs() {
+    check_shared_mode_left_replacement(true, SharedModeReplacement::Strong, (true, true));
+}
+
+#[test]
+fn shared_mode_scalar_delete_then_clear_keeps_both_graphs() {
+    check_shared_mode_left_replacement(true, SharedModeReplacement::Clear, (true, true));
+}
+
+#[test]
+fn shared_mode_scalar_delete_then_replace_k_keeps_both_graphs() {
+    check_shared_mode_left_replacement(true, SharedModeReplacement::Mode("k"), (true, true));
+}
+
+#[test]
+fn shared_mode_scalar_delete_then_replace_v_clears_left_graph() {
+    check_shared_mode_left_replacement(true, SharedModeReplacement::Mode("v"), (false, true));
+}
+
+#[test]
+fn shared_mode_scalar_delete_then_replace_kv_clears_left_graph() {
+    check_shared_mode_left_replacement(true, SharedModeReplacement::Mode("kv"), (false, true));
+}
+
+#[test]
+fn shared_mode_scalar_left_clear_keeps_only_left() {
+    check_shared_mode_left_replacement(false, SharedModeReplacement::Clear, (true, false));
+}

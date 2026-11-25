@@ -76,6 +76,24 @@ pub(super) struct MarkState {
     rescan_owner: Option<u32>,
     rescan_cursor: Option<u32>,
     rescan_mode: WeakMode,
+    /// Indexed by metatable slot; initialized alongside the weak-mode cache.
+    /// Stamps from completed passes are left in place and no longer match.
+    discover_marks: Vec<ModeDiscoveryMark>,
+    /// Zero is reserved for unarmed slots. Each new batch requires another
+    /// distinct cache entry to become strong, so at most `limits.nodes`
+    /// batches can start in one mark (no slot reuse in the mutation window).
+    discover_batch: u32,
+    /// A delete after the cursor moves stamps the next batch instead, so
+    /// owners behind the cursor are not missed.
+    discover_next: bool,
+    discover_at: usize,
+    discover_on: bool,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct ModeDiscoveryMark {
+    generation: u32,
+    batch: u32,
 }
 
 enum MarkPhase {
@@ -149,6 +167,11 @@ impl MarkState {
             rescan_owner: None,
             rescan_cursor: None,
             rescan_mode: WeakMode::default(),
+            discover_marks: Vec::new(),
+            discover_batch: 0,
+            discover_next: false,
+            discover_at: 0,
+            discover_on: false,
         }
     }
 
@@ -364,6 +387,17 @@ impl<'a> ParkedMark<'a> {
             owner: state.rescan_owner?,
             cursor: state.rescan_cursor?,
         })
+    }
+
+    /// Next slot a deleted-mode probe will read. `None` when that walk is
+    /// not armed. This does not move the cursor.
+    #[cfg(test)]
+    pub(super) fn discovery_slot(&self) -> Option<u32> {
+        let state = self.heap.mark.as_ref()?;
+        if !state.discover_on {
+            return None;
+        }
+        u32::try_from(state.discover_at).ok()
     }
 
     pub(super) fn marked(&self, table: TableRef) -> bool {
@@ -904,10 +938,13 @@ fn step_mode_init(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
     let slot_count = heap.slots.len();
     if state.modes.is_none() {
         state.modes = Some(Vec::with_capacity(slot_count));
+        state.discover_marks = Vec::with_capacity(slot_count);
     }
     let modes = state.modes.as_mut().expect("mode init has a cache");
     modes.push(WeakMode::default());
+    state.discover_marks.push(ModeDiscoveryMark::default());
     heap.scan.scratch.weak_modes_inited += 1;
+    heap.scan.scratch.mode_discover_inited += 1;
     state.init_at += 1;
     if state.init_at == slot_count {
         let parsed = state.pending_mode;
@@ -970,6 +1007,9 @@ fn step_gray(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
     }
     if let Some(slot) = pop_rescan(heap, state) {
         return open_rescan(heap, state, slot);
+    }
+    if state.discover_on {
+        return probe_deleted_mode_owner(heap, state);
     }
     state.phase = MarkPhase::Done;
     false
@@ -1128,6 +1168,81 @@ fn open_rescan(heap: &mut LuaHeap, state: &mut MarkState, slot: u32) -> bool {
     state.rescan_owner = Some(slot);
     state.rescan_mode = mode;
     true
+}
+
+/// Reads one capacity slot and at most one indexed discovery stamp. A
+/// matching owner that already started a weak scan is queued on the existing
+/// intrusive rescan list. Only the discovery cursor advances here.
+fn probe_deleted_mode_owner(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
+    let at = state.discover_at;
+    if at >= heap.slots.len() {
+        state.discover_at = 0;
+        state.discover_on = std::mem::take(&mut state.discover_next);
+        if state.discover_on {
+            state.discover_batch += 1;
+        }
+        return false;
+    }
+    state.discover_at = at + 1;
+    heap.scan.mode_owner_probes += 1;
+    let Some(stored) = heap.slots.get(at) else {
+        return true;
+    };
+    if stored.kind != HandleKind::Table || !matches!(stored.state, SlotState::Live { .. }) {
+        return true;
+    }
+    let Some((meta_slot, meta_gen)) = stored.metatable else {
+        return true;
+    };
+    let Some(&stamp) = state.discover_marks.get(meta_slot as usize) else {
+        return true;
+    };
+    let active = ModeDiscoveryMark {
+        generation: meta_gen,
+        batch: state.discover_batch,
+    };
+    heap.scan.mode_discover_compares += 1;
+    if stamp == active {
+        queue_started_owner(heap, state, at as u32);
+    }
+    true
+}
+
+fn queue_started_owner(heap: &mut LuaHeap, state: &mut MarkState, owner: u32) {
+    let started = heap
+        .slots
+        .get(owner as usize)
+        .is_some_and(|stored| stored.rescan_epoch == state.rescan_epoch);
+    if !started {
+        return;
+    }
+    if heap
+        .slots
+        .get(owner as usize)
+        .is_some_and(|stored| stored.rescan_queued)
+    {
+        return;
+    }
+    push_rescan(heap, state, owner);
+    heap.scan.scratch.owner_rescan_pushed += 1;
+    heap.scan.owner_rescan_schedules += 1;
+}
+
+/// Called only on the cache's weak-to-strong transition, once per metatable
+/// slot per mark. No identity lookup or allocation is needed to arm it.
+fn arm_deleted_mode(heap: &mut LuaHeap, state: &mut MarkState, slot: u32, generation: u32) {
+    if !state.discover_on {
+        state.discover_batch += 1;
+        state.discover_on = true;
+    }
+    let batch = if state.discover_at == 0 {
+        state.discover_batch
+    } else {
+        state.discover_next = true;
+        state.discover_batch + 1
+    };
+    state.discover_marks[slot as usize] = ModeDiscoveryMark { generation, batch };
+    heap.scan.mode_discover_writes += 1;
 }
 
 fn follow_rescan_ends(heap: &mut LuaHeap, state: &mut MarkState, cursor: u32) {
@@ -1414,7 +1529,8 @@ impl LuaHeap {
                 || state.cursor.is_some()
                 || state.rescan_owner.is_some()
                 || state.rescan_cursor.is_some()
-                || state.rescan_head.is_some(),
+                || state.rescan_head.is_some()
+                || state.discover_on,
         ))
     }
 
@@ -1563,6 +1679,44 @@ impl LuaHeap {
         self.slots
             .get(owner as usize)
             .is_some_and(|slot| slot.rescan_epoch == state.rescan_epoch)
+    }
+
+    /// After a real direct `__mode` unlink, replace this cycle's value-weak
+    /// cache for that same generation. Owners that have not started read the
+    /// missing-field mode. Owners that already started stay for the budgeted
+    /// probe. A key-weak cache, a missing record, and a closed mutation are
+    /// left alone. This does not walk slots or move either cursor.
+    pub(super) fn note_direct_mode_deleted(&mut self, owner: u32) {
+        let Some(mut state) = self.mark.take() else {
+            return;
+        };
+        if !state.mutation_open() {
+            self.mark = Some(state);
+            return;
+        }
+        let generation = self.slots[owner as usize].generation;
+        let cached = state
+            .modes
+            .as_ref()
+            .and_then(|modes| modes.get(owner as usize))
+            .copied()
+            .unwrap_or_default();
+        if !cached.values || cached.keys {
+            self.mark = Some(state);
+            return;
+        }
+        let Some(slot_mode) = state
+            .modes
+            .as_mut()
+            .and_then(|modes| modes.get_mut(owner as usize))
+        else {
+            self.mark = Some(state);
+            return;
+        };
+        *slot_mode = WeakMode::default();
+        self.scan.mode_cache_updates += 1;
+        arm_deleted_mode(self, &mut state, owner, generation);
+        self.mark = Some(state);
     }
 
     /// Queues one chain-head rescan for an owner that already started a weak
