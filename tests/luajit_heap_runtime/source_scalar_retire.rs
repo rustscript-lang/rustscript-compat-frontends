@@ -124,6 +124,9 @@ struct Trace {
     bit_tail: Vec<Option<heap::SavedTailState>>,
     bit_roots: Vec<Vec<Option<heap::TableRef>>>,
     bit_resources: Vec<usize>,
+    bit_collects: Vec<usize>,
+    bit_root_visits: Vec<u64>,
+    bit_root_slots: Vec<u32>,
     marks: Vec<MarkNote>,
     occupancy: Vec<OccupancyNote>,
 }
@@ -162,6 +165,13 @@ struct Ran {
     tail_state: Option<heap::SavedTailState>,
     peek_end: Vec<(bool, bool)>,
     resources: usize,
+    reports: Vec<candidate::CollectNote>,
+    issued_alive: Vec<bool>,
+    root_visits: Vec<u64>,
+    tail_accounting: Option<(u32, u32)>,
+    top_roots: Vec<Option<heap::TableRef>>,
+    permit: Option<(u32, bool)>,
+    txn: Option<heap::ReleaseTxnWitness>,
 }
 
 struct Plugin {
@@ -459,18 +469,28 @@ impl HostOwnedFunction for HostOp {
                     return Err(host_fault("expected a guest boolean"));
                 };
                 let tail = heap::saved_sweep_tail(&mut host).map_err(host_heap)?;
-                let collections = heap::stats(&mut host).map_err(host_heap)?.collections;
+                let stats = heap::stats(&mut host).map_err(host_heap)?;
                 let accounting = heap::saved_tail_accounting(&mut host).map_err(host_heap)?;
                 let tail_state = heap::saved_tail_state(&mut host).map_err(host_heap)?;
                 let roots = heap::top_frame_tables(&mut host).map_err(host_heap)?;
                 let resources = host.resource_count();
+                let collects = host
+                    .scope_state::<candidate::ReturnWitness>()
+                    .map(|witness| witness.collects.len())
+                    .unwrap_or(0);
+                let root_visits = heap::copy_scan_meter(&mut host)
+                    .map_err(host_heap)?
+                    .root_slot_visits;
                 note(&mut host, |state| {
                     state.bits.push((*tag, *bit));
-                    state.bit_cycle_state.push((tail, collections));
+                    state.bit_cycle_state.push((tail, stats.collections));
                     state.bit_accounting.push(accounting);
                     state.bit_tail.push(tail_state);
                     state.bit_roots.push(roots);
                     state.bit_resources.push(resources);
+                    state.bit_collects.push(collects);
+                    state.bit_root_visits.push(root_visits);
+                    state.bit_root_slots.push(stats.root_slots);
                 })?;
                 Value::Bool(*bit)
             }
@@ -673,7 +693,14 @@ fn run_control(source: &str, budgets: Option<&[u64]>) -> Ran {
 }
 
 fn run_auto_table(source: &str, budgets: Option<&[u64]>) -> Ran {
-    drive_plugin_opts(source, budgets, &AUTO_TABLE_PLUGIN, None, 8, false)
+    drive_plugin_opts(
+        source,
+        budgets,
+        &AUTO_TABLE_PLUGIN,
+        None,
+        8,
+        AutoReleaseFault::None,
+    )
 }
 
 fn run_auto_table_limited(
@@ -689,7 +716,22 @@ fn run_auto_table_limited(
         &AUTO_TABLE_PLUGIN,
         Some(nodes),
         max_generation,
-        fail_after_registration,
+        if fail_after_registration {
+            AutoReleaseFault::AfterRegistration
+        } else {
+            AutoReleaseFault::None
+        },
+    )
+}
+
+fn run_auto_table_post_commit(source: &str, budgets: Option<&[u64]>) -> Ran {
+    drive_plugin_opts(
+        source,
+        budgets,
+        &AUTO_TABLE_PLUGIN,
+        Some(64),
+        8,
+        AutoReleaseFault::AfterCommit,
     )
 }
 
@@ -710,7 +752,14 @@ fn drive_plugin(
     plugin: &'static Plugin,
     nodes: Option<u32>,
 ) -> Ran {
-    drive_plugin_opts(source, budgets, plugin, nodes, 8, false)
+    drive_plugin_opts(source, budgets, plugin, nodes, 8, AutoReleaseFault::None)
+}
+
+#[derive(Clone, Copy)]
+enum AutoReleaseFault {
+    None,
+    AfterRegistration,
+    AfterCommit,
 }
 
 fn drive_plugin_opts(
@@ -719,7 +768,7 @@ fn drive_plugin_opts(
     plugin: &'static Plugin,
     nodes: Option<u32>,
     max_generation: u32,
-    fail_after_registration: bool,
+    fault: AutoReleaseFault,
 ) -> Ran {
     let catalog = Arc::clone(plugin_catalog(plugin));
     let options = CompileSourceFileOptions::new()
@@ -752,8 +801,20 @@ fn drive_plugin_opts(
         )
         .expect("test host installs the node quota before execution");
     }
-    if fail_after_registration {
-        candidate::arm_release_alloc_fault(&mut vm.host_context()).expect("arm release fault");
+    match fault {
+        AutoReleaseFault::AfterRegistration => {
+            candidate::arm_release_alloc_fault(&mut vm.host_context()).expect("arm release fault");
+        }
+        AutoReleaseFault::AfterCommit => {
+            candidate::arm_release_alloc_post_commit_fault(&mut vm.host_context())
+                .expect("arm the post-commit injection");
+        }
+        AutoReleaseFault::None => {}
+    }
+    if plugin.auto_table {
+        vm.host_context()
+            .scope_state_or_insert_with(candidate::VisitSamples::default)
+            .expect("record root-slot visits");
     }
     let status = vm.run();
     let trace = vm
@@ -815,6 +876,7 @@ fn drive_plugin_opts(
         .unwrap_or((None, None));
     let budgets = candidate::remaining_step_budgets(&mut vm.host_context());
     let running = candidate::gc_running(&vm.host_context());
+    let status_debug = format!("{status:?}");
     let stop = match status {
         Ok(VmStatus::Halted) => Stop::Halted,
         Err(VmError::HostError(message)) => Stop::HostError(message),
@@ -847,6 +909,27 @@ fn drive_plugin_opts(
         })
         .collect();
     let resources = vm.host_context().resource_count();
+    let (reports, issued_alive) = vm
+        .host_context()
+        .scope_state::<candidate::ReturnWitness>()
+        .map(|witness| {
+            (
+                witness.collects.clone(),
+                witness.issued_alive_at_collect.clone(),
+            )
+        })
+        .unwrap_or_default();
+    let root_visits = vm
+        .host_context()
+        .scope_state::<candidate::VisitSamples>()
+        .map(|samples| samples.visits.clone())
+        .unwrap_or_default();
+    let tail_accounting = heap::saved_tail_accounting(&mut vm.host_context())
+        .unwrap_or_else(|error| panic!("tail accounting failed after {status_debug}: {error}"));
+    let top_roots = heap::top_frame_tables(&mut vm.host_context())
+        .unwrap_or_else(|error| panic!("top frame read failed after {status_debug}: {error}"));
+    let permit = candidate::release_alloc_permit(&vm.host_context());
+    let txn = heap::release_txn_witness(&vm.host_context());
     Ran {
         stop,
         stack: vm.stack().to_vec(),
@@ -871,6 +954,13 @@ fn drive_plugin_opts(
         tail_state,
         peek_end,
         resources,
+        reports,
+        issued_alive,
+        root_visits,
+        tail_accounting,
+        top_roots,
+        permit,
+        txn,
     }
 }
 
@@ -4821,9 +4911,67 @@ fn auto_release_pause_allocates_the_empty_local() {
         Some(fresh),
         "top-frame slot 3 is fresh"
     );
+    let held = ran.trace.peeks[0].table;
+    let table_w = ran.trace.peeks[1].table;
+    assert_eq!(roots.len(), roots.iter().flatten().count());
+    assert_eq!(roots[0], Some(table_w));
+    assert_eq!(roots[2], Some(held));
+    assert!(roots[1].is_some());
+    assert_ne!(roots[1], Some(table_w));
+    assert_ne!(roots[1], Some(held));
+    assert_ne!(roots[1], Some(fresh));
+    let occupied = roots.iter().flatten().count();
+    let txn = ran.txn.expect("the handoff stored a root");
+    assert_eq!(txn.before.tail, txn.after.tail);
+    assert_eq!(txn.before.tail.phase, heap::SavedTailPhase::Release);
+    assert_eq!(txn.before.marked, txn.after.marked);
+    assert!(txn.before.marked > 0, "the pause sampled a real mark count");
+    assert_eq!(txn.before.late, 0);
+    assert_eq!(txn.after.late, txn.before.late + 1);
+    assert_eq!(
+        ran.trace.bit_accounting[2],
+        Some((txn.after.marked, txn.after.late))
+    );
+    assert_eq!(ran.trace.bit_tail[2], Some(txn.after.tail));
+    assert_eq!(
+        ran.trace.bit_collects,
+        vec![0, 0, 0, 1, 2],
+        "paused handoff, one continuation, then the in-function collect"
+    );
+    assert_eq!(ran.reports.len(), 3, "frame exit is followed by one report");
+    assert_eq!(ran.collects, 3);
+    assert_eq!(ran.collections, 3);
+    assert_eq!(ran.issued_alive.len(), ran.reports.len());
+    assert_eq!(ran.root_visits.len(), ran.reports.len());
+    let continuation = &ran.reports[0];
+    assert_eq!(continuation.marked_nodes, txn.before.marked);
+    assert_eq!(continuation.live_nodes, txn.before.marked + 1);
+    assert_eq!(continuation.live_roots as usize, occupied);
+    assert_eq!(ran.trace.bit_root_slots[2] as usize, roots.len());
+    let continuation_visits = ran.root_visits[0] - ran.trace.bit_root_visits[2];
+    assert_eq!(
+        continuation_visits as usize,
+        roots.len(),
+        "continuation scans each fixed root slot once"
+    );
+    assert!(
+        ran.issued_alive[1],
+        "the in-function collect still sees this generation"
+    );
+    assert_eq!(ran.trace.peeks[4].table.generation(), fresh.generation());
+    assert!(
+        !ran.issued_alive[2],
+        "the collect after return no longer sees fresh"
+    );
+    assert_eq!(
+        ran.tail_accounting, None,
+        "a finished tail is not late zero"
+    );
     let alive = ran.peek_end[2];
     assert!(!alive.0, "scalar return then collect releases the node");
     assert!(!alive.1, "the token is closed with the node");
+    assert_eq!(ran.peek_end[3], (false, false));
+    assert_eq!(ran.peek_end[4], (false, false));
 }
 
 #[test]
@@ -4840,6 +4988,10 @@ fn stopped_release_shape_allocates_without_a_cycle() {
         "the empty local is an ordinary allocation"
     );
     assert_eq!(text_value(&ran.trace, 1.0), "table");
+    assert_eq!(
+        ran.tail_accounting, None,
+        "stop never opens a tail; None is not a zero late count"
+    );
 }
 
 #[test]
@@ -4853,11 +5005,16 @@ fn auto_release_roots_pause_does_not_allocate() {
     assert_eq!(ran.collections, 0);
     let state = ran.tail_state.expect("saved tail");
     assert_eq!(state.phase, heap::SavedTailPhase::Roots);
-    assert_eq!(
-        heap_tail_late(&ran),
-        Some(0),
-        "the Roots refusal adds no late node"
-    );
+    let (marked, late) = saved_release_accounting(&ran);
+    assert_eq!(late, 0, "the Roots refusal adds no late node");
+    assert!(marked > 0);
+    assert_eq!(ran.permit, None, "Roots never installs a Release permit");
+    assert_eq!(ran.top_roots.len(), ran.trace.bit_roots[1].len());
+    for (after, before) in ran.top_roots.iter().zip(&ran.trace.bit_roots[1]) {
+        if after.is_some() {
+            assert_eq!(after, before, "the Roots refusal writes no new root");
+        }
+    }
 }
 
 #[test]
@@ -4894,7 +5051,13 @@ return 1
     let state = ran.tail_state.expect("saved tail");
     assert_eq!(state.phase, heap::SavedTailPhase::Release);
     assert!(state.cursor > 0 && state.cursor < state.dead_len);
-    assert_eq!(heap_tail_late(&ran), Some(0));
+    let (_, late) = saved_release_accounting(&ran);
+    assert_eq!(late, 0);
+    assert_eq!(
+        ran.permit, None,
+        "a chunk local never takes a Release permit"
+    );
+    assert_eq!(ran.trace.peeks.len(), 2, "fresh is not issued");
 }
 
 #[test]
@@ -4911,7 +5074,13 @@ fn auto_release_pause_refuses_a_full_node_quota() {
     assert_eq!(state.cursor, 1);
     assert!(state.cursor < state.dead_len);
     assert_eq!(state.live_roots, 0);
-    assert_eq!(heap_tail_late(&ran), Some(0));
+    let (_, late) = saved_release_accounting(&ran);
+    assert_eq!(late, 0);
+    assert_eq!(
+        ran.permit.map(|(_, consumed)| consumed),
+        Some(true),
+        "capacity is refused after the permit is taken"
+    );
     assert_eq!(
         ran.live_nodes, 6,
         "the release visit is scan progress, not a new node"
@@ -4931,7 +5100,8 @@ fn auto_release_pause_rolls_back_a_registered_token() {
         "capacity refusal is the no-token control: {clean:#?}"
     );
     assert_eq!(refused.trace.peeks.len(), 2);
-    assert_eq!(heap_tail_late(&refused), Some(0));
+    let (_, late) = saved_release_accounting(&refused);
+    assert_eq!(late, 0);
     assert_eq!(
         refused.tail_state, clean.tail_state,
         "rollback does not move the legal scan"
@@ -4943,16 +5113,61 @@ fn auto_release_pause_rolls_back_a_registered_token() {
     );
 }
 
-fn heap_tail_late(ran: &Ran) -> Option<u32> {
-    ran.tail_state.and(Some(0)).map(|_| {
-        ran.trace
-            .bit_accounting
-            .iter()
-            .rev()
-            .find_map(|item| *item)
-            .map(|(_, late)| late)
-            .unwrap_or(0)
-    })
+#[test]
+fn auto_release_pause_rolls_back_an_injected_committed_late() {
+    // Injected after commit_late and before the first root write. This is not
+    // a guest store error. The rollback is the same close, undo_committed_late,
+    // and slot release a real store error uses.
+    let injected = run_auto_table_post_commit(RELEASE_ALLOC_PAUSE, Some(&[10_000, 1]));
+    let clean = run_auto_table_limited(RELEASE_ALLOC_PAUSE, Some(&[10_000, 1]), 7, 1, false);
+    assert!(
+        matches!(
+            injected.stop,
+            Stop::HostError(ref message)
+                if message.contains("injected after commit_late and before the first root write")
+        ),
+        "{injected:#?}"
+    );
+    assert!(
+        matches!(clean.stop, Stop::HostError(ref message) if message.contains("node capacity")),
+        "capacity refusal is the no-token control: {clean:#?}"
+    );
+    assert!(injected.txn.is_none(), "the injection never stores a root");
+    let (_, late) = saved_release_accounting(&injected);
+    assert_eq!(late, 0, "undo_committed_late returns the late count");
+    assert_eq!(injected.tail_accounting, clean.tail_accounting);
+    assert_eq!(
+        injected.tail_state, clean.tail_state,
+        "the cursor is not advanced"
+    );
+    assert_eq!(injected.live_nodes, clean.live_nodes);
+    assert_eq!(
+        injected.resources, clean.resources,
+        "the committed token is closed"
+    );
+    assert_eq!(
+        root_identity(&injected.top_roots),
+        root_identity(&clean.top_roots),
+        "the root was not stored"
+    );
+    assert!(
+        injected.top_roots.last().is_some_and(|slot| slot.is_none()),
+        "the handoff slot stays empty"
+    );
+    assert_eq!(injected.trace.peeks.len(), 2);
+    assert_eq!(injected.permit.map(|(_, consumed)| consumed), Some(true));
+}
+
+fn saved_release_accounting(ran: &Ran) -> (u32, u32) {
+    ran.tail_accounting
+        .expect("a saved tail is Some((marked, late)), not a missing sample")
+}
+
+fn root_identity(roots: &[Option<heap::TableRef>]) -> Vec<Option<(u32, u32)>> {
+    roots
+        .iter()
+        .map(|slot| slot.map(|table| (table.slot(), table.generation())))
+        .collect()
 }
 
 #[test]

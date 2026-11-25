@@ -2103,10 +2103,25 @@ struct ReleaseRootAck {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct ReleaseAllocFault;
 
+pub(super) struct ReleaseAllocPostCommitFault;
+
 pub(super) fn arm_release_alloc_fault(host: &mut vm::HostContext<'_>) -> Result<(), VmError> {
     host.scope_state_or_insert_with(|| ReleaseAllocFault)
         .map(|_| ())
         .map_err(|error| VmError::HostError(error.to_string()))
+}
+
+pub(super) fn arm_release_alloc_post_commit_fault(
+    host: &mut vm::HostContext<'_>,
+) -> Result<(), VmError> {
+    host.scope_state_or_insert_with(|| ReleaseAllocPostCommitFault)
+        .map(|_| ())
+        .map_err(|error| VmError::HostError(error.to_string()))
+}
+
+pub(super) fn release_alloc_permit(host: &vm::HostContext<'_>) -> Option<(u32, bool)> {
+    host.scope_state::<ReleaseAllocPermit>()
+        .map(|permit| (permit.slot, permit.consumed))
 }
 
 fn release_handoff_slot(flag: Option<&Value>) -> Option<u32> {
@@ -2194,7 +2209,9 @@ fn take_automatic_release_table(host: &mut vm::HostContext<'_>) -> Result<Option
         permit.consumed = true;
     }
     let fail = host.scope_state::<ReleaseAllocFault>().is_some();
-    let value = heap::publish_automatic_release_table(host, slot, fail).map_err(heap_error)?;
+    let fail_after_commit = host.scope_state::<ReleaseAllocPostCommitFault>().is_some();
+    let value = heap::publish_automatic_release_table(host, slot, fail, fail_after_commit)
+        .map_err(heap_error)?;
     let Some(value) = value else {
         return Err(VmError::HostError(
             "automatic release allocation was not admitted at NEW_TABLE".to_string(),

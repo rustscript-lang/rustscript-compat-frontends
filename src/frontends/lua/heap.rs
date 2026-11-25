@@ -436,11 +436,16 @@ fn publish_late(host: &mut HostContext) -> Result<(TableRef, vm::ResourceHandle)
 /// Release handoff; nothing was reserved. A later refusal closes the token,
 /// confirms it is closed, and only then returns the slot. The Release cursor,
 /// mark count, and accounted roots are not moved.
+/// `fail_after_commit` is a test injection. It runs only after `commit_late`
+/// has succeeded and before the first root write, then uses the same close,
+/// `undo_committed_late`, and slot-release branch as a real store error.
+///
 #[cfg(test)]
 pub fn publish_automatic_release_table(
     host: &mut HostContext,
     slot: u32,
     fail_after_registration: bool,
+    fail_after_commit: bool,
 ) -> Result<Option<Value>, HeapError> {
     let Some(heap) = host.scope_state::<LuaHeap>() else {
         return Ok(None);
@@ -507,20 +512,28 @@ pub fn publish_automatic_release_table(
         );
     }
     let raw = handle.raw();
+    let before = release_txn_snap(host)?;
     host.scope_state_mut::<LuaHeap>()
         .expect("reservation keeps the installed heap")
         .commit_late(reservation, raw);
-    if let Err(error) = host
-        .scope_state_mut::<LuaHeap>()
-        .expect("committed late node keeps the installed heap")
-        .store_release_top_root(slot, table)
-    {
+    let stored = if fail_after_commit {
+        Err(HeapError::Scope(
+            "injected after commit_late and before the first root write".to_string(),
+        ))
+    } else {
+        host.scope_state_mut::<LuaHeap>()
+            .expect("committed late node keeps the installed heap")
+            .store_release_top_root(slot, table)
+    };
+    if let Err(error) = stored {
         close_confirmed_token(host, handle)?;
         host.scope_state_mut::<LuaHeap>()
             .expect("committed late node keeps the installed heap")
             .undo_committed_late(table)?;
         return Err(error);
     }
+    let after = release_txn_snap(host)?;
+    remember_release_txn(host, ReleaseTxnWitness { before, after })?;
     Ok(Some(value))
 }
 
@@ -580,6 +593,53 @@ pub fn saved_tail_accounting(host: &mut HostContext) -> Result<Option<(u32, u32)
         return Ok(None);
     };
     Ok(heap.saved_tail_accounting())
+}
+
+/// One saved-tail reading around an automatic Release handoff.
+///
+/// `marked` and `late` come from the tail itself. This does not resume it.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReleaseTxnSnap {
+    pub tail: SavedTailState,
+    pub marked: u32,
+    pub late: u32,
+}
+
+/// Readings taken immediately before `commit_late` and after the root store.
+/// Absent when that handoff did not store a root.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReleaseTxnWitness {
+    pub before: ReleaseTxnSnap,
+    pub after: ReleaseTxnSnap,
+}
+
+/// Returns the committed handoff readings, if this execution stored one.
+#[cfg(test)]
+pub fn release_txn_witness(host: &HostContext) -> Option<ReleaseTxnWitness> {
+    host.scope_state::<ReleaseTxnWitness>().copied()
+}
+
+#[cfg(test)]
+fn release_txn_snap(host: &mut HostContext) -> Result<ReleaseTxnSnap, HeapError> {
+    let tail = saved_tail_state(host)?.ok_or(HeapError::SweepDenied)?;
+    let (marked, late) = saved_tail_accounting(host)?.ok_or(HeapError::SweepDenied)?;
+    Ok(ReleaseTxnSnap { tail, marked, late })
+}
+
+#[cfg(test)]
+fn remember_release_txn(
+    host: &mut HostContext,
+    witness: ReleaseTxnWitness,
+) -> Result<(), HeapError> {
+    if let Some(existing) = host.scope_state_mut::<ReleaseTxnWitness>() {
+        *existing = witness;
+        return Ok(());
+    }
+    host.scope_state_or_insert_with(|| witness)
+        .map(|_| ())
+        .map_err(HeapError::from_scope)
 }
 
 /// Table roots in the current top frame, in slot order. Does not scan.
