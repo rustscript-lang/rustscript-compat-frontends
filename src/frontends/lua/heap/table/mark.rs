@@ -1063,6 +1063,16 @@ fn discovered_table(heap: &LuaHeap, owner: u32) -> bool {
     })
 }
 
+/// Reads the mark bit of one upvalue generation. A reused slot of another
+/// generation is not this cell. No chain walk and no scan counter.
+fn discovered_upvalue(heap: &LuaHeap, owner: u32, generation: u32) -> bool {
+    heap.slots.get(owner as usize).is_some_and(|slot| {
+        slot.kind == HandleKind::Upvalue
+            && slot.generation == generation
+            && matches!(slot.state, SlotState::Live { marked: true })
+    })
+}
+
 /// Reads the reset-time mode cache. No metatable follow and no scan counter.
 fn cached_values_weak(heap: &LuaHeap, state: &MarkState, owner: u32) -> bool {
     if heap.metatable_edges == 0 {
@@ -1285,6 +1295,30 @@ impl LuaHeap {
             return;
         };
         if state.mutation_open() && discovered_table(self, owner) {
+            enqueue_barrier_target(self, &mut state, slot, generation, HandleKind::Table);
+        }
+        self.mark = Some(state);
+    }
+
+    /// Enqueues a table stored through an already discovered closed cell.
+    ///
+    /// The current edge is strong: a cell is not a table entry, so weak values
+    /// do not apply. Only the direct table is queued; its child waits for the
+    /// continued scan. The cell itself is not rescanned. This does not add a
+    /// root, read `__mode`, or move either cursor. An owner that is not this
+    /// upvalue generation, or is not yet marked, is left for the continued
+    /// scan. A published tail never reaches here.
+    pub(super) fn barrier_strong_closed_cell(
+        &mut self,
+        owner: u32,
+        owner_generation: u32,
+        slot: u32,
+        generation: u32,
+    ) {
+        let Some(mut state) = self.mark.take() else {
+            return;
+        };
+        if state.mutation_open() && discovered_upvalue(self, owner, owner_generation) {
             enqueue_barrier_target(self, &mut state, slot, generation, HandleKind::Table);
         }
         self.mark = Some(state);

@@ -1110,7 +1110,9 @@ impl LuaHeap {
     /// An existing current edge is overwritten. This does not insert a second
     /// record. A closure target uses [`Self::write_closure_upvalue`]. A
     /// boolean, binary64, string, or bytes value uses
-    /// [`Self::write_scalar_upvalue`].
+    /// [`Self::write_scalar_upvalue`]. After the write commits, an already
+    /// discovered cell shades only that direct table. The published tail is
+    /// still refused inside the write, before any barrier.
     pub fn write_upvalue(&mut self, cell: UpvalueRef, table: TableRef) -> Result<(), HeapError> {
         self.require_upvalue(cell)?;
         self.require_live(table)?;
@@ -1121,7 +1123,14 @@ impl LuaHeap {
                 slot: table.slot(),
                 generation: table.generation(),
             },
-        )
+        )?;
+        self.barrier_strong_closed_cell(
+            cell.slot(),
+            cell.generation(),
+            table.slot(),
+            table.generation(),
+        );
+        Ok(())
     }
 
     /// Replaces the current edge with a closure. Same record as a table write.

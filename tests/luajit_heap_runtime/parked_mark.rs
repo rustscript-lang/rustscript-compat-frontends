@@ -4,8 +4,8 @@
 //! The bound below is only a harness limit. Sweep stays outside the pulse.
 
 use super::{
-    HeapError, HeapLimits, HeapStats, LuaHeap, ParkedMark, PausedOp, PendingScan, RootFrameId,
-    ScanMeter, TableRef, UpvalueRef,
+    ClosureRef, HeapError, HeapLimits, HeapStats, LuaHeap, ParkedMark, PausedOp, PendingScan,
+    RootFrameId, ScanMeter, TableRef, UpvalueRef,
 };
 use vm::Value;
 
@@ -4834,6 +4834,539 @@ fn published_tail_set_metatable_refuses_without_changing_identity() {
                 !heap.alive(fresh),
                 "the rejected metatable was never stored"
             );
+            Ok(())
+        })
+        .expect("after release");
+    });
+}
+
+struct ClosedCellPlant {
+    frame: RootFrameId,
+    sentinel: TableRef,
+    sentinel_record: u32,
+    getter: ClosureRef,
+    setter: ClosureRef,
+    setter_edge: u32,
+    cell: UpvalueRef,
+    current_edge: Option<u32>,
+    witness: TableRef,
+    fresh: TableRef,
+    child: TableRef,
+    orphan: TableRef,
+    old: Option<TableRef>,
+}
+
+fn plant_closed_cell(heap: &mut LuaHeap, replaces: bool) -> Result<ClosedCellPlant, HeapError> {
+    let frame = heap.enter_roots(5)?;
+    let sentinel = heap.alloc()?;
+    heap.set_named_scalar(sentinel, "pending", Value::string("wait"))?;
+    let (_, sentinel_record) = heap
+        .locate_named(sentinel.slot(), "pending")
+        .expect("sentinel record");
+    let getter = heap.alloc_closure()?;
+    let setter = heap.alloc_closure()?;
+    let cell = heap.alloc_upvalue()?;
+    heap.set_upvalue_edge(getter, cell)?;
+    heap.set_upvalue_edge(setter, cell)?;
+    let setter_edge = heap
+        .find_key(setter.slot(), &super::EdgeKey::Field(super::UPVALUE_EDGE))
+        .expect("setter upvalue edge");
+    let old = if replaces {
+        let old = heap.alloc()?;
+        heap.write_upvalue(cell, old)?;
+        Some(old)
+    } else {
+        None
+    };
+    let current_edge = old.map(|_| {
+        heap.find_key(cell.slot(), &super::EdgeKey::Field(super::CURRENT_EDGE))
+            .expect("cell value edge")
+    });
+    let witness = heap.alloc()?;
+    let witness_meta = heap.alloc()?;
+    heap.set_mode_scalar(witness_meta, Value::string("v"))?;
+    heap.set_metatable(witness, Some(witness_meta))?;
+    let fresh = heap.alloc()?;
+    let child = heap.alloc()?;
+    let orphan = heap.alloc()?;
+    heap.set_named_edge(fresh, "child", child)?;
+    heap.set_named_scalar(child, "id", Value::string("child"))?;
+    heap.set_named_edge(witness, "fresh", fresh)?;
+    heap.set_named_edge(witness, "child", child)?;
+    heap.set_named_edge(witness, "orphan", orphan)?;
+    // Sentinel is rooted first so it is scanned last. The closures are scanned,
+    // and the shared cell is finished, before that pending record is reached.
+    heap.write_root(frame, 0, sentinel)?;
+    heap.write_closure_root(frame, 1, getter)?;
+    heap.write_closure_root(frame, 2, setter)?;
+    heap.write_root(frame, 3, witness)?;
+    if let Some(old) = old {
+        heap.write_root(frame, 4, old)?;
+    }
+    Ok(ClosedCellPlant {
+        frame,
+        sentinel,
+        sentinel_record,
+        getter,
+        setter,
+        setter_edge,
+        cell,
+        current_edge,
+        witness,
+        fresh,
+        child,
+        orphan,
+        old,
+    })
+}
+
+fn slot_is_marked(heap: &LuaHeap, slot: u32, generation: u32, kind: super::HandleKind) -> bool {
+    heap.slots.get(slot as usize).is_some_and(|stored| {
+        stored.generation == generation
+            && stored.kind == kind
+            && matches!(stored.state, super::SlotState::Live { marked: true })
+    })
+}
+
+fn assert_no_independent_strong_root(
+    heap: &LuaHeap,
+    fresh: TableRef,
+    child: TableRef,
+    orphan: TableRef,
+) {
+    for rooted in &heap.roots {
+        if let Some(super::Rooted::Table(handle)) = rooted {
+            assert_ne!(*handle, fresh, "fresh has no independent strong root");
+            assert_ne!(*handle, child, "child has no independent strong root");
+            assert_ne!(*handle, orphan, "orphan has no independent strong root");
+        }
+    }
+}
+
+struct ClosedCellSnap {
+    fresh_marked: bool,
+    child_marked: bool,
+    orphan_marked: bool,
+    visits: u64,
+    pushed: u64,
+    barriers: u64,
+    roots: u32,
+}
+
+fn run_closed_cell(publishes: bool, replaces: bool) {
+    let label = match (publishes, replaces) {
+        (true, false) => "nil first write",
+        (true, true) => "table value replacement",
+        (false, false) => "omitted nil write",
+        (false, true) => "omitted replacement",
+    };
+    crate::with_idle_vm(|vm| {
+        use crate::heap::{self, StepOutcome};
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits(16, 8, 16)).expect("install");
+        let planted = heap::with_heap(&mut host, |heap| -> Result<ClosedCellPlant, HeapError> {
+            plant_closed_cell(heap, replaces)
+        })
+        .expect("plant");
+        heap::open_fixed_step(&mut host).expect("open");
+        let snap = heap::with_heap(&mut host, |heap| -> Result<ClosedCellSnap, HeapError> {
+            let mut parked = ParkedMark::resume(heap).expect("resume saved mark");
+            let before_heads = parked.meter().owner_head_checks;
+            pause_at(&mut parked, planted.setter.slot(), planted.setter_edge);
+            parked.with_saved_heap(|heap| {
+                assert!(
+                    !slot_is_marked(
+                        heap,
+                        planted.cell.slot(),
+                        planted.cell.generation(),
+                        super::HandleKind::Upvalue,
+                    ),
+                    "{label}: the shared cell is not marked before its closure edge is charged"
+                );
+                assert!(!parked_table_marked(heap, planted.fresh));
+                assert!(!parked_table_marked(heap, planted.child));
+            });
+            let before_edges = parked.meter().outgoing_edge_checks;
+            if let Some(current_edge) = planted.current_edge {
+                pause_at(&mut parked, planted.cell.slot(), current_edge);
+                parked.with_saved_heap(|heap| {
+                    assert!(
+                        slot_is_marked(
+                            heap,
+                            planted.cell.slot(),
+                            planted.cell.generation(),
+                            super::HandleKind::Upvalue,
+                        ),
+                        "{label}: replacement reaches the cell before its value edge is charged"
+                    );
+                });
+            }
+            pause_at(
+                &mut parked,
+                planted.sentinel.slot(),
+                planted.sentinel_record,
+            );
+            let pending = parked.pending().expect("sentinel still pending");
+            assert_eq!(pending.owner, planted.sentinel.slot());
+            assert_eq!(pending.cursor, planted.sentinel_record);
+            assert_eq!(parked.phase_name(), "gray");
+            assert!(
+                parked.mutation_open(),
+                "{label}: mutation stays open in gray"
+            );
+            assert_eq!(parked.scanning_owner(), Some(planted.sentinel.slot()));
+            assert_ne!(parked.scanning_owner(), Some(planted.cell.slot()));
+            assert!(
+                parked.meter().owner_head_checks > before_heads,
+                "{label}: the cell owner was begun before the sentinel record"
+            );
+            if replaces {
+                assert!(
+                    parked.meter().outgoing_edge_checks > before_edges,
+                    "{label}: the cell value edge was charged before the write"
+                );
+            }
+            let before = parked.meter();
+            let roots_before = parked.stats().live_roots;
+            let getter_root = parked.root_closure(planted.frame, 1)?;
+            let setter_root = parked.root_closure(planted.frame, 2)?;
+            parked
+                .with_saved_heap(|heap| -> Result<(), HeapError> {
+                    assert!(
+                        slot_is_marked(
+                            heap,
+                            planted.cell.slot(),
+                            planted.cell.generation(),
+                            super::HandleKind::Upvalue,
+                        ),
+                        "{label}: the shared cell is already scanned"
+                    );
+                    assert_eq!(heap.upvalue_of(planted.getter)?, planted.cell);
+                    assert_eq!(heap.upvalue_of(planted.setter)?, planted.cell);
+                    assert_ne!(planted.getter.slot(), planted.setter.slot());
+                    assert_eq!(
+                        getter_root,
+                        Some(planted.getter),
+                        "{label}: at least one closure is a strong root"
+                    );
+                    assert_eq!(setter_root, Some(planted.setter));
+                    assert_no_independent_strong_root(
+                        heap,
+                        planted.fresh,
+                        planted.child,
+                        planted.orphan,
+                    );
+                    assert!(!parked_table_marked(heap, planted.fresh));
+                    assert!(!parked_table_marked(heap, planted.child));
+                    assert!(!parked_table_marked(heap, planted.orphan));
+                    match planted.old {
+                        Some(old) => {
+                            assert_eq!(heap.current_table(planted.cell)?, Some(old));
+                            assert_eq!(heap.read_upvalue(planted.getter)?, old);
+                            assert_eq!(heap.read_upvalue(planted.setter)?, old);
+                            assert!(parked_table_marked(heap, old));
+                        }
+                        None => {
+                            assert_eq!(heap.current_table(planted.cell)?, None);
+                            assert!(matches!(
+                                heap.read_upvalue(planted.getter),
+                                Err(HeapError::StaleHandle)
+                            ));
+                            assert!(matches!(
+                                heap.read_upvalue(planted.setter),
+                                Err(HeapError::StaleHandle)
+                            ));
+                        }
+                    }
+                    assert_eq!(
+                        heap.stats().live_roots,
+                        if replaces { 5 } else { 4 },
+                        "{label}: fresh, child, and orphan are not roots"
+                    );
+                    Ok(())
+                })
+                .expect("scanned cell");
+            let snap = parked
+                .with_saved_heap(|heap| -> Result<ClosedCellSnap, HeapError> {
+                    if publishes {
+                        heap.write_upvalue(planted.cell, planted.fresh)?;
+                        let stored = heap.current_table(planted.cell)?.expect("stored table");
+                        assert_eq!(stored.slot(), planted.fresh.slot());
+                        assert_eq!(stored.generation(), planted.fresh.generation());
+                        assert_eq!(heap.read_upvalue(planted.getter)?, planted.fresh);
+                        assert_eq!(heap.read_upvalue(planted.setter)?, planted.fresh);
+                    }
+                    Ok(ClosedCellSnap {
+                        fresh_marked: parked_table_marked(heap, planted.fresh),
+                        child_marked: parked_table_marked(heap, planted.child),
+                        orphan_marked: parked_table_marked(heap, planted.orphan),
+                        visits: heap
+                            .scan
+                            .node_slot_visits
+                            .saturating_sub(before.node_slot_visits),
+                        pushed: heap
+                            .scan
+                            .scratch
+                            .work_pushed
+                            .saturating_sub(before.scratch.work_pushed),
+                        barriers: heap
+                            .scan
+                            .parked_barrier_marks
+                            .saturating_sub(before.parked_barrier_marks),
+                        roots: heap.stats().live_roots,
+                    })
+                })
+                .expect("write");
+            let after = parked.meter();
+            assert_write_did_not_scan(&before, &after);
+            assert_eq!(after.weak_mode_lookups, before.weak_mode_lookups);
+            assert_eq!(after.metatable_edge_checks, before.metatable_edge_checks);
+            assert!(same_pending(Some(pending), parked.pending()));
+            assert_eq!(parked.scanning_owner(), Some(planted.sentinel.slot()));
+            assert_eq!(snap.roots, roots_before, "{label}: the write adds no root");
+            assert_eq!(parked.phase_name(), "gray");
+            assert!(
+                !snap.child_marked,
+                "{label}: the child is not scanned at the write"
+            );
+            assert!(!snap.orphan_marked);
+            parked.park()?;
+            Ok(snap)
+        })
+        .expect("pause");
+        let paused = heap::step_fixed_frames(&mut host, 64).expect("publish");
+        assert!(
+            matches!(paused, StepOutcome::Published { .. }),
+            "{label}: publish the weak clear, got {paused:?}"
+        );
+        let finished = heap::step_fixed_frames(&mut host, 128).expect("finish");
+        assert!(
+            matches!(finished, StepOutcome::Completed(_)),
+            "{label}: {finished:?}"
+        );
+        assert!(heap::fixed_step_idle(&mut host).expect("idle"));
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            assert!(
+                !heap.alive(planted.orphan),
+                "{label}: the weak orphan clears this cycle"
+            );
+            assert_eq!(
+                heap.alive(planted.fresh),
+                publishes,
+                "{label}: a scanned closed cell did not keep the table written by write_upvalue"
+            );
+            assert_eq!(
+                heap.alive(planted.child),
+                publishes,
+                "{label}: the child follows only if the direct table was retained"
+            );
+            assert!(heap.alive(planted.sentinel));
+            assert!(heap.closure_alive(planted.getter));
+            assert!(heap.closure_alive(planted.setter));
+            assert!(heap.upvalue_alive(planted.cell));
+            if publishes {
+                let stored = heap
+                    .current_table(planted.cell)?
+                    .expect("cell still stores the table");
+                assert_eq!(stored, planted.fresh);
+                assert_eq!(heap.read_upvalue(planted.getter)?, planted.fresh);
+                assert_eq!(heap.read_upvalue(planted.setter)?, planted.fresh);
+                assert_eq!(heap.named_edge(planted.fresh, "child")?, Some(planted.child));
+                assert_eq!(
+                    heap.named_value(planted.child, "id")?,
+                    Value::string("child")
+                );
+                assert_eq!(heap.named_edge(planted.witness, "fresh")?, Some(planted.fresh));
+                assert_eq!(heap.named_edge(planted.witness, "orphan")?, None);
+                assert!(
+                    snap.fresh_marked,
+                    "{label}: the write grays only the direct table"
+                );
+                assert_eq!(snap.visits, 2, "{label}: one target visit, not a child scan");
+                assert_eq!(snap.pushed, 1, "{label}: the direct table is queued once");
+                assert_eq!(snap.barriers, 1, "{label}: one strong barrier mark");
+                heap.clear_upvalue(planted.cell)?;
+                assert_eq!(heap.current_table(planted.cell)?, None);
+                let _ = heap.collect();
+                assert!(
+                    !heap.alive(planted.fresh),
+                    "{label}: clearing the cell edge releases the new graph next cycle"
+                );
+                assert!(!heap.alive(planted.child));
+                assert!(heap.closure_alive(planted.getter));
+                assert!(heap.upvalue_alive(planted.cell));
+            } else {
+                assert!(!snap.fresh_marked, "{label}: omitting the write leaves the table white");
+                assert_eq!(snap.visits, 0);
+                assert_eq!(snap.pushed, 0);
+                assert_eq!(snap.barriers, 0);
+                match planted.old {
+                    Some(old) => {
+                        let stored = heap
+                            .current_table(planted.cell)?
+                            .expect("old edge remains");
+                        assert_eq!(stored, old);
+                        assert_eq!(heap.read_upvalue(planted.getter)?, old);
+                        assert!(heap.alive(old));
+                    }
+                    None => assert_eq!(heap.current_table(planted.cell)?, None),
+                }
+            }
+            if let Some(old) = planted.old {
+                assert!(
+                    heap.alive(old),
+                    "{label}: the old table has its own root and is not this cycle's collection witness"
+                );
+            }
+            Ok(())
+        })
+        .expect("observe");
+    });
+}
+
+fn parked_table_marked(heap: &LuaHeap, table: TableRef) -> bool {
+    slot_is_marked(
+        heap,
+        table.slot(),
+        table.generation(),
+        super::HandleKind::Table,
+    )
+}
+
+#[test]
+fn gray_closed_cell_insert_keeps_the_new_graph() {
+    run_closed_cell(true, false);
+}
+
+#[test]
+fn gray_closed_cell_replace_keeps_the_new_graph() {
+    run_closed_cell(true, true);
+}
+
+#[test]
+fn gray_closed_cell_insert_omitted_collects_the_new_graph() {
+    run_closed_cell(false, false);
+}
+
+#[test]
+fn gray_closed_cell_replace_omitted_keeps_the_old_edge() {
+    run_closed_cell(false, true);
+}
+
+#[test]
+fn published_tail_write_upvalue_refuses_without_changing_identity() {
+    crate::with_idle_vm(|vm| {
+        use crate::heap::{self, StepOutcome};
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits(16, 4, 16)).expect("install");
+        let planted = heap::with_heap(&mut host, |heap| -> Result<_, HeapError> {
+            let frame = heap.enter_roots(4)?;
+            let sentinel = heap.alloc()?;
+            heap.set_named_scalar(sentinel, "pending", Value::string("wait"))?;
+            let owner = heap.alloc()?;
+            heap.set_named_scalar(owner, "kept", Value::string("kept"))?;
+            let old = heap.alloc()?;
+            let fresh = heap.alloc()?;
+            let cell = heap.alloc_upvalue()?;
+            let nil_cell = heap.alloc_upvalue()?;
+            let getter = heap.alloc_closure()?;
+            let nil_getter = heap.alloc_closure()?;
+            heap.set_upvalue_edge(getter, cell)?;
+            heap.set_upvalue_edge(nil_getter, nil_cell)?;
+            heap.write_upvalue(cell, old)?;
+            let current_edge = heap
+                .find_key(cell.slot(), &super::EdgeKey::Field(super::CURRENT_EDGE))
+                .expect("current edge");
+            let dust = heap.alloc()?;
+            heap.write_root(frame, 0, sentinel)?;
+            heap.write_root(frame, 1, owner)?;
+            heap.write_closure_root(frame, 2, getter)?;
+            heap.write_closure_root(frame, 3, nil_getter)?;
+            let _ = dust;
+            Ok((cell, nil_cell, old, fresh, current_edge))
+        })
+        .expect("plant");
+        let (cell, nil_cell, old, fresh, current_edge) = planted;
+        heap::open_fixed_step(&mut host).expect("open");
+        let published = heap::step_fixed_frames(&mut host, 128).expect("publish");
+        assert!(
+            matches!(published, StepOutcome::Published { .. }),
+            "{published:?}"
+        );
+        let before_tail = heap::saved_tail_state(&mut host)
+            .expect("tail read")
+            .expect("published tail");
+        let (before_stats, before_meter, before_current, before_nil) =
+            heap::with_heap(&mut host, |heap| -> Result<_, HeapError> {
+                Ok((
+                    heap.stats(),
+                    heap.scan_meter(),
+                    heap.current_table(cell)?,
+                    heap.current_table(nil_cell)?,
+                ))
+            })
+            .expect("before");
+        let refused = heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            let replace = heap.write_upvalue(cell, fresh);
+            assert!(
+                matches!(replace, Err(HeapError::SweepPending)),
+                "published tail refuses a closed-cell replacement, got {replace:?}"
+            );
+            let insert = heap.write_upvalue(nil_cell, fresh);
+            assert!(
+                matches!(insert, Err(HeapError::SweepPending)),
+                "published tail refuses a closed-cell nil write, got {insert:?}"
+            );
+            let stored = heap.current_table(cell)?.expect("old identity remains");
+            assert_eq!(stored.slot(), old.slot());
+            assert_eq!(stored.generation(), old.generation());
+            assert_eq!(
+                heap.find_key(cell.slot(), &super::EdgeKey::Field(super::CURRENT_EDGE)),
+                Some(current_edge),
+                "the refusal does not move the cell record"
+            );
+            assert_eq!(heap.current_table(nil_cell)?, None);
+            assert_eq!(
+                heap.find_key(nil_cell.slot(), &super::EdgeKey::Field(super::CURRENT_EDGE)),
+                None,
+                "the refusal does not insert a nil cell edge"
+            );
+            assert_eq!(heap.current_table(cell)?, before_current);
+            assert_eq!(heap.current_table(nil_cell)?, before_nil);
+            assert!(
+                heap.alive(fresh),
+                "refusal does not release the rejected table"
+            );
+            assert_eq!(heap.stats(), before_stats, "accounting is untouched");
+            assert_eq!(
+                heap.scan_meter(),
+                before_meter,
+                "the cursor accounts are untouched"
+            );
+            heap.write_upvalue(nil_cell, fresh)
+        });
+        assert!(
+            matches!(refused, Err(HeapError::SweepPending)),
+            "the tail gate is the refusal, got {refused:?}"
+        );
+        let after_tail = heap::saved_tail_state(&mut host)
+            .expect("tail read")
+            .expect("tail still saved");
+        assert_eq!(before_tail.phase, after_tail.phase);
+        assert_eq!(before_tail.cursor, after_tail.cursor);
+        assert_eq!(before_tail.live_roots, after_tail.live_roots);
+        assert_eq!(before_tail.dead_len, after_tail.dead_len);
+        let finished = heap::step_fixed_frames(&mut host, 128).expect("finish");
+        assert!(
+            matches!(finished, StepOutcome::Completed(_)),
+            "{finished:?}"
+        );
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            let stored = heap.current_table(cell)?.expect("old edge remains");
+            assert_eq!(stored.slot(), old.slot());
+            assert_eq!(stored.generation(), old.generation());
+            assert_eq!(heap.current_table(nil_cell)?, None);
+            assert!(!heap.alive(fresh), "the rejected table was never stored");
             Ok(())
         })
         .expect("after release");
