@@ -7275,3 +7275,770 @@ fn gray_scanned_weak_owner_clear_metatable_marks_bare_userdata() {
 fn gray_scanned_weak_owner_omitted_clears_bare_userdata() {
     run_bare_userdata(BareArm::Omit);
 }
+
+const LEFT_SCALAR: &str = "101";
+const RIGHT_SCALAR: &str = "202";
+const KEY_PAUSE_BOUND: u32 = 256;
+
+/// Stops on a real pending record. Checks the cursor before pulsing, so a
+/// record that is already pending is not charged by the search itself.
+fn pause_record(parked: &mut ParkedMark<'_>, owner: u32, cursor: u32) -> PendingScan {
+    for _ in 0..KEY_PAUSE_BOUND {
+        if let Some(pending) = parked.pending()
+            && pending.owner == owner
+            && pending.cursor == cursor
+        {
+            assert_eq!(parked.phase_name(), "gray");
+            assert!(parked.mutation_open());
+            assert_eq!(parked.meter().sweep_edge_checks, 0);
+            assert_eq!(parked.meter().mark_passes, 1);
+            return pending;
+        }
+        let view = parked.pulse(1);
+        assert!(
+            !view.finished,
+            "mark finished before owner {owner} record {cursor} was pending"
+        );
+        assert_eq!(view.meter.sweep_edge_checks, 0, "a pulse must not sweep");
+        assert_eq!(
+            view.meter.mark_passes, 1,
+            "pause stays in the original pass"
+        );
+    }
+    panic!("pending record {cursor} on owner {owner} was not observed");
+}
+
+/// Charges the pending record and requires every named target to stay white.
+/// `marked(owner)` is not this proof: the cursor was that record, and the
+/// charge incremented the occupied-edge meter.
+fn charge_white(parked: &mut ParkedMark<'_>, owner: u32, record: u32, white: &[TableRef]) {
+    let pending = pause_record(parked, owner, record);
+    assert_eq!(pending.owner, owner);
+    assert_eq!(pending.cursor, record);
+    let edges = parked.meter().outgoing_edge_checks;
+    let gaps = parked.meter().outgoing_gap_checks;
+    let view = parked.pulse(1);
+    assert!(!view.finished, "charging one record finished the mark");
+    assert_eq!(
+        parked.meter().outgoing_edge_checks,
+        edges + 1,
+        "the pending record was not charged"
+    );
+    assert_eq!(parked.meter().outgoing_gap_checks, gaps);
+    for table in white {
+        assert!(
+            !parked.marked(*table),
+            "weak scan marked slot {}",
+            table.slot()
+        );
+    }
+}
+
+fn assert_still_white(parked: &ParkedMark<'_>, white: &[TableRef]) {
+    for table in white {
+        assert!(
+            !parked.marked(*table),
+            "slot {} was marked before the rescan budget",
+            table.slot()
+        );
+    }
+}
+
+fn assert_setter_reserved(
+    parked: &ParkedMark<'_>,
+    pending: Option<PendingScan>,
+    before: &ScanMeter,
+    roots: u32,
+) {
+    assert!(
+        same_pending(pending, parked.pending()),
+        "set_metatable moved the ordinary pending cursor"
+    );
+    assert_setter_did_not_move_scan(before, &parked.meter());
+    assert_eq!(parked.stats().live_roots, roots);
+}
+
+fn see_object_scalar(heap: &LuaHeap, owner: TableRef, key: TableRef, scalar: &str) -> bool {
+    let Ok(found) = heap.object_value(owner, key) else {
+        return false;
+    };
+    if found != Value::string(scalar) {
+        return false;
+    }
+    let Ok(carrier) = heap.issued_value(key) else {
+        return false;
+    };
+    let mut cursor = Value::Null;
+    let mut saw = false;
+    while let Ok(Some((next_key, next_value))) = heap.next_guest(owner, &cursor) {
+        if next_key == carrier && next_value == Value::string(scalar) {
+            saw = true;
+        }
+        cursor = next_key;
+    }
+    saw
+}
+
+struct KeyGraph {
+    sentinel: TableRef,
+    left: TableRef,
+    right: TableRef,
+    witness: TableRef,
+    old_mt: TableRef,
+    strong_mt: TableRef,
+    left_key: TableRef,
+    successor: TableRef,
+    right_key: TableRef,
+    orphan: TableRef,
+    dust: TableRef,
+    key_record: u32,
+    sentinel_record: u32,
+}
+
+fn plant_key_graph(heap: &mut LuaHeap) -> Result<KeyGraph, HeapError> {
+    let sentinel = heap.alloc()?;
+    let left = heap.alloc()?;
+    let right = heap.alloc()?;
+    let witness = heap.alloc()?;
+    let old_mt = heap.alloc()?;
+    let witness_mt = heap.alloc()?;
+    let strong_mt = heap.alloc()?;
+    let left_key = heap.alloc()?;
+    let successor = heap.alloc()?;
+    let right_key = heap.alloc()?;
+    let orphan = heap.alloc()?;
+    let dust = heap.alloc()?;
+    heap.set_mode_scalar(old_mt, Value::string("k"))?;
+    heap.set_mode_scalar(witness_mt, Value::string("v"))?;
+    heap.set_metatable(left, Some(old_mt))?;
+    heap.set_metatable(right, Some(old_mt))?;
+    heap.set_metatable(witness, Some(witness_mt))?;
+    heap.set_object_scalar(left, left_key, Value::string(LEFT_SCALAR))?;
+    heap.set_named_edge(left_key, "next", successor)?;
+    heap.set_object_scalar(right, right_key, Value::string(RIGHT_SCALAR))?;
+    heap.set_named_edge(witness, "key", left_key)?;
+    heap.set_named_edge(witness, "succ", successor)?;
+    heap.set_named_edge(witness, "orphan", orphan)?;
+    heap.issue_carrier(left_key)?;
+    heap.set_named_scalar(sentinel, "pending", Value::Bool(true))?;
+    assert_eq!(heap.object_edge(strong_mt, left_key)?, None);
+    assert_eq!(heap.named_edge(strong_mt, "next")?, None);
+    let frame = heap.enter_roots(5)?;
+    heap.write_root(frame, 0, sentinel)?;
+    heap.write_root(frame, 1, right)?;
+    heap.write_root(frame, 2, witness)?;
+    heap.write_root(frame, 3, strong_mt)?;
+    heap.write_root(frame, 4, left)?;
+    let key_record = heap
+        .find_key(left.slot(), &super::EdgeKey::object(left_key))
+        .expect("left object-key record");
+    let (_, sentinel_record) = heap
+        .locate_named(sentinel.slot(), "pending")
+        .expect("sentinel record");
+    let _ = (witness_mt, frame);
+    Ok(KeyGraph {
+        sentinel,
+        left,
+        right,
+        witness,
+        old_mt,
+        strong_mt,
+        left_key,
+        successor,
+        right_key,
+        orphan,
+        dust,
+        key_record,
+        sentinel_record,
+    })
+}
+
+fn open_key_graph(host: &mut vm::HostContext<'_>) -> KeyGraph {
+    heap::install(host, limits(16, 8, 24)).expect("install");
+    let graph = heap::with_heap(host, plant_key_graph).expect("plant");
+    heap::open_fixed_step(host).expect("open");
+    graph
+}
+
+fn prove_key_then_sentinel(parked: &mut ParkedMark<'_>, graph: &KeyGraph) {
+    let white = [
+        graph.left_key,
+        graph.successor,
+        graph.right_key,
+        graph.orphan,
+    ];
+    charge_white(parked, graph.left.slot(), graph.key_record, &white);
+    let pending = pause_record(parked, graph.sentinel.slot(), graph.sentinel_record);
+    assert_eq!(pending.owner, graph.sentinel.slot());
+    assert_eq!(pending.cursor, graph.sentinel_record);
+    assert!(
+        parked.marked(graph.left),
+        "the owner is marked, which alone does not prove the key record was charged"
+    );
+    assert_still_white(parked, &white);
+}
+
+fn finish_key_cycle(host: &mut vm::HostContext<'_>, graph: &KeyGraph, keep: bool) {
+    let done = finish_fixed_cycle(host);
+    assert!(
+        matches!(done, crate::heap::StepOutcome::Completed(_)),
+        "{done:?}"
+    );
+    assert!(heap::fixed_step_idle(host).expect("idle"));
+    heap::with_heap(host, |heap| -> Result<(), HeapError> {
+        assert!(!heap.alive(graph.right_key), "the sibling weak key clears");
+        assert!(heap.next_guest(graph.right, &Value::Null)?.is_none());
+        assert!(!heap.alive(graph.orphan), "the independent orphan clears");
+        assert_eq!(heap.named_edge(graph.witness, "orphan")?, None);
+        assert!(!heap.alive(graph.dust), "an unrooted node was released");
+        if keep {
+            assert!(heap.alive(graph.left_key), "the strengthened key stays");
+            assert!(heap.alive(graph.successor), "the key successor stays");
+            assert_eq!(heap.object_edge(graph.strong_mt, graph.left_key)?, None);
+            assert!(see_object_scalar(
+                heap,
+                graph.left,
+                graph.left_key,
+                LEFT_SCALAR
+            ));
+            assert_eq!(
+                heap.named_edge(graph.left_key, "next")?,
+                Some(graph.successor)
+            );
+            assert_eq!(heap.named_edge(graph.witness, "key")?, Some(graph.left_key));
+            assert_eq!(
+                heap.named_edge(graph.witness, "succ")?,
+                Some(graph.successor)
+            );
+        } else {
+            assert!(!heap.alive(graph.left_key), "omission clears the weak key");
+            assert!(!heap.alive(graph.successor));
+            assert!(heap.next_guest(graph.left, &Value::Null)?.is_none());
+            assert_eq!(heap.named_edge(graph.witness, "key")?, None);
+            assert_eq!(heap.named_edge(graph.witness, "succ")?, None);
+        }
+        Ok(())
+    })
+    .expect("this cycle");
+    if keep {
+        heap::with_heap(host, |heap| -> Result<(), HeapError> {
+            heap.set_metatable(graph.left, Some(graph.old_mt))?;
+            assert!(
+                heap.alive(graph.left_key),
+                "restoring k does not drop the key"
+            );
+            assert!(see_object_scalar(
+                heap,
+                graph.left,
+                graph.left_key,
+                LEFT_SCALAR
+            ));
+            Ok(())
+        })
+        .expect("restore k");
+        heap::collect(host).expect("next cycle");
+        heap::with_heap(host, |heap| {
+            assert!(
+                !heap.alive(graph.left_key),
+                "the next cycle releases the key"
+            );
+            assert!(
+                !heap.alive(graph.successor),
+                "the next cycle releases the successor"
+            );
+            assert!(
+                heap.next_guest(graph.left, &Value::Null)
+                    .expect("next")
+                    .is_none()
+            );
+            Ok(())
+        })
+        .expect("released");
+    } else {
+        heap::with_heap(host, |heap| -> Result<(), HeapError> {
+            heap.set_metatable(graph.left, Some(graph.strong_mt))?;
+            Ok(())
+        })
+        .expect("late strong metatable");
+        heap::collect(host).expect("collect after a cleared key");
+        heap::with_heap(host, |heap| {
+            assert!(
+                !heap.alive(graph.left_key),
+                "a cleared key does not come back"
+            );
+            assert!(!heap.alive(graph.successor));
+            Ok(())
+        })
+        .expect("no resurrection");
+    }
+}
+
+#[derive(Clone, Copy)]
+enum KeyArm {
+    Swap,
+    Clear,
+    Omit,
+}
+
+fn run_key_arm(arm: KeyArm) {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        let graph = open_key_graph(&mut host);
+        resume_weak(&mut host, |parked| {
+            prove_key_then_sentinel(parked, &graph);
+            let pending = parked.pending();
+            let before = parked.meter();
+            let roots = parked.stats().live_roots;
+            match arm {
+                KeyArm::Swap => {
+                    write_metatable(parked, graph.left, Some(graph.strong_mt))
+                        .expect("preallocated strong metatable");
+                }
+                KeyArm::Clear => {
+                    write_metatable(parked, graph.left, None).expect("clear the weak metatable");
+                }
+                KeyArm::Omit => {}
+            }
+            if !matches!(arm, KeyArm::Omit) {
+                assert_setter_reserved(parked, pending, &before, roots);
+                let right_mt = parked.with_saved_heap(|heap| heap.metatable(graph.right));
+                assert!(matches!(right_mt, Ok(Some(mt)) if mt == graph.old_mt));
+                assert_still_white(
+                    parked,
+                    &[
+                        graph.left_key,
+                        graph.successor,
+                        graph.right_key,
+                        graph.orphan,
+                    ],
+                );
+                assert_subject_marked(parked, graph.left_key);
+                assert_subject_marked(parked, graph.successor);
+            }
+        });
+        finish_key_cycle(&mut host, &graph, !matches!(arm, KeyArm::Omit));
+    });
+}
+
+#[test]
+fn gray_scanned_weak_key_swap_keeps_object_key_and_successor() {
+    run_key_arm(KeyArm::Swap);
+}
+
+#[test]
+fn gray_scanned_weak_key_clear_keeps_object_key_and_successor() {
+    run_key_arm(KeyArm::Clear);
+}
+
+#[test]
+fn gray_scanned_weak_key_omit_clears_object_key() {
+    run_key_arm(KeyArm::Omit);
+}
+
+#[test]
+fn gray_scanned_weak_key_sole_clear_keeps_object_key() {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits(8, 4, 8)).expect("install");
+        let planted = heap::with_heap(&mut host, |heap| -> Result<_, HeapError> {
+            let sentinel = heap.alloc()?;
+            let left = heap.alloc()?;
+            let old_mt = heap.alloc()?;
+            let left_key = heap.alloc()?;
+            let successor = heap.alloc()?;
+            let dust = heap.alloc()?;
+            heap.set_mode_scalar(old_mt, Value::string("k"))?;
+            heap.set_metatable(left, Some(old_mt))?;
+            heap.set_object_scalar(left, left_key, Value::string(LEFT_SCALAR))?;
+            heap.set_named_edge(left_key, "next", successor)?;
+            heap.issue_carrier(left_key)?;
+            heap.set_named_scalar(sentinel, "pending", Value::Bool(true))?;
+            let frame = heap.enter_roots(2)?;
+            heap.write_root(frame, 0, sentinel)?;
+            heap.write_root(frame, 1, left)?;
+            let record = heap
+                .find_key(left.slot(), &super::EdgeKey::object(left_key))
+                .expect("object-key record");
+            let (_, sentinel_record) = heap
+                .locate_named(sentinel.slot(), "pending")
+                .expect("sentinel");
+            let _ = frame;
+            Ok((
+                sentinel,
+                left,
+                left_key,
+                successor,
+                dust,
+                record,
+                sentinel_record,
+            ))
+        })
+        .expect("plant");
+        let (sentinel, left, left_key, successor, dust, record, sentinel_record) = planted;
+        heap::open_fixed_step(&mut host).expect("open");
+        resume_weak(&mut host, |parked| {
+            charge_white(parked, left.slot(), record, &[left_key, successor]);
+            pause_record(parked, sentinel.slot(), sentinel_record);
+            assert_still_white(parked, &[left_key, successor]);
+            let edges = parked.with_saved_heap(|heap| heap.metatable_edges);
+            assert_eq!(edges, 1, "this clear drops the only metatable edge");
+            let pending = parked.pending();
+            let before = parked.meter();
+            let roots = parked.stats().live_roots;
+            write_metatable(parked, left, None).expect("clear the only metatable");
+            assert_eq!(parked.with_saved_heap(|heap| heap.metatable_edges), 0);
+            assert_setter_reserved(parked, pending, &before, roots);
+            assert_eq!(parked.meter().node_slot_visits, before.node_slot_visits);
+            assert_still_white(parked, &[left_key, successor]);
+            assert_subject_marked(parked, left_key);
+            assert_subject_marked(parked, successor);
+        });
+        let done = finish_fixed_cycle(&mut host);
+        assert!(
+            matches!(done, crate::heap::StepOutcome::Completed(_)),
+            "{done:?}"
+        );
+        heap::with_heap(&mut host, |heap| {
+            assert!(
+                heap.alive(left_key),
+                "old key weakness was read before the count hit zero"
+            );
+            assert!(heap.alive(successor));
+            assert!(see_object_scalar(heap, left, left_key, LEFT_SCALAR));
+            assert!(!heap.alive(dust), "sweep still released an unrooted node");
+            Ok(())
+        })
+        .expect("sole edge");
+    });
+}
+
+struct KvGraph {
+    sentinel: TableRef,
+    left: TableRef,
+    right: TableRef,
+    witness: TableRef,
+    kv_mt: TableRef,
+    value_mt: TableRef,
+    key_mt: TableRef,
+    strong_mt: TableRef,
+    left_key: TableRef,
+    key_succ: TableRef,
+    value: TableRef,
+    value_succ: TableRef,
+    right_key: TableRef,
+    right_value: TableRef,
+    orphan: TableRef,
+    dust: TableRef,
+    key_record: u32,
+    value_record: u32,
+    sentinel_record: u32,
+}
+
+fn plant_kv_graph(heap: &mut LuaHeap) -> Result<KvGraph, HeapError> {
+    let sentinel = heap.alloc()?;
+    let left = heap.alloc()?;
+    let right = heap.alloc()?;
+    let witness = heap.alloc()?;
+    let kv_mt = heap.alloc()?;
+    let value_mt = heap.alloc()?;
+    let key_mt = heap.alloc()?;
+    let strong_mt = heap.alloc()?;
+    let left_key = heap.alloc()?;
+    let key_succ = heap.alloc()?;
+    let value = heap.alloc()?;
+    let value_succ = heap.alloc()?;
+    let right_key = heap.alloc()?;
+    let right_key_succ = heap.alloc()?;
+    let right_value = heap.alloc()?;
+    let right_value_succ = heap.alloc()?;
+    let orphan = heap.alloc()?;
+    let dust = heap.alloc()?;
+    heap.set_mode_scalar(kv_mt, Value::string("kv"))?;
+    heap.set_mode_scalar(value_mt, Value::string("v"))?;
+    heap.set_mode_scalar(key_mt, Value::string("k"))?;
+    heap.set_metatable(left, Some(kv_mt))?;
+    heap.set_metatable(right, Some(kv_mt))?;
+    heap.set_metatable(witness, Some(value_mt))?;
+    heap.set_object_scalar(left, left_key, Value::string(LEFT_SCALAR))?;
+    heap.set_named_edge(left_key, "next", key_succ)?;
+    heap.set_named_edge(left, "value", value)?;
+    heap.set_named_edge(value, "next", value_succ)?;
+    heap.set_object_scalar(right, right_key, Value::string(RIGHT_SCALAR))?;
+    heap.set_named_edge(right_key, "next", right_key_succ)?;
+    heap.set_named_edge(right, "value", right_value)?;
+    heap.set_named_edge(right_value, "next", right_value_succ)?;
+    heap.set_named_edge(witness, "key", left_key)?;
+    heap.set_named_edge(witness, "key_succ", key_succ)?;
+    heap.set_named_edge(witness, "val", value)?;
+    heap.set_named_edge(witness, "val_succ", value_succ)?;
+    heap.set_named_edge(witness, "orphan", orphan)?;
+    heap.issue_carrier(left_key)?;
+    heap.issue_carrier(value)?;
+    heap.set_named_scalar(sentinel, "pending", Value::Bool(true))?;
+    for mt in [value_mt, key_mt, strong_mt] {
+        assert_eq!(heap.object_edge(mt, left_key)?, None);
+        assert_eq!(heap.named_edge(mt, "value")?, None);
+        assert_eq!(heap.object_edge(mt, value)?, None);
+    }
+    let frame = heap.enter_roots(7)?;
+    heap.write_root(frame, 0, sentinel)?;
+    heap.write_root(frame, 1, right)?;
+    heap.write_root(frame, 2, witness)?;
+    heap.write_root(frame, 3, strong_mt)?;
+    heap.write_root(frame, 4, value_mt)?;
+    heap.write_root(frame, 5, key_mt)?;
+    heap.write_root(frame, 6, left)?;
+    let key_record = heap
+        .find_key(left.slot(), &super::EdgeKey::object(left_key))
+        .expect("object-key record");
+    let (_, value_record) = heap
+        .locate_named(left.slot(), "value")
+        .expect("string-key record");
+    let (_, sentinel_record) = heap
+        .locate_named(sentinel.slot(), "pending")
+        .expect("sentinel record");
+    let _ = frame;
+    Ok(KvGraph {
+        sentinel,
+        left,
+        right,
+        witness,
+        kv_mt,
+        value_mt,
+        key_mt,
+        strong_mt,
+        left_key,
+        key_succ,
+        value,
+        value_succ,
+        right_key,
+        right_value,
+        orphan,
+        dust,
+        key_record,
+        value_record,
+        sentinel_record,
+    })
+}
+
+fn open_kv_graph(host: &mut vm::HostContext<'_>) -> KvGraph {
+    heap::install(host, limits(24, 8, 40)).expect("install");
+    let graph = heap::with_heap(host, plant_kv_graph).expect("plant");
+    heap::open_fixed_step(host).expect("open");
+    graph
+}
+
+fn prove_both_records(parked: &mut ParkedMark<'_>, graph: &KvGraph) {
+    let white = [
+        graph.left_key,
+        graph.key_succ,
+        graph.value,
+        graph.value_succ,
+        graph.right_key,
+        graph.right_value,
+        graph.orphan,
+    ];
+    charge_white(parked, graph.left.slot(), graph.key_record, &white);
+    charge_white(parked, graph.left.slot(), graph.value_record, &white);
+    let pending = pause_record(parked, graph.sentinel.slot(), graph.sentinel_record);
+    assert_eq!(pending.cursor, graph.sentinel_record);
+    assert!(parked.marked(graph.left));
+    assert_still_white(parked, &white);
+}
+
+fn see_string_value(heap: &LuaHeap, owner: TableRef, value: TableRef) -> bool {
+    let Ok(Some(found)) = heap.named_edge(owner, "value") else {
+        return false;
+    };
+    if found != value {
+        return false;
+    }
+    let Ok(carrier) = heap.issued_value(value) else {
+        return false;
+    };
+    let mut cursor = Value::Null;
+    let mut saw = false;
+    while let Ok(Some((key, next_value))) = heap.next_guest(owner, &cursor) {
+        if key == Value::string("value") && next_value == carrier {
+            saw = true;
+        }
+        cursor = key;
+    }
+    saw
+}
+
+fn finish_kv_cycle(
+    host: &mut vm::HostContext<'_>,
+    graph: &KvGraph,
+    keep_key: bool,
+    keep_value: bool,
+) {
+    let done = finish_fixed_cycle(host);
+    assert!(
+        matches!(done, crate::heap::StepOutcome::Completed(_)),
+        "{done:?}"
+    );
+    heap::with_heap(host, |heap| -> Result<(), HeapError> {
+        assert!(!heap.alive(graph.right_key), "the sibling key clears");
+        assert!(!heap.alive(graph.right_value), "the sibling value clears");
+        assert!(heap.next_guest(graph.right, &Value::Null)?.is_none());
+        assert!(!heap.alive(graph.orphan));
+        assert_eq!(heap.named_edge(graph.witness, "orphan")?, None);
+        assert!(!heap.alive(graph.dust));
+        if keep_key {
+            assert!(heap.alive(graph.left_key));
+            assert!(heap.alive(graph.key_succ));
+            assert!(see_object_scalar(
+                heap,
+                graph.left,
+                graph.left_key,
+                LEFT_SCALAR
+            ));
+            assert_eq!(
+                heap.named_edge(graph.left_key, "next")?,
+                Some(graph.key_succ)
+            );
+            assert_eq!(heap.named_edge(graph.witness, "key")?, Some(graph.left_key));
+            assert_eq!(
+                heap.named_edge(graph.witness, "key_succ")?,
+                Some(graph.key_succ)
+            );
+        } else {
+            assert!(!heap.alive(graph.left_key));
+            assert!(!heap.alive(graph.key_succ));
+            assert_eq!(heap.named_edge(graph.witness, "key")?, None);
+            assert_eq!(heap.named_edge(graph.witness, "key_succ")?, None);
+        }
+        if keep_value {
+            assert!(heap.alive(graph.value));
+            assert!(heap.alive(graph.value_succ));
+            assert!(see_string_value(heap, graph.left, graph.value));
+            assert_eq!(
+                heap.named_edge(graph.value, "next")?,
+                Some(graph.value_succ)
+            );
+            assert_eq!(heap.named_edge(graph.witness, "val")?, Some(graph.value));
+            assert_eq!(
+                heap.named_edge(graph.witness, "val_succ")?,
+                Some(graph.value_succ)
+            );
+        } else {
+            assert!(!heap.alive(graph.value));
+            assert!(!heap.alive(graph.value_succ));
+            assert_eq!(heap.named_edge(graph.left, "value")?, None);
+            assert_eq!(heap.named_edge(graph.witness, "val")?, None);
+            assert_eq!(heap.named_edge(graph.witness, "val_succ")?, None);
+        }
+        Ok(())
+    })
+    .expect("this cycle");
+    if keep_key || keep_value {
+        heap::with_heap(host, |heap| -> Result<(), HeapError> {
+            heap.set_metatable(graph.left, Some(graph.kv_mt))?;
+            if keep_key {
+                assert!(
+                    heap.alive(graph.left_key),
+                    "restoring kv does not drop the key"
+                );
+            }
+            if keep_value {
+                assert!(
+                    heap.alive(graph.value),
+                    "restoring kv does not drop the value"
+                );
+            }
+            Ok(())
+        })
+        .expect("restore kv");
+        heap::collect(host).expect("next cycle");
+        heap::with_heap(host, |heap| {
+            assert!(!heap.alive(graph.left_key));
+            assert!(!heap.alive(graph.key_succ));
+            assert!(!heap.alive(graph.value));
+            assert!(!heap.alive(graph.value_succ));
+            Ok(())
+        })
+        .expect("released");
+    }
+}
+
+#[derive(Clone, Copy)]
+enum KvArm {
+    ToValue,
+    ToKey,
+    ToStrong,
+    Omit,
+}
+
+fn run_kv_arm(arm: KvArm) {
+    let keep_key = matches!(arm, KvArm::ToValue | KvArm::ToStrong);
+    let keep_value = matches!(arm, KvArm::ToKey | KvArm::ToStrong);
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        let graph = open_kv_graph(&mut host);
+        resume_weak(&mut host, |parked| {
+            prove_both_records(parked, &graph);
+            let pending = parked.pending();
+            let before = parked.meter();
+            let roots = parked.stats().live_roots;
+            let replacement = match arm {
+                KvArm::ToValue => Some(graph.value_mt),
+                KvArm::ToKey => Some(graph.key_mt),
+                KvArm::ToStrong => Some(graph.strong_mt),
+                KvArm::Omit => None,
+            };
+            if let Some(mt) = replacement {
+                write_metatable(parked, graph.left, Some(mt)).expect("replace one owner metatable");
+                assert_setter_reserved(parked, pending, &before, roots);
+                let right_mt = parked.with_saved_heap(|heap| heap.metatable(graph.right));
+                assert!(matches!(right_mt, Ok(Some(found)) if found == graph.kv_mt));
+                assert_still_white(
+                    parked,
+                    &[
+                        graph.left_key,
+                        graph.key_succ,
+                        graph.value,
+                        graph.value_succ,
+                    ],
+                );
+            }
+            if keep_key {
+                assert_subject_marked(parked, graph.left_key);
+                assert_subject_marked(parked, graph.key_succ);
+            }
+            if keep_value {
+                assert_subject_marked(parked, graph.value);
+                assert_subject_marked(parked, graph.value_succ);
+            }
+            if replacement.is_some() && !keep_key {
+                assert!(!parked.marked(graph.left_key));
+                assert!(!parked.marked(graph.key_succ));
+            }
+            if replacement.is_some() && !keep_value {
+                assert!(!parked.marked(graph.value));
+                assert!(!parked.marked(graph.value_succ));
+            }
+        });
+        finish_kv_cycle(&mut host, &graph, keep_key, keep_value);
+    });
+}
+
+#[test]
+fn gray_scanned_kv_to_value_keeps_only_the_object_key() {
+    run_kv_arm(KvArm::ToValue);
+}
+
+#[test]
+fn gray_scanned_kv_to_key_keeps_only_the_value() {
+    run_kv_arm(KvArm::ToKey);
+}
+
+#[test]
+fn gray_scanned_kv_to_strong_keeps_both_edges() {
+    run_kv_arm(KvArm::ToStrong);
+}
+
+#[test]
+fn gray_scanned_kv_omit_clears_both_edges() {
+    run_kv_arm(KvArm::Omit);
+}

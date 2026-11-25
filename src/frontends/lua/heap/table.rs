@@ -2253,7 +2253,7 @@ impl LuaHeap {
         self.ensure_sweep_open()?;
         let old_tuple = self.slots[owner.slot() as usize].metatable;
         let new_tuple = mt.map(|target| (target.slot(), target.generation()));
-        let strengthen = self.note_value_strengthen(owner.slot(), old_tuple, new_tuple);
+        let rescan = self.needs_owner_rescan(owner.slot(), old_tuple, new_tuple);
         let had = old_tuple.is_some();
         if had != new_tuple.is_some() {
             if new_tuple.is_some() {
@@ -2263,8 +2263,8 @@ impl LuaHeap {
             }
         }
         self.slots[owner.slot() as usize].metatable = new_tuple;
-        if strengthen {
-            self.schedule_value_rescan(owner.slot());
+        if rescan {
+            self.schedule_owner_rescan(owner.slot());
         }
         if let Some(target) = mt {
             self.barrier_strong_metatable(owner.slot(), target.slot(), target.generation());

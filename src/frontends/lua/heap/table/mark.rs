@@ -999,7 +999,7 @@ fn begin_owner(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
     state.owner = Some(slot);
     state.owner_kind = kind;
     state.owner_mode = mode;
-    if mode.values {
+    if mode.keys || mode.values {
         note_weak_started(heap, state, slot);
     }
     true
@@ -1459,12 +1459,12 @@ impl LuaHeap {
         self.mark = Some(state);
     }
 
-    /// Records a weak-value to strong transition using the tuples captured
+    /// Checks whether either weak side becomes strong using the tuples captured
     /// before the slot write. The old mode comes from this cycle's cache and
     /// that tuple, not from the edge count, so clearing the last metatable
     /// edge cannot make the old mode look strong. A not-yet-started owner is
     /// left for the ordinary scan. This does not enqueue, scan, or move a cursor.
-    pub(super) fn note_value_strengthen(
+    pub(super) fn needs_owner_rescan(
         &self,
         owner: u32,
         old_tuple: Option<(u32, u32)>,
@@ -1478,7 +1478,7 @@ impl LuaHeap {
         }
         let old_mode = mode_of_tuple(state, old_tuple);
         let new_mode = mode_of_tuple(state, new_tuple);
-        if !old_mode.values || new_mode.values {
+        if !((old_mode.keys && !new_mode.keys) || (old_mode.values && !new_mode.values)) {
             return false;
         }
         state
@@ -1491,7 +1491,7 @@ impl LuaHeap {
     /// Queues one chain-head rescan for an owner that already started a weak
     /// scan. A repeat reads the slot bit and does not walk the queue. This
     /// does not scan the owner, reset a mark, or move the ordinary cursor.
-    pub(super) fn schedule_value_rescan(&mut self, owner: u32) {
+    pub(super) fn schedule_owner_rescan(&mut self, owner: u32) {
         let Some(mut state) = self.mark.take() else {
             return;
         };
