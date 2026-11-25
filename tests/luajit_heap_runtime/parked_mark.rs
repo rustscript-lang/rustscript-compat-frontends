@@ -10995,3 +10995,549 @@ fn shared_mode_delete_original_metatable_walks_grown_owner_slots() {
         .expect("grown owner slots");
     });
 }
+
+const ORPHAN_SCALAR: &str = "303";
+
+/// One weak-key owner on each side plus an independent weak-only orphan.
+/// The left and right owners share the initial `k` or `kv` metatable, their
+/// keys are bare userdata with distinct scalar values, and no value points
+/// back at any key. The witness observes all three userdata identities only
+/// through a `v` metatable, so it adds no strong root. The orphan table holds
+/// the third userdata under the same initial weak metatable. A dust table is
+/// unrooted and proves that this cycle really sweeps.
+struct BareKeyGraph {
+    sentinel: TableRef,
+    left: TableRef,
+    right: TableRef,
+    witness: TableRef,
+    orphan_table: TableRef,
+    k_mt: TableRef,
+    v_mt: TableRef,
+    strong_mt: TableRef,
+    left_key: UserdataRef,
+    right_key: UserdataRef,
+    orphan: UserdataRef,
+    dust: TableRef,
+    old_mt: TableRef,
+    key_record: u32,
+    sentinel_record: u32,
+}
+
+fn plant_bare_key_graph(heap: &mut LuaHeap, mode: &str) -> Result<BareKeyGraph, HeapError> {
+    let sentinel = heap.alloc()?;
+    let left = heap.alloc()?;
+    let right = heap.alloc()?;
+    let witness = heap.alloc()?;
+    let orphan_table = heap.alloc()?;
+    let k_mt = heap.alloc()?;
+    let v_mt = heap.alloc()?;
+    let kv_mt = heap.alloc()?;
+    let strong_mt = heap.alloc()?;
+    let left_key = heap.alloc_userdata()?;
+    let right_key = heap.alloc_userdata()?;
+    let orphan = heap.alloc_userdata()?;
+    let dust = heap.alloc()?;
+    assert_ne!(left_key, right_key, "left and right keys share an identity");
+    assert_ne!(left_key, orphan, "left and orphan keys share an identity");
+    assert_ne!(right_key, orphan, "right and orphan keys share an identity");
+    heap.set_mode_scalar(k_mt, Value::string("k"))?;
+    heap.set_mode_scalar(v_mt, Value::string("v"))?;
+    heap.set_mode_scalar(kv_mt, Value::string("kv"))?;
+    heap.set_named_scalar(strong_mt, "tag", Value::string("preallocated"))?;
+    let old_mt = match mode {
+        "k" => k_mt,
+        "kv" => kv_mt,
+        other => panic!("unexpected weak mode {other}"),
+    };
+    heap.set_metatable(left, Some(old_mt))?;
+    heap.set_metatable(right, Some(old_mt))?;
+    heap.set_metatable(witness, Some(v_mt))?;
+    heap.set_metatable(orphan_table, Some(old_mt))?;
+    heap.set_userdata_key_scalar(left, left_key, Value::string(LEFT_SCALAR))?;
+    heap.set_userdata_key_scalar(right, right_key, Value::string(RIGHT_SCALAR))?;
+    heap.set_userdata_key_scalar(orphan_table, orphan, Value::string(ORPHAN_SCALAR))?;
+    heap.set_number_userdata(witness, 1.0, left_key)?;
+    heap.set_number_userdata(witness, 2.0, right_key)?;
+    heap.set_number_userdata(witness, 3.0, orphan)?;
+    heap.set_named_scalar(sentinel, "pending", Value::Bool(true))?;
+    let frame = heap.enter_roots(9)?;
+    // Last written root is scanned first. The sentinel stays pending until
+    // every owner written after it has been scanned.
+    heap.write_root(frame, 0, sentinel)?;
+    heap.write_root(frame, 1, right)?;
+    heap.write_root(frame, 2, witness)?;
+    heap.write_root(frame, 3, orphan_table)?;
+    heap.write_root(frame, 4, strong_mt)?;
+    heap.write_root(frame, 5, v_mt)?;
+    heap.write_root(frame, 6, k_mt)?;
+    heap.write_root(frame, 7, kv_mt)?;
+    heap.write_root(frame, 8, left)?;
+    assert_userdata_unrooted(heap, left_key);
+    assert_userdata_unrooted(heap, right_key);
+    assert_userdata_unrooted(heap, orphan);
+    let key_record = heap
+        .find_key(left.slot(), &super::EdgeKey::userdata_key(left_key))
+        .expect("left userdata-key record");
+    let (_, sentinel_record) = heap
+        .locate_named(sentinel.slot(), "pending")
+        .expect("sentinel record");
+    let _ = frame;
+    Ok(BareKeyGraph {
+        sentinel,
+        left,
+        right,
+        witness,
+        orphan_table,
+        k_mt,
+        v_mt,
+        strong_mt,
+        left_key,
+        right_key,
+        orphan,
+        dust,
+        old_mt,
+        key_record,
+        sentinel_record,
+    })
+}
+
+fn open_bare_key_graph(host: &mut vm::HostContext<'_>, mode: &str) -> BareKeyGraph {
+    heap::install(host, limits(20, 12, 24)).expect("install");
+    let graph = heap::with_heap(host, |heap| plant_bare_key_graph(heap, mode)).expect("plant");
+    heap::open_fixed_step(host).expect("open");
+    graph
+}
+
+/// The rawget-shaped typed read plus the next-shaped visible-entry walk.
+///
+/// This heap has no guest carrier for a bare userdata key, so `next_guest`
+/// returns `NextUnsupported` for that record. The test therefore checks the
+/// same visible facts at the typed boundary: `userdata_key_value` is the
+/// rawget-analogue, `find_key` keeps the original slot/generation/kind
+/// identity, and the owner has exactly one visible record whose stored key is
+/// that identity and whose scalar is unchanged. It does not use a fixed scan
+/// order and does not claim a guest `next`.
+fn see_userdata_key_scalar(
+    parked: &mut ParkedMark<'_>,
+    owner: TableRef,
+    key: UserdataRef,
+    scalar: &str,
+) -> bool {
+    parked.with_saved_heap(|heap| {
+        let Ok(found) = heap.userdata_key_value(owner, key) else {
+            return false;
+        };
+        if found != Value::string(scalar) {
+            return false;
+        }
+        if heap
+            .find_key(owner.slot(), &super::EdgeKey::userdata_key(key))
+            .is_none()
+        {
+            return false;
+        }
+        let Some(stored) = heap.slots.get(owner.slot() as usize) else {
+            return false;
+        };
+        let mut cursor = stored.edge_head;
+        let mut visible = 0;
+        while let Some(index) = cursor {
+            let record = &heap.edge_slots[index as usize];
+            cursor = record.next;
+            let Some(edge) = record.edge.as_ref() else {
+                continue;
+            };
+            if edge.value.is_cursor_gap() {
+                continue;
+            }
+            visible += 1;
+            if edge.key != super::EdgeKey::userdata_key(key) {
+                return false;
+            }
+            let super::EdgeValue::Scalar(Value::String(text)) = &edge.value else {
+                return false;
+            };
+            if text.as_str() != scalar {
+                return false;
+            }
+        }
+        visible == 1
+    })
+}
+
+/// Charges the left owner's only physical edge and proves that the weak scan
+/// neither marks the userdata key nor runs out of independent work. The
+/// sentinel is the independent record that stays pending after the charge.
+fn prove_bare_key_white(parked: &mut ParkedMark<'_>, graph: &BareKeyGraph) {
+    let white = [graph.left_key, graph.right_key, graph.orphan];
+    let pending = pause_record(parked, graph.left.slot(), graph.key_record);
+    assert_eq!(pending.owner, graph.left.slot());
+    assert_eq!(pending.cursor, graph.key_record);
+    let edges = parked.meter().outgoing_edge_checks;
+    let gaps = parked.meter().outgoing_gap_checks;
+    let view = parked.pulse(1);
+    assert!(
+        !view.finished,
+        "the weak-key charge must leave independent work"
+    );
+    assert_eq!(
+        parked.meter().outgoing_edge_checks,
+        edges + 1,
+        "the physical weak-key record was budgeted once"
+    );
+    assert_eq!(parked.meter().outgoing_gap_checks, gaps);
+    for key in white {
+        assert!(
+            !userdata_marked(parked, key),
+            "the weak key scan marked userdata slot {}",
+            key.slot()
+        );
+    }
+    let pending = pause_record(parked, graph.sentinel.slot(), graph.sentinel_record);
+    assert_eq!(pending.owner, graph.sentinel.slot());
+    assert_eq!(pending.cursor, graph.sentinel_record);
+    assert!(
+        parked.marked(graph.left),
+        "the owner is marked, which alone does not prove the key record was charged"
+    );
+    for key in white {
+        assert!(
+            !userdata_marked(parked, key),
+            "independent pending work marked userdata slot {}",
+            key.slot()
+        );
+    }
+    parked.with_saved_heap(|heap| {
+        assert_userdata_unrooted(heap, graph.left_key);
+        assert_userdata_unrooted(heap, graph.right_key);
+        assert_userdata_unrooted(heap, graph.orphan);
+        assert_eq!(
+            heap.metatable(graph.right).expect("right metatable"),
+            Some(graph.old_mt)
+        );
+        assert_eq!(
+            heap.metatable(graph.left).expect("left metatable"),
+            Some(graph.old_mt)
+        );
+        assert_eq!(
+            heap.userdata_key_value(graph.left, graph.left_key)
+                .expect("left scalar"),
+            Value::string(LEFT_SCALAR)
+        );
+        assert_eq!(
+            heap.userdata_key_value(graph.right, graph.right_key)
+                .expect("right scalar"),
+            Value::string(RIGHT_SCALAR)
+        );
+        assert_eq!(
+            heap.userdata_key_value(graph.orphan_table, graph.orphan)
+                .expect("orphan scalar"),
+            Value::string(ORPHAN_SCALAR)
+        );
+        assert_eq!(
+            heap.number_userdata(graph.witness, 1.0)
+                .expect("witness left"),
+            Some(graph.left_key)
+        );
+        assert_eq!(
+            heap.number_userdata(graph.witness, 2.0)
+                .expect("witness right"),
+            Some(graph.right_key)
+        );
+        assert_eq!(
+            heap.number_userdata(graph.witness, 3.0)
+                .expect("witness orphan"),
+            Some(graph.orphan)
+        );
+    });
+}
+
+/// Runs one real metatable setter after the owner was weak-scanned. The
+/// setter reserves a chain-head rescan but must not move the ordinary cursor,
+/// open the rescan, add a root, or mark/clear the original key by itself.
+fn replace_bare_key(
+    parked: &mut ParkedMark<'_>,
+    graph: &BareKeyGraph,
+    replacement: Option<TableRef>,
+) {
+    let pending = parked.pending();
+    let before = parked.meter();
+    let roots = parked.stats().live_roots;
+    write_metatable(parked, graph.left, replacement).expect("replace the left metatable");
+    assert_setter_reserved(parked, pending, &before, roots);
+    assert_eq!(
+        parked.meter().owner_rescan_heads,
+        before.owner_rescan_heads,
+        "the setter does not open the rescan"
+    );
+    assert_eq!(
+        parked.meter().owner_rescan_schedules,
+        before.owner_rescan_schedules + 1,
+        "one real setter schedules one chain-head rescan"
+    );
+    assert!(
+        !userdata_marked(parked, graph.left_key),
+        "the setter did not synchronously mark the userdata key"
+    );
+    assert!(see_userdata_key_scalar(
+        parked,
+        graph.left,
+        graph.left_key,
+        LEFT_SCALAR
+    ));
+    assert!(see_userdata_key_scalar(
+        parked,
+        graph.right,
+        graph.right_key,
+        RIGHT_SCALAR
+    ));
+    assert!(see_userdata_key_scalar(
+        parked,
+        graph.orphan_table,
+        graph.orphan,
+        ORPHAN_SCALAR
+    ));
+    let right_mt = parked.with_saved_heap(|heap| heap.metatable(graph.right));
+    assert!(matches!(right_mt, Ok(Some(mt)) if mt == graph.old_mt));
+    let left_mt = parked.with_saved_heap(|heap| heap.metatable(graph.left));
+    match replacement {
+        Some(mt) => assert!(matches!(left_mt, Ok(Some(found)) if found == mt)),
+        None => assert!(matches!(left_mt, Ok(None))),
+    }
+}
+
+/// Pauses on the rescan record that the setter scheduled, charges exactly one
+/// edge, and requires the key marking to follow the new weak mode only. A
+/// `k`-to-`k` replacement still gets a rescan because its value side changed,
+/// but its key stays weak and must remain white.
+fn charge_bare_key_rescan(parked: &mut ParkedMark<'_>, graph: &BareKeyGraph, follows_key: bool) {
+    let pending = pause_on_rescan(parked, graph.left.slot(), graph.key_record);
+    assert_eq!(pending.owner, graph.left.slot());
+    assert_eq!(pending.cursor, graph.key_record);
+    assert!(
+        !userdata_marked(parked, graph.left_key),
+        "the rescan cursor has not charged the userdata key yet"
+    );
+    let checks = parked.meter().outgoing_edge_checks;
+    let _view = parked.pulse(1);
+    assert_eq!(
+        parked.meter().outgoing_edge_checks,
+        checks + 1,
+        "the rescan charged exactly one physical edge for the key record"
+    );
+    assert!(
+        parked.pending_rescan().is_none(),
+        "the key record was consumed by the rescan pulse"
+    );
+    if follows_key {
+        assert!(
+            userdata_marked(parked, graph.left_key),
+            "the budgeted rescan did not mark the strengthened userdata key"
+        );
+    } else {
+        assert!(
+            !userdata_marked(parked, graph.left_key),
+            "k still leaves the userdata key weak during the rescan"
+        );
+    }
+    assert!(see_userdata_key_scalar(
+        parked,
+        graph.left,
+        graph.left_key,
+        LEFT_SCALAR
+    ));
+}
+
+fn finish_bare_key_cycle(host: &mut vm::HostContext<'_>, graph: &BareKeyGraph, keep: bool) {
+    let done = finish_fixed_cycle(host);
+    assert!(
+        matches!(done, crate::heap::StepOutcome::Completed(_)),
+        "{done:?}"
+    );
+    assert!(heap::fixed_step_idle(host).expect("idle"));
+    heap::with_heap(host, |heap| -> Result<(), HeapError> {
+        assert!(
+            !heap.userdata_alive(graph.right_key),
+            "the sibling weak key clears"
+        );
+        assert!(heap.next_guest(graph.right, &Value::Null)?.is_none());
+        assert!(
+            !heap.userdata_alive(graph.orphan),
+            "the independent orphan clears"
+        );
+        assert!(heap.next_guest(graph.orphan_table, &Value::Null)?.is_none());
+        assert_eq!(heap.number_userdata(graph.witness, 2.0)?, None);
+        assert_eq!(heap.number_userdata(graph.witness, 3.0)?, None);
+        assert!(!heap.alive(graph.dust), "sweep released an unrooted node");
+        if keep {
+            assert!(
+                heap.userdata_alive(graph.left_key),
+                "the strengthened key stays"
+            );
+            assert_eq!(
+                heap.userdata_key_value(graph.left, graph.left_key)?,
+                Value::string(LEFT_SCALAR)
+            );
+            assert_eq!(
+                heap.number_userdata(graph.witness, 1.0)?,
+                Some(graph.left_key)
+            );
+            assert!(
+                heap.find_key(
+                    graph.left.slot(),
+                    &super::EdgeKey::userdata_key(graph.left_key)
+                )
+                .is_some()
+            );
+        } else {
+            assert!(
+                !heap.userdata_alive(graph.left_key),
+                "the weak key clears this cycle"
+            );
+            assert_eq!(
+                heap.userdata_key_value(graph.left, graph.left_key),
+                Err(HeapError::StaleHandle)
+            );
+            assert!(heap.next_guest(graph.left, &Value::Null)?.is_none());
+            assert_eq!(heap.number_userdata(graph.witness, 1.0)?, None);
+        }
+        Ok(())
+    })
+    .expect("this cycle");
+    if keep {
+        heap::with_heap(host, |heap| -> Result<(), HeapError> {
+            heap.set_metatable(graph.left, Some(graph.old_mt))?;
+            assert!(
+                heap.userdata_alive(graph.left_key),
+                "restoring k does not drop the key"
+            );
+            assert_eq!(
+                heap.userdata_key_value(graph.left, graph.left_key)?,
+                Value::string(LEFT_SCALAR)
+            );
+            Ok(())
+        })
+        .expect("restore the weak mode");
+        heap::collect(host).expect("next cycle");
+        heap::with_heap(host, |heap| {
+            assert!(
+                !heap.userdata_alive(graph.left_key),
+                "the next cycle releases the kept key"
+            );
+            assert_eq!(
+                heap.userdata_key_value(graph.left, graph.left_key),
+                Err(HeapError::StaleHandle)
+            );
+            assert_eq!(heap.number_userdata(graph.witness, 1.0)?, None);
+            Ok(())
+        })
+        .expect("released");
+    } else {
+        heap::with_heap(host, |heap| -> Result<(), HeapError> {
+            heap.set_metatable(graph.left, Some(graph.strong_mt))?;
+            Ok(())
+        })
+        .expect("late strong metatable");
+        heap::collect(host).expect("collect after a cleared key");
+        heap::with_heap(host, |heap| {
+            assert!(
+                !heap.userdata_alive(graph.left_key),
+                "a cleared key does not come back"
+            );
+            assert!(heap.next_guest(graph.left, &Value::Null)?.is_none());
+            Ok(())
+        })
+        .expect("no resurrection");
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BareKeyArm {
+    KSwap,
+    KClear,
+    KOmit,
+    KvToValue,
+    KvToKey,
+    KvOmit,
+}
+
+#[derive(Clone, Copy)]
+enum BareKeyChange {
+    Omit,
+    Clear,
+    Replace(TableRef),
+}
+
+impl BareKeyArm {
+    fn mode(self) -> &'static str {
+        match self {
+            Self::KSwap | Self::KClear | Self::KOmit => "k",
+            Self::KvToValue | Self::KvToKey | Self::KvOmit => "kv",
+        }
+    }
+
+    fn keeps_key(self) -> bool {
+        matches!(self, Self::KSwap | Self::KClear | Self::KvToValue)
+    }
+}
+
+fn run_bare_key_arm(arm: BareKeyArm) {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        let graph = open_bare_key_graph(&mut host, arm.mode());
+        let change = match arm {
+            BareKeyArm::KSwap => BareKeyChange::Replace(graph.strong_mt),
+            BareKeyArm::KClear => BareKeyChange::Clear,
+            BareKeyArm::KOmit | BareKeyArm::KvOmit => BareKeyChange::Omit,
+            BareKeyArm::KvToValue => BareKeyChange::Replace(graph.v_mt),
+            BareKeyArm::KvToKey => BareKeyChange::Replace(graph.k_mt),
+        };
+        resume_weak(&mut host, |parked| {
+            prove_bare_key_white(parked, &graph);
+            match change {
+                BareKeyChange::Omit => {
+                    assert_eq!(parked.meter().owner_rescan_schedules, 0);
+                }
+                BareKeyChange::Clear => {
+                    replace_bare_key(parked, &graph, None);
+                    charge_bare_key_rescan(parked, &graph, arm.keeps_key());
+                }
+                BareKeyChange::Replace(mt) => {
+                    replace_bare_key(parked, &graph, Some(mt));
+                    charge_bare_key_rescan(parked, &graph, arm.keeps_key());
+                }
+            }
+        });
+        finish_bare_key_cycle(&mut host, &graph, arm.keeps_key());
+    });
+}
+
+#[test]
+fn gray_scanned_k_swap_keeps_the_bare_userdata_key() {
+    run_bare_key_arm(BareKeyArm::KSwap);
+}
+
+#[test]
+fn gray_scanned_k_clear_keeps_the_bare_userdata_key() {
+    run_bare_key_arm(BareKeyArm::KClear);
+}
+
+#[test]
+fn gray_scanned_k_omit_clears_the_bare_userdata_key() {
+    run_bare_key_arm(BareKeyArm::KOmit);
+}
+
+#[test]
+fn gray_scanned_kv_to_value_keeps_the_bare_userdata_key() {
+    run_bare_key_arm(BareKeyArm::KvToValue);
+}
+
+#[test]
+fn gray_scanned_kv_to_key_clears_the_bare_userdata_key() {
+    run_bare_key_arm(BareKeyArm::KvToKey);
+}
+
+#[test]
+fn gray_scanned_kv_omit_clears_the_bare_userdata_key() {
+    run_bare_key_arm(BareKeyArm::KvOmit);
+}
