@@ -1274,6 +1274,22 @@ impl LuaHeap {
         self.mark = Some(state);
     }
 
+    /// Enqueues a metatable stored on an already discovered owner.
+    ///
+    /// The edge is strong even when that owner caches weak values. Only the
+    /// direct metatable is queued; its `__index` child waits for the continued
+    /// scan. An absent metatable is not a target. This does not read `__mode`,
+    /// scan the owner, restart the cycle, or push an object that is already marked.
+    pub(super) fn barrier_strong_metatable(&mut self, owner: u32, slot: u32, generation: u32) {
+        let Some(mut state) = self.mark.take() else {
+            return;
+        };
+        if state.mutation_open() && discovered_table(self, owner) {
+            enqueue_barrier_target(self, &mut state, slot, generation, HandleKind::Table);
+        }
+        self.mark = Some(state);
+    }
+
     /// Enqueues a newly inserted table-object key, and a strong table value.
     ///
     /// A string value is not a table node. An owner that is not yet marked is

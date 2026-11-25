@@ -2087,6 +2087,9 @@ impl LuaHeap {
             }
         }
         self.slots[owner.slot() as usize].metatable = next;
+        if let Some(target) = mt {
+            self.barrier_strong_metatable(owner.slot(), target.slot(), target.generation());
+        }
         Ok(())
     }
 

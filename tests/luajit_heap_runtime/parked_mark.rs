@@ -4427,3 +4427,415 @@ fn gray_ordinary_gap_text_omitted_write_keeps_the_gap() {
 fn gray_ordinary_gap_number_omitted_write_keeps_the_gap() {
     ordinary_gap_refill_after_real_clear(OrdinaryGapKey::Number, OrdinaryGapWrite::Omitted);
 }
+
+#[derive(Clone, Copy, Debug)]
+enum MetatableWrite {
+    Attach,
+    Replace,
+    OmitAttach,
+    OmitReplace,
+    WeakReplace,
+}
+
+fn metatable_write_publishes(arm: MetatableWrite) -> bool {
+    matches!(
+        arm,
+        MetatableWrite::Attach | MetatableWrite::Replace | MetatableWrite::WeakReplace
+    )
+}
+
+fn metatable_write_replaces(arm: MetatableWrite) -> bool {
+    matches!(
+        arm,
+        MetatableWrite::Replace | MetatableWrite::OmitReplace | MetatableWrite::WeakReplace
+    )
+}
+
+struct MetatablePlant {
+    frame: RootFrameId,
+    sentinel: TableRef,
+    owner: TableRef,
+    witness: TableRef,
+    old: Option<TableRef>,
+    fresh: TableRef,
+    child: TableRef,
+    orphan: TableRef,
+    owner_record: u32,
+    sentinel_record: u32,
+}
+
+struct MetatableWriteSnap {
+    fresh_marked: bool,
+    child_marked: bool,
+    visits: u64,
+    pushed: u64,
+    barriers: u64,
+}
+
+fn gray_metatable_after_owner_scan(arm: MetatableWrite) {
+    let publishes = metatable_write_publishes(arm);
+    let replaces = metatable_write_replaces(arm);
+    let weak_owner = matches!(arm, MetatableWrite::WeakReplace);
+    crate::with_idle_vm(|vm| {
+        use crate::heap::{self, StepOutcome};
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits(16, 4, 16)).expect("install");
+        let planted = heap::with_heap(&mut host, |heap| -> Result<MetatablePlant, HeapError> {
+            let sentinel = heap.alloc()?;
+            let owner = heap.alloc()?;
+            let witness = heap.alloc()?;
+            let witness_meta = heap.alloc()?;
+            let fresh = heap.alloc()?;
+            let child = heap.alloc()?;
+            let orphan = heap.alloc()?;
+            let dust = heap.alloc()?;
+            let old = if replaces { Some(heap.alloc()?) } else { None };
+            heap.set_named_scalar(sentinel, "pending", Value::Bool(true))?;
+            heap.set_named_scalar(owner, "kept", Value::string("kept"))?;
+            heap.set_metatable(witness, Some(witness_meta))?;
+            heap.set_mode_scalar(witness_meta, Value::string("v"))?;
+            heap.set_named_edge(fresh, "__index", child)?;
+            heap.set_named_scalar(child, "field", Value::string("41"))?;
+            heap.set_named_edge(witness, "fresh", fresh)?;
+            heap.set_named_edge(witness, "child", child)?;
+            heap.set_named_edge(witness, "orphan", orphan)?;
+            if let Some(old) = old {
+                if weak_owner {
+                    heap.set_mode_scalar(old, Value::string("v"))?;
+                    heap.set_mode_scalar(fresh, Value::string("v"))?;
+                }
+                heap.set_metatable(owner, Some(old))?;
+            }
+            let frame = heap.enter_roots(3)?;
+            heap.write_root(frame, 0, sentinel)?;
+            heap.write_root(frame, 1, owner)?;
+            heap.write_root(frame, 2, witness)?;
+            let owner_record = heap
+                .locate_named(owner.slot(), "kept")
+                .expect("owner record")
+                .1;
+            let sentinel_record = heap
+                .locate_named(sentinel.slot(), "pending")
+                .expect("sentinel record")
+                .1;
+            let _ = dust;
+            Ok(MetatablePlant {
+                frame,
+                sentinel,
+                owner,
+                witness,
+                old,
+                fresh,
+                child,
+                orphan,
+                owner_record,
+                sentinel_record,
+            })
+        })
+        .expect("plant");
+        heap::open_fixed_step(&mut host).expect("open");
+        let snap = heap::with_heap(&mut host, |heap| -> Result<MetatableWriteSnap, HeapError> {
+            let mut parked = ParkedMark::resume(heap).expect("resume saved mark");
+            let before_edges = parked.meter().outgoing_edge_checks;
+            pause_at(&mut parked, planted.owner.slot(), planted.owner_record);
+            pause_at(
+                &mut parked,
+                planted.sentinel.slot(),
+                planted.sentinel_record,
+            );
+            assert_eq!(parked.phase_name(), "gray", "collector is parked in Gray");
+            assert!(parked.mutation_open(), "Gray still accepts a write");
+            assert!(
+                parked.meter().outgoing_edge_checks > before_edges,
+                "the owner record was charged, so the owner scan has moved on"
+            );
+            assert_eq!(parked.phase_name(), "gray");
+            assert!(parked.mutation_open());
+            assert!(parked.pending().is_some(), "sentinel work is still pending");
+            assert!(parked.marked(planted.owner), "the owner is already marked");
+            assert!(
+                !parked.marked(planted.fresh),
+                "the new metatable starts white"
+            );
+            assert!(
+                !parked.marked(planted.child),
+                "the index child starts white"
+            );
+            if let Some(old) = planted.old {
+                assert!(
+                    parked.marked(old),
+                    "the old metatable was followed when the owner scan began"
+                );
+            }
+            parked.with_saved_heap(|heap| -> Result<(), HeapError> {
+                assert_eq!(
+                    heap.stats().live_roots,
+                    3,
+                    "only the three frame roots exist"
+                );
+                for slot in 0..3 {
+                    let rooted = heap.rooted_table(planted.frame, slot)?;
+                    assert_ne!(rooted, Some(planted.fresh), "fresh has no independent root");
+                    assert_ne!(rooted, Some(planted.child), "child has no independent root");
+                    assert_ne!(
+                        rooted,
+                        Some(planted.orphan),
+                        "orphan has no independent root"
+                    );
+                }
+                match planted.old {
+                    Some(old) => assert_eq!(heap.metatable(planted.owner)?, Some(old)),
+                    None => assert_eq!(heap.metatable(planted.owner)?, None),
+                }
+                if weak_owner {
+                    let old = planted
+                        .old
+                        .expect("weak arm replaces an existing metatable");
+                    let old_mode = heap.named_value(old, "__mode")?;
+                    let new_mode = heap.named_value(planted.fresh, "__mode")?;
+                    assert_eq!(old_mode, Value::string("v"));
+                    assert_eq!(new_mode, old_mode, "old and new weak modes stay equal");
+                }
+                Ok(())
+            })?;
+            let before = parked.meter();
+            let pending = parked.pending();
+            if publishes {
+                parked.with_saved_heap(|heap| -> Result<(), HeapError> {
+                    heap.set_metatable(planted.owner, Some(planted.fresh))?;
+                    let read = heap.metatable(planted.owner)?.expect("immediate readback");
+                    assert_eq!(read.slot(), planted.fresh.slot());
+                    assert_eq!(
+                        read.generation(),
+                        planted.fresh.generation(),
+                        "the setter stores the original generation"
+                    );
+                    Ok(())
+                })?;
+            }
+            let after = parked.meter();
+            assert_write_did_not_scan(&before, &after);
+            assert!(
+                same_pending(pending, parked.pending()),
+                "the write does not move the pending cursor"
+            );
+            assert_eq!(
+                parked.phase_name(),
+                "gray",
+                "the write does not finish the mark"
+            );
+            assert!(
+                parked.pending().is_some(),
+                "sentinel work remains after the write"
+            );
+            assert_eq!(
+                after.metatable_edge_checks, before.metatable_edge_checks,
+                "the setter does not scan the owner metatable chain"
+            );
+            assert_eq!(
+                after.weak_mode_lookups, before.weak_mode_lookups,
+                "the setter does not consult the weak-mode cache"
+            );
+            let snap = MetatableWriteSnap {
+                fresh_marked: parked.marked(planted.fresh),
+                child_marked: parked.marked(planted.child),
+                visits: after.node_slot_visits - before.node_slot_visits,
+                pushed: after.scratch.work_pushed - before.scratch.work_pushed,
+                barriers: after.parked_barrier_marks - before.parked_barrier_marks,
+            };
+            parked.park()?;
+            Ok(snap)
+        })
+        .expect("pause");
+        let published = heap::step_fixed_frames(&mut host, 128).expect("publish");
+        assert!(
+            matches!(published, StepOutcome::Published { .. }),
+            "the cycle publishes weak clears before release: {published:?}"
+        );
+        let finished = heap::step_fixed_frames(&mut host, 128).expect("finish");
+        assert!(
+            matches!(finished, StepOutcome::Completed(_)),
+            "the continuation finishes the cycle: {finished:?}"
+        );
+        assert!(heap::fixed_step_idle(&mut host).expect("idle"));
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            assert!(
+                !heap.alive(planted.orphan),
+                "the weak orphan is cleared in this cycle"
+            );
+            assert_eq!(heap.named_edge(planted.witness, "orphan")?, None);
+            assert_eq!(
+                heap.alive(planted.fresh),
+                publishes,
+                "after this cycle the new metatable is alive only through the strong metatable edge"
+            );
+            assert_eq!(heap.alive(planted.child), publishes);
+            if publishes {
+                let mounted = heap.metatable(planted.owner)?.expect("mounted");
+                assert_eq!(mounted.slot(), planted.fresh.slot());
+                assert_eq!(mounted.generation(), planted.fresh.generation());
+                let index = heap.named_edge(mounted, "__index")?.expect("index child");
+                assert_eq!(index.slot(), planted.child.slot());
+                assert_eq!(index.generation(), planted.child.generation());
+                assert_eq!(heap.named_value(index, "field")?, Value::string("41"));
+                assert_eq!(
+                    heap.named_edge(planted.witness, "fresh")?,
+                    Some(planted.fresh),
+                    "the weak witness reads the original object and does not root it"
+                );
+                assert!(
+                    snap.fresh_marked,
+                    "the write grays only the direct metatable"
+                );
+                assert!(
+                    !snap.child_marked,
+                    "the index child stays white until the continued scan"
+                );
+                assert_eq!(snap.visits, 2, "the setter visits only the new metatable");
+                assert_eq!(snap.pushed, 1);
+                assert_eq!(snap.barriers, 1);
+                heap.set_metatable(planted.owner, None)?;
+                assert_eq!(heap.metatable(planted.owner)?, None);
+                let _ = heap.collect();
+                assert!(
+                    !heap.alive(planted.fresh),
+                    "removing the only metatable edge collects the new metatable"
+                );
+                assert!(
+                    !heap.alive(planted.child),
+                    "the index child has no other root"
+                );
+                assert!(heap.alive(planted.owner));
+                assert!(heap.alive(planted.sentinel));
+            } else {
+                assert!(!snap.fresh_marked);
+                assert!(!snap.child_marked);
+                assert_eq!(snap.visits, 0);
+                assert_eq!(snap.pushed, 0);
+                assert_eq!(snap.barriers, 0);
+                match planted.old {
+                    Some(old) => {
+                        let still = heap.metatable(planted.owner)?.expect("old edge remains");
+                        assert_eq!(still.slot(), old.slot());
+                        assert_eq!(still.generation(), old.generation());
+                    }
+                    None => assert_eq!(heap.metatable(planted.owner)?, None),
+                }
+                assert_eq!(heap.named_edge(planted.witness, "fresh")?, None);
+                assert_eq!(heap.named_edge(planted.witness, "child")?, None);
+            }
+            Ok(())
+        })
+        .expect("observe");
+    });
+}
+
+#[test]
+fn gray_metatable_attach_keeps_the_new_graph() {
+    gray_metatable_after_owner_scan(MetatableWrite::Attach);
+}
+
+#[test]
+fn gray_metatable_replace_keeps_the_new_graph() {
+    gray_metatable_after_owner_scan(MetatableWrite::Replace);
+}
+
+#[test]
+fn gray_metatable_attach_omitted_collects_the_new_graph() {
+    gray_metatable_after_owner_scan(MetatableWrite::OmitAttach);
+}
+
+#[test]
+fn gray_metatable_replace_omitted_keeps_the_old_edge() {
+    gray_metatable_after_owner_scan(MetatableWrite::OmitReplace);
+}
+
+#[test]
+fn gray_weak_value_owner_keeps_an_equal_mode_metatable() {
+    gray_metatable_after_owner_scan(MetatableWrite::WeakReplace);
+}
+
+#[test]
+fn published_tail_set_metatable_refuses_without_changing_identity() {
+    crate::with_idle_vm(|vm| {
+        use crate::heap::{self, StepOutcome};
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits(8, 2, 8)).expect("install");
+        let (owner, old, fresh) = heap::with_heap(&mut host, |heap| -> Result<_, HeapError> {
+            let sentinel = heap.alloc()?;
+            let owner = heap.alloc()?;
+            let old = heap.alloc()?;
+            let fresh = heap.alloc()?;
+            let dust = heap.alloc()?;
+            heap.set_metatable(owner, Some(old))?;
+            heap.set_named_scalar(owner, "kept", Value::string("kept"))?;
+            heap.set_named_scalar(sentinel, "pending", Value::Bool(true))?;
+            let frame = heap.enter_roots(2)?;
+            heap.write_root(frame, 0, sentinel)?;
+            heap.write_root(frame, 1, owner)?;
+            let _ = (dust, frame);
+            Ok((owner, old, fresh))
+        })
+        .expect("plant");
+        heap::open_fixed_step(&mut host).expect("open");
+        let published = heap::step_fixed_frames(&mut host, 128).expect("publish");
+        assert!(
+            matches!(published, StepOutcome::Published { .. }),
+            "{published:?}"
+        );
+        let tail_before = heap::saved_tail_state(&mut host)
+            .expect("tail read")
+            .expect("published tail");
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            let stored = heap.slots[owner.slot() as usize].metatable;
+            let edges = heap.metatable_edges;
+            let stats = heap.stats();
+            let meter = heap.scan_meter();
+            assert_eq!(heap.metatable(owner)?, Some(old));
+            assert_eq!(
+                heap.set_metatable(owner, Some(fresh)),
+                Err(HeapError::SweepPending)
+            );
+            assert_eq!(
+                heap.set_metatable(owner, None),
+                Err(HeapError::SweepPending)
+            );
+            assert_eq!(heap.metatable(owner)?, Some(old));
+            assert_eq!(heap.slots[owner.slot() as usize].metatable, stored);
+            assert_eq!(heap.metatable_edges, edges);
+            assert_eq!(heap.stats(), stats);
+            assert_eq!(heap.scan_meter(), meter);
+            assert_eq!(heap.named_value(owner, "kept")?, Value::string("kept"));
+            assert!(
+                heap.alive(fresh),
+                "refusal does not release the rejected target"
+            );
+            assert!(heap.alive(old));
+            Ok(())
+        })
+        .expect("refusal");
+        let tail_after = heap::saved_tail_state(&mut host)
+            .expect("tail read")
+            .expect("tail still saved");
+        assert_eq!(tail_before.phase, tail_after.phase);
+        assert_eq!(tail_before.cursor, tail_after.cursor);
+        assert_eq!(tail_before.live_roots, tail_after.live_roots);
+        assert_eq!(tail_before.dead_len, tail_after.dead_len);
+        let finished = heap::step_fixed_frames(&mut host, 128).expect("finish");
+        assert!(
+            matches!(finished, StepOutcome::Completed(_)),
+            "{finished:?}"
+        );
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            let still = heap.metatable(owner)?.expect("old edge remains");
+            assert_eq!(still.slot(), old.slot());
+            assert_eq!(still.generation(), old.generation());
+            assert!(
+                !heap.alive(fresh),
+                "the rejected metatable was never stored"
+            );
+            Ok(())
+        })
+        .expect("after release");
+    });
+}
