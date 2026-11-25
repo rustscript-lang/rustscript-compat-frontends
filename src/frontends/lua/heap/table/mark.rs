@@ -1691,6 +1691,15 @@ impl LuaHeap {
         if !state.mutation_open() {
             return false;
         }
+        // Re-setting the same metatable is not a transition. A direct delete
+        // already armed the discovery probe for that owner; scheduling here
+        // would duplicate it, and the owner was popped from the queue before
+        // its rescan started, so a repeat setter could link it back ahead of
+        // discovery forever. The old bit restored from the delete stamp is
+        // only for an owner that actually moved off that metatable.
+        if old_tuple == new_tuple {
+            return false;
+        }
         let old_mode = mode_before_direct_delete(state, old_tuple)
             .unwrap_or_else(|| mode_of_tuple(state, old_tuple));
         let new_mode = mode_of_tuple(state, new_tuple);
