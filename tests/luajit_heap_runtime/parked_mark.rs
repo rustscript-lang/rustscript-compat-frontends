@@ -5,7 +5,7 @@
 
 use super::{
     ClosureRef, HeapError, HeapLimits, HeapStats, LuaHeap, ParkedMark, PausedOp, PendingScan,
-    RootFrameId, ScanMeter, TableRef, UpvalueRef,
+    RootFrameId, ScanMeter, TableRef, UpvalueRef, UserdataRef,
 };
 use crate::heap;
 use vm::Value;
@@ -5518,6 +5518,9 @@ fn assert_closure_graph_unrooted(heap: &LuaHeap, planted: &ClosedCellClosurePlan
                     "{label}: the capture cell has no strong root"
                 );
             }
+            // This check names the planted closure graph. A userdata root is
+            // another kind and is not one of those nodes.
+            Some(super::Rooted::Userdata(_handle)) => {}
             None => {}
         }
     }
@@ -6952,4 +6955,323 @@ fn rescan_unrelated_delete_leaves_the_cursor() {
         })
         .expect("published");
     });
+}
+
+/// Bare userdata under numeric key 1 of a weak-value table. The value has no
+/// independent strong root. A sibling shares the original `v` metatable and
+/// holds a different userdata. A third weak table observes the same userdata.
+/// A separate weak table holds an orphan userdata.
+struct BareUserdata {
+    sentinel: TableRef,
+    left: TableRef,
+    right: TableRef,
+    witness: TableRef,
+    orphan_table: TableRef,
+    weak_mt: TableRef,
+    strong_mt: TableRef,
+    subject: UserdataRef,
+    sibling: UserdataRef,
+    orphan: UserdataRef,
+    dust: TableRef,
+    sentinel_record: u32,
+    subject_record: u32,
+}
+
+#[derive(Clone, Copy)]
+enum BareArm {
+    Swap,
+    Clear,
+    Omit,
+}
+
+fn plant_bare_userdata(heap: &mut LuaHeap) -> Result<BareUserdata, HeapError> {
+    let sentinel = heap.alloc()?;
+    let left = heap.alloc()?;
+    let right = heap.alloc()?;
+    let witness = heap.alloc()?;
+    let orphan_table = heap.alloc()?;
+    let weak_mt = heap.alloc()?;
+    let strong_mt = heap.alloc()?;
+    let subject = heap.alloc_userdata()?;
+    let sibling = heap.alloc_userdata()?;
+    let orphan = heap.alloc_userdata()?;
+    let dust = heap.alloc()?;
+    heap.set_mode_scalar(weak_mt, Value::string("v"))?;
+    heap.set_metatable(left, Some(weak_mt))?;
+    heap.set_metatable(right, Some(weak_mt))?;
+    heap.set_metatable(witness, Some(weak_mt))?;
+    heap.set_metatable(orphan_table, Some(weak_mt))?;
+    heap.set_named_scalar(sentinel, "pending", Value::Bool(true))?;
+    heap.set_named_scalar(left, "charged", Value::Bool(true))?;
+    heap.set_number_userdata(left, 1.0, subject)?;
+    heap.set_number_userdata(right, 1.0, sibling)?;
+    heap.set_number_userdata(witness, 1.0, subject)?;
+    heap.set_number_userdata(orphan_table, 1.0, orphan)?;
+    let frame = heap.enter_roots(6)?;
+    // Last written root is scanned first. The sentinel stays pending until
+    // the owners written after it have been scanned.
+    heap.write_root(frame, 0, sentinel)?;
+    heap.write_root(frame, 1, right)?;
+    heap.write_root(frame, 2, witness)?;
+    heap.write_root(frame, 3, orphan_table)?;
+    heap.write_root(frame, 4, strong_mt)?;
+    heap.write_root(frame, 5, left)?;
+    assert_userdata_unrooted(heap, subject);
+    assert_userdata_unrooted(heap, sibling);
+    assert_userdata_unrooted(heap, orphan);
+    let (_, sentinel_record) = heap
+        .locate_named(sentinel.slot(), "pending")
+        .expect("sentinel record");
+    let subject_record = heap
+        .number_edge_watch(left, 1.0)
+        .expect("numeric userdata edge")
+        .0;
+    let _ = frame;
+    let _ = dust;
+    Ok(BareUserdata {
+        sentinel,
+        left,
+        right,
+        witness,
+        orphan_table,
+        weak_mt,
+        strong_mt,
+        subject,
+        sibling,
+        orphan,
+        dust,
+        sentinel_record,
+        subject_record,
+    })
+}
+
+fn assert_userdata_unrooted(heap: &LuaHeap, value: UserdataRef) {
+    for rooted in &heap.roots {
+        if let Some(super::Rooted::Userdata(handle)) = rooted {
+            assert_ne!(*handle, value, "userdata has no independent strong root");
+        }
+    }
+}
+
+fn userdata_marked(parked: &mut ParkedMark<'_>, value: UserdataRef) -> bool {
+    parked.with_saved_heap(|heap| {
+        slot_is_marked(
+            heap,
+            value.slot(),
+            value.generation(),
+            super::HandleKind::Userdata,
+        )
+    })
+}
+
+fn open_bare_userdata(host: &mut vm::HostContext<'_>) -> BareUserdata {
+    heap::install(host, limits(16, 8, 24)).expect("install");
+    let graph = heap::with_heap(host, plant_bare_userdata).expect("plant");
+    heap::open_fixed_step(host).expect("open");
+    graph
+}
+
+fn prove_scanned_white(parked: &mut ParkedMark<'_>, graph: &BareUserdata) {
+    let pending = pause_at(parked, graph.sentinel.slot(), graph.sentinel_record);
+    assert_eq!(pending.owner, graph.sentinel.slot());
+    assert_eq!(pending.cursor, graph.sentinel_record);
+    assert_ne!(
+        pending.cursor, graph.subject_record,
+        "the pending record is not the userdata edge"
+    );
+    assert!(parked.marked(graph.left), "the owner weak edge was scanned");
+    assert!(
+        parked.meter().outgoing_edge_checks > 0,
+        "the owner scan charged an edge"
+    );
+    assert!(
+        !userdata_marked(parked, graph.subject),
+        "the weak scan left the userdata white"
+    );
+    assert!(!userdata_marked(parked, graph.sibling));
+    assert!(!userdata_marked(parked, graph.orphan));
+    let record = parked
+        .with_saved_heap(|heap| heap.number_edge_watch(graph.left, 1.0))
+        .expect("userdata edge remains")
+        .0;
+    assert_eq!(record, graph.subject_record);
+    parked.with_saved_heap(|heap| {
+        assert_userdata_unrooted(heap, graph.subject);
+        assert_eq!(
+            heap.metatable(graph.right).expect("sibling metatable"),
+            Some(graph.weak_mt)
+        );
+        assert_eq!(
+            heap.metatable(graph.left).expect("owner metatable"),
+            Some(graph.weak_mt)
+        );
+    });
+}
+
+fn refuse_parked_userdata_write(parked: &mut ParkedMark<'_>, graph: &BareUserdata) {
+    let pending = parked.pending();
+    let before = parked.meter();
+    let refused =
+        parked.with_saved_heap(|heap| heap.set_number_userdata(graph.left, 1.0, graph.sibling));
+    assert!(
+        matches!(refused, Err(HeapError::MarkDenied)),
+        "a paused mark refuses an unbarriered userdata write, got {refused:?}"
+    );
+    assert!(same_pending(pending, parked.pending()));
+    assert_setter_did_not_move_scan(&before, &parked.meter());
+    assert!(!userdata_marked(parked, graph.subject));
+    let stored =
+        parked.with_saved_heap(|heap| heap.number_userdata(graph.left, 1.0).expect("read"));
+    assert_eq!(stored, Some(graph.subject));
+}
+
+fn strengthen_bare(parked: &mut ParkedMark<'_>, graph: &BareUserdata, arm: BareArm) {
+    let pending = parked.pending();
+    let before = parked.meter();
+    let roots = parked.stats().live_roots;
+    match arm {
+        BareArm::Swap => {
+            write_metatable(parked, graph.left, Some(graph.strong_mt))
+                .expect("replace with the preallocated strong metatable");
+        }
+        BareArm::Clear => {
+            write_metatable(parked, graph.left, None).expect("clear the weak metatable");
+        }
+        BareArm::Omit => unreachable!("omit does not call the setter"),
+    }
+    assert!(same_pending(pending, parked.pending()));
+    assert_setter_did_not_move_scan(&before, &parked.meter());
+    assert_eq!(parked.stats().live_roots, roots);
+    assert_eq!(
+        parked.meter().owner_rescan_heads,
+        before.owner_rescan_heads,
+        "the setter does not open the rescan"
+    );
+    assert_eq!(
+        parked.meter().owner_rescan_schedules,
+        before.owner_rescan_schedules + 1
+    );
+    assert!(!userdata_marked(parked, graph.subject));
+    let rescan = pause_on_rescan(parked, graph.left.slot(), graph.subject_record);
+    assert_eq!(rescan.cursor, graph.subject_record);
+    assert!(
+        parked.meter().owner_rescan_heads > before.owner_rescan_heads,
+        "a budgeted pulse opened the rescan"
+    );
+    assert!(
+        !userdata_marked(parked, graph.subject),
+        "the rescan cursor has not charged the userdata yet"
+    );
+    let checks = parked.meter().outgoing_edge_checks;
+    let _view = parked.pulse(1);
+    assert_eq!(parked.meter().outgoing_edge_checks, checks + 1);
+    assert!(
+        userdata_marked(parked, graph.subject),
+        "budgeted rescan did not keep the same userdata alive"
+    );
+    let stored =
+        parked.with_saved_heap(|heap| heap.number_userdata(graph.left, 1.0).expect("read"));
+    assert_eq!(stored, Some(graph.subject));
+}
+
+fn finish_bare_kept(host: &mut vm::HostContext<'_>, graph: &BareUserdata) {
+    let done = finish_fixed_cycle(host);
+    assert!(
+        matches!(done, crate::heap::StepOutcome::Completed(_)),
+        "{done:?}"
+    );
+    assert!(heap::fixed_step_idle(host).expect("idle"));
+    heap::with_heap(host, |heap| -> Result<(), HeapError> {
+        let found = heap
+            .number_userdata(graph.left, 1.0)?
+            .expect("original userdata");
+        assert_eq!(found.slot(), graph.subject.slot());
+        assert_eq!(found.generation(), graph.subject.generation());
+        assert!(heap.userdata_alive(found));
+        assert_eq!(
+            heap.number_userdata(graph.witness, 1.0)?,
+            Some(graph.subject)
+        );
+        assert_eq!(heap.number_userdata(graph.right, 1.0)?, None);
+        assert!(!heap.userdata_alive(graph.sibling));
+        assert_eq!(heap.number_userdata(graph.orphan_table, 1.0)?, None);
+        assert!(!heap.userdata_alive(graph.orphan));
+        assert!(!heap.alive(graph.dust), "sweep released an unrooted node");
+        heap.set_metatable(graph.left, Some(graph.weak_mt))?;
+        Ok(())
+    })
+    .expect("kept cycle");
+    heap::collect(host).expect("next cycle after restoring v");
+    heap::with_heap(host, |heap| -> Result<(), HeapError> {
+        assert!(
+            !heap.userdata_alive(graph.subject),
+            "the next cycle clears the restored weak value"
+        );
+        assert_eq!(heap.number_userdata(graph.left, 1.0)?, None);
+        assert_eq!(heap.number_userdata(graph.witness, 1.0)?, None);
+        Ok(())
+    })
+    .expect("released");
+}
+
+fn finish_bare_omitted(host: &mut vm::HostContext<'_>, graph: &BareUserdata) {
+    let done = finish_fixed_cycle(host);
+    assert!(
+        matches!(done, crate::heap::StepOutcome::Completed(_)),
+        "{done:?}"
+    );
+    assert!(heap::fixed_step_idle(host).expect("idle"));
+    heap::with_heap(host, |heap| -> Result<(), HeapError> {
+        assert_eq!(heap.number_userdata(graph.left, 1.0)?, None);
+        assert!(!heap.userdata_alive(graph.subject));
+        assert_eq!(heap.number_userdata(graph.witness, 1.0)?, None);
+        assert_eq!(heap.number_userdata(graph.right, 1.0)?, None);
+        assert!(!heap.userdata_alive(graph.sibling));
+        assert_eq!(heap.number_userdata(graph.orphan_table, 1.0)?, None);
+        assert!(!heap.userdata_alive(graph.orphan));
+        assert!(!heap.alive(graph.dust));
+        heap.set_metatable(graph.left, Some(graph.weak_mt))?;
+        Ok(())
+    })
+    .expect("omitted cycle");
+    heap::collect(host).expect("next cycle");
+    heap::with_heap(host, |heap| {
+        assert!(!heap.userdata_alive(graph.subject));
+        assert_eq!(heap.number_userdata(graph.left, 1.0)?, None);
+        Ok(())
+    })
+    .expect("still clear");
+}
+
+fn run_bare_userdata(arm: BareArm) {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        let graph = open_bare_userdata(&mut host);
+        resume_weak(&mut host, |parked| {
+            prove_scanned_white(parked, &graph);
+            refuse_parked_userdata_write(parked, &graph);
+            if !matches!(arm, BareArm::Omit) {
+                strengthen_bare(parked, &graph, arm);
+            }
+        });
+        match arm {
+            BareArm::Omit => finish_bare_omitted(&mut host, &graph),
+            BareArm::Swap | BareArm::Clear => finish_bare_kept(&mut host, &graph),
+        }
+    });
+}
+
+#[test]
+fn gray_scanned_weak_owner_strengthen_marks_bare_userdata() {
+    run_bare_userdata(BareArm::Swap);
+}
+
+#[test]
+fn gray_scanned_weak_owner_clear_metatable_marks_bare_userdata() {
+    run_bare_userdata(BareArm::Clear);
+}
+
+#[test]
+fn gray_scanned_weak_owner_omitted_clears_bare_userdata() {
+    run_bare_userdata(BareArm::Omit);
 }

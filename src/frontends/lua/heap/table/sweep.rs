@@ -591,6 +591,9 @@ impl<'a> SweepSession<'a> {
             EdgeValue::Upvalue { slot, generation } => {
                 !self.typed(*slot, *generation, HandleKind::Upvalue)
             }
+            EdgeValue::Userdata { slot, generation } => {
+                !self.typed(*slot, *generation, HandleKind::Userdata)
+            }
         };
         let make_gap = owner_marked && weak && value_dead && self.guest_cursor(&edge.key);
         let value_ok = make_gap
@@ -602,6 +605,9 @@ impl<'a> SweepSession<'a> {
                 }
                 EdgeValue::Upvalue { slot, generation } => {
                     self.typed(*slot, *generation, HandleKind::Upvalue)
+                }
+                EdgeValue::Userdata { slot, generation } => {
+                    self.typed(*slot, *generation, HandleKind::Userdata)
                 }
             };
         let key_ok = match &edge.key {

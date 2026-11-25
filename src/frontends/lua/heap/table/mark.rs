@@ -749,6 +749,7 @@ fn validate_root_batch(heap: &LuaHeap, batch: &[Rooted]) -> Result<(), HeapError
             Rooted::Table(handle) => heap.require_live(handle)?,
             Rooted::Closure(handle) => heap.require_closure(handle)?,
             Rooted::Upvalue(handle) => heap.require_upvalue(handle)?,
+            Rooted::Userdata(handle) => heap.require_userdata(handle)?,
         }
     }
     Ok(())
@@ -1079,6 +1080,9 @@ fn follow_rescan_ends(heap: &mut LuaHeap, state: &mut MarkState, cursor: u32) {
             EdgeValue::Upvalue { slot, generation } => {
                 Some((*slot, *generation, HandleKind::Upvalue))
             }
+            EdgeValue::Userdata { slot, generation } => {
+                Some((*slot, *generation, HandleKind::Userdata))
+            }
             EdgeValue::Scalar(_) => None,
         };
         (object_key, value_target)
@@ -1117,6 +1121,9 @@ fn follow_edge_ends(heap: &mut LuaHeap, state: &mut MarkState, cursor: u32) {
             EdgeValue::Upvalue { slot, generation } => {
                 Some((*slot, *generation, HandleKind::Upvalue))
             }
+            EdgeValue::Userdata { slot, generation } => {
+                Some((*slot, *generation, HandleKind::Userdata))
+            }
             EdgeValue::Scalar(_) => None,
         };
         (object_key, value_target)
@@ -1128,8 +1135,9 @@ fn follow_edge_ends(heap: &mut LuaHeap, state: &mut MarkState, cursor: u32) {
     {
         let _matched = follow_one(heap, state, slot, generation, kind);
     }
-    // A table entry follows that table's weak mode. A closure or cell
-    // link is not a table entry, so it stays strong.
+    // A table entry follows that table's weak mode. A closure, cell, or
+    // userdata value on a non-table owner is not a table entry, so it stays
+    // strong. A userdata value on a table is weak exactly when values are.
     let strong_value = !from_table || !state.owner_mode.values;
     if strong_value && let Some((slot, generation, kind)) = value_target {
         let _matched = follow_one(heap, state, slot, generation, kind);
@@ -1190,6 +1198,7 @@ fn rooted_identity(rooted: Rooted) -> (u32, u32, HandleKind) {
         Rooted::Table(handle) => (handle.slot(), handle.generation(), HandleKind::Table),
         Rooted::Closure(handle) => (handle.slot(), handle.generation(), HandleKind::Closure),
         Rooted::Upvalue(handle) => (handle.slot(), handle.generation(), HandleKind::Upvalue),
+        Rooted::Userdata(handle) => (handle.slot(), handle.generation(), HandleKind::Userdata),
     }
 }
 
@@ -1427,6 +1436,7 @@ impl LuaHeap {
             Rooted::Table(handle) => (handle.slot(), handle.generation(), HandleKind::Table),
             Rooted::Closure(handle) => (handle.slot(), handle.generation(), HandleKind::Closure),
             Rooted::Upvalue(handle) => (handle.slot(), handle.generation(), HandleKind::Upvalue),
+            Rooted::Userdata(handle) => (handle.slot(), handle.generation(), HandleKind::Userdata),
         };
         enqueue_barrier_target(self, &mut state, slot, generation, kind);
         self.mark = Some(state);

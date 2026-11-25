@@ -1,10 +1,12 @@
-//! Non-moving mark/sweep storage for tables, closures, and shared cells.
+//! Non-moving mark/sweep storage for tables, closures, shared cells, and bare
+//! userdata.
 //!
-//! Closure and cell nodes use the same slots, edges, roots, and sweep as
-//! tables. A private field id is not a Lua number. Internal links are strong.
-//! Only a table entry follows that table's weak mode. An object key stores
-//! the slot, generation, and kind. A closure key is that record with closure
-//! kind. It is not a private field id and not a second edge table.
+//! Closure, cell, and userdata nodes use the same slots, edges, roots, and
+//! sweep as tables. A private field id is not a Lua number. Internal links
+//! are strong. Only a table entry follows that table's weak mode. An object
+//! key stores the slot, generation, and kind. A closure or userdata key is
+//! that record with its own kind. It is not a private field id and not a
+//! second edge table.
 
 use std::fmt;
 use std::sync::Arc;
@@ -12,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use vm::{HostContextError, Value};
 
-use super::handle::{ClosureRef, HandleKind, TableRef, UpvalueRef};
+use super::handle::{ClosureRef, HandleKind, TableRef, UpvalueRef, UserdataRef};
 
 #[path = "table/mark.rs"]
 mod mark;
@@ -340,7 +342,8 @@ fn value_payload(value: &EdgeValue) -> u64 {
         EdgeValue::Scalar(_)
         | EdgeValue::Table { .. }
         | EdgeValue::Closure { .. }
-        | EdgeValue::Upvalue { .. } => 0,
+        | EdgeValue::Upvalue { .. }
+        | EdgeValue::Userdata { .. } => 0,
     }
 }
 
@@ -381,6 +384,11 @@ enum EdgeValue {
         slot: u32,
         generation: u32,
     },
+    /// A bare userdata target. Not a guest table and not a Core number.
+    Userdata {
+        slot: u32,
+        generation: u32,
+    },
     /// One guest scalar in the same record as a table target. Field 0 on a
     /// table is the only key whose string is read as `__mode`. A cell current
     /// edge may hold a boolean, binary64, string, or bytes; that value is not
@@ -391,9 +399,10 @@ enum EdgeValue {
 impl EdgeValue {
     fn object_slot(&self) -> Option<u32> {
         match self {
-            Self::Table { slot, .. } | Self::Closure { slot, .. } | Self::Upvalue { slot, .. } => {
-                Some(*slot)
-            }
+            Self::Table { slot, .. }
+            | Self::Closure { slot, .. }
+            | Self::Upvalue { slot, .. }
+            | Self::Userdata { slot, .. } => Some(*slot),
             Self::Scalar(_) => None,
         }
     }
@@ -422,7 +431,8 @@ pub enum CellValue {
     Scalar(Value),
 }
 
-/// One explicit root. Table, closure, and upvalue roots share the root vector.
+/// One explicit root. Table, closure, upvalue, and bare userdata roots share
+/// the root vector.
 ///
 /// Visible to the private host continuation. Not a public heap schema.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -430,6 +440,7 @@ pub(super) enum Rooted {
     Table(TableRef),
     Closure(ClosureRef),
     Upvalue(UpvalueRef),
+    Userdata(UserdataRef),
 }
 
 impl Rooted {
@@ -438,6 +449,7 @@ impl Rooted {
             Self::Table(handle) => handle.slot(),
             Self::Closure(handle) => handle.slot(),
             Self::Upvalue(handle) => handle.slot(),
+            Self::Userdata(handle) => handle.slot(),
         }
     }
 }
@@ -466,7 +478,11 @@ impl EdgeKey {
         Self::identity(key.slot(), key.generation(), key.kind())
     }
 
-    /// One object-key record. Table and closure keys differ by `kind`.
+    fn userdata_key(key: UserdataRef) -> Self {
+        Self::identity(key.slot(), key.generation(), key.kind())
+    }
+
+    /// One object-key record. Table, closure, and userdata keys differ by `kind`.
     fn identity(slot: u32, generation: u32, kind: HandleKind) -> Self {
         Self::Object {
             slot,
@@ -871,6 +887,26 @@ impl LuaHeap {
     pub fn alloc_upvalue(&mut self) -> Result<UpvalueRef, HeapError> {
         let (index, generation) = self.alloc_slot(HandleKind::Upvalue)?;
         Ok(UpvalueRef::upvalue(self.domain, index, generation))
+    }
+
+    /// Reserves a live, unrooted bare userdata. It uses the same node cap as a
+    /// table. It has no guest carrier, finalizer, or resource token.
+    ///
+    /// A paused mark and a published tail are refused before a free slot is
+    /// taken or a new slot is grown. `alloc_slot` alone does not see a paused
+    /// gray mark. A full node vector still reports capacity and does not write.
+    pub fn alloc_userdata(&mut self) -> Result<UserdataRef, HeapError> {
+        if !self.free_list.is_empty() {
+            self.deny_unbarriered()?;
+        } else if self.slots.len() >= self.limits.nodes as usize {
+            return Err(HeapError::NodeCapacity);
+        } else if self.limits.max_generation == 0 {
+            return Err(HeapError::GenerationExhausted);
+        } else {
+            self.deny_unbarriered()?;
+        }
+        let (index, generation) = self.alloc_slot(HandleKind::Userdata)?;
+        Ok(UserdataRef::userdata(self.domain, index, generation))
     }
 
     fn alloc_slot(&mut self, kind: HandleKind) -> Result<(u32, u32), HeapError> {
@@ -1342,7 +1378,9 @@ impl LuaHeap {
             EdgeValue::Scalar(
                 value @ (Value::Bool(_) | Value::Float(_) | Value::String(_) | Value::Bytes(_)),
             ) => Ok(Some(CellValue::Scalar(value.clone()))),
-            EdgeValue::Upvalue { .. } | EdgeValue::Scalar(_) => Err(HeapError::WrongKind),
+            EdgeValue::Upvalue { .. } | EdgeValue::Userdata { .. } | EdgeValue::Scalar(_) => {
+                Err(HeapError::WrongKind)
+            }
         }
     }
 
@@ -1539,7 +1577,9 @@ impl LuaHeap {
             let utf8 = matches!(edge.key, EdgeKey::Utf8(_));
             let value = match &edge.value {
                 EdgeValue::Scalar(Value::Null) => PublishedName::Gap,
-                EdgeValue::Closure { .. } | EdgeValue::Upvalue { .. } => PublishedName::Internal,
+                EdgeValue::Closure { .. }
+                | EdgeValue::Upvalue { .. }
+                | EdgeValue::Userdata { .. } => PublishedName::Internal,
                 EdgeValue::Table { slot, generation } => PublishedName::Table(*slot, *generation),
                 EdgeValue::Scalar(_) => PublishedName::Scalar,
             };
@@ -1643,6 +1683,48 @@ impl LuaHeap {
         self.write_edge(from, EdgeKey::closure_key(key), EdgeValue::Scalar(value))
     }
 
+    /// Writes one boolean, binary64, string, or bytes value under a bare userdata key.
+    ///
+    /// Nil removes that record through [`Self::clear_edge`]. It does not store
+    /// a cursor gap, and a missing key allocates nothing. An integer, array,
+    /// map, callable, or any other carrier is [`HeapError::WrongKind`] and
+    /// leaves the table unchanged.
+    ///
+    /// The key is an object record with userdata kind. It is not a table key
+    /// and not a numeric key. Handle checks run before the gray and published
+    /// tail gates, and those gates run before value classification. A bad
+    /// handle does not write and does not depend on phase. Nil uses the same
+    /// gates. This write has no edge barrier, so a paused mark or saved tail
+    /// is refused before the record changes.
+    pub fn set_userdata_key_scalar(
+        &mut self,
+        from: TableRef,
+        key: UserdataRef,
+        value: Value,
+    ) -> Result<(), HeapError> {
+        self.require_live(from)?;
+        self.require_userdata(key)?;
+        self.deny_unbarriered()?;
+        let stored = EdgeKey::userdata_key(key);
+        match value {
+            Value::Null => self.clear_edge(from, &stored),
+            Value::Bool(_) | Value::Float(_) | Value::String(_) | Value::Bytes(_) => {
+                self.write_edge(from, stored, EdgeValue::Scalar(value))
+            }
+            _ => Err(HeapError::WrongKind),
+        }
+    }
+
+    /// Reads the scalar stored under a bare userdata key.
+    ///
+    /// A dead or reused key is `StaleHandle`. A stored userdata or other
+    /// internal target is `WrongKind`, not a Core number or table.
+    pub fn userdata_key_value(&self, from: TableRef, key: UserdataRef) -> Result<Value, HeapError> {
+        self.require_userdata(key)?;
+        let key = EdgeKey::userdata_key(key);
+        self.stored_value(from, |stored| stored == &key)
+    }
+
     /// Removes one closure-key record. Another closure, including one that
     /// shares this key's cell, is a different identity and stays.
     pub fn clear_closure_key(&mut self, from: TableRef, key: ClosureRef) -> Result<(), HeapError> {
@@ -1685,6 +1767,59 @@ impl LuaHeap {
     ) -> Result<(), HeapError> {
         let key = Self::number_key(key)?;
         self.write_table_edge(from, key, to)
+    }
+
+    /// Writes one bare userdata under a binary64 key.
+    ///
+    /// NaN is refused before any lookup. `+0` and `-0` select the same record.
+    /// The value stays a userdata identity; readers must not return it as a
+    /// table or a Core number. Handle checks run before the gray and published
+    /// tail gates. This write has no edge barrier, so those gates refuse it
+    /// before the record changes.
+    pub fn set_number_userdata(
+        &mut self,
+        from: TableRef,
+        key: f64,
+        value: UserdataRef,
+    ) -> Result<(), HeapError> {
+        let key = Self::number_key(key)?;
+        self.require_live(from)?;
+        self.require_userdata(value)?;
+        self.deny_unbarriered()?;
+        self.write_edge(
+            from,
+            key,
+            EdgeValue::Userdata {
+                slot: value.slot(),
+                generation: value.generation(),
+            },
+        )
+    }
+
+    /// Reads the userdata stored under a binary64 key.
+    ///
+    /// NaN reads as missing after the table is confirmed live. A stored table,
+    /// closure, or cell is `WrongKind`. A scalar, including a weak-cleared
+    /// cursor, is missing. This does not claim a guest `rawget`.
+    pub fn number_userdata(
+        &self,
+        from: TableRef,
+        key: f64,
+    ) -> Result<Option<UserdataRef>, HeapError> {
+        self.require_live(from)?;
+        if key.is_nan() {
+            return Ok(None);
+        }
+        let key = EdgeKey::number(key);
+        match self.read_edge(from, |stored| stored == &key)? {
+            Some(EdgeValue::Userdata { slot, generation }) => {
+                Ok(Some(UserdataRef::userdata(self.domain, *slot, *generation)))
+            }
+            Some(EdgeValue::Scalar(_)) | None => Ok(None),
+            Some(
+                EdgeValue::Table { .. } | EdgeValue::Closure { .. } | EdgeValue::Upvalue { .. },
+            ) => Err(HeapError::WrongKind),
+        }
     }
 
     /// Writes one string under a binary64 key. Nil removal stays on
@@ -2019,7 +2154,7 @@ impl LuaHeap {
             EdgeValue::Table { slot, generation } => {
                 self.issued_value(TableRef::table(self.domain, *slot, *generation))
             }
-            EdgeValue::Closure { .. } | EdgeValue::Upvalue { .. } => {
+            EdgeValue::Closure { .. } | EdgeValue::Upvalue { .. } | EdgeValue::Userdata { .. } => {
                 Err(HeapError::NextUnsupported)
             }
         }
@@ -2055,9 +2190,9 @@ impl LuaHeap {
                 self.issued_value(TableRef::table(self.domain, *slot, *generation))
             }
             Some(EdgeValue::Scalar(value)) => Ok(value.clone()),
-            Some(EdgeValue::Closure { .. } | EdgeValue::Upvalue { .. }) => {
-                Err(HeapError::WrongKind)
-            }
+            Some(
+                EdgeValue::Closure { .. } | EdgeValue::Upvalue { .. } | EdgeValue::Userdata { .. },
+            ) => Err(HeapError::WrongKind),
             None => Ok(Value::Null),
         }
     }
@@ -2072,9 +2207,9 @@ impl LuaHeap {
                 Ok(Some(TableRef::table(self.domain, *slot, *generation)))
             }
             Some(EdgeValue::Scalar(_)) | None => Ok(None),
-            Some(EdgeValue::Closure { .. } | EdgeValue::Upvalue { .. }) => {
-                Err(HeapError::WrongKind)
-            }
+            Some(
+                EdgeValue::Closure { .. } | EdgeValue::Upvalue { .. } | EdgeValue::Userdata { .. },
+            ) => Err(HeapError::WrongKind),
         }
     }
 
@@ -2227,6 +2362,22 @@ impl LuaHeap {
     ) -> Result<(), HeapError> {
         self.require_upvalue(handle)?;
         self.store_root(frame, slot, Rooted::Upvalue(handle))
+    }
+
+    /// Stores a bare userdata in an open frame. Same vector and quota as a
+    /// table root.
+    ///
+    /// A stale, foreign, or wrong-kind handle is refused before the slot
+    /// changes. The existing root barrier marks the node while mutation is
+    /// open. This does not write an edge.
+    pub fn write_userdata_root(
+        &mut self,
+        frame: RootFrameId,
+        slot: u32,
+        handle: UserdataRef,
+    ) -> Result<(), HeapError> {
+        self.require_userdata(handle)?;
+        self.store_root(frame, slot, Rooted::Userdata(handle))
     }
 
     fn store_root(
@@ -2593,6 +2744,19 @@ impl LuaHeap {
         }
     }
 
+    /// Refuses a userdata allocation or edge write that has no full barrier.
+    ///
+    /// A saved tail is reported first. A parked mark, including paused gray, is
+    /// `MarkDenied`. `alloc_slot` only checks the tail, so callers that cannot
+    /// barrier the new node must use this before taking or growing a slot.
+    fn deny_unbarriered(&self) -> Result<(), HeapError> {
+        self.ensure_sweep_open()?;
+        if self.mark.is_some() {
+            return Err(HeapError::MarkDenied);
+        }
+        Ok(())
+    }
+
     fn ensure_published_tail(&self) -> Result<(), HeapError> {
         if self.sweep_tail.is_some() {
             Ok(())
@@ -2744,6 +2908,11 @@ impl LuaHeap {
         self.require_upvalue(handle).is_ok()
     }
 
+    /// Reports whether `handle` names a live bare userdata in this heap.
+    pub fn userdata_alive(&self, handle: UserdataRef) -> bool {
+        self.require_userdata(handle).is_ok()
+    }
+
     /// Current occupancy. Peaks count storage, not only live objects.
     /// Does not collect and does not add scan counts.
     pub fn stats(&self) -> HeapStats {
@@ -2824,6 +2993,15 @@ impl LuaHeap {
             handle.slot(),
             handle.generation(),
             HandleKind::Upvalue,
+        )
+    }
+
+    fn require_userdata(&self, handle: UserdataRef) -> Result<(), HeapError> {
+        self.require_kind(
+            handle.domain(),
+            handle.slot(),
+            handle.generation(),
+            HandleKind::Userdata,
         )
     }
 
@@ -2932,6 +3110,7 @@ impl LuaHeap {
             Rooted::Table(handle) => self.alive(handle),
             Rooted::Closure(handle) => self.closure_alive(handle),
             Rooted::Upvalue(handle) => self.upvalue_alive(handle),
+            Rooted::Userdata(handle) => self.userdata_alive(handle),
         }
     }
 
@@ -3206,3 +3385,6 @@ mod safepoint_roots;
 #[cfg(test)]
 #[path = "../../../../tests/luajit_heap_runtime/step_cycle.rs"]
 mod step_cycle;
+#[cfg(test)]
+#[path = "../../../../tests/luajit_heap_runtime/userdata_identity.rs"]
+mod userdata_identity;

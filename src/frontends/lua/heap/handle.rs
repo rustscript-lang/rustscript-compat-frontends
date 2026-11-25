@@ -1,7 +1,8 @@
 //! Private handles. They are not VM values and have no bare-integer ABI.
 
-/// Kind carried by a private handle. Table, closure, and upvalue nodes share
-/// one heap. An operation rejects a live node of a different kind.
+/// Kind carried by a private handle. Table, closure, upvalue, and bare
+/// userdata nodes share one heap. An operation rejects a live node of a
+/// different kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HandleKind {
     /// A table node.
@@ -12,6 +13,9 @@ pub enum HandleKind {
     /// scalar (boolean, binary64, string, or bytes), or is absent (nil). It has
     /// no open or closed flag.
     Upvalue,
+    /// A bare userdata node. It has no finalizer, metatable, environment, or
+    /// guest carrier. It is not a table and not a Core number.
+    Userdata,
 }
 
 /// Domain-checked reference to one table node.
@@ -142,6 +146,49 @@ impl UpvalueRef {
     }
 
     /// Handle kind. Upvalue operations reject any other kind.
+    pub fn kind(self) -> HandleKind {
+        self.kind
+    }
+}
+
+/// Domain-checked reference to one bare userdata node.
+///
+/// Construction stays inside the heap. A guest `Value` is not a
+/// `UserdataRef`. The node has no finalizer, environment, or payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UserdataRef {
+    domain: u64,
+    slot: u32,
+    generation: u32,
+    kind: HandleKind,
+}
+
+impl UserdataRef {
+    pub(super) fn userdata(domain: u64, slot: u32, generation: u32) -> Self {
+        Self {
+            domain,
+            slot,
+            generation,
+            kind: HandleKind::Userdata,
+        }
+    }
+
+    /// Heap domain that allocated this handle.
+    pub fn domain(self) -> u64 {
+        self.domain
+    }
+
+    /// Stable slot index. Collection does not move it.
+    pub fn slot(self) -> u32 {
+        self.slot
+    }
+
+    /// Generation observed when the handle was issued.
+    pub fn generation(self) -> u32 {
+        self.generation
+    }
+
+    /// Handle kind. Userdata operations reject any other kind.
     pub fn kind(self) -> HandleKind {
         self.kind
     }
