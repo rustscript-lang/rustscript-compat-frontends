@@ -88,6 +88,26 @@ pub(super) struct MarkState {
     discover_next: bool,
     discover_at: usize,
     discover_on: bool,
+    /// Metatables allocated after the indexed cache was sized, in first-write
+    /// order. Each entry costs one grow step per slot and one byte per parse
+    /// step; a setter only appends the marker.
+    late_modes: Vec<LateMode>,
+    late_mode_at: usize,
+    /// Slots below this index were parsed by the reset walk. A later slot is
+    /// known only after one of its own late entries has been parsed, even when
+    /// growing for a farther metatable already pushed a default placeholder.
+    mode_floor: usize,
+    /// Mode-edge record currently being read. A changed pointer restarts the
+    /// byte cursor at zero, so a rewritten direct field cannot mix old bytes.
+    late_edge: Option<u32>,
+    late_byte_at: usize,
+    late_pending_mode: WeakMode,
+    /// Writes that already happened but needed a late mode. Parsed before any
+    /// roots or gray step after the registration.
+    late_events: Vec<LateEvent>,
+    late_event_at: usize,
+    /// Phase the late window returns to. Set only on entering `ModeLate`.
+    late_return: Option<MarkPhase>,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -96,6 +116,13 @@ struct ModeDiscoveryMark {
     batch: u32,
 }
 
+/// Mark phases. `ModeLate` is entered only while the mark is already inside
+/// the roots or gray window: a `__mode` string written on a table allocated
+/// after the reset-time cache was sized registers a bounded late parse.
+/// It grows the indexed cache one slot per budget unit and reads the mode
+/// with the reset-time byte reader, so a long suffix is never walked in the
+/// setter, one pulse, or sweep.
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum MarkPhase {
     Start,
     Reset,
@@ -104,7 +131,43 @@ enum MarkPhase {
     ModeInit,
     Roots,
     Gray,
+    ModeLate,
     Done,
+}
+
+/// One metatable slot whose direct `__mode` string was written after the
+/// indexed mode cache was sized. The generation identifies the allocation.
+#[derive(Clone, Copy)]
+struct LateMode {
+    slot: u32,
+    generation: u32,
+}
+
+/// A write that already happened in the mutation window but whose mode read
+/// depends on a late metatable. Events are evaluated only after every pending
+/// late mode is parsed, one unit per pulse.
+#[derive(Clone, Copy)]
+enum LateEvent {
+    /// A setter replaced an owner's metatable. The old mode is restored with
+    /// the same direct-delete rule as the synchronous setter.
+    OwnerRescan {
+        owner: u32,
+        old_tuple: Option<(u32, u32)>,
+        new_tuple: Option<(u32, u32)>,
+    },
+    /// A missing ordinary key received a table value on a discovered owner.
+    StrongValue {
+        owner: u32,
+        slot: u32,
+        generation: u32,
+    },
+    /// A missing table-object key received a table key and/or table value.
+    StrongNewKey {
+        owner: u32,
+        key_slot: u32,
+        key_generation: u32,
+        value: Option<(u32, u32)>,
+    },
 }
 
 pub(super) struct MarkView {
@@ -172,11 +235,34 @@ impl MarkState {
             discover_next: false,
             discover_at: 0,
             discover_on: false,
+            late_modes: Vec::new(),
+            late_mode_at: 0,
+            mode_floor: 0,
+            late_edge: None,
+            late_byte_at: 0,
+            late_pending_mode: WeakMode::default(),
+            late_events: Vec::new(),
+            late_event_at: 0,
+            late_return: None,
         }
     }
 
     fn mutation_open(&self) -> bool {
         matches!(self.phase, MarkPhase::Roots | MarkPhase::Gray)
+    }
+
+    /// The write hooks stay active through the late-mode sub-phase: a guest
+    /// can write between any two pulses, and a late parse is still inside the
+    /// roots/gray window rather than a new mark.
+    fn write_barriers_open(&self) -> bool {
+        matches!(
+            self.phase,
+            MarkPhase::Roots | MarkPhase::Gray | MarkPhase::ModeLate
+        )
+    }
+
+    fn has_late_work(&self) -> bool {
+        self.late_mode_at < self.late_modes.len() || self.late_event_at < self.late_events.len()
     }
 
     fn phase_name(&self) -> &'static str {
@@ -188,6 +274,7 @@ impl MarkState {
             MarkPhase::ModeInit => "mode-init",
             MarkPhase::Roots => "roots",
             MarkPhase::Gray => "gray",
+            MarkPhase::ModeLate => "mode-late",
             MarkPhase::Done => "done",
         }
     }
@@ -429,8 +516,17 @@ impl<'a> ParkedMark<'a> {
             .is_some_and(MarkState::mutation_open)
     }
 
+    /// Mutation through the whole roots/gray window, including the budgeted
+    /// late-mode sub-phase. Used by the write hooks and gated root writers.
+    pub(super) fn write_barriers_open(&self) -> bool {
+        self.heap
+            .mark
+            .as_ref()
+            .is_some_and(MarkState::write_barriers_open)
+    }
+
     pub(super) fn write_allowed(&self, owner: TableRef) -> bool {
-        self.mutation_open() && self.heap.alive(owner) && !self.marked(owner)
+        self.write_barriers_open() && self.heap.alive(owner) && !self.marked(owner)
     }
 
     pub(super) fn field_index(&self, owner: TableRef, key: u32) -> Option<u32> {
@@ -536,7 +632,7 @@ impl<'a> ParkedMark<'a> {
     }
 
     fn gate_root_batch(&self, batch: &[Rooted]) -> Result<(), HeapError> {
-        if !self.saved_mark()?.mutation_open() {
+        if !self.saved_mark()?.write_barriers_open() {
             return Err(HeapError::MarkDenied);
         }
         validate_root_batch(self.heap, batch)
@@ -707,7 +803,7 @@ impl<'a> ParkedMark<'a> {
 
     fn gate_mutation(&self) -> Result<(), HeapError> {
         let state = self.heap.mark.as_ref().ok_or(HeapError::MarkDenied)?;
-        if !state.mutation_open() {
+        if !state.write_barriers_open() {
             return Err(HeapError::MarkDenied);
         }
         Ok(())
@@ -847,6 +943,10 @@ fn view(heap: &LuaHeap, state: &MarkState) -> MarkView {
 }
 
 fn step(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
+    if matches!(state.phase, MarkPhase::Roots | MarkPhase::Gray) && state.has_late_work() {
+        state.late_return = Some(state.phase);
+        state.phase = MarkPhase::ModeLate;
+    }
     match state.phase {
         MarkPhase::Start => false,
         MarkPhase::Reset => step_reset(heap, state),
@@ -855,6 +955,7 @@ fn step(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
         MarkPhase::ModeInit => step_mode_init(heap, state),
         MarkPhase::Roots => step_root(heap, state),
         MarkPhase::Gray => step_gray(heap, state),
+        MarkPhase::ModeLate => step_mode_late(heap, state),
         MarkPhase::Done => false,
     }
 }
@@ -947,6 +1048,7 @@ fn step_mode_init(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
     heap.scan.scratch.mode_discover_inited += 1;
     state.init_at += 1;
     if state.init_at == slot_count {
+        state.mode_floor = slot_count;
         let parsed = state.pending_mode;
         store_mode(state, parsed);
         advance_after_mode(state);
@@ -963,6 +1065,235 @@ fn advance_after_mode(state: &mut MarkState) {
     state.mode_edge = None;
     state.index += 1;
     state.phase = MarkPhase::Reset;
+}
+
+/// One budget unit of the late-mode window: grow the indexed cache by one
+/// slot, read one mode byte, or evaluate one deferred write. Entries are
+/// consumed in registration order; a new registration appended between pulses
+/// is picked up by the same cursor.
+fn step_mode_late(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
+    if state.late_mode_at < state.late_modes.len() {
+        return step_late_mode(heap, state);
+    }
+    if state.late_event_at < state.late_events.len() {
+        let event = state.late_events[state.late_event_at];
+        state.late_event_at += 1;
+        apply_late_event(heap, state, event);
+        return true;
+    }
+    state.phase = state.late_return.take().unwrap_or(MarkPhase::Roots);
+    false
+}
+
+fn step_late_mode(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
+    let entry = state.late_modes[state.late_mode_at];
+    let live = heap.slots.get(entry.slot as usize).is_some_and(|stored| {
+        stored.generation == entry.generation
+            && stored.kind == HandleKind::Table
+            && matches!(stored.state, SlotState::Live { .. })
+    });
+    if !live {
+        finish_late_mode(state, WeakMode::default());
+        return true;
+    }
+    if state.modes.is_none() {
+        state.modes = Some(Vec::new());
+        state.discover_marks = Vec::new();
+        return true;
+    }
+    if state.modes.as_ref().expect("late mode cache").len() <= entry.slot as usize {
+        state
+            .modes
+            .as_mut()
+            .expect("late mode cache")
+            .push(WeakMode::default());
+        state.discover_marks.push(ModeDiscoveryMark::default());
+        heap.scan.scratch.weak_modes_inited += 1;
+        heap.scan.scratch.mode_discover_inited += 1;
+        return true;
+    }
+    let Some(edge) = heap.slots[entry.slot as usize].mode_edge else {
+        finish_late_mode(state, WeakMode::default());
+        return true;
+    };
+    if state.late_edge != Some(edge) {
+        state.late_edge = Some(edge);
+        state.late_byte_at = 0;
+        state.late_pending_mode = WeakMode::default();
+        heap.scan.weak_mode_edge_checks += 1;
+        return true;
+    }
+    let at = state.late_byte_at;
+    let Some(byte) = mode_string_byte(heap, edge, at) else {
+        finish_late_mode(state, state.late_pending_mode);
+        return true;
+    };
+    heap.scan.weak_mode_bytes += 1;
+    state.late_byte_at = at + 1;
+    match byte {
+        b'k' => state.late_pending_mode.keys = true,
+        b'v' => state.late_pending_mode.values = true,
+        0 => {
+            finish_late_mode(state, state.late_pending_mode);
+            return true;
+        }
+        _ => {}
+    }
+    let len = mode_string_len(heap, edge).unwrap_or(0);
+    if state.late_byte_at >= len {
+        finish_late_mode(state, state.late_pending_mode);
+    }
+    true
+}
+
+/// Stores the parsed mode at its real metatable slot. The grow step above
+/// already made that index valid, so a later direct delete reads and stamps
+/// the discovered slot rather than a pre-growth capacity.
+fn finish_late_mode(state: &mut MarkState, parsed: WeakMode) {
+    let entry = state.late_modes[state.late_mode_at];
+    if let Some(modes) = state.modes.as_mut()
+        && let Some(current) = modes.get_mut(entry.slot as usize)
+    {
+        *current = parsed;
+    }
+    state.late_mode_at += 1;
+    state.late_edge = None;
+    state.late_byte_at = 0;
+    state.late_pending_mode = WeakMode::default();
+}
+
+fn apply_late_event(heap: &mut LuaHeap, state: &mut MarkState, event: LateEvent) {
+    match event {
+        LateEvent::OwnerRescan {
+            owner,
+            old_tuple,
+            new_tuple,
+        } => {
+            let old_mode = mode_before_direct_delete(state, old_tuple)
+                .unwrap_or_else(|| mode_of_tuple(state, old_tuple));
+            let new_mode = mode_of_tuple(state, new_tuple);
+            if (old_mode.keys && !new_mode.keys) || (old_mode.values && !new_mode.values) {
+                schedule_started_owner(heap, state, owner);
+            }
+        }
+        LateEvent::StrongValue {
+            owner,
+            slot,
+            generation,
+        } => {
+            if discovered_table(heap, owner) && !cached_values_weak(heap, state, owner) {
+                enqueue_barrier_target(heap, state, slot, generation, HandleKind::Table);
+            }
+        }
+        LateEvent::StrongNewKey {
+            owner,
+            key_slot,
+            key_generation,
+            value,
+        } => {
+            if discovered_table(heap, owner) {
+                let mode = cached_owner_mode(heap, state, owner);
+                if !mode.keys {
+                    enqueue_barrier_target(
+                        heap,
+                        state,
+                        key_slot,
+                        key_generation,
+                        HandleKind::Table,
+                    );
+                }
+                if !mode.values
+                    && let Some((slot, generation)) = value
+                {
+                    enqueue_barrier_target(heap, state, slot, generation, HandleKind::Table);
+                }
+            }
+        }
+    }
+}
+
+/// Records one already-started weak owner whose new metatable is still being
+/// read. A repeat setter for the same owner keeps the first-old/final-new
+/// pair, because no scan can run between two writes in one pause.
+fn record_late_rescan(
+    state: &mut MarkState,
+    owner: u32,
+    old_tuple: Option<(u32, u32)>,
+    new_tuple: Option<(u32, u32)>,
+) {
+    let start = state.late_event_at.min(state.late_events.len());
+    for event in &mut state.late_events[start..] {
+        if let LateEvent::OwnerRescan {
+            owner: pending_owner,
+            new_tuple: pending_new,
+            ..
+        } = event
+            && *pending_owner == owner
+        {
+            *pending_new = new_tuple;
+            return;
+        }
+    }
+    state.late_events.push(LateEvent::OwnerRescan {
+        owner,
+        old_tuple,
+        new_tuple,
+    });
+}
+
+/// Whether `tuple` names a metatable whose `__mode` is registered but not yet
+/// parsed. Only a pending entry makes it unknown; a parsed entry or an
+/// in-domain reset slot is already in the cache.
+fn late_mode_unknown(state: &MarkState, tuple: Option<(u32, u32)>) -> bool {
+    let Some((slot, generation)) = tuple else {
+        return false;
+    };
+    state.late_modes[state.late_mode_at.min(state.late_modes.len())..]
+        .iter()
+        .any(|entry| entry.slot == slot && entry.generation == generation)
+}
+
+/// Whether the owner's current mode is already readable. A default placeholder
+/// pushed while growing toward a farther metatable is not a parsed mode.
+fn late_mode_known(state: &MarkState, owner: u32) -> bool {
+    let Some(modes) = state.modes.as_ref() else {
+        return false;
+    };
+    let slot = owner as usize;
+    if slot >= modes.len() {
+        return false;
+    }
+    if slot < state.mode_floor {
+        return true;
+    }
+    state.late_modes[..state.late_mode_at.min(state.late_modes.len())]
+        .iter()
+        .any(|entry| entry.slot == owner)
+}
+
+/// Reads the owner's current metatable tuple through the slot vector. No
+/// follower, no mark step, and no scan counter.
+fn owner_mode_unknown(heap: &LuaHeap, state: &MarkState, owner: u32) -> bool {
+    let tuple = heap
+        .slots
+        .get(owner as usize)
+        .and_then(|slot| slot.metatable);
+    late_mode_unknown(state, tuple)
+}
+
+/// Queues one owner that already started a weak scan. Same checks and meters
+/// as the synchronous setter path, without taking the saved mark.
+fn schedule_started_owner(heap: &mut LuaHeap, state: &mut MarkState, owner: u32) {
+    if heap
+        .slots
+        .get(owner as usize)
+        .is_some_and(|slot| slot.rescan_epoch == state.rescan_epoch)
+        && !heap.slots[owner as usize].rescan_queued
+    {
+        push_rescan(heap, state, owner);
+        heap.scan.scratch.owner_rescan_pushed += 1;
+        heap.scan.owner_rescan_schedules += 1;
+    }
 }
 
 fn step_root(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
@@ -1229,7 +1560,9 @@ fn queue_started_owner(heap: &mut LuaHeap, state: &mut MarkState, owner: u32) {
 }
 
 /// Called only on the cache's weak-to-strong transition, once per metatable
-/// slot per mark. No identity lookup or allocation is needed to arm it.
+/// slot per mark. The entry is bounds-checked: a late-grown slot reaches here
+/// only after the late window has grown both indexed vectors, but a stale
+/// generation or an unexpected path must not panic the collector.
 fn arm_deleted_mode(heap: &mut LuaHeap, state: &mut MarkState, slot: u32, generation: u32) {
     if !state.discover_on {
         state.discover_batch += 1;
@@ -1241,7 +1574,10 @@ fn arm_deleted_mode(heap: &mut LuaHeap, state: &mut MarkState, slot: u32, genera
         state.discover_next = true;
         state.discover_batch + 1
     };
-    state.discover_marks[slot as usize] = ModeDiscoveryMark { generation, batch };
+    let Some(stamp) = state.discover_marks.get_mut(slot as usize) else {
+        return;
+    };
+    *stamp = ModeDiscoveryMark { generation, batch };
     heap.scan.mode_discover_writes += 1;
 }
 
@@ -1535,8 +1871,8 @@ pub(super) enum ClosedCellTarget {
 }
 
 impl LuaHeap {
-    /// Phase and whether a gray edge or queued owner is still unscanned.
-    /// Does not take the mark, scan, or write.
+    /// Phase and whether a gray edge, queued owner, or late-mode unit is still
+    /// unscanned. Does not take the mark, scan, or write.
     #[cfg(test)]
     pub fn saved_mark_query(&self) -> Option<(&'static str, bool)> {
         let state = self.mark.as_ref()?;
@@ -1547,7 +1883,8 @@ impl LuaHeap {
                 || state.rescan_owner.is_some()
                 || state.rescan_cursor.is_some()
                 || state.rescan_head.is_some()
-                || state.discover_on,
+                || state.discover_on
+                || state.has_late_work(),
         ))
     }
 
@@ -1559,7 +1896,7 @@ impl LuaHeap {
         let gray_len = u32::try_from(state.gray.len()).unwrap_or(u32::MAX);
         Some(super::super::SavedMarkWatch {
             phase: state.phase_name(),
-            pending: !state.gray.is_empty() || state.cursor.is_some(),
+            pending: !state.gray.is_empty() || state.cursor.is_some() || state.has_late_work(),
             cursor_owner: state.owner,
             cursor_index: state.cursor,
             gray_len,
@@ -1634,12 +1971,13 @@ impl LuaHeap {
 
     /// Counts a fixed root store and marks its target while mutation is open.
     /// The enqueue uses the same `follow_one` path as a root visit. It does
-    /// not move the root cursor or the current owner cursor.
+    /// not move the root cursor or the current owner cursor. The late-mode
+    /// sub-phase still belongs to that window.
     pub(super) fn note_parked_root_store(&mut self, rooted: Rooted) {
         let Some(mut state) = self.mark.take() else {
             return;
         };
-        if !state.mutation_open() {
+        if !state.write_barriers_open() {
             self.mark = Some(state);
             return;
         }
@@ -1656,17 +1994,24 @@ impl LuaHeap {
 
     /// Marks a strong table value written into an already discovered field.
     /// Weak values stay on the cached mode and are not followed. An owner
-    /// that is not yet marked does not enter the gray queue. This does not
-    /// call `owner_mode` and does not move either cursor.
+    /// that is not yet marked does not enter the gray queue. A field whose
+    /// metatable was created after the cache was sized records the target and
+    /// lets the budgeted late parse decide; a weak arm must not mark it early.
+    /// This does not call `owner_mode` and does not move either cursor.
     pub(super) fn barrier_strong_field(&mut self, owner: u32, slot: u32, generation: u32) {
         let Some(mut state) = self.mark.take() else {
             return;
         };
-        if state.mutation_open()
-            && discovered_table(self, owner)
-            && !cached_values_weak(self, &state, owner)
-        {
-            enqueue_barrier_target(self, &mut state, slot, generation, HandleKind::Table);
+        if state.write_barriers_open() && discovered_table(self, owner) {
+            if owner_mode_unknown(self, &state, owner) {
+                state.late_events.push(LateEvent::StrongValue {
+                    owner,
+                    slot,
+                    generation,
+                });
+            } else if !cached_values_weak(self, &state, owner) {
+                enqueue_barrier_target(self, &mut state, slot, generation, HandleKind::Table);
+            }
         }
         self.mark = Some(state);
     }
@@ -1678,49 +2023,58 @@ impl LuaHeap {
     /// already replaced that cache entry with the missing-field mode; its
     /// discovery stamp restores the pre-delete value bit for an owner that
     /// started under the same metatable. A not-yet-started owner is left for
-    /// the ordinary scan. This does not enqueue, scan, or move a cursor.
+    /// the ordinary scan. A new metatable whose `__mode` is still being read is
+    /// recorded instead: the deferred evaluation uses the same transition rule
+    /// after the budgeted parse, and no long string is walked here. This does
+    /// not enqueue, scan, or move a cursor.
     pub(super) fn needs_owner_rescan(
-        &self,
+        &mut self,
         owner: u32,
         old_tuple: Option<(u32, u32)>,
         new_tuple: Option<(u32, u32)>,
     ) -> bool {
-        let Some(state) = self.mark.as_ref() else {
+        let Some(mut state) = self.mark.take() else {
             return false;
         };
-        if !state.mutation_open() {
-            return false;
+        let mut rescan = false;
+        if state.write_barriers_open() && old_tuple != new_tuple {
+            // Re-setting the same metatable is not a transition. A direct
+            // delete already armed the discovery probe for that owner;
+            // scheduling here would duplicate it, and the owner was popped
+            // from the queue before its rescan started, so a repeat setter
+            // could link it back ahead of discovery forever. The old bit
+            // restored from the delete stamp is only for an owner that
+            // actually moved off that metatable.
+            if late_mode_unknown(&state, new_tuple) {
+                record_late_rescan(&mut state, owner, old_tuple, new_tuple);
+            } else {
+                let old_mode = mode_before_direct_delete(&state, old_tuple)
+                    .unwrap_or_else(|| mode_of_tuple(&state, old_tuple));
+                let new_mode = mode_of_tuple(&state, new_tuple);
+                rescan = ((old_mode.keys && !new_mode.keys)
+                    || (old_mode.values && !new_mode.values))
+                    && self
+                        .slots
+                        .get(owner as usize)
+                        .is_some_and(|slot| slot.rescan_epoch == state.rescan_epoch);
+            }
         }
-        // Re-setting the same metatable is not a transition. A direct delete
-        // already armed the discovery probe for that owner; scheduling here
-        // would duplicate it, and the owner was popped from the queue before
-        // its rescan started, so a repeat setter could link it back ahead of
-        // discovery forever. The old bit restored from the delete stamp is
-        // only for an owner that actually moved off that metatable.
-        if old_tuple == new_tuple {
-            return false;
-        }
-        let old_mode = mode_before_direct_delete(state, old_tuple)
-            .unwrap_or_else(|| mode_of_tuple(state, old_tuple));
-        let new_mode = mode_of_tuple(state, new_tuple);
-        if !((old_mode.keys && !new_mode.keys) || (old_mode.values && !new_mode.values)) {
-            return false;
-        }
-        self.slots
-            .get(owner as usize)
-            .is_some_and(|slot| slot.rescan_epoch == state.rescan_epoch)
+        self.mark = Some(state);
+        rescan
     }
 
     /// After a real direct `__mode` unlink, replace this cycle's value-weak
     /// cache for that same generation. Owners that have not started read the
     /// missing-field mode. Owners that already started stay for the budgeted
     /// probe. A key-weak cache, a missing record, and a closed mutation are
-    /// left alone. This does not walk slots or move either cursor.
+    /// left alone. A grow-loop slot reaches this only after its late parse has
+    /// sized both indexed vectors, so the discovery stamp stays in bounds.
+    /// This does not walk slots or move either cursor.
     pub(super) fn note_direct_mode_deleted(&mut self, owner: u32) {
         let Some(mut state) = self.mark.take() else {
             return;
         };
-        if !state.mutation_open() {
+        if !state.write_barriers_open() {
             self.mark = Some(state);
             return;
         }
@@ -1757,7 +2111,7 @@ impl LuaHeap {
         let Some(mut state) = self.mark.take() else {
             return;
         };
-        if state.mutation_open()
+        if state.write_barriers_open()
             && self
                 .slots
                 .get(owner as usize)
@@ -1781,7 +2135,7 @@ impl LuaHeap {
         let Some(mut state) = self.mark.take() else {
             return;
         };
-        if state.mutation_open() && discovered_table(self, owner) {
+        if state.write_barriers_open() && discovered_table(self, owner) {
             enqueue_barrier_target(self, &mut state, slot, generation, HandleKind::Table);
         }
         self.mark = Some(state);
@@ -1807,7 +2161,7 @@ impl LuaHeap {
         let Some(mut state) = self.mark.take() else {
             return;
         };
-        if state.mutation_open() && discovered_upvalue(self, owner, owner_generation) {
+        if state.write_barriers_open() && discovered_upvalue(self, owner, owner_generation) {
             let kind = match target {
                 ClosedCellTarget::Table => HandleKind::Table,
                 ClosedCellTarget::Closure => HandleKind::Closure,
@@ -1820,8 +2174,9 @@ impl LuaHeap {
     /// Enqueues a newly inserted table-object key, and a strong table value.
     ///
     /// A string value is not a table node. An owner that is not yet marked is
-    /// left for the continued scan. Successors stay on the gray queue. This
-    /// does not read a metatable or move the pending cursor.
+    /// left for the continued scan. Successors stay on the gray queue. A new
+    /// metatable still being read defers the whole write, so a weak value is
+    /// not marked early. This does not move the pending cursor.
     pub(super) fn barrier_new_table_key(
         &mut self,
         owner: u32,
@@ -1832,21 +2187,61 @@ impl LuaHeap {
         let Some(mut state) = self.mark.take() else {
             return;
         };
-        if state.mutation_open() && discovered_table(self, owner) {
-            let mode = cached_owner_mode(self, &state, owner);
-            if !mode.keys {
-                enqueue_barrier_target(
-                    self,
-                    &mut state,
+        if state.write_barriers_open() && discovered_table(self, owner) {
+            if owner_mode_unknown(self, &state, owner) {
+                state.late_events.push(LateEvent::StrongNewKey {
+                    owner,
                     key_slot,
                     key_generation,
-                    HandleKind::Table,
-                );
+                    value,
+                });
+            } else {
+                let mode = cached_owner_mode(self, &state, owner);
+                if !mode.keys {
+                    enqueue_barrier_target(
+                        self,
+                        &mut state,
+                        key_slot,
+                        key_generation,
+                        HandleKind::Table,
+                    );
+                }
+                if !mode.values
+                    && let Some((slot, generation)) = value
+                {
+                    enqueue_barrier_target(self, &mut state, slot, generation, HandleKind::Table);
+                }
             }
-            if !mode.values
-                && let Some((slot, generation)) = value
-            {
-                enqueue_barrier_target(self, &mut state, slot, generation, HandleKind::Table);
+        }
+        self.mark = Some(state);
+    }
+
+    /// Registers a direct `__mode` string written on a table whose slot is past
+    /// the reset-time indexed cache. The setter appends one marker only; the
+    /// budgeted late window grows the cache and reads the bytes. An in-domain
+    /// slot, a non-string value, and a closed write window are not registered.
+    pub(super) fn note_late_mode_write(&mut self, owner: u32, index: u32) {
+        let is_string = self.edge_slots[index as usize]
+            .edge
+            .as_ref()
+            .is_some_and(|edge| matches!(edge.value, EdgeValue::Scalar(Value::String(_))));
+        if !is_string {
+            return;
+        }
+        let Some(mut state) = self.mark.take() else {
+            return;
+        };
+        if state.write_barriers_open() && !late_mode_known(&state, owner) {
+            let generation = self.slots[owner as usize].generation;
+            let pending = state.late_modes[state.late_mode_at.min(state.late_modes.len())..]
+                .iter()
+                .any(|entry| entry.slot == owner && entry.generation == generation);
+            if !pending {
+                state.late_modes.push(LateMode {
+                    slot: owner,
+                    generation,
+                });
+                self.scan.mode_late_registrations += 1;
             }
         }
         self.mark = Some(state);

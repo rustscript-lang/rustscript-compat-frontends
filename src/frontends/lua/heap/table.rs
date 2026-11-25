@@ -698,6 +698,12 @@ pub struct ScanMeter {
     /// key-strong cache with the missing-field mode. One per real unlink, not
     /// a slot walk and not a pulse unit.
     pub mode_cache_updates: u64,
+    /// Direct `__mode` strings written on tables allocated after the indexed
+    /// cache was sized. One per metatable per mark; a repeat value on the same
+    /// generation reuses the pending marker. This is the setter-side append
+    /// only: the cache grow and the bytes read are `weak_modes_inited` and
+    /// `weak_mode_bytes`.
+    pub mode_late_registrations: u64,
     pub scratch: ScanScratch,
 }
 
@@ -3365,6 +3371,7 @@ impl LuaHeap {
         );
         if is_table && is_mode {
             self.slots[owner as usize].mode_edge = Some(index);
+            self.note_late_mode_write(owner, index);
         }
     }
 }
