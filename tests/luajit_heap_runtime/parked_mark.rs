@@ -10544,6 +10544,192 @@ fn shared_mode_scalar_left_clear_keeps_only_left() {
     check_shared_mode_left_replacement(false, SharedModeReplacement::Clear, (true, false));
 }
 
+/// The matching control for the same-tuple setter: discovery has been armed
+/// but has not yet probed the owner slot. Re-setting the same metatable must
+/// not become a setter rescan; the probe still makes the normal first schedule
+/// for that left owner. The end state keeps both shared owners and clears the
+/// independent orphan.
+#[test]
+fn shared_mode_same_metatable_reset_before_probe_schedules_only_discovery() {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        let graph = open_shared_mode_graph(&mut host);
+        let mut probed = None;
+        resume_weak(&mut host, |parked| {
+            pause_after_both_weak_edges(parked, &graph);
+            parked
+                .with_saved_heap(|heap| heap.set_named_scalar(graph.shared, "__mode", Value::Null))
+                .expect("delete the shared direct mode in place");
+            assert_eq!(parked.discovery_slot(), Some(0));
+            let before = parked.meter();
+            write_metatable(parked, graph.left, Some(graph.shared))
+                .expect("re-set the same metatable before the probe runs");
+            assert_eq!(
+                parked.meter().scratch.owner_rescan_pushed,
+                before.scratch.owner_rescan_pushed,
+                "a same-tuple setter must not link the owner"
+            );
+            assert_eq!(
+                parked.meter().owner_rescan_schedules,
+                before.owner_rescan_schedules,
+                "a same-tuple setter is not a weak-to-strong transition"
+            );
+            assert_eq!(
+                parked.meter().owner_rescan_heads,
+                before.owner_rescan_heads,
+                "the setter must not open a rescan"
+            );
+            let mut seen = false;
+            for _ in 0..HARNESS_BOUND {
+                let slot = parked.discovery_slot();
+                let before = parked.meter();
+                let view = parked.pulse(1);
+                let after = parked.meter();
+                if after.scratch.owner_rescan_pushed > before.scratch.owner_rescan_pushed {
+                    assert_eq!(
+                        after.scratch.owner_rescan_pushed - before.scratch.owner_rescan_pushed,
+                        1
+                    );
+                    assert_eq!(
+                        after.mode_owner_probes - before.mode_owner_probes,
+                        1,
+                        "one capacity-slot probe made the first schedule"
+                    );
+                    probed = slot;
+                    seen = true;
+                    break;
+                }
+                assert!(
+                    !view.finished,
+                    "mark finished before discovery probed the left slot"
+                );
+            }
+            assert!(seen, "discovery never scheduled the left owner");
+            assert_eq!(
+                probed,
+                Some(graph.left.slot()),
+                "the first schedule for the same target comes from its capacity-slot probe"
+            );
+            assert!(
+                !parked.marked(graph.left_value) && !parked.marked(graph.left_child),
+                "the setter did not trace the left graph inline"
+            );
+        });
+        finish_shared_mode_cycle(&mut host);
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            let seen = read_shared_mode_outcome(heap, &graph)?;
+            assert!(seen.left_value && seen.left_child);
+            assert!(seen.right_value && seen.right_child);
+            assert!(!seen.orphan && !seen.dust);
+            assert_eq!(heap.scan_meter().scratch.owner_rescan_pushed, 2);
+            assert_eq!(heap.scan_meter().owner_rescan_heads, 2);
+            Ok(())
+        })
+        .expect("same metatable before probe");
+    });
+}
+
+/// The owner already left the intrusive rescan queue: `open_rescan` popped it
+/// and the rescan is charging its value record. Repeating the same
+/// `(slot, generation)` setter must not link it again; a link here lets the
+/// rescan queue stay ahead of the deleted-mode probe indefinitely. The probe
+/// must still reach the right owner, and both shared owners keep their value
+/// and successor while the independent orphan clears.
+#[test]
+fn shared_mode_same_metatable_reset_during_rescan_does_not_requeue_owner() {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        let graph = open_shared_mode_graph(&mut host);
+        let mut repeats = 0u32;
+        let mut advanced = false;
+        resume_weak(&mut host, |parked| {
+            pause_after_both_weak_edges(parked, &graph);
+            parked
+                .with_saved_heap(|heap| heap.set_named_scalar(graph.shared, "__mode", Value::Null))
+                .expect("delete the shared direct mode in place");
+            let mut popped = false;
+            for _ in 0..HARNESS_BOUND {
+                if let Some(pending) = parked.pending_rescan()
+                    && pending.owner == graph.left.slot()
+                    && pending.cursor == graph.left_value_record
+                {
+                    popped = true;
+                    break;
+                }
+                assert!(
+                    !parked.pulse(1).finished,
+                    "mark finished before the left rescan opened"
+                );
+            }
+            assert!(
+                popped,
+                "the left owner never left the queue into a live rescan"
+            );
+            let before = parked.meter();
+            write_metatable(parked, graph.left, Some(graph.shared))
+                .expect("re-set the same metatable while the rescan is active");
+            let after_setter = parked.meter();
+
+            for _ in 0..HARNESS_BOUND {
+                if parked
+                    .discovery_slot()
+                    .is_some_and(|slot| slot > graph.right.slot())
+                {
+                    advanced = true;
+                    break;
+                }
+                if let Some(pending) = parked.pending_rescan()
+                    && pending.owner == graph.left.slot()
+                    && pending.cursor == graph.left_value_record
+                {
+                    repeats += 1;
+                    write_metatable(parked, graph.left, Some(graph.shared))
+                        .expect("repeat the same metatable during the rescan");
+                }
+                if parked.pulse(1).finished {
+                    break;
+                }
+            }
+            assert!(
+                advanced,
+                "repeated same-tuple setters kept the left owner ahead of discovery (repeats={repeats})"
+            );
+            assert_eq!(
+                after_setter.scratch.owner_rescan_pushed, before.scratch.owner_rescan_pushed,
+                "a popped owner must not be linked by a same-tuple setter"
+            );
+            assert_eq!(
+                after_setter.owner_rescan_schedules, before.owner_rescan_schedules,
+                "a same-tuple setter is not a weak-to-strong transition"
+            );
+            assert_eq!(
+                after_setter.owner_rescan_heads, before.owner_rescan_heads,
+                "the setter must not open another rescan"
+            );
+            assert_eq!(
+                parked.meter().scratch.owner_rescan_pushed,
+                before.scratch.owner_rescan_pushed + 1,
+                "only the right owner is left for discovery to schedule"
+            );
+            assert!(
+                !parked.marked(graph.right_value),
+                "the right owner was scheduled by the probe but its rescan has not run"
+            );
+        });
+        finish_shared_mode_cycle(&mut host);
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            let seen = read_shared_mode_outcome(heap, &graph)?;
+            assert!(seen.left_value && seen.left_child);
+            assert!(seen.right_value && seen.right_child);
+            assert!(!seen.orphan && !seen.dust);
+            assert_eq!(heap.scan_meter().scratch.owner_rescan_pushed, 2);
+            assert_eq!(heap.scan_meter().owner_rescan_heads, 2);
+            Ok(())
+        })
+        .expect("same metatable during rescan");
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Gray slot growth + shared direct-mode delete witness.
 // ---------------------------------------------------------------------------
