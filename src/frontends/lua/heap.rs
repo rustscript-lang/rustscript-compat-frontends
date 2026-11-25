@@ -922,6 +922,83 @@ pub fn saved_mark_query(host: &HostContext) -> Option<(&'static str, bool)> {
         .and_then(LuaHeap::saved_mark_query)
 }
 
+/// Saved mark cursor. Absent means no saved mark. Does not take, scan, or write.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SavedMarkWatch {
+    pub phase: &'static str,
+    pub pending: bool,
+    pub cursor_owner: Option<u32>,
+    pub cursor_index: Option<u32>,
+    pub gray_len: u32,
+}
+
+/// One existing edge record. `value_slot` is set only for a table value.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SavedEdgeWatch {
+    pub index: u32,
+    pub value_slot: Option<u32>,
+    pub value_string: bool,
+}
+
+/// Reads the saved mark cursor. Does not take the mark, scan, enqueue, or write.
+#[cfg(test)]
+pub fn saved_mark_watch(host: &HostContext) -> Option<SavedMarkWatch> {
+    host.scope_state::<LuaHeap>()?.saved_mark_watch()
+}
+
+/// Live marked bit. A missing heap or a stale handle is false. Does not scan.
+#[cfg(test)]
+pub fn table_marked(host: &HostContext, table: TableRef) -> bool {
+    host.scope_state::<LuaHeap>()
+        .is_some_and(|heap| heap.table_marked(table))
+}
+
+/// Saved gray-vector membership. Does not walk edges or push.
+#[cfg(test)]
+pub fn table_in_gray(host: &HostContext, table: TableRef) -> bool {
+    host.scope_state::<LuaHeap>()
+        .is_some_and(|heap| heap.table_in_gray(table))
+}
+
+/// Whether the current top frame already roots this table. Does not scan edges.
+#[cfg(test)]
+pub fn current_frame_roots_table(host: &HostContext, table: TableRef) -> bool {
+    let Some(heap) = host.scope_state::<LuaHeap>() else {
+        return false;
+    };
+    let Some(frame) = heap.current_frame() else {
+        return false;
+    };
+    heap.frame_roots_table(frame, table)
+}
+
+/// Existing number-key record. `None` means the key is absent or the table is dead.
+#[cfg(test)]
+pub fn number_edge_watch(host: &HostContext, table: TableRef, key: f64) -> Option<SavedEdgeWatch> {
+    let (index, value_slot, value_string) = host
+        .scope_state::<LuaHeap>()?
+        .number_edge_watch(table, key)?;
+    Some(SavedEdgeWatch {
+        index,
+        value_slot,
+        value_string,
+    })
+}
+
+/// Existing UTF-8 record. Same read-only contract as [`number_edge_watch`].
+#[cfg(test)]
+pub fn utf8_edge_watch(host: &HostContext, table: TableRef, key: &str) -> Option<SavedEdgeWatch> {
+    let (index, value_slot, value_string) =
+        host.scope_state::<LuaHeap>()?.utf8_edge_watch(table, key)?;
+    Some(SavedEdgeWatch {
+        index,
+        value_slot,
+        value_string,
+    })
+}
+
 /// Capacity of an already decoded automatic root batch.
 ///
 /// A missing heap is `SweepDenied` and does not install one. This does not

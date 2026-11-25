@@ -1866,6 +1866,31 @@ pub(super) fn capture_counts(vm: &mut vm::Vm) -> (u32, u32) {
         .unwrap_or((0, 0))
 }
 
+/// Tables already decoded for a real safepoint. Recording them does not gather,
+/// step, or write a root. The batch that was passed to the stepper is copied
+/// after decode and before the step consumes it.
+#[derive(Clone, Debug, Default)]
+pub(super) struct SafepointBatches {
+    pub batches: Vec<Vec<heap::TableRef>>,
+}
+
+pub(super) fn safepoint_batches(host: &vm::HostContext<'_>) -> Vec<Vec<heap::TableRef>> {
+    host.scope_state::<SafepointBatches>()
+        .map(|state| state.batches.clone())
+        .unwrap_or_default()
+}
+
+fn note_safepoint_batch(
+    host: &mut vm::HostContext<'_>,
+    batch: &[heap::TableRef],
+) -> Result<(), VmError> {
+    let state = host
+        .scope_state_or_insert_with(SafepointBatches::default)
+        .map_err(|error| VmError::HostError(error.to_string()))?;
+    state.batches.push(batch.to_vec());
+    Ok(())
+}
+
 fn decode_safepoint_roots(call: &mut OwnedHostCall<'_>) -> Result<Vec<heap::TableRef>, VmError> {
     let roots = match call.args() {
         [Value::Null] | [Value::Null, _] => return Ok(Vec::new()),
@@ -1956,6 +1981,32 @@ fn restore_running_after_progress(host: &mut vm::HostContext<'_>) -> Result<(), 
     Ok(())
 }
 
+/// Counts real `step_data` calls. A literal fallback never reaches this host.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct StepDataNotes {
+    pub calls: u32,
+    pub number_zero: bool,
+    pub text_zero: bool,
+}
+
+pub(super) fn step_data_notes(host: &vm::HostContext<'_>) -> StepDataNotes {
+    host.scope_state::<StepDataNotes>()
+        .copied()
+        .unwrap_or_default()
+}
+
+fn note_step_data(call: &mut OwnedHostCall<'_>, value: &Value) -> Result<(), VmError> {
+    let mut host = call.vm().host_context();
+    let notes = host
+        .scope_state_or_insert_with(StepDataNotes::default)
+        .map_err(|error| VmError::HostError(error.to_string()))?;
+    notes.calls = notes.calls.saturating_add(1);
+    notes.number_zero = matches!(value, Value::Float(number) if *number == 0.0);
+    notes.text_zero = matches!(value, Value::String(text) if text.as_bytes() == b"0")
+        || matches!(value, Value::Bytes(bytes) if bytes.as_ref() == b"0");
+    Ok(())
+}
+
 fn step_data_default(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
     // Category only. Do not pop a budget, read a tail, or gather.
     // Static nil, the byte string "0", and the positive-zero number token
@@ -1972,6 +2023,7 @@ fn step_data_default(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
             ));
         }
     };
+    note_step_data(call, &value)?;
     let accepted = match &value {
         Value::Null => true,
         Value::Float(number) => *number == 0.0,
@@ -2281,6 +2333,7 @@ fn auto_table_restart(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
     if let Some(control) = host.scope_state_mut::<GcRunControl>() {
         control.auto_requested = true;
     }
+    note_safepoint_batch(&mut host, &tables)?;
     let first = heap::step_source_safepoint(&mut host, mark_budget, tables).map_err(heap_error)?;
     match first {
         heap::StepOutcome::Completed(report) => {
@@ -2338,6 +2391,7 @@ fn step_at_safepoint(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
         decode_safepoint_roots(call)?
     };
     let mut host = call.vm().host_context();
+    note_safepoint_batch(&mut host, &tables)?;
     let outcome = heap::step_source_safepoint(&mut host, budget, tables).map_err(heap_error)?;
     if let heap::StepOutcome::Completed(report) = outcome {
         note_collect(&mut host, report)?;

@@ -1155,6 +1155,87 @@ impl LuaHeap {
         ))
     }
 
+    /// Phase, pending bit, cursor owner slot, cursor record, and gray length.
+    /// Reads the saved mark only. Does not take it, walk an edge, enqueue, or write.
+    #[cfg(test)]
+    pub fn saved_mark_watch(&self) -> Option<super::super::SavedMarkWatch> {
+        let state = self.mark.as_ref()?;
+        let gray_len = u32::try_from(state.gray.len()).unwrap_or(u32::MAX);
+        Some(super::super::SavedMarkWatch {
+            phase: state.phase_name(),
+            pending: !state.gray.is_empty() || state.cursor.is_some(),
+            cursor_owner: state.owner,
+            cursor_index: state.cursor,
+            gray_len,
+        })
+    }
+
+    /// Live marked bit of one table. Does not walk an edge or change the bit.
+    #[cfg(test)]
+    pub fn table_marked(&self, table: TableRef) -> bool {
+        self.slots.get(table.slot() as usize).is_some_and(|slot| {
+            slot.generation == table.generation()
+                && slot.kind == HandleKind::Table
+                && matches!(slot.state, SlotState::Live { marked: true })
+        })
+    }
+
+    /// Whether this table's slot is already in the saved gray vector.
+    /// Reads that vector only. Does not walk edges or push.
+    #[cfg(test)]
+    pub fn table_in_gray(&self, table: TableRef) -> bool {
+        self.mark
+            .as_ref()
+            .is_some_and(|state| state.gray.contains(&table.slot()))
+    }
+
+    /// Whether one open frame already roots this table. Empty and non-table
+    /// slots are skipped. Does not scan edges.
+    #[cfg(test)]
+    pub fn frame_roots_table(&self, frame: RootFrameId, table: TableRef) -> bool {
+        let Ok(found) = self.frame(frame) else {
+            return false;
+        };
+        (0..found.width).any(|slot| {
+            self.rooted_table(frame, slot)
+                .ok()
+                .flatten()
+                .is_some_and(|rooted| rooted == table)
+        })
+    }
+
+    /// Record index of one number key, plus the table slot of its value when
+    /// that value is a table, and whether the value is a string. One owner-chain
+    /// read. Does not write, enqueue, or move a cursor.
+    #[cfg(test)]
+    pub fn number_edge_watch(&self, table: TableRef, key: f64) -> Option<(u32, Option<u32>, bool)> {
+        if key.is_nan() || !self.alive(table) {
+            return None;
+        }
+        self.edge_watch(table, &EdgeKey::number(key))
+    }
+
+    /// Record index of one UTF-8 key. Same read-only shape as [`Self::number_edge_watch`].
+    #[cfg(test)]
+    pub fn utf8_edge_watch(&self, table: TableRef, key: &str) -> Option<(u32, Option<u32>, bool)> {
+        if !self.alive(table) {
+            return None;
+        }
+        self.edge_watch(table, &EdgeKey::named(key))
+    }
+
+    #[cfg(test)]
+    fn edge_watch(&self, table: TableRef, key: &EdgeKey) -> Option<(u32, Option<u32>, bool)> {
+        let index = self.find_key(table.slot(), key)?;
+        let edge = self.edge_slots[index as usize].edge.as_ref()?;
+        let (value_slot, value_string) = match &edge.value {
+            EdgeValue::Table { slot, .. } => (Some(*slot), false),
+            EdgeValue::Scalar(Value::String(_)) => (None, true),
+            _ => (None, false),
+        };
+        Some((index, value_slot, value_string))
+    }
+
     /// Counts a fixed root store and marks its target while mutation is open.
     /// The enqueue uses the same `follow_one` path as a root visit. It does
     /// not move the root cursor or the current owner cursor.

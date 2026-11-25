@@ -30,6 +30,10 @@ const SHAPE: &str = "lua_host::shape";
 const METER: &str = "lua_host::meter";
 const MARK_PHASE: &str = "lua_host::mark_phase";
 const OCCUPY: &str = "lua_host::occupy";
+const PRODUCE_ZERO: &str = "lua_host::produce_zero";
+const PRODUCE_TEXT_ZERO: &str = "lua_host::produce_text_zero";
+const MARK_WATCH: &str = "lua_host::mark_watch";
+const STORED_ALIVE: &str = "lua_host::stored_alive";
 
 const SOURCE: &str = r#"
 local function witness()
@@ -84,7 +88,7 @@ struct StepNote {
     collections: u32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 struct MarkNote {
     tag: f64,
     phase: Option<&'static str>,
@@ -111,6 +115,27 @@ struct OccupancyNote {
     node_slot_visits: u64,
 }
 
+/// Read-only mark cursor and one borrowed table. The host does not write,
+/// enqueue, or move the cursor. `edge` fields are absent when that key is missing.
+#[derive(Clone, Copy, Debug)]
+struct WatchNote {
+    tag: f64,
+    phase: Option<&'static str>,
+    pending: bool,
+    cursor_owner: Option<u32>,
+    cursor_index: Option<u32>,
+    gray_len: u32,
+    table: heap::TableRef,
+    marked: bool,
+    in_gray: bool,
+    frame_rooted: bool,
+    number_index: Option<u32>,
+    number_value_slot: Option<u32>,
+    number_string: bool,
+    utf8_index: Option<u32>,
+    utf8_string: bool,
+}
+
 #[derive(Clone, Debug, Default)]
 struct Trace {
     steps: Vec<StepNote>,
@@ -129,6 +154,13 @@ struct Trace {
     bit_root_slots: Vec<u32>,
     marks: Vec<MarkNote>,
     occupancy: Vec<OccupancyNote>,
+    watches: Vec<WatchNote>,
+    batches: Vec<Vec<heap::TableRef>>,
+    step_data_calls: u32,
+    step_data_number_zero: bool,
+    step_data_text_zero: bool,
+    zero_evals: u32,
+    text_zero_evals: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -267,7 +299,7 @@ fn install_witness_schemas(builder: &mut vm::HostApiBuilder) {
         SAME,
         vec![
             HostParamSchema::with_passing("left", table.clone(), HostParamPassing::Borrow),
-            HostParamSchema::with_passing("right", table, HostParamPassing::Borrow),
+            HostParamSchema::with_passing("right", table.clone(), HostParamPassing::Borrow),
         ],
         HostTypeSchema::Float,
     ));
@@ -314,6 +346,29 @@ fn install_witness_schemas(builder: &mut vm::HostApiBuilder) {
         OCCUPY,
         vec![HostParamSchema::value("tag", HostTypeSchema::Float)],
         HostTypeSchema::Float,
+    ));
+    builder.function(vm::HostFunctionSchema::with_return(
+        PRODUCE_ZERO,
+        vec![],
+        HostTypeSchema::Float,
+    ));
+    builder.function(vm::HostFunctionSchema::with_return(
+        PRODUCE_TEXT_ZERO,
+        vec![],
+        HostTypeSchema::String,
+    ));
+    builder.function(vm::HostFunctionSchema::with_return(
+        MARK_WATCH,
+        vec![
+            HostParamSchema::value("tag", HostTypeSchema::Float),
+            HostParamSchema::with_passing("table", table, HostParamPassing::Borrow),
+        ],
+        HostTypeSchema::Float,
+    ));
+    builder.function(vm::HostFunctionSchema::with_return(
+        STORED_ALIVE,
+        vec![HostParamSchema::value("index", HostTypeSchema::Float)],
+        HostTypeSchema::Bool,
     ));
 }
 
@@ -405,6 +460,10 @@ fn register(registry: &mut HostFunctionRegistry, catalog: &vm::HostApiCatalog) {
         (METER, HostOp::Meter),
         (MARK_PHASE, HostOp::MarkPhase),
         (OCCUPY, HostOp::Occupy),
+        (PRODUCE_ZERO, HostOp::ProduceZero),
+        (PRODUCE_TEXT_ZERO, HostOp::ProduceTextZero),
+        (MARK_WATCH, HostOp::MarkWatch),
+        (STORED_ALIVE, HostOp::StoredAlive),
     ] {
         let function = catalog.function(name).expect("scalar step host schema");
         registry
@@ -430,6 +489,10 @@ enum HostOp {
     Meter,
     MarkPhase,
     Occupy,
+    ProduceZero,
+    ProduceTextZero,
+    MarkWatch,
+    StoredAlive,
 }
 
 impl HostOwnedFunction for HostOp {
@@ -578,6 +641,69 @@ impl HostOwnedFunction for HostOp {
                 };
                 note(&mut host, |state| state.occupancy.push(snap))?;
                 Value::Float(0.0)
+            }
+            Self::ProduceZero => {
+                note(&mut host, |state| {
+                    state.zero_evals = state.zero_evals.saturating_add(1);
+                })?;
+                Value::Float(0.0)
+            }
+            Self::ProduceTextZero => {
+                note(&mut host, |state| {
+                    state.text_zero_evals = state.text_zero_evals.saturating_add(1);
+                })?;
+                Value::string("0")
+            }
+            Self::MarkWatch => {
+                let [Value::Float(tag), table_value] = args.as_slice() else {
+                    return Err(host_fault("expected a mark watch"));
+                };
+                let observed = borrowed_table(&mut host, table_value)?;
+                let cursor = heap::saved_mark_watch(&host);
+                let marked = heap::table_marked(&host, observed.table);
+                let in_gray = heap::table_in_gray(&host, observed.table);
+                let frame_rooted = heap::current_frame_roots_table(&host, observed.table);
+                let number = heap::number_edge_watch(&host, observed.table, 7.0);
+                let utf8 = heap::utf8_edge_watch(&host, observed.table, "7");
+                let tag = *tag;
+                note(&mut host, |state| {
+                    state.watches.push(WatchNote {
+                        tag,
+                        phase: cursor.map(|item| item.phase),
+                        pending: cursor.is_some_and(|item| item.pending),
+                        cursor_owner: cursor.and_then(|item| item.cursor_owner),
+                        cursor_index: cursor.and_then(|item| item.cursor_index),
+                        gray_len: cursor.map(|item| item.gray_len).unwrap_or(0),
+                        table: observed.table,
+                        marked,
+                        in_gray,
+                        frame_rooted,
+                        number_index: number.map(|item| item.index),
+                        number_value_slot: number.and_then(|item| item.value_slot),
+                        number_string: number.is_some_and(|item| item.value_string),
+                        utf8_index: utf8.map(|item| item.index),
+                        utf8_string: utf8.is_some_and(|item| item.value_string),
+                    });
+                })?;
+                Value::Float(0.0)
+            }
+            Self::StoredAlive => {
+                let [Value::Float(tag)] = args.as_slice() else {
+                    return Err(host_fault("expected a stored watch tag"));
+                };
+                let table = note(&mut host, |state| {
+                    state
+                        .watches
+                        .iter()
+                        .find(|item| item.tag == *tag)
+                        .map(|item| item.table)
+                })?;
+                let Some(table) = table else {
+                    return Err(host_fault("stored watch was not recorded"));
+                };
+                let alive =
+                    heap::with_heap(&mut host, |heap| Ok(heap.alive(table))).map_err(host_heap)?;
+                Value::Bool(alive)
             }
         };
         Ok(CallOutcome::Return(CallReturn::one(value)))
@@ -817,11 +943,16 @@ fn drive_plugin_opts(
             .expect("record root-slot visits");
     }
     let status = vm.run();
-    let trace = vm
+    let mut trace = vm
         .host_context()
         .scope_state::<Trace>()
         .cloned()
         .unwrap_or_default();
+    let step_data = candidate::step_data_notes(&vm.host_context());
+    trace.step_data_calls = step_data.calls;
+    trace.step_data_number_zero = step_data.number_zero;
+    trace.step_data_text_zero = step_data.text_zero;
+    trace.batches = candidate::safepoint_batches(&vm.host_context());
     let frame = vm
         .host_context()
         .scope_state::<heap::LuaHeap>()
@@ -5619,4 +5750,488 @@ return 1
     assert!(!ran.meter.requested);
     assert_eq!(ran.budgets, ROOT_STEP_BUDGETS.to_vec());
     assert_eq!(ran.trace.peeks.len(), 3);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CrossArm {
+    Strong,
+    Weak,
+    Omit,
+}
+
+fn cross_source(arm: CrossArm) -> String {
+    let mut source = String::from(
+        "local function witness()\n  \
+local sentinel = {}\n  \
+local weak = {}\n  \
+local mode = {}\n",
+    );
+    if arm == CrossArm::Weak {
+        source.push_str("  local owner_mode = {}\n");
+    }
+    source.push_str(
+        "  local owner = {}\n  \
+mode.__mode = \"v\"\n  \
+setmetatable(weak, mode)\n",
+    );
+    if arm == CrossArm::Weak {
+        source.push_str("  owner_mode.__mode = \"v\"\n  setmetatable(owner, owner_mode)\n");
+    }
+    source.push_str(
+        "  owner[7] = \"old\"\n  \
+owner[\"7\"] = \"text\"\n  \
+weak.target = {}\n  \
+weak.target.child = {}\n  \
+weak.orphan = {}\n  \
+sentinel.a = true\n  \
+sentinel.b = true\n  \
+sentinel.c = true\n  \
+sentinel.d = true\n  \
+sentinel.e = true\n  \
+sentinel.f = true\n  \
+sentinel.g = true\n  \
+sentinel.h = true\n  \
+bit(1, peek(sentinel))\n  \
+note(1, collectgarbage(\"restart\"))\n  \
+local fresh = {}\n  \
+bit(2, peek(fresh))\n  \
+mark_phase(1)\n  \
+note(2, collectgarbage(\"stop\"))\n  \
+bit(3, collectgarbage(\"isrunning\"))\n  \
+local zero = produce_zero()\n  \
+bit(4, collectgarbage(\"step\", zero))\n  \
+bit(5, collectgarbage(\"isrunning\"))\n  \
+mark_phase(2)\n  \
+text(1, type(rawget(weak, \"orphan\")))\n  \
+mark_watch(1, owner)\n  \
+mark_watch(2, weak.target)\n  \
+mark_watch(3, rawget(weak.target, \"child\"))\n  \
+mark_watch(4, sentinel)\n",
+    );
+    if arm != CrossArm::Omit {
+        source.push_str("  rawset(owner, 7, weak.target)\n");
+    }
+    source.push_str(
+        "  mark_watch(5, owner)\n  \
+mark_watch(6, weak.target)\n  \
+mark_watch(7, rawget(weak.target, \"child\"))\n  \
+mark_watch(8, sentinel)\n  \
+text(2, rawget(owner, \"7\"))\n  \
+bit(6, collectgarbage(\"step\"))\n  \
+mark_phase(3)\n  \
+text(3, type(rawget(weak, \"orphan\")))\n  \
+bit(7, collectgarbage(\"step\"))\n  \
+mark_phase(4)\n  \
+text(4, type(rawget(weak, \"orphan\")))\n  \
+text(5, rawget(owner, \"7\"))\n  \
+bit(8, peek(fresh))\n  \
+bit(9, peek(sentinel))\n  \
+mark_watch(9, owner)\n  \
+bit(14, stored_alive(2))\n  \
+bit(15, stored_alive(3))\n",
+    );
+    if arm == CrossArm::Strong {
+        source.push_str(
+            "  rawset(owner, 7, nil)\n  \
+bit(10, collectgarbage(\"step\"))\n  \
+bit(13, collectgarbage(\"step\"))\n  \
+bit(11, stored_alive(2))\n  \
+bit(12, stored_alive(3))\n",
+        );
+    }
+    source.push_str("  return 1\nend\nwitness()\nreturn 1\n");
+    source
+}
+
+fn watch_opt(trace: &Trace, tag: f64) -> Option<&WatchNote> {
+    trace.watches.iter().find(|item| item.tag == tag)
+}
+
+fn text_opt(trace: &Trace, tag: f64) -> Option<&str> {
+    trace
+        .texts
+        .iter()
+        .find(|(found, _)| *found == tag)
+        .map(|(_, text)| text.as_str())
+}
+
+fn bit_opt(trace: &Trace, tag: f64) -> Option<bool> {
+    trace
+        .bits
+        .iter()
+        .find(|(found, _)| *found == tag)
+        .map(|(_, bit)| *bit)
+}
+
+fn mark_opt(trace: &Trace, tag: f64) -> Option<&MarkNote> {
+    trace.marks.iter().find(|item| item.tag == tag)
+}
+
+fn missing_step_budget(stop: &Stop) -> bool {
+    matches!(stop, Stop::HostError(message) if message.contains("missing source step fixture budget"))
+}
+
+fn batch_has(batches: &[Vec<heap::TableRef>], table: heap::TableRef) -> bool {
+    batches.iter().any(|batch| batch.contains(&table))
+}
+
+fn pause_window(ran: &Ran) -> Result<(), String> {
+    if ran.stop != Stop::Halted && !missing_step_budget(&ran.stop) {
+        return Err(format!("stop {:?}", ran.stop));
+    }
+    let owner = watch_opt(&ran.trace, 1.0).ok_or("owner watch missing")?;
+    let target = watch_opt(&ran.trace, 2.0).ok_or("target watch missing")?;
+    let child = watch_opt(&ran.trace, 3.0).ok_or("child watch missing")?;
+    let sentinel = watch_opt(&ran.trace, 4.0).ok_or("sentinel watch missing")?;
+    if owner.phase != Some("gray") || !owner.pending {
+        return Err(format!("phase {:?} pending {}", owner.phase, owner.pending));
+    }
+    if !owner.marked {
+        return Err("owner is not marked".to_string());
+    }
+    if owner.cursor_owner != Some(sentinel.table.slot()) || owner.cursor_index.is_none() {
+        return Err(format!(
+            "cursor {:?} index {:?} is not the sentinel {}",
+            owner.cursor_owner,
+            owner.cursor_index,
+            sentinel.table.slot()
+        ));
+    }
+    if target.marked || target.in_gray || child.marked || child.in_gray {
+        return Err(format!(
+            "target/child already reached marked {} {} gray {} {}",
+            target.marked, child.marked, target.in_gray, child.in_gray
+        ));
+    }
+    if target.frame_rooted || child.frame_rooted {
+        return Err("target or child is in the fixed frame".to_string());
+    }
+    if batch_has(&ran.trace.batches, target.table) || batch_has(&ran.trace.batches, child.table) {
+        return Err(format!(
+            "target or child entered a safepoint batch {:?}",
+            ran.trace.batches
+        ));
+    }
+    if text_opt(&ran.trace, 1.0) != Some("table") {
+        return Err(format!("orphan already {:?}", text_opt(&ran.trace, 1.0)));
+    }
+    if bit_opt(&ran.trace, 4.0) != Some(false) {
+        return Err(format!("explicit step {:?}", bit_opt(&ran.trace, 4.0)));
+    }
+    if bit_opt(&ran.trace, 5.0) != Some(true) {
+        return Err("running was not restored".to_string());
+    }
+    if ran.trace.zero_evals != 1
+        || ran.trace.step_data_calls != 1
+        || !ran.trace.step_data_number_zero
+    {
+        return Err(format!(
+            "step data evals {} calls {} number {}",
+            ran.trace.zero_evals, ran.trace.step_data_calls, ran.trace.step_data_number_zero
+        ));
+    }
+    let after = mark_opt(&ran.trace, 2.0).ok_or("mark after the explicit step missing")?;
+    if after.phase != Some("gray") || !after.pending || after.collects != 0 {
+        return Err(format!("explicit step left {after:?}"));
+    }
+    if !bit_opt(&ran.trace, 2.0).unwrap_or(false) {
+        return Err("fresh was not published".to_string());
+    }
+    Ok(())
+}
+
+fn number_route(ran: &Ran, arm: CrossArm) -> Result<(), String> {
+    let before = watch_opt(&ran.trace, 1.0).ok_or("before owner missing")?;
+    let after = watch_opt(&ran.trace, 5.0).ok_or("after owner missing")?;
+    let target = watch_opt(&ran.trace, 6.0).ok_or("after target missing")?;
+    if before.utf8_index.is_none() || before.utf8_index != after.utf8_index || !after.utf8_string {
+        return Err(format!(
+            "string key record {:?} -> {:?}",
+            before.utf8_index, after.utf8_index
+        ));
+    }
+    match arm {
+        CrossArm::Strong | CrossArm::Weak => {
+            if after.number_index != before.number_index
+                || after.number_value_slot != Some(target.table.slot())
+            {
+                return Err(format!(
+                    "number route missed {:?} {:?} -> {:?} {:?}",
+                    before.number_index,
+                    before.number_value_slot,
+                    after.number_index,
+                    after.number_value_slot
+                ));
+            }
+        }
+        CrossArm::Omit => {
+            if !after.number_string || after.number_value_slot.is_some() {
+                return Err(format!(
+                    "omit changed the number key string {} slot {:?}",
+                    after.number_string, after.number_value_slot
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn barrier_held(ran: &Ran, arm: CrossArm) -> Result<(), String> {
+    let before = watch_opt(&ran.trace, 1.0).ok_or("before owner missing")?;
+    let after = watch_opt(&ran.trace, 5.0).ok_or("after owner missing")?;
+    let target = watch_opt(&ran.trace, 6.0).ok_or("after target missing")?;
+    let child = watch_opt(&ran.trace, 7.0).ok_or("after child missing")?;
+    if after.phase != before.phase
+        || after.cursor_owner != before.cursor_owner
+        || after.cursor_index != before.cursor_index
+    {
+        return Err(format!(
+            "write moved cursor {:?} {:?} -> {:?} {:?}",
+            before.phase, before.cursor_index, after.phase, after.cursor_index
+        ));
+    }
+    if before.utf8_index.is_none() || before.utf8_index != after.utf8_index || !after.utf8_string {
+        return Err(format!(
+            "string key record {:?} -> {:?}",
+            before.utf8_index, after.utf8_index
+        ));
+    }
+    match arm {
+        CrossArm::Strong => {
+            if !target.marked || !target.in_gray {
+                return Err(format!(
+                    "strong target was not enqueued marked {} gray {}",
+                    target.marked, target.in_gray
+                ));
+            }
+            if child.marked || child.in_gray {
+                return Err("barrier followed the child".to_string());
+            }
+            if after.gray_len != before.gray_len.saturating_add(1) {
+                return Err(format!("gray {} -> {}", before.gray_len, after.gray_len));
+            }
+            if after.number_index != before.number_index
+                || after.number_value_slot != Some(target.table.slot())
+            {
+                return Err(format!(
+                    "number record {:?} {:?} -> {:?} {:?}",
+                    before.number_index,
+                    before.number_value_slot,
+                    after.number_index,
+                    after.number_value_slot
+                ));
+            }
+        }
+        CrossArm::Weak | CrossArm::Omit => {
+            if target.in_gray || child.in_gray || target.marked || child.marked {
+                return Err(format!(
+                    "weak/omit enqueued target {} {} child {} {}",
+                    target.marked, target.in_gray, child.marked, child.in_gray
+                ));
+            }
+            if after.gray_len != before.gray_len {
+                return Err(format!(
+                    "gray len changed {} -> {}",
+                    before.gray_len, after.gray_len
+                ));
+            }
+            if arm == CrossArm::Omit && !after.number_string {
+                return Err("omit wrote the number key".to_string());
+            }
+            if arm == CrossArm::Weak
+                && (after.number_index != before.number_index
+                    || after.number_value_slot != Some(target.table.slot()))
+            {
+                return Err("weak write missed the existing number record".to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn continuation_publishes(ran: &Ran) -> bool {
+    bit_opt(&ran.trace, 6.0) == Some(false)
+        && text_opt(&ran.trace, 3.0) == Some("nil")
+        && mark_opt(&ran.trace, 3.0).is_some_and(|item| item.collects == 0)
+}
+
+fn continuation_completes(ran: &Ran) -> bool {
+    (ran.stop == Stop::Halted || missing_step_budget(&ran.stop))
+        && bit_opt(&ran.trace, 7.0) == Some(true)
+        && mark_opt(&ran.trace, 4.0).is_some_and(|item| item.collects == 1)
+        && text_opt(&ran.trace, 4.0) == Some("nil")
+        && text_opt(&ran.trace, 5.0) == Some("text")
+}
+
+/// Same source: automatic gray allocation, one runtime zero step, then the
+/// existing number-key replacement. Pause, publish, complete, and release
+/// budgets were measured for this graph. They are not the older gray fixture's 40.
+#[test]
+fn auto_runtime_number_write_crosses_gray_pause_and_step_data() {
+    finish_cross(CrossArm::Strong, 30, 16, 8);
+    finish_cross(CrossArm::Weak, 37, 16, 16);
+    finish_cross(CrossArm::Omit, 30, 16, 16);
+    let source = cross_source(CrossArm::Strong);
+    let ran = run_auto_table(&source, Some(&[30, 1, 16, 8, 64, 8]));
+    assert_eq!(ran.stop, Stop::Halted, "{ran:?}");
+    assert_eq!(bit_opt(&ran.trace, 11.0), Some(false));
+    assert_eq!(bit_opt(&ran.trace, 12.0), Some(false));
+    assert!(ran.collects >= 2);
+    assert_eq!(text_value(&ran.trace, 5.0), "text");
+}
+
+fn finish_cross(arm: CrossArm, pause: u64, publish: u64, complete: u64) {
+    let source = cross_source(arm);
+    let window = run_auto_table(&source, Some(&[pause, 1]));
+    pause_window(&window).unwrap_or_else(|err| panic!("{arm:?} window: {err}"));
+    number_route(&window, arm).unwrap_or_else(|err| panic!("{arm:?} route: {err}"));
+    barrier_held(&window, arm).unwrap_or_else(|err| panic!("{arm:?} barrier: {err}"));
+    let published = run_auto_table(&source, Some(&[pause, 1, publish]));
+    assert!(
+        continuation_publishes(&published),
+        "{arm:?} publish pause {pause} step {publish} stop {:?} bit6 {:?} orphan {:?} collects {:?}",
+        published.stop,
+        bit_opt(&published.trace, 6.0),
+        text_opt(&published.trace, 3.0),
+        mark_opt(&published.trace, 3.0).map(|item| item.collects)
+    );
+    let finished = run_auto_table(&source, Some(&[pause, 1, publish, complete]));
+    assert!(
+        continuation_completes(&finished),
+        "{arm:?} complete pause {pause} publish {publish} step {complete} stop {:?} bit7 {:?} collects {:?} string {:?}",
+        finished.stop,
+        bit_opt(&finished.trace, 7.0),
+        mark_opt(&finished.trace, 4.0).map(|item| item.collects),
+        text_opt(&finished.trace, 5.0)
+    );
+    assert_eq!(finished.collects, 1, "{arm:?} {:?}", finished.stop);
+    assert_eq!(finished.collections, 1);
+    assert!(!finished.tail);
+    assert!(bit_opt(&finished.trace, 8.0).unwrap_or(false), "fresh died");
+    assert!(
+        bit_opt(&finished.trace, 9.0).unwrap_or(false),
+        "sentinel died"
+    );
+    assert_eq!(finished.trace.peeks[0].table, finished.trace.peeks[3].table);
+    assert_eq!(finished.trace.peeks[1].table, finished.trace.peeks[2].table);
+    let kept = bit_opt(&finished.trace, 14.0);
+    let child_kept = bit_opt(&finished.trace, 15.0);
+    match arm {
+        CrossArm::Strong => {
+            assert_eq!(
+                kept,
+                Some(true),
+                "strong target must survive the first cycle"
+            );
+            assert_eq!(
+                child_kept,
+                Some(true),
+                "child must survive by the later scan"
+            );
+        }
+        CrossArm::Weak | CrossArm::Omit => {
+            assert_eq!(kept, Some(false), "{arm:?} target must be released");
+            assert_eq!(child_kept, Some(false), "{arm:?} child must be released");
+        }
+    }
+}
+
+#[test]
+fn stopped_same_position_allocation_does_not_request_auto_table() {
+    let source = "\
+local function witness()
+  local sentinel = {}
+  local weak = {}
+  local mode = {}
+  local owner = {}
+  mode.__mode = \"v\"
+  setmetatable(weak, mode)
+  owner[7] = \"old\"
+  owner[\"7\"] = \"text\"
+  weak.target = {}
+  weak.target.child = {}
+  weak.orphan = {}
+  sentinel.a = true
+  note(1, collectgarbage(\"stop\"))
+  local fresh = {}
+  bit(2, peek(fresh))
+  mark_phase(1)
+  text(1, type(rawget(weak, \"orphan\")))
+  return 1
+end
+witness()
+return 1
+";
+    let queued = [11_u64, 13];
+    let ran = run_auto_table(source, Some(&queued));
+    assert_eq!(ran.stop, Stop::Halted, "{ran:?}");
+    assert_eq!(ran.budgets, queued, "stop must not consume a step budget");
+    assert_eq!(ran.trace.step_data_calls, 0, "no runtime step data");
+    assert_eq!(ran.trace.zero_evals, 0);
+    assert!(
+        ran.trace.batches.is_empty(),
+        "no automatic safepoint {:?}",
+        ran.trace.batches
+    );
+    assert!(bit_value(&ran.trace, 2.0), "fresh still allocates");
+    let idle = mark_note(&ran.trace, 1.0);
+    assert_eq!(idle.phase, None, "stop must not open a mark phase");
+    assert!(!idle.pending, "stop must not leave a pending scan");
+    assert_eq!(idle.collects, 0);
+    assert_eq!(ran.collects, 0);
+    assert_eq!(text_value(&ran.trace, 1.0), "table");
+    assert!(!ran.running);
+}
+
+#[test]
+fn literal_step_zero_does_not_call_runtime_step_data() {
+    let literal = "\
+local function witness()
+  local w = {}
+  note(1, collectgarbage(\"stop\"))
+  bit(1, collectgarbage(\"step\", 0))
+  return 1
+end
+witness()
+return 1
+";
+    let ran = run_auto_table(literal, Some(&[1]));
+    assert_eq!(
+        ran.trace.step_data_calls, 0,
+        "literal zero is not runtime data: {ran:?}"
+    );
+    assert!(!ran.trace.step_data_number_zero);
+    assert_eq!(ran.trace.zero_evals, 0);
+
+    let produced = "\
+local function witness()
+  local w = {}
+  note(1, collectgarbage(\"stop\"))
+  local zero = produce_zero()
+  bit(1, collectgarbage(\"step\", zero))
+  return 1
+end
+witness()
+return 1
+";
+    let ran = run_auto_table(produced, Some(&[1]));
+    assert_eq!(ran.trace.zero_evals, 1, "{ran:?}");
+    assert_eq!(ran.trace.step_data_calls, 1, "{ran:?}");
+    assert!(ran.trace.step_data_number_zero);
+
+    let text_zero = "\
+local function witness()
+  local w = {}
+  note(1, collectgarbage(\"stop\"))
+  local text_zero = produce_text_zero()
+  bit(1, collectgarbage(\"step\", text_zero))
+  return 1
+end
+witness()
+return 1
+";
+    let ran = run_auto_table(text_zero, Some(&[1]));
+    assert_eq!(ran.trace.text_zero_evals, 1, "{ran:?}");
+    assert_eq!(ran.trace.step_data_calls, 1, "{ran:?}");
+    assert!(ran.trace.step_data_text_zero, "{ran:?}");
 }
