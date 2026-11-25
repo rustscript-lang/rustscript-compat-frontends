@@ -1151,11 +1151,29 @@ fn note_weak_started(heap: &mut LuaHeap, state: &mut MarkState, slot: u32) {
     }
 }
 
+/// Sizes the slot-indexed rescan bits before a weak owner starts or a
+/// strengthening request is queued. A slot grown by a mid-cycle allocation is
+/// outside the first bitmap, so the next request extends both bit vectors by
+/// the new suffix. The extension runs inside the same weak-start or setter
+/// request that needs it, zero-fills only the suffix, and is recorded in
+/// `owner_rescan_inited`. `Vec` growth doubles capacity, so the extension is
+/// amortized O(1) per added slot; it does not walk the heap or an owner chain.
 fn ensure_rescan_bits(heap: &mut LuaHeap, state: &mut MarkState) {
+    let len = heap.slots.len();
     if state.rescan_ready {
+        if state.weak_started.len() >= len {
+            return;
+        }
+        let grown = len - state.weak_started.len();
+        state.weak_started.resize(len, false);
+        state.rescan_queued.resize(len, false);
+        heap.scan.scratch.owner_rescan_inited = heap
+            .scan
+            .scratch
+            .owner_rescan_inited
+            .saturating_add(u64::try_from(grown).unwrap_or(u64::MAX));
         return;
     }
-    let len = heap.slots.len();
     state.weak_started = vec![false; len];
     state.rescan_queued = vec![false; len];
     state.rescan = Vec::with_capacity(len);

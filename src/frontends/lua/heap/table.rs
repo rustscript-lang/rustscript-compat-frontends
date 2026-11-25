@@ -697,8 +697,9 @@ pub struct ScanScratch {
     /// Not a collective zero-fill. 0 when every live node is marked and the
     /// filter is skipped.
     pub sweep_bitmap_inited: u64,
-    /// Slot-indexed rescan bits zeroed once per mark, bounded by the node
-    /// limit. 0 when this cycle never started a weak-value owner scan.
+    /// Slot-indexed rescan bits zeroed once per mark plus any suffix extended
+    /// for slots grown during the mark. Bounded by the node limit. 0 when this
+    /// cycle never started a weak-value owner scan.
     pub owner_rescan_inited: u64,
     /// Owners appended to the rescan queue. One per owner per mark. A repeat
     /// setter does not append and does not increment this.
