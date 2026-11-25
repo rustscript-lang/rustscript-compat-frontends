@@ -66,6 +66,18 @@ pub(super) struct MarkState {
     pub(super) cursor: Option<u32>,
     owner_kind: HandleKind,
     owner_mode: WeakMode,
+    /// Slot-indexed. True after this mark's ordinary scan has opened the
+    /// owner with weak values. Bounded by the node limit. Dropped with the mark.
+    weak_started: Vec<bool>,
+    /// Dedup bit for `rescan`. A repeat setter reads this and does not walk
+    /// the queue, the owner chain, or the gray stack.
+    rescan_queued: Vec<bool>,
+    /// Owners waiting for a chain-head rescan. At most one entry each.
+    rescan: Vec<u32>,
+    rescan_owner: Option<u32>,
+    rescan_cursor: Option<u32>,
+    rescan_mode: WeakMode,
+    rescan_ready: bool,
 }
 
 enum MarkPhase {
@@ -134,6 +146,13 @@ impl MarkState {
             cursor: None,
             owner_kind: HandleKind::Table,
             owner_mode: WeakMode::default(),
+            weak_started: Vec::new(),
+            rescan_queued: Vec::new(),
+            rescan: Vec::new(),
+            rescan_owner: None,
+            rescan_cursor: None,
+            rescan_mode: WeakMode::default(),
+            rescan_ready: false,
         }
     }
 
@@ -929,7 +948,21 @@ fn step_gray(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
         state.owner = None;
         return false;
     }
-    begin_owner(heap, state)
+    if !state.gray.is_empty() {
+        return begin_owner(heap, state);
+    }
+    if state.rescan_owner.is_some() {
+        if state.rescan_cursor.is_some() {
+            return charge_rescan(heap, state);
+        }
+        state.rescan_owner = None;
+        return false;
+    }
+    if let Some(slot) = state.rescan.pop() {
+        return open_rescan(heap, state, slot);
+    }
+    state.phase = MarkPhase::Done;
+    false
 }
 
 fn begin_owner(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
@@ -954,6 +987,9 @@ fn begin_owner(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
     state.owner = Some(slot);
     state.owner_kind = kind;
     state.owner_mode = mode;
+    if mode.values {
+        note_weak_started(heap, state, slot);
+    }
     true
 }
 
@@ -972,6 +1008,80 @@ fn charge_edge(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
     heap.scan.outgoing_edge_checks += 1;
     follow_edge_ends(heap, state, cursor);
     true
+}
+
+fn charge_rescan(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
+    let cursor = state.rescan_cursor.expect("rescan unit has a cursor");
+    let next = heap.edge_slots[cursor as usize].next;
+    state.rescan_cursor = next;
+    let gap = heap.edge_slots[cursor as usize]
+        .edge
+        .as_ref()
+        .is_some_and(|edge| edge.value.is_cursor_gap());
+    if gap {
+        heap.scan.outgoing_gap_checks += 1;
+        return true;
+    }
+    heap.scan.outgoing_edge_checks += 1;
+    follow_rescan_ends(heap, state, cursor);
+    true
+}
+
+fn open_rescan(heap: &mut LuaHeap, state: &mut MarkState, slot: u32) -> bool {
+    if let Some(queued) = state.rescan_queued.get_mut(slot as usize) {
+        *queued = false;
+    }
+    let Some(stored) = heap.slots.get(slot as usize) else {
+        return false;
+    };
+    if stored.kind != HandleKind::Table || !matches!(stored.state, SlotState::Live { .. }) {
+        return false;
+    }
+    let mode = cached_owner_mode(heap, state, slot);
+    heap.scan.owner_head_checks += 1;
+    heap.scan.owner_rescan_heads += 1;
+    state.rescan_cursor = heap.slots[slot as usize].edge_head;
+    state.rescan_owner = Some(slot);
+    state.rescan_mode = mode;
+    true
+}
+
+fn follow_rescan_ends(heap: &mut LuaHeap, state: &mut MarkState, cursor: u32) {
+    let (object_key, value_target) = {
+        let edge = heap.edge_slots[cursor as usize]
+            .edge
+            .as_ref()
+            .expect("rescan chain holds an occupied record");
+        let object_key = match &edge.key {
+            EdgeKey::Object {
+                slot,
+                generation,
+                kind,
+            } => Some((*slot, *generation, *kind)),
+            EdgeKey::Field(_) | EdgeKey::Utf8(_) | EdgeKey::Number(_) => None,
+        };
+        let value_target = match &edge.value {
+            EdgeValue::Table { slot, generation } => Some((*slot, *generation, HandleKind::Table)),
+            EdgeValue::Closure { slot, generation } => {
+                Some((*slot, *generation, HandleKind::Closure))
+            }
+            EdgeValue::Upvalue { slot, generation } => {
+                Some((*slot, *generation, HandleKind::Upvalue))
+            }
+            EdgeValue::Scalar(_) => None,
+        };
+        (object_key, value_target)
+    };
+    if !state.rescan_mode.keys
+        && let Some((slot, generation, kind)) = object_key
+    {
+        let _matched = follow_one(heap, state, slot, generation, kind);
+    }
+    if !state.rescan_mode.values
+        && let Some((slot, generation, kind)) = value_target
+    {
+        let _matched = follow_one(heap, state, slot, generation, kind);
+    }
 }
 
 fn follow_edge_ends(heap: &mut LuaHeap, state: &mut MarkState, cursor: u32) {
@@ -1013,6 +1123,37 @@ fn follow_edge_ends(heap: &mut LuaHeap, state: &mut MarkState, cursor: u32) {
     if strong_value && let Some((slot, generation, kind)) = value_target {
         let _matched = follow_one(heap, state, slot, generation, kind);
     }
+}
+
+fn note_weak_started(heap: &mut LuaHeap, state: &mut MarkState, slot: u32) {
+    ensure_rescan_bits(heap, state);
+    if let Some(started) = state.weak_started.get_mut(slot as usize) {
+        *started = true;
+    }
+}
+
+fn ensure_rescan_bits(heap: &mut LuaHeap, state: &mut MarkState) {
+    if state.rescan_ready {
+        return;
+    }
+    let len = heap.slots.len();
+    state.weak_started = vec![false; len];
+    state.rescan_queued = vec![false; len];
+    state.rescan = Vec::with_capacity(len);
+    heap.scan.scratch.owner_rescan_inited = u64::try_from(len).unwrap_or(u64::MAX);
+    state.rescan_ready = true;
+}
+
+fn mode_of_tuple(state: &MarkState, tuple: Option<(u32, u32)>) -> WeakMode {
+    let Some((slot, _)) = tuple else {
+        return WeakMode::default();
+    };
+    state
+        .modes
+        .as_ref()
+        .and_then(|modes| modes.get(slot as usize))
+        .copied()
+        .unwrap_or_default()
 }
 
 fn owner_mode(heap: &mut LuaHeap, state: &mut MarkState, slot: u32) -> WeakMode {
@@ -1170,7 +1311,11 @@ impl LuaHeap {
         let state = self.mark.as_ref()?;
         Some((
             state.phase_name(),
-            !state.gray.is_empty() || state.cursor.is_some(),
+            !state.gray.is_empty()
+                || state.cursor.is_some()
+                || state.rescan_owner.is_some()
+                || state.rescan_cursor.is_some()
+                || !state.rescan.is_empty(),
         ))
     }
 
@@ -1289,6 +1434,61 @@ impl LuaHeap {
             && !cached_values_weak(self, &state, owner)
         {
             enqueue_barrier_target(self, &mut state, slot, generation, HandleKind::Table);
+        }
+        self.mark = Some(state);
+    }
+
+    /// Records a weak-value to strong transition using the tuples captured
+    /// before the slot write. The old mode comes from this cycle's cache and
+    /// that tuple, not from the edge count, so clearing the last metatable
+    /// edge cannot make the old mode look strong. A not-yet-started owner is
+    /// left for the ordinary scan. This does not enqueue, scan, or move a cursor.
+    pub(super) fn note_value_strengthen(
+        &self,
+        owner: u32,
+        old_tuple: Option<(u32, u32)>,
+        new_tuple: Option<(u32, u32)>,
+    ) -> bool {
+        let Some(state) = self.mark.as_ref() else {
+            return false;
+        };
+        if !state.mutation_open() {
+            return false;
+        }
+        let old_mode = mode_of_tuple(state, old_tuple);
+        let new_mode = mode_of_tuple(state, new_tuple);
+        if !old_mode.values || new_mode.values {
+            return false;
+        }
+        state
+            .weak_started
+            .get(owner as usize)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Queues one chain-head rescan for an owner that already started a weak
+    /// scan. A repeat reads the slot bit and does not walk the queue. This
+    /// does not scan the owner, reset a mark, or move the ordinary cursor.
+    pub(super) fn schedule_value_rescan(&mut self, owner: u32) {
+        let Some(mut state) = self.mark.take() else {
+            return;
+        };
+        if state.mutation_open() {
+            ensure_rescan_bits(self, &mut state);
+            if let Some(queued) = state.rescan_queued.get_mut(owner as usize)
+                && !*queued
+                && state
+                    .weak_started
+                    .get(owner as usize)
+                    .copied()
+                    .unwrap_or(false)
+            {
+                *queued = true;
+                state.rescan.push(owner);
+                self.scan.scratch.owner_rescan_pushed += 1;
+                self.scan.owner_rescan_schedules += 1;
+            }
         }
         self.mark = Some(state);
     }

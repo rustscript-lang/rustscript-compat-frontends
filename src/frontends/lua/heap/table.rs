@@ -645,6 +645,13 @@ pub struct ScanMeter {
     /// counted here or in `node_slot_visits`. Not a pulse unit. A full collect
     /// leaves this at zero.
     pub parked_root_batch_accepts: u64,
+    /// Chain-head reads of an owner whose weak-value scan already started and
+    /// whose metatable later became strong. Not an ordinary first coloring,
+    /// and not the setter that only recorded the request.
+    pub owner_rescan_heads: u64,
+    /// Setter requests that recorded one such owner. A repeat does not
+    /// increment this. Not an outgoing edge visit and not a pulse unit.
+    pub owner_rescan_schedules: u64,
     pub scratch: ScanScratch,
 }
 
@@ -670,6 +677,12 @@ pub struct ScanScratch {
     /// Not a collective zero-fill. 0 when every live node is marked and the
     /// filter is skipped.
     pub sweep_bitmap_inited: u64,
+    /// Slot-indexed rescan bits zeroed once per mark, bounded by the node
+    /// limit. 0 when this cycle never started a weak-value owner scan.
+    pub owner_rescan_inited: u64,
+    /// Owners appended to the rescan queue. One per owner per mark. A repeat
+    /// setter does not append and does not increment this.
+    pub owner_rescan_pushed: u64,
 }
 
 /// A stored token identified while marking. Close checks this slot and
@@ -2099,16 +2112,21 @@ impl LuaHeap {
             self.require_live(target)?;
         }
         self.ensure_sweep_open()?;
-        let had = self.slots[owner.slot() as usize].metatable.is_some();
-        let next = mt.map(|target| (target.slot(), target.generation()));
-        if had != next.is_some() {
-            if next.is_some() {
+        let old_tuple = self.slots[owner.slot() as usize].metatable;
+        let new_tuple = mt.map(|target| (target.slot(), target.generation()));
+        let strengthen = self.note_value_strengthen(owner.slot(), old_tuple, new_tuple);
+        let had = old_tuple.is_some();
+        if had != new_tuple.is_some() {
+            if new_tuple.is_some() {
                 self.metatable_edges = self.metatable_edges.saturating_add(1);
             } else {
                 self.metatable_edges = self.metatable_edges.saturating_sub(1);
             }
         }
-        self.slots[owner.slot() as usize].metatable = next;
+        self.slots[owner.slot() as usize].metatable = new_tuple;
+        if strengthen {
+            self.schedule_value_rescan(owner.slot());
+        }
         if let Some(target) = mt {
             self.barrier_strong_metatable(owner.slot(), target.slot(), target.generation());
         }

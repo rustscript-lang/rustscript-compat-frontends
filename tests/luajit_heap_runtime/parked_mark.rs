@@ -7,6 +7,7 @@ use super::{
     ClosureRef, HeapError, HeapLimits, HeapStats, LuaHeap, ParkedMark, PausedOp, PendingScan,
     RootFrameId, ScanMeter, TableRef, UpvalueRef,
 };
+use crate::heap;
 use vm::Value;
 
 const KEY_X: u32 = 1;
@@ -5980,5 +5981,587 @@ fn published_tail_closed_cell_closure_refuses_without_changing_identity() {
             Ok(())
         })
         .expect("after release");
+    });
+}
+
+/// Where the weak-value owner sits when the metatable write runs.
+#[derive(Clone, Copy)]
+enum WeakOwnerPlace {
+    /// Gray already walked the owner. A later owner still has a real cursor.
+    Scanned,
+    /// The owner's second record is the pending cursor. An earlier edge was charged.
+    Scanning,
+    /// The owner is marked and still under the sentinel in the gray stack.
+    Queued,
+}
+
+struct WeakGraph {
+    sentinel: TableRef,
+    left: TableRef,
+    right: TableRef,
+    witness: TableRef,
+    old_mt: TableRef,
+    strong_mt: TableRef,
+    subject: TableRef,
+    child: TableRef,
+    right_val: TableRef,
+    orphan: TableRef,
+    dust: TableRef,
+    sentinel_record: u32,
+    left_scalar: u32,
+    left_subject: u32,
+    old_mode_record: u32,
+}
+
+fn plant_weak_graph(heap: &mut LuaHeap, place: WeakOwnerPlace) -> Result<WeakGraph, HeapError> {
+    let sentinel = heap.alloc()?;
+    let left = heap.alloc()?;
+    let right = heap.alloc()?;
+    let witness = heap.alloc()?;
+    let old_mt = heap.alloc()?;
+    let strong_mt = heap.alloc()?;
+    let subject = heap.alloc()?;
+    let child = heap.alloc()?;
+    let right_val = heap.alloc()?;
+    let orphan = heap.alloc()?;
+    let dust = heap.alloc()?;
+    heap.set_mode_scalar(old_mt, Value::string("v"))?;
+    heap.set_metatable(left, Some(old_mt))?;
+    heap.set_metatable(right, Some(old_mt))?;
+    heap.set_metatable(witness, Some(old_mt))?;
+    heap.set_named_scalar(sentinel, "pending", Value::Bool(true))?;
+    heap.set_named_scalar(left, "charged", Value::Bool(true))?;
+    heap.set_named_edge(left, "subj", subject)?;
+    heap.set_named_edge(subject, "next", child)?;
+    heap.set_named_edge(right, "gone", right_val)?;
+    heap.set_named_edge(witness, "child", child)?;
+    heap.set_named_edge(witness, "orphan", orphan)?;
+    heap.issue_carrier(subject)?;
+    let frame = heap.enter_roots(5)?;
+    // Last written root is popped first. The sentinel stays pending until the
+    // owners written after it have been scanned, except the queued arm.
+    match place {
+        WeakOwnerPlace::Scanned | WeakOwnerPlace::Scanning => {
+            heap.write_root(frame, 0, sentinel)?;
+            heap.write_root(frame, 1, right)?;
+            heap.write_root(frame, 2, witness)?;
+            heap.write_root(frame, 3, strong_mt)?;
+            heap.write_root(frame, 4, left)?;
+        }
+        WeakOwnerPlace::Queued => {
+            heap.write_root(frame, 0, left)?;
+            heap.write_root(frame, 1, right)?;
+            heap.write_root(frame, 2, witness)?;
+            heap.write_root(frame, 3, strong_mt)?;
+            heap.write_root(frame, 4, sentinel)?;
+        }
+    }
+    let (_, sentinel_record) = heap
+        .locate_named(sentinel.slot(), "pending")
+        .expect("sentinel record");
+    let (_, left_scalar) = heap
+        .locate_named(left.slot(), "charged")
+        .expect("charged record");
+    let (_, left_subject) = heap
+        .locate_named(left.slot(), "subj")
+        .expect("subject record");
+    let old_mode_record = heap.slots[old_mt.slot() as usize]
+        .edge_head
+        .expect("mode record");
+    let _ = dust;
+    let _ = frame;
+    Ok(WeakGraph {
+        sentinel,
+        left,
+        right,
+        witness,
+        old_mt,
+        strong_mt,
+        subject,
+        child,
+        right_val,
+        orphan,
+        dust,
+        sentinel_record,
+        left_scalar,
+        left_subject,
+        old_mode_record,
+    })
+}
+
+fn open_weak_graph(host: &mut vm::HostContext<'_>, place: WeakOwnerPlace) -> WeakGraph {
+    crate::heap::install(host, limits(16, 8, 24)).expect("install");
+    let graph = crate::heap::with_heap(host, |heap| plant_weak_graph(heap, place)).expect("plant");
+    crate::heap::open_fixed_step(host).expect("open");
+    graph
+}
+
+fn resume_weak(host: &mut vm::HostContext<'_>, body: impl FnOnce(&mut ParkedMark<'_>)) {
+    crate::heap::with_heap(host, |heap| {
+        let mut parked = ParkedMark::resume(heap).expect("resume saved mark");
+        body(&mut parked);
+        parked.park().expect("park");
+        Ok(())
+    })
+    .expect("resume");
+}
+
+fn write_metatable(
+    parked: &mut ParkedMark<'_>,
+    owner: TableRef,
+    mt: Option<TableRef>,
+) -> Result<(), HeapError> {
+    parked.with_saved_heap(|heap| heap.set_metatable(owner, mt))
+}
+
+fn assert_setter_did_not_move_scan(before: &ScanMeter, after: &ScanMeter) {
+    assert_eq!(before.outgoing_edge_checks, after.outgoing_edge_checks);
+    assert_eq!(before.owner_head_checks, after.owner_head_checks);
+    assert_eq!(before.weak_mode_lookups, after.weak_mode_lookups);
+    assert_eq!(before.root_slot_visits, after.root_slot_visits);
+}
+
+fn assert_subject_marked(parked: &mut ParkedMark<'_>, subject: TableRef) {
+    if parked.marked(subject) {
+        return;
+    }
+    for _ in 0..HARNESS_BOUND {
+        let view = parked.pulse(1);
+        if parked.marked(subject) {
+            return;
+        }
+        if view.finished {
+            break;
+        }
+    }
+    assert!(parked.marked(subject), "弱扫描跳过的值没有被标活");
+}
+
+fn finish_fixed_cycle(host: &mut vm::HostContext<'_>) -> crate::heap::StepOutcome {
+    let mut outcome = heap::step_fixed_frames(host, 128).expect("step fixed frames");
+    for _ in 0..HARNESS_BOUND {
+        if matches!(outcome, crate::heap::StepOutcome::Completed(_)) {
+            return outcome;
+        }
+        outcome = heap::step_fixed_frames(host, 128).expect("resume published tail");
+    }
+    outcome
+}
+
+fn finish_kept_cycle(host: &mut vm::HostContext<'_>, graph: &WeakGraph) {
+    let done = finish_fixed_cycle(host);
+    assert!(
+        matches!(done, crate::heap::StepOutcome::Completed(_)),
+        "{done:?}"
+    );
+    assert!(heap::fixed_step_idle(host).expect("idle"));
+    heap::with_heap(host, |heap| -> Result<(), HeapError> {
+        assert!(
+            heap.alive(graph.subject),
+            "the strengthened edge keeps the value"
+        );
+        assert!(
+            heap.alive(graph.child),
+            "the continued scan keeps the successor"
+        );
+        assert_eq!(heap.named_edge(graph.left, "subj")?, Some(graph.subject));
+        assert_eq!(heap.named_edge(graph.subject, "next")?, Some(graph.child));
+        let carrier = heap.issued_value(graph.subject)?;
+        let mut cursor = Value::Null;
+        let mut saw = false;
+        while let Some((key, value)) = heap.next_guest(graph.left, &cursor)? {
+            if value == carrier {
+                saw = true;
+            }
+            cursor = key;
+        }
+        assert!(saw, "iteration still yields the original subject");
+        assert_eq!(heap.named_edge(graph.right, "gone")?, None);
+        assert!(
+            !heap.alive(graph.right_val),
+            "the shared weak table still clears"
+        );
+        assert_eq!(heap.named_edge(graph.witness, "orphan")?, None);
+        assert!(
+            !heap.alive(graph.orphan),
+            "the weak orphan proves this cycle released nodes"
+        );
+        assert_eq!(heap.named_edge(graph.witness, "child")?, Some(graph.child));
+        assert!(!heap.alive(graph.dust), "an unrooted node was released");
+        heap.set_named_scalar(graph.left, "subj", Value::Null)?;
+        Ok(())
+    })
+    .expect("this cycle");
+    heap::collect(host).expect("next cycle after the keep-alive edge is removed");
+    heap::with_heap(host, |heap| {
+        assert!(
+            !heap.alive(graph.subject),
+            "the next cycle clears the value"
+        );
+        assert!(
+            !heap.alive(graph.child),
+            "the next cycle clears the successor"
+        );
+        assert_eq!(heap.named_edge(graph.witness, "child").expect("read"), None);
+        Ok(())
+    })
+    .expect("next cycle");
+}
+
+#[test]
+fn gray_scanned_weak_owner_strengthen_marks_skipped_value() {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        let graph = open_weak_graph(&mut host, WeakOwnerPlace::Scanned);
+        resume_weak(&mut host, |parked| {
+            let pending = pause_at(parked, graph.sentinel.slot(), graph.sentinel_record);
+            assert_eq!(pending.owner, graph.sentinel.slot());
+            assert!(
+                parked.marked(graph.left),
+                "the left table was already scanned"
+            );
+            assert!(
+                !parked.marked(graph.subject),
+                "the weak scan left the value white"
+            );
+            assert!(
+                !parked.marked(graph.child),
+                "the successor has no other strong root"
+            );
+            assert!(parked.meter().outgoing_edge_checks > 0);
+            let before = parked.meter();
+            let roots = parked.stats().live_roots;
+            write_metatable(parked, graph.left, Some(graph.strong_mt))
+                .expect("replace with the preallocated strong metatable");
+            assert!(same_pending(Some(pending), parked.pending()));
+            assert_setter_did_not_move_scan(&before, &parked.meter());
+            assert_eq!(parked.stats().live_roots, roots);
+            assert!(!parked.marked(graph.subject));
+            assert_subject_marked(parked, graph.subject);
+            assert_subject_marked(parked, graph.child);
+        });
+        finish_kept_cycle(&mut host, &graph);
+    });
+}
+
+#[test]
+fn gray_scanned_weak_owner_clear_metatable_marks_skipped_value() {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        let graph = open_weak_graph(&mut host, WeakOwnerPlace::Scanned);
+        resume_weak(&mut host, |parked| {
+            pause_at(parked, graph.sentinel.slot(), graph.sentinel_record);
+            assert!(parked.marked(graph.left));
+            assert!(!parked.marked(graph.subject));
+            let before = parked.meter();
+            let pending = parked.pending();
+            let roots = parked.stats().live_roots;
+            write_metatable(parked, graph.left, None).expect("clear the weak metatable");
+            assert!(same_pending(pending, parked.pending()));
+            assert_setter_did_not_move_scan(&before, &parked.meter());
+            assert_eq!(parked.stats().live_roots, roots);
+            assert_eq!(parked.meter().node_slot_visits, before.node_slot_visits);
+            assert_subject_marked(parked, graph.subject);
+        });
+        finish_kept_cycle(&mut host, &graph);
+    });
+}
+
+#[test]
+fn gray_scanned_weak_owner_sole_edge_clear_still_reads_old_weakness() {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits(12, 4, 16)).expect("install");
+        let graph = heap::with_heap(&mut host, |heap| -> Result<_, HeapError> {
+            let sentinel = heap.alloc()?;
+            let left = heap.alloc()?;
+            let old_mt = heap.alloc()?;
+            let subject = heap.alloc()?;
+            let child = heap.alloc()?;
+            let dust = heap.alloc()?;
+            heap.set_mode_scalar(old_mt, Value::string("v"))?;
+            heap.set_metatable(left, Some(old_mt))?;
+            heap.set_named_scalar(sentinel, "pending", Value::Bool(true))?;
+            heap.set_named_scalar(left, "charged", Value::Bool(true))?;
+            heap.set_named_edge(left, "subj", subject)?;
+            heap.set_named_edge(subject, "next", child)?;
+            let frame = heap.enter_roots(2)?;
+            heap.write_root(frame, 0, sentinel)?;
+            heap.write_root(frame, 1, left)?;
+            let (_, sentinel_record) = heap
+                .locate_named(sentinel.slot(), "pending")
+                .expect("sentinel");
+            Ok((sentinel, left, subject, child, dust, sentinel_record, frame))
+        })
+        .expect("plant");
+        let (sentinel, left, subject, child, dust, sentinel_record, _frame) = graph;
+        heap::open_fixed_step(&mut host).expect("open");
+        resume_weak(&mut host, |parked| {
+            pause_at(parked, sentinel.slot(), sentinel_record);
+            assert!(parked.marked(left));
+            assert!(!parked.marked(subject));
+            let edges = parked.with_saved_heap(|heap| heap.metatable_edges);
+            assert_eq!(edges, 1, "clearing this edge drops the count to zero");
+            write_metatable(parked, left, None).expect("clear the only metatable edge");
+            assert_eq!(parked.with_saved_heap(|heap| heap.metatable_edges), 0);
+            assert_subject_marked(parked, subject);
+            let _ = child;
+        });
+        let done = finish_fixed_cycle(&mut host);
+        assert!(
+            matches!(done, crate::heap::StepOutcome::Completed(_)),
+            "{done:?}"
+        );
+        heap::with_heap(&mut host, |heap| {
+            assert!(
+                heap.alive(subject),
+                "old weakness was read before the count hit zero"
+            );
+            assert!(heap.alive(child));
+            assert!(!heap.alive(dust), "sweep still released an unrooted node");
+            Ok(())
+        })
+        .expect("sole edge");
+    });
+}
+
+#[test]
+fn gray_scanned_weak_owner_omitted_or_still_weak_clears_value() {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        let graph = open_weak_graph(&mut host, WeakOwnerPlace::Scanned);
+        resume_weak(&mut host, |parked| {
+            pause_at(parked, graph.sentinel.slot(), graph.sentinel_record);
+            assert!(!parked.marked(graph.subject));
+        });
+        let done = finish_fixed_cycle(&mut host);
+        assert!(
+            matches!(done, crate::heap::StepOutcome::Completed(_)),
+            "{done:?}"
+        );
+        heap::with_heap(&mut host, |heap| {
+            assert!(
+                !heap.alive(graph.subject),
+                "omission still clears the weak value"
+            );
+            assert!(!heap.alive(graph.right_val));
+            assert!(!heap.alive(graph.orphan));
+            Ok(())
+        })
+        .expect("omitted");
+    });
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        let graph = open_weak_graph(&mut host, WeakOwnerPlace::Scanned);
+        resume_weak(&mut host, |parked| {
+            pause_at(parked, graph.sentinel.slot(), graph.sentinel_record);
+            write_metatable(parked, graph.left, Some(graph.old_mt)).expect("equal weak metatable");
+            assert!(!parked.marked(graph.subject));
+        });
+        let done = finish_fixed_cycle(&mut host);
+        assert!(
+            matches!(done, crate::heap::StepOutcome::Completed(_)),
+            "{done:?}"
+        );
+        heap::with_heap(&mut host, |heap| {
+            assert!(
+                !heap.alive(graph.subject),
+                "an equal weak mode does not keep the value"
+            );
+            Ok(())
+        })
+        .expect("still weak");
+    });
+}
+
+#[test]
+fn gray_scanning_weak_owner_continues_then_rescans_from_head() {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        let graph = open_weak_graph(&mut host, WeakOwnerPlace::Scanning);
+        resume_weak(&mut host, |parked| {
+            let at_scalar = pause_at(parked, graph.left.slot(), graph.left_scalar);
+            assert_eq!(at_scalar.cursor, graph.left_scalar);
+            let before_edge = parked.meter().outgoing_edge_checks;
+            let _charged = parked.pulse(1);
+            assert_eq!(parked.meter().outgoing_edge_checks, before_edge + 1);
+            assert!(
+                !parked.marked(graph.subject),
+                "the charged edge was not the value"
+            );
+            let pending = parked.pending().expect("subject record is still pending");
+            assert_eq!(pending.owner, graph.left.slot());
+            assert_eq!(pending.cursor, graph.left_subject);
+            let before = parked.meter();
+            let roots = parked.stats().live_roots;
+            write_metatable(parked, graph.left, Some(graph.strong_mt))
+                .expect("strengthen while the weak scan is in progress");
+            assert!(same_pending(Some(pending), parked.pending()));
+            assert_setter_did_not_move_scan(&before, &parked.meter());
+            assert_eq!(parked.stats().live_roots, roots);
+            let continued = parked.pulse(1);
+            let _ = continued;
+            assert_eq!(
+                parked.meter().outgoing_edge_checks,
+                before.outgoing_edge_checks + 1
+            );
+            assert_eq!(parked.meter().owner_head_checks, before.owner_head_checks);
+            assert!(
+                !parked.marked(graph.subject),
+                "the original scan still uses the weak mode"
+            );
+            let next = parked.pulse(1);
+            let _ = next;
+            let queued = parked.pending().expect("another owner is still pending");
+            assert_eq!(queued.owner, graph.old_mt.slot());
+            assert_eq!(queued.cursor, graph.old_mode_record);
+            assert!(
+                !parked.marked(graph.subject),
+                "the queued owner is not a chain-head rescan"
+            );
+            assert_subject_marked(parked, graph.subject);
+            assert_subject_marked(parked, graph.child);
+        });
+        finish_kept_cycle(&mut host, &graph);
+    });
+}
+
+#[test]
+fn gray_queued_weak_owner_reads_new_mode_without_extra_rescan() {
+    fn run(change_during_gray: bool) -> ScanMeter {
+        let mut meter = ScanMeter::default();
+        crate::with_idle_vm(|vm| {
+            let mut host = vm.host_context();
+            if change_during_gray {
+                let graph = open_weak_graph(&mut host, WeakOwnerPlace::Queued);
+                resume_weak(&mut host, |parked| {
+                    pause_at(parked, graph.sentinel.slot(), graph.sentinel_record);
+                    assert!(parked.marked(graph.left), "the root visit queued the owner");
+                    assert_ne!(
+                        parked.pending().expect("sentinel").owner,
+                        graph.left.slot(),
+                        "the left table has not started"
+                    );
+                    assert!(!parked.marked(graph.subject));
+                    write_metatable(parked, graph.left, Some(graph.strong_mt))
+                        .expect("strengthen before the ordinary scan");
+                    assert!(!parked.marked(graph.subject));
+                });
+                let done = finish_fixed_cycle(&mut host);
+                assert!(
+                    matches!(done, crate::heap::StepOutcome::Completed(_)),
+                    "{done:?}"
+                );
+                meter = heap::with_heap(&mut host, |heap| {
+                    assert!(
+                        heap.alive(graph.subject),
+                        "the ordinary scan reads the new mode"
+                    );
+                    assert!(heap.alive(graph.child));
+                    Ok(heap.scan_meter())
+                })
+                .expect("queued");
+            } else {
+                heap::install(&mut host, limits(16, 8, 24)).expect("install");
+                heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+                    let graph = plant_weak_graph(heap, WeakOwnerPlace::Queued)?;
+                    heap.set_metatable(graph.left, Some(graph.strong_mt))?;
+                    Ok(())
+                })
+                .expect("pre-cycle");
+                heap::open_fixed_step(&mut host).expect("open");
+                let done = finish_fixed_cycle(&mut host);
+                assert!(
+                    matches!(done, crate::heap::StepOutcome::Completed(_)),
+                    "{done:?}"
+                );
+                meter = heap::take_scan_meter(&mut host).expect("meter");
+            }
+        });
+        meter
+    }
+    let during = run(true);
+    let before = run(false);
+    assert_eq!(
+        during.owner_head_checks, before.owner_head_checks,
+        "a not-yet-started owner is not rescanned"
+    );
+    assert_eq!(
+        during.outgoing_edge_checks, before.outgoing_edge_checks,
+        "the ordinary scan walks the chain once"
+    );
+}
+
+#[test]
+fn gray_scanned_weak_owner_repeated_strengthen_schedules_one_rescan() {
+    fn heads_until_marked(repeats: u32) -> u64 {
+        let mut heads = 0;
+        crate::with_idle_vm(|vm| {
+            let mut host = vm.host_context();
+            let graph = open_weak_graph(&mut host, WeakOwnerPlace::Scanned);
+            resume_weak(&mut host, |parked| {
+                pause_at(parked, graph.sentinel.slot(), graph.sentinel_record);
+                let before = parked.meter();
+                let pending = parked.pending();
+                let roots = parked.stats().live_roots;
+                for _ in 0..repeats {
+                    write_metatable(parked, graph.left, Some(graph.strong_mt)).expect("attach");
+                    write_metatable(parked, graph.left, None).expect("clear");
+                    write_metatable(parked, graph.left, Some(graph.strong_mt))
+                        .expect("attach again");
+                }
+                assert!(same_pending(pending, parked.pending()));
+                assert_setter_did_not_move_scan(&before, &parked.meter());
+                assert_eq!(parked.stats().live_roots, roots);
+                assert_subject_marked(parked, graph.subject);
+                heads = parked.meter().owner_head_checks;
+            });
+        });
+        heads
+    }
+    let once = heads_until_marked(1);
+    let again = heads_until_marked(3);
+    assert_eq!(once, again, "repeated attach or clear leaves one rescan");
+}
+
+#[test]
+fn published_tail_refuses_live_weak_strengthen_without_moving_state() {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        let graph = open_weak_graph(&mut host, WeakOwnerPlace::Scanned);
+        let published = heap::step_fixed_frames(&mut host, 128).expect("publish");
+        assert!(
+            matches!(published, crate::heap::StepOutcome::Published { .. }),
+            "{published:?}"
+        );
+        let before_tail = heap::saved_tail_state(&mut host)
+            .expect("tail read")
+            .expect("published tail");
+        let refused = heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            let before_stats = heap.stats();
+            let before_meter = heap.scan_meter();
+            let before_mt = heap.metatable(graph.left)?;
+            assert_eq!(before_mt.unwrap().slot(), graph.old_mt.slot());
+            assert_eq!(before_mt.unwrap().generation(), graph.old_mt.generation());
+            let write = heap.set_metatable(graph.left, Some(graph.strong_mt));
+            assert!(
+                matches!(write, Err(HeapError::SweepPending)),
+                "a live same-generation write is refused, got {write:?}"
+            );
+            let after_mt = heap.metatable(graph.left)?;
+            assert_eq!(after_mt.unwrap().slot(), graph.old_mt.slot());
+            assert_eq!(after_mt.unwrap().generation(), graph.old_mt.generation());
+            assert_eq!(heap.stats(), before_stats);
+            assert_eq!(heap.scan_meter(), before_meter);
+            heap.set_metatable(graph.left, Some(graph.strong_mt))
+        });
+        assert!(matches!(refused, Err(HeapError::SweepPending)));
+        let after_tail = heap::saved_tail_state(&mut host)
+            .expect("tail read")
+            .expect("tail still saved");
+        assert_eq!(before_tail.phase, after_tail.phase);
+        assert_eq!(before_tail.cursor, after_tail.cursor);
+        assert_eq!(before_tail.live_roots, after_tail.live_roots);
+        assert_eq!(before_tail.dead_len, after_tail.dead_len);
     });
 }
