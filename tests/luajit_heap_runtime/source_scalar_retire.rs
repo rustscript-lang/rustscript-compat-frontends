@@ -120,6 +120,10 @@ struct Trace {
     texts: Vec<(f64, String)>,
     bits: Vec<(f64, bool)>,
     bit_cycle_state: Vec<(bool, u32)>,
+    bit_accounting: Vec<Option<(u32, u32)>>,
+    bit_tail: Vec<Option<heap::SavedTailState>>,
+    bit_roots: Vec<Vec<Option<heap::TableRef>>>,
+    bit_resources: Vec<usize>,
     marks: Vec<MarkNote>,
     occupancy: Vec<OccupancyNote>,
 }
@@ -155,6 +159,9 @@ struct Ran {
     mark_phase: Option<&'static str>,
     mark_pending: bool,
     parked_root_writes: u64,
+    tail_state: Option<heap::SavedTailState>,
+    peek_end: Vec<(bool, bool)>,
+    resources: usize,
 }
 
 struct Plugin {
@@ -453,9 +460,17 @@ impl HostOwnedFunction for HostOp {
                 };
                 let tail = heap::saved_sweep_tail(&mut host).map_err(host_heap)?;
                 let collections = heap::stats(&mut host).map_err(host_heap)?.collections;
+                let accounting = heap::saved_tail_accounting(&mut host).map_err(host_heap)?;
+                let tail_state = heap::saved_tail_state(&mut host).map_err(host_heap)?;
+                let roots = heap::top_frame_tables(&mut host).map_err(host_heap)?;
+                let resources = host.resource_count();
                 note(&mut host, |state| {
                     state.bits.push((*tag, *bit));
                     state.bit_cycle_state.push((tail, collections));
+                    state.bit_accounting.push(accounting);
+                    state.bit_tail.push(tail_state);
+                    state.bit_roots.push(roots);
+                    state.bit_resources.push(resources);
                 })?;
                 Value::Bool(*bit)
             }
@@ -658,7 +673,24 @@ fn run_control(source: &str, budgets: Option<&[u64]>) -> Ran {
 }
 
 fn run_auto_table(source: &str, budgets: Option<&[u64]>) -> Ran {
-    drive_plugin(source, budgets, &AUTO_TABLE_PLUGIN, None)
+    drive_plugin_opts(source, budgets, &AUTO_TABLE_PLUGIN, None, 8, false)
+}
+
+fn run_auto_table_limited(
+    source: &str,
+    budgets: Option<&[u64]>,
+    nodes: u32,
+    max_generation: u32,
+    fail_after_registration: bool,
+) -> Ran {
+    drive_plugin_opts(
+        source,
+        budgets,
+        &AUTO_TABLE_PLUGIN,
+        Some(nodes),
+        max_generation,
+        fail_after_registration,
+    )
 }
 
 fn drive(source: &str, budgets: Option<&[u64]>, run_control: bool, nodes: Option<u32>) -> Ran {
@@ -677,6 +709,17 @@ fn drive_plugin(
     budgets: Option<&[u64]>,
     plugin: &'static Plugin,
     nodes: Option<u32>,
+) -> Ran {
+    drive_plugin_opts(source, budgets, plugin, nodes, 8, false)
+}
+
+fn drive_plugin_opts(
+    source: &str,
+    budgets: Option<&[u64]>,
+    plugin: &'static Plugin,
+    nodes: Option<u32>,
+    max_generation: u32,
+    fail_after_registration: bool,
 ) -> Ran {
     let catalog = Arc::clone(plugin_catalog(plugin));
     let options = CompileSourceFileOptions::new()
@@ -704,10 +747,13 @@ fn drive_plugin(
                 nodes,
                 roots: 64,
                 edges: 64,
-                max_generation: 8,
+                max_generation,
             },
         )
         .expect("test host installs the node quota before execution");
+    }
+    if fail_after_registration {
+        candidate::arm_release_alloc_fault(&mut vm.host_context()).expect("arm release fault");
     }
     let status = vm.run();
     let trace = vm
@@ -777,6 +823,30 @@ fn drive_plugin(
     };
     let mark = heap::saved_mark_query(&vm.host_context());
     let meter = heap::copy_scan_meter(&mut vm.host_context()).unwrap_or_default();
+    let tail_state = heap::saved_tail_state(&mut vm.host_context())
+        .ok()
+        .flatten();
+    let peek_end: Vec<(bool, bool)> = trace
+        .peeks
+        .iter()
+        .map(|observed| {
+            let alive =
+                heap::with_heap(
+                    &mut vm.host_context(),
+                    |heap| Ok(heap.alive(observed.table)),
+                )
+                .unwrap_or(false);
+            let open = vm
+                .host_context()
+                .typed_resource_with_key::<heap::LuaTableResource>(
+                    observed.token,
+                    &heap::LuaTableResource::key(),
+                )
+                .is_ok();
+            (alive, open)
+        })
+        .collect();
+    let resources = vm.host_context().resource_count();
     Ran {
         stop,
         stack: vm.stack().to_vec(),
@@ -798,6 +868,9 @@ fn drive_plugin(
         mark_phase: mark.map(|(phase, _)| phase),
         mark_pending: mark.is_some_and(|(_, pending)| pending),
         parked_root_writes: meter.parked_root_writes,
+        tail_state,
+        peek_end,
+        resources,
     }
 }
 
@@ -4612,6 +4685,274 @@ bit(1, peek(held))
     assert_eq!(text_value(&ran.trace, 1.0), "table");
     assert!(ran.tail);
     assert!(ran.mark_phase.is_none());
+}
+
+/// Same function, one ordinary empty local, after restart has made the heap due.
+/// Four weak-only entries give the published tail a dead suffix. The first
+/// budget is fixture evidence that this graph publishes; it is not a phase
+/// contract. The second budget does one Release visit and leaves a suffix.
+const RELEASE_ALLOC_BODY: &str = r#"
+local function witness()
+  local w = {}
+  local mt = {}
+  local held = {}
+  mt.__mode = "v"
+  setmetatable(w, mt)
+  w[1] = held
+  w[2] = {}
+  w[3] = {}
+  w[4] = {}
+  w[5] = {}
+  bit(1, peek(held))
+  bit(2, peek(w))
+  note(1, collectgarbage("restart"))
+  text(1, type(rawget(w, 2)))
+  local fresh = {}
+  text(2, type(rawget(w, 2)))
+  bit(3, peek(fresh))
+  collectgarbage("step")
+  bit(4, peek(fresh))
+  collectgarbage("collect")
+  bit(5, peek(fresh))
+  return 1
+end
+witness()
+collectgarbage("collect")
+return 1
+"#;
+
+const RELEASE_ALLOC_PAUSE: &str = r#"
+local function witness()
+  local w = {}
+  local mt = {}
+  local held = {}
+  mt.__mode = "v"
+  setmetatable(w, mt)
+  w[1] = held
+  w[2] = {}
+  w[3] = {}
+  w[4] = {}
+  w[5] = {}
+  bit(1, peek(held))
+  bit(2, peek(w))
+  note(1, collectgarbage("restart"))
+  text(1, type(rawget(w, 2)))
+  local fresh = {}
+  bit(3, peek(fresh))
+  return 1
+end
+witness()
+return 1
+"#;
+
+fn release_pause_error(message: &str) -> bool {
+    message == "auto table restart did not finish the published tail: Paused { tail: true }"
+}
+
+#[test]
+fn auto_release_pause_allocates_the_empty_local() {
+    let ran = run_auto_table(RELEASE_ALLOC_BODY, Some(&[10_000, 1, 10_000]));
+    assert_eq!(ran.stop, Stop::Halted, "{ran:#?}");
+    assert_eq!(
+        ran.trace.peeks.len(),
+        5,
+        "fresh is issued and re-read: {ran:#?}"
+    );
+    let fresh = ran.trace.peeks[2].table;
+    assert_eq!(ran.trace.peeks[3].table, fresh);
+    assert_eq!(ran.trace.peeks[4].table, fresh);
+    assert!(
+        fresh.generation() > 1,
+        "the new node reuses a released slot: {fresh:?}"
+    );
+    assert_eq!(
+        ran.trace.bit_cycle_state[2],
+        (true, 0),
+        "handoff keeps the tail"
+    );
+    assert_eq!(
+        ran.trace.bit_cycle_state[3],
+        (false, 1),
+        "explicit continuation completes once"
+    );
+    assert_eq!(
+        ran.trace.bits[3],
+        (4.0, true),
+        "the same object stays reachable"
+    );
+    assert_eq!(
+        ran.trace.bits[4],
+        (5.0, true),
+        "the function root keeps it through another cycle"
+    );
+    assert_eq!(text_value(&ran.trace, 1.0), "table");
+    assert_eq!(
+        text_value(&ran.trace, 2.0),
+        "nil",
+        "the independent weak entry was cleared"
+    );
+    assert_eq!(
+        ran.parked_root_writes, 0,
+        "the handoff must not park a mark"
+    );
+    let accounting = ran.trace.bit_accounting[2].expect("tail accounting at the handoff");
+    assert_eq!(accounting.1, 1, "one late node: {accounting:?}");
+    assert!(
+        accounting.0 > 0,
+        "the handoff does not clear the mark count"
+    );
+    let tail = ran.trace.bit_tail[2].expect("saved tail at the handoff");
+    assert_eq!(tail.phase, heap::SavedTailPhase::Release);
+    assert_eq!(
+        tail.cursor, 1,
+        "the handoff does not move the release cursor"
+    );
+    assert_eq!(
+        tail.live_roots, 0,
+        "the new root is not counted until continuation"
+    );
+    assert!(
+        tail.cursor < tail.dead_len,
+        "an unconsumed dead suffix remains"
+    );
+    let roots = &ran.trace.bit_roots[2];
+    assert_eq!(
+        roots.get(3).copied().flatten(),
+        Some(fresh),
+        "top-frame slot 3 is fresh"
+    );
+    let alive = ran.peek_end[2];
+    assert!(!alive.0, "scalar return then collect releases the node");
+    assert!(!alive.1, "the token is closed with the node");
+}
+
+#[test]
+fn stopped_release_shape_allocates_without_a_cycle() {
+    let source =
+        RELEASE_ALLOC_PAUSE.replace("collectgarbage(\"restart\")", "collectgarbage(\"stop\")");
+    let ran = run_auto_table(&source, None);
+    assert_eq!(ran.stop, Stop::Halted, "{ran:#?}");
+    assert!(!ran.tail, "stop must not start a cycle");
+    assert_eq!(ran.collections, 0);
+    assert_eq!(
+        ran.trace.peeks.len(),
+        3,
+        "the empty local is an ordinary allocation"
+    );
+    assert_eq!(text_value(&ran.trace, 1.0), "table");
+}
+
+#[test]
+fn auto_release_roots_pause_does_not_allocate() {
+    let ran = run_auto_table(RELEASE_ALLOC_PAUSE, Some(&[10_000, 5]));
+    assert!(
+        matches!(ran.stop, Stop::HostError(ref message) if release_pause_error(message)),
+        "{ran:#?}"
+    );
+    assert_eq!(ran.trace.peeks.len(), 2);
+    assert_eq!(ran.collections, 0);
+    let state = ran.tail_state.expect("saved tail");
+    assert_eq!(state.phase, heap::SavedTailPhase::Roots);
+    assert_eq!(
+        heap_tail_late(&ran),
+        Some(0),
+        "the Roots refusal adds no late node"
+    );
+}
+
+#[test]
+fn auto_release_chunk_local_does_not_allocate() {
+    let source = r#"
+local function keep_return_window()
+  return 1
+end
+keep_return_window()
+local w = {}
+local mt = {}
+local held = {}
+mt.__mode = "v"
+setmetatable(w, mt)
+w[1] = held
+w[2] = {}
+w[3] = {}
+w[4] = {}
+w[5] = {}
+bit(1, peek(held))
+bit(2, peek(w))
+note(1, collectgarbage("restart"))
+text(1, type(rawget(w, 2)))
+local fresh = {}
+bit(3, peek(fresh))
+return 1
+"#;
+    let ran = run_auto_table(source, Some(&[10_000, 1]));
+    assert!(
+        matches!(ran.stop, Stop::HostError(ref message) if release_pause_error(message)),
+        "chunk has no root handoff: {ran:#?}"
+    );
+    assert_eq!(ran.trace.peeks.len(), 2);
+    let state = ran.tail_state.expect("saved tail");
+    assert_eq!(state.phase, heap::SavedTailPhase::Release);
+    assert!(state.cursor > 0 && state.cursor < state.dead_len);
+    assert_eq!(heap_tail_late(&ran), Some(0));
+}
+
+#[test]
+fn auto_release_pause_refuses_a_full_node_quota() {
+    let ran = run_auto_table_limited(RELEASE_ALLOC_PAUSE, Some(&[10_000, 1]), 7, 1, false);
+    assert!(
+        matches!(ran.stop, Stop::HostError(ref message) if message.contains("node capacity")),
+        "{ran:#?}"
+    );
+    assert_eq!(ran.trace.peeks.len(), 2, "the refused local is not issued");
+    assert_eq!(ran.collections, 0);
+    let state = ran.tail_state.expect("legal scan remains");
+    assert_eq!(state.phase, heap::SavedTailPhase::Release);
+    assert_eq!(state.cursor, 1);
+    assert!(state.cursor < state.dead_len);
+    assert_eq!(state.live_roots, 0);
+    assert_eq!(heap_tail_late(&ran), Some(0));
+    assert_eq!(
+        ran.live_nodes, 6,
+        "the release visit is scan progress, not a new node"
+    );
+}
+
+#[test]
+fn auto_release_pause_rolls_back_a_registered_token() {
+    let refused = run_auto_table_limited(RELEASE_ALLOC_PAUSE, Some(&[10_000, 1]), 64, 8, true);
+    let clean = run_auto_table_limited(RELEASE_ALLOC_PAUSE, Some(&[10_000, 1]), 7, 1, false);
+    assert!(
+        matches!(refused.stop, Stop::HostError(ref message) if message.contains("refused after the token was registered")),
+        "{refused:#?}"
+    );
+    assert!(
+        matches!(clean.stop, Stop::HostError(ref message) if message.contains("node capacity")),
+        "capacity refusal is the no-token control: {clean:#?}"
+    );
+    assert_eq!(refused.trace.peeks.len(), 2);
+    assert_eq!(heap_tail_late(&refused), Some(0));
+    assert_eq!(
+        refused.tail_state, clean.tail_state,
+        "rollback does not move the legal scan"
+    );
+    assert_eq!(refused.live_nodes, clean.live_nodes);
+    assert_eq!(
+        refused.resources, clean.resources,
+        "the registered token is closed"
+    );
+}
+
+fn heap_tail_late(ran: &Ran) -> Option<u32> {
+    ran.tail_state.and(Some(0)).map(|_| {
+        ran.trace
+            .bit_accounting
+            .iter()
+            .rev()
+            .find_map(|item| *item)
+            .map(|(_, late)| late)
+            .unwrap_or(0)
+    })
 }
 
 #[test]

@@ -107,6 +107,21 @@ impl SweepTail {
         self.dead.len()
     }
 
+    #[cfg(test)]
+    pub(super) fn marked_nodes(&self) -> u32 {
+        self.marked_nodes
+    }
+
+    #[cfg(test)]
+    pub(super) fn late_nodes(&self) -> u32 {
+        self.late_nodes
+    }
+
+    #[cfg(test)]
+    pub(super) fn undo_late(&mut self) {
+        self.late_nodes = self.late_nodes.saturating_sub(1);
+    }
+
     /// Spends `budget` on the shared release/root machine. Zero does not read the heap.
     pub(super) fn drive(self, heap: &mut LuaHeap, budget: u64) -> TailStep {
         let mut phase = self.phase;

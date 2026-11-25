@@ -429,6 +429,168 @@ fn publish_late(host: &mut HostContext) -> Result<(TableRef, vm::ResourceHandle)
     }
 }
 
+/// Publishes one empty table into the current top frame while Release is paused.
+///
+/// Admission, including the empty root slot, is checked before a node or a
+/// Core token is registered. `Ok(None)` means this pause is not an admitted
+/// Release handoff; nothing was reserved. A later refusal closes the token,
+/// confirms it is closed, and only then returns the slot. The Release cursor,
+/// mark count, and accounted roots are not moved.
+#[cfg(test)]
+pub fn publish_automatic_release_table(
+    host: &mut HostContext,
+    slot: u32,
+    fail_after_registration: bool,
+) -> Result<Option<Value>, HeapError> {
+    let Some(heap) = host.scope_state::<LuaHeap>() else {
+        return Ok(None);
+    };
+    if !heap.automatic_release_slot_admitted(slot)? {
+        return Ok(None);
+    }
+    let reservation = {
+        let heap = host
+            .scope_state_mut::<LuaHeap>()
+            .expect("admission found the installed heap");
+        heap.reserve_late_table()?
+    };
+    if !host
+        .scope_state::<LuaHeap>()
+        .expect("reservation keeps the installed heap")
+        .automatic_release_slot_admitted(slot)?
+    {
+        host.scope_state_mut::<LuaHeap>()
+            .expect("reservation keeps the installed heap")
+            .abandon_late(reservation);
+        return Err(HeapError::Scope(
+            "release handoff lost admission after reserve".to_string(),
+        ));
+    }
+    let table = reservation.table();
+    let resource = match host.push_resource(LuaTableResource::new(table)) {
+        Ok(resource) => resource,
+        Err(error) => {
+            host.scope_state_mut::<LuaHeap>()
+                .expect("reservation keeps the installed heap")
+                .abandon_late(reservation);
+            return Err(HeapError::from_scope(error));
+        }
+    };
+    let handle = resource.handle();
+    if fail_after_registration {
+        return rollback_unbound_release(
+            host,
+            reservation,
+            handle,
+            HeapError::Scope(
+                "automatic release allocation refused after the token was registered".to_string(),
+            ),
+        );
+    }
+    let value = match host.scope_state_mut::<LuaHeap>() {
+        Some(heap) => heap.issue_reserved_carrier(table),
+        None => Err(HeapError::SweepDenied),
+    };
+    let value = match value {
+        Ok(value) => value,
+        Err(error) => return rollback_unbound_release(host, reservation, handle, error),
+    };
+    if !host
+        .scope_state::<LuaHeap>()
+        .is_some_and(|heap| heap.automatic_release_slot_admitted(slot).unwrap_or(false))
+    {
+        return rollback_unbound_release(
+            host,
+            reservation,
+            handle,
+            HeapError::Scope("release handoff lost admission after issue".to_string()),
+        );
+    }
+    let raw = handle.raw();
+    host.scope_state_mut::<LuaHeap>()
+        .expect("reservation keeps the installed heap")
+        .commit_late(reservation, raw);
+    if let Err(error) = host
+        .scope_state_mut::<LuaHeap>()
+        .expect("committed late node keeps the installed heap")
+        .store_release_top_root(slot, table)
+    {
+        close_confirmed_token(host, handle)?;
+        host.scope_state_mut::<LuaHeap>()
+            .expect("committed late node keeps the installed heap")
+            .undo_committed_late(table)?;
+        return Err(error);
+    }
+    Ok(Some(value))
+}
+
+#[cfg(test)]
+fn rollback_unbound_release(
+    host: &mut HostContext,
+    reservation: table::LateReservation,
+    handle: vm::ResourceHandle,
+    error: HeapError,
+) -> Result<Option<Value>, HeapError> {
+    close_confirmed_token(host, handle)?;
+    host.scope_state_mut::<LuaHeap>()
+        .expect("unbound reservation keeps the installed heap")
+        .abandon_late(reservation);
+    Err(error)
+}
+
+#[cfg(test)]
+fn close_confirmed_token(
+    host: &mut HostContext,
+    handle: vm::ResourceHandle,
+) -> Result<(), HeapError> {
+    match host.close_resource::<LuaTableResource>(handle, vm::ResourceCloseReason::Requested) {
+        Ok(vm::resource::CloseProgress::Ready) => {}
+        Ok(_) => {
+            return Err(HeapError::Scope(
+                "lua table close did not finish synchronously".to_string(),
+            ));
+        }
+        Err(error) => return Err(HeapError::from_scope(error)),
+    }
+    match host.close_resource::<LuaTableResource>(handle, vm::ResourceCloseReason::Requested) {
+        Err(error) if retired_lua_token(&error) => Ok(()),
+        Ok(_) => Err(HeapError::Scope(
+            "lua table close did not stay closed".to_string(),
+        )),
+        Err(error) => Err(HeapError::from_scope(error)),
+    }
+}
+
+/// True when `slot` can receive one automatic empty table on the saved Release tail.
+#[cfg(test)]
+pub fn automatic_release_slot_admitted(
+    host: &mut HostContext,
+    slot: u32,
+) -> Result<bool, HeapError> {
+    let Some(heap) = host.scope_state::<LuaHeap>() else {
+        return Ok(false);
+    };
+    heap.automatic_release_slot_admitted(slot)
+}
+
+/// Mark count and late-node count of the saved tail. Does not resume it.
+#[cfg(test)]
+pub fn saved_tail_accounting(host: &mut HostContext) -> Result<Option<(u32, u32)>, HeapError> {
+    let Some(heap) = host.scope_state::<LuaHeap>() else {
+        return Ok(None);
+    };
+    Ok(heap.saved_tail_accounting())
+}
+
+/// Table roots in the current top frame, in slot order. Does not scan.
+#[cfg(test)]
+pub fn top_frame_tables(host: &mut HostContext) -> Result<Vec<Option<TableRef>>, HeapError> {
+    let Some(heap) = host.scope_state::<LuaHeap>() else {
+        return Ok(Vec::new());
+    };
+    Ok(heap.top_frame_tables())
+}
+
 /// Replaces one ordinary UTF-8 gap with an already issued table while this
 /// scope's published sweep tail is saved. Does not install a heap and does
 /// not resume the tail.

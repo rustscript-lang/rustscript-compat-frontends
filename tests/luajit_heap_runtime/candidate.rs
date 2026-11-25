@@ -503,8 +503,11 @@ enum Op {
 impl HostOwnedFunction for Op {
     fn call(&mut self, call: &mut OwnedHostCall<'_>) -> Result<CallOutcome, VmError> {
         let value = match self {
-            Self::NewTable => heap::publish_guest(&mut call.vm().host_context())
-                .map_err(|error| VmError::HostError(error.to_string()))?,
+            Self::NewTable => match take_automatic_release_table(&mut call.vm().host_context())? {
+                Some(value) => value,
+                None => heap::publish_guest(&mut call.vm().host_context())
+                    .map_err(|error| VmError::HostError(error.to_string()))?,
+            },
             Self::Type => {
                 let value = match call.args() {
                     [value] => value.clone(),
@@ -1065,10 +1068,12 @@ fn root_issued(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
         heap.current_frame().ok_or(heap::HeapError::StaleFrame)
     })
     .map_err(heap_error)?;
-    heap::with_heap(&mut call.vm().host_context(), |heap| {
-        heap.write_root(frame, slot, table)
-    })
-    .map_err(heap_error)?;
+    if !acknowledge_release_root(&mut call.vm().host_context(), table, slot)? {
+        heap::with_heap(&mut call.vm().host_context(), |heap| {
+            heap.write_root(frame, slot, table)
+        })
+        .map_err(heap_error)?;
+    }
     with_witness(call.vm(), |witness| {
         witness.issued.push(table);
         if role == 0 {
@@ -2079,6 +2084,42 @@ pub(super) fn auto_root_plan(host: &vm::HostContext<'_>) -> Option<AutoRootPlan>
     host.scope_state::<AutoRootPlan>().copied()
 }
 
+/// One function-local empty table that the next `NEW_TABLE` may publish
+/// into the saved Release tail. Not a permission for ordinary `alloc`.
+struct ReleaseAllocPermit {
+    slot: u32,
+    consumed: bool,
+}
+
+/// The top-frame root already written for that permit. `ROOT_ISSUED` records
+/// the witness and does not call the ordinary writer.
+struct ReleaseRootAck {
+    table: heap::TableRef,
+    slot: u32,
+    pending: bool,
+}
+
+/// Test-only refusal after the Core token is registered. Not a source example.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ReleaseAllocFault;
+
+pub(super) fn arm_release_alloc_fault(host: &mut vm::HostContext<'_>) -> Result<(), VmError> {
+    host.scope_state_or_insert_with(|| ReleaseAllocFault)
+        .map(|_| ())
+        .map_err(|error| VmError::HostError(error.to_string()))
+}
+
+fn release_handoff_slot(flag: Option<&Value>) -> Option<u32> {
+    let Value::Float(flag) = flag? else {
+        return None;
+    };
+    if !flag.is_finite() || *flag < 1.0 || flag.fract() != 0.0 {
+        return None;
+    }
+    let slot = (*flag as u64).checked_sub(1)?;
+    u32::try_from(slot).ok()
+}
+
 fn note_auto_root_plan(host: &mut vm::HostContext<'_>, batch: usize) -> Result<(), VmError> {
     let (phase, root_slots) = {
         let Some(heap) = host.scope_state::<heap::LuaHeap>() else {
@@ -2113,15 +2154,106 @@ fn note_auto_root_plan(host: &mut vm::HostContext<'_>, batch: usize) -> Result<(
 /// token close, and the Owners walk stay on the existing driver's own meters
 /// and are not limited by either allowance. This does not call `heap::collect`
 /// and does not treat a saved tail as idle.
+fn prepare_automatic_release(host: &mut vm::HostContext<'_>, slot: u32) -> Result<bool, VmError> {
+    let admitted = heap::automatic_release_slot_admitted(host, slot).map_err(heap_error)?;
+    if !admitted {
+        return Ok(false);
+    }
+    if host
+        .scope_state::<ReleaseAllocPermit>()
+        .is_some_and(|permit| !permit.consumed)
+    {
+        return Err(VmError::HostError(
+            "automatic release allocation is already pending".to_string(),
+        ));
+    }
+    let permit = ReleaseAllocPermit {
+        slot,
+        consumed: false,
+    };
+    if let Some(existing) = host.scope_state_mut::<ReleaseAllocPermit>() {
+        *existing = permit;
+    } else {
+        host.scope_state_or_insert_with(|| permit)
+            .map_err(|error| VmError::HostError(error.to_string()))?;
+    }
+    Ok(true)
+}
+
+fn take_automatic_release_table(host: &mut vm::HostContext<'_>) -> Result<Option<Value>, VmError> {
+    let Some(slot) = host.scope_state::<ReleaseAllocPermit>().and_then(|permit| {
+        if permit.consumed {
+            None
+        } else {
+            Some(permit.slot)
+        }
+    }) else {
+        return Ok(None);
+    };
+    if let Some(permit) = host.scope_state_mut::<ReleaseAllocPermit>() {
+        permit.consumed = true;
+    }
+    let fail = host.scope_state::<ReleaseAllocFault>().is_some();
+    let value = heap::publish_automatic_release_table(host, slot, fail).map_err(heap_error)?;
+    let Some(value) = value else {
+        return Err(VmError::HostError(
+            "automatic release allocation was not admitted at NEW_TABLE".to_string(),
+        ));
+    };
+    let table = match classify(host, &value)? {
+        heap::GuestClass::Table(table) => table,
+        _ => {
+            return Err(VmError::HostError(
+                "automatic release carrier is not a table".to_string(),
+            ));
+        }
+    };
+    let ack = ReleaseRootAck {
+        table,
+        slot,
+        pending: true,
+    };
+    if let Some(existing) = host.scope_state_mut::<ReleaseRootAck>() {
+        *existing = ack;
+    } else {
+        host.scope_state_or_insert_with(|| ack)
+            .map_err(|error| VmError::HostError(error.to_string()))?;
+    }
+    Ok(Some(value))
+}
+
+fn acknowledge_release_root(
+    host: &mut vm::HostContext<'_>,
+    table: heap::TableRef,
+    slot: u32,
+) -> Result<bool, VmError> {
+    let matches = host
+        .scope_state::<ReleaseRootAck>()
+        .is_some_and(|ack| ack.pending && ack.table == table && ack.slot == slot);
+    if matches && let Some(ack) = host.scope_state_mut::<ReleaseRootAck>() {
+        ack.pending = false;
+    }
+    Ok(matches)
+}
+
+/// One idle empty-local safepoint after single-arg restart.
+///
+/// The mark allowance and, only when that call publishes a tail, the
+/// continuation allowance are separate host phase budgets. Pending close,
+/// token close, and the Owners walk stay on the existing driver's own meters
+/// and are not limited by either allowance. This does not call `heap::collect`
+/// and does not treat a saved tail as idle.
 fn auto_table_restart(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
     if !auto_table_due(&mut call.vm().host_context())? {
         return Ok(Value::Float(0.0));
     }
     let tables = decode_safepoint_roots(call)?;
-    // 1 is emitted only for a function-local empty table, whose next statements
-    // are NEW_TABLE and ROOT_ISSUED. The host still requires a saved gray phase
-    // with a pending scan; chunk locals and direct calls pass 0.
-    let root_handoff = matches!(call.args().get(1), Some(Value::Float(flag)) if *flag == 1.0);
+    // A positive integer is the function-local root slot plus one. The next
+    // statements are NEW_TABLE and ROOT_ISSUED. Chunk locals and direct calls
+    // pass 0. Gray still only continues when that slot is present; the slot
+    // number is used by the Release handoff, not by the gray pause.
+    let handoff_slot = release_handoff_slot(call.args().get(1));
+    let root_handoff = handoff_slot.is_some();
     {
         let mut host = call.vm().host_context();
         note_auto_root_plan(&mut host, tables.len())?;
@@ -2146,6 +2278,15 @@ fn auto_table_restart(call: &mut OwnedHostCall<'_>) -> Result<Value, VmError> {
                 heap::StepOutcome::Completed(report) => {
                     note_collect(&mut host, report)?;
                     confirm_round_finished(&mut host)?;
+                }
+                heap::StepOutcome::Paused { tail: true } => {
+                    let unfinished = "auto table restart did not finish the published tail: Paused { tail: true }".to_string();
+                    let Some(slot) = handoff_slot else {
+                        return Err(VmError::HostError(unfinished));
+                    };
+                    if !prepare_automatic_release(&mut host, slot)? {
+                        return Err(VmError::HostError(unfinished));
+                    }
                 }
                 other => {
                     return Err(VmError::HostError(format!(
@@ -3218,8 +3359,13 @@ impl Lower<'_> {
         let gather = self.stmts.split_off(start);
         // Only a function-local empty table continues into NEW_TABLE and then
         // ROOT_ISSUED, with no guest safepoint between those statements.
-        // Chunk locals, and the direct probe, pass 0 and keep the pause error.
-        let handoff = Expr::Float(if self.in_function { 1.0 } else { 0.0 });
+        // The handoff float is that local's root slot plus one. Chunk locals,
+        // and the direct probe, pass 0 and keep the pause error.
+        let handoff = Expr::Float(if self.in_function {
+            f64::from(self.root_slot) + 1.0
+        } else {
+            0.0
+        });
         let taken = self.call(AUTO_TABLE_RESTART, vec![roots, handoff])?;
         let expr = Expr::IfElse {
             condition: Box::new(due),

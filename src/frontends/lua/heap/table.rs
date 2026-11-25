@@ -993,6 +993,36 @@ impl LuaHeap {
         Ok(value)
     }
 
+    /// Issues the carrier for one unmarked reservation while a sweep tail is saved.
+    ///
+    /// Ordinary [`Self::issue_carrier`] stays closed: it still calls
+    /// `ensure_sweep_open` and refuses a second issue. This path requires the
+    /// exact live unmarked reservation and does not resume the tail.
+    #[cfg(test)]
+    pub(super) fn issue_reserved_carrier(&mut self, table: TableRef) -> Result<Value, HeapError> {
+        self.ensure_published_tail()?;
+        self.require_live(table)?;
+        let index = table.slot() as usize;
+        if Self::slot_marked(&self.slots[index].state) {
+            return Err(HeapError::Scope(
+                "release handoff carrier slot was marked".to_string(),
+            ));
+        }
+        if self.slots[index].carrier.is_some() || self.slots[index].token.is_some() {
+            return Err(HeapError::StaleHandle);
+        }
+        let value = Value::array(vec![
+            Value::Int(i64::from(table.slot())),
+            Value::Int(i64::from(table.generation())),
+        ]);
+        let carrier = match &value {
+            Value::Array(issued) => Arc::clone(issued),
+            _ => unreachable!("Value::array returns an array"),
+        };
+        self.slots[index].carrier = Some(carrier);
+        Ok(value)
+    }
+
     /// Classifies a guest value against this heap.
     ///
     /// A table result requires the live slot, the issued generation, and the
@@ -2219,6 +2249,122 @@ impl LuaHeap {
         self.published_token(table)?;
         self.roots[index] = Some(Rooted::Table(table));
         Ok(())
+    }
+
+    /// True when this top-frame slot can receive one automatic empty table.
+    ///
+    /// Release must already have visited a dead slot and left a suffix. The
+    /// slot must be the current top frame's empty fixed root. A Roots pause,
+    /// a cursor that has not released, or a finished suffix is `Ok(false)`
+    /// and does not allocate. An occupied or missing slot is an error and
+    /// does not allocate either.
+    #[cfg(test)]
+    pub(super) fn automatic_release_slot_admitted(&self, slot: u32) -> Result<bool, HeapError> {
+        let Some(tail) = self.sweep_tail.as_ref() else {
+            return Ok(false);
+        };
+        if tail.phase() != sweep::TailPhase::Release {
+            return Ok(false);
+        }
+        let cursor = tail.cursor();
+        if cursor == 0 || cursor >= tail.dead_len() {
+            return Ok(false);
+        }
+        self.release_top_slot_empty(slot)?;
+        Ok(true)
+    }
+
+    /// Stores one unmarked reservation in the current top frame's empty slot.
+    ///
+    /// This is not [`Self::store_release_caller_root`]: that path still requires
+    /// a marked table in the direct caller. This write does not call
+    /// `ensure_sweep_open`, does not park a mark, and does not move the Release
+    /// cursor, the mark count, or the accounted root count.
+    #[cfg(test)]
+    pub(super) fn store_release_top_root(
+        &mut self,
+        slot: u32,
+        table: TableRef,
+    ) -> Result<(), HeapError> {
+        if !self.automatic_release_slot_admitted(slot)? {
+            return Err(HeapError::Scope(
+                "release handoff root was not empty at store".to_string(),
+            ));
+        }
+        self.require_live(table)?;
+        let index = table.slot() as usize;
+        if Self::slot_marked(&self.slots[index].state) {
+            return Err(HeapError::Scope(
+                "release handoff root table was marked".to_string(),
+            ));
+        }
+        let frame = self.frames.last().expect("admission found the top frame");
+        let root_index = frame.start as usize + slot as usize;
+        self.roots[root_index] = Some(Rooted::Table(table));
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn release_top_slot_empty(&self, slot: u32) -> Result<(), HeapError> {
+        let Some(frame) = self.frames.last() else {
+            return Err(HeapError::NoRootFrame);
+        };
+        if slot >= frame.width {
+            return Err(HeapError::StaleFrame);
+        }
+        let index = frame.start as usize + slot as usize;
+        if self.roots.get(index).is_none() {
+            return Err(HeapError::StaleFrame);
+        }
+        if self.roots[index].is_some() {
+            return Err(HeapError::Scope(format!(
+                "release handoff slot {slot} is occupied"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Drops one late node that was committed and then refused. The Core token
+    /// must already be closed. Does not move the Release cursor or mark count.
+    #[cfg(test)]
+    pub(super) fn undo_committed_late(&mut self, table: TableRef) -> Result<(), HeapError> {
+        self.ensure_published_tail()?;
+        self.require_live(table)?;
+        let index = table.slot() as usize;
+        if Self::slot_marked(&self.slots[index].state) {
+            return Err(HeapError::SweepPending);
+        }
+        self.sweep_tail
+            .as_mut()
+            .expect("published tail accepted the undo")
+            .undo_late();
+        self.slots[index].carrier = None;
+        self.slots[index].token = None;
+        self.release_slot(table.slot());
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn saved_tail_accounting(&self) -> Option<(u32, u32)> {
+        let tail = self.sweep_tail.as_ref()?;
+        Some((tail.marked_nodes(), tail.late_nodes()))
+    }
+
+    #[cfg(test)]
+    pub fn top_frame_tables(&self) -> Vec<Option<TableRef>> {
+        let Some(frame) = self.frames.last() else {
+            return Vec::new();
+        };
+        let start = frame.start as usize;
+        (0..frame.width)
+            .map(|slot| {
+                let index = start + slot as usize;
+                match self.roots.get(index) {
+                    Some(Some(Rooted::Table(table))) => Some(*table),
+                    _ => None,
+                }
+            })
+            .collect()
     }
 
     /// Clears one slot of an open frame. The frame does not have to be the
