@@ -6565,3 +6565,391 @@ fn published_tail_refuses_live_weak_strengthen_without_moving_state() {
         assert_eq!(before_tail.dead_len, after_tail.dead_len);
     });
 }
+
+/// One weak-value owner, paused on the rescan record that `open_rescan` just
+/// installed. The successor, donor, and foreign target are not roots.
+struct RescanOwner {
+    owner: TableRef,
+    weak_mt: TableRef,
+    strong_mt: TableRef,
+    sentinel: TableRef,
+    pending_value: TableRef,
+    suffix: Option<TableRef>,
+    donor: TableRef,
+    foreign: TableRef,
+    dust: TableRef,
+}
+
+fn plant_rescan_owner(heap: &mut LuaHeap, successor: bool) -> Result<RescanOwner, HeapError> {
+    let owner = heap.alloc()?;
+    let weak_mt = heap.alloc()?;
+    let strong_mt = heap.alloc()?;
+    let sentinel = heap.alloc()?;
+    let pending_value = heap.alloc()?;
+    let suffix = if successor { Some(heap.alloc()?) } else { None };
+    let donor = heap.alloc()?;
+    let foreign = heap.alloc()?;
+    let dust = heap.alloc()?;
+    heap.set_mode_scalar(weak_mt, Value::string("v"))?;
+    heap.set_metatable(owner, Some(weak_mt))?;
+    heap.set_edge(owner, KEY_Y, pending_value)?;
+    if let Some(suffix) = suffix {
+        heap.set_edge(owner, KEY_Z, suffix)?;
+    }
+    heap.set_named_scalar(sentinel, "pending", Value::string("keep"))?;
+    let frame = heap.enter_roots(4)?;
+    heap.write_root(frame, 0, sentinel)?;
+    heap.write_root(frame, 1, weak_mt)?;
+    heap.write_root(frame, 2, strong_mt)?;
+    heap.write_root(frame, 3, owner)?;
+    Ok(RescanOwner {
+        owner,
+        weak_mt,
+        strong_mt,
+        sentinel,
+        pending_value,
+        suffix,
+        donor,
+        foreign,
+        dust,
+    })
+}
+
+fn open_rescan_owner(host: &mut vm::HostContext<'_>, successor: bool) -> RescanOwner {
+    heap::install(host, limits(16, 8, 24)).expect("install");
+    let graph = heap::with_heap(host, |heap| plant_rescan_owner(heap, successor)).expect("plant");
+    heap::open_fixed_step(host).expect("open");
+    graph
+}
+
+fn strengthen_open_owner(parked: &mut ParkedMark<'_>, graph: &RescanOwner, record: u32) {
+    let mt = parked.metatable(graph.owner).expect("metatable");
+    assert_eq!(
+        mt.expect("owner metatable").slot(),
+        graph.weak_mt.slot(),
+        "the owner is still weak when the ordinary scan reaches the record"
+    );
+    let ordinary = pause_at(parked, graph.owner.slot(), record);
+    assert!(
+        !parked.marked(graph.pending_value),
+        "the weak scan has not charged the pending value"
+    );
+    let before = parked.meter();
+    let roots = parked.stats().live_roots;
+    write_metatable(parked, graph.owner, Some(graph.strong_mt)).expect("strengthen");
+    assert!(
+        same_pending(Some(ordinary), parked.pending()),
+        "the setter does not move the ordinary cursor"
+    );
+    assert_setter_did_not_move_scan(&before, &parked.meter());
+    assert_eq!(
+        parked.meter().owner_rescan_heads,
+        before.owner_rescan_heads,
+        "the setter does not open the rescan"
+    );
+    assert_eq!(
+        parked.meter().owner_rescan_schedules,
+        before.owner_rescan_schedules + 1
+    );
+    assert_eq!(parked.stats().live_roots, roots, "the setter adds no root");
+}
+
+/// Pulses until the real rescan cursor is this record. Does not invent a step count.
+fn pause_on_rescan(parked: &mut ParkedMark<'_>, owner: u32, cursor: u32) -> PendingScan {
+    for _ in 0..HARNESS_BOUND {
+        let view = parked.pulse(1);
+        assert!(
+            !view.finished,
+            "mark finished before rescan owner {owner} record {cursor}"
+        );
+        assert_eq!(view.meter.sweep_edge_checks, 0, "a pulse must not sweep");
+        assert_eq!(
+            view.meter.mark_passes, 1,
+            "pause stays in the original pass"
+        );
+        if let Some(pending) = parked.pending_rescan()
+            && pending.owner == owner
+            && pending.cursor == cursor
+        {
+            assert!(
+                parked.pending().is_none(),
+                "the ordinary cursor is not this rescan"
+            );
+            assert_eq!(parked.phase_name(), "gray");
+            assert!(parked.mutation_open());
+            return pending;
+        }
+    }
+    panic!("rescan record {cursor} on owner {owner} was not observed");
+}
+
+fn pause_rescan(parked: &mut ParkedMark<'_>, graph: &RescanOwner) -> (u32, Option<u32>) {
+    let record = parked
+        .field_index(graph.owner, KEY_Y)
+        .expect("pending record");
+    let suffix = graph.suffix.map(|_| {
+        parked
+            .field_index(graph.owner, KEY_Z)
+            .expect("suffix record")
+    });
+    strengthen_open_owner(parked, graph, record);
+    let pending = pause_on_rescan(parked, graph.owner.slot(), record);
+    assert_eq!(pending.cursor, record);
+    assert!(!parked.marked(graph.pending_value));
+    if let Some(suffix) = graph.suffix {
+        assert!(!parked.marked(suffix), "rescan has not charged the suffix");
+    }
+    assert!(!parked.marked(graph.foreign));
+    assert!(!parked.marked(graph.donor));
+    assert!(!parked.marked(graph.dust));
+    (record, suffix)
+}
+
+fn finish_published(host: &mut vm::HostContext<'_>) {
+    let done = finish_fixed_cycle(host);
+    assert!(
+        matches!(done, crate::heap::StepOutcome::Completed(_)),
+        "{done:?}"
+    );
+    assert!(heap::fixed_step_idle(host).expect("idle"));
+}
+
+#[test]
+fn rescan_delete_keeps_the_successor() {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        let graph = open_rescan_owner(&mut host, true);
+        let suffix = graph.suffix.expect("suffix");
+        resume_weak(&mut host, |parked| {
+            let (record, suffix_index) = pause_rescan(parked, &graph);
+            let suffix_index = suffix_index.expect("suffix record");
+            let next = parked.with_saved_heap(|heap| heap.edge_slots[record as usize].next);
+            assert_eq!(
+                next,
+                Some(suffix_index),
+                "the pending record has a successor"
+            );
+            parked
+                .delete_field(graph.owner, KEY_Y)
+                .expect("delete the pending record");
+            let after_delete = parked.pending_rescan();
+            let repairs = parked.meter().parked_rescan_cursor_repairs;
+            // The next pulse reads this record. A stale cursor hits the empty-record expect.
+            let checks = parked.meter().outgoing_edge_checks;
+            let view = parked.pulse(1);
+            assert!(
+                parked.marked(suffix),
+                "this pulse marks the successor; cursor after delete {after_delete:?}, repairs {repairs}"
+            );
+            assert!(!view.finished, "one edge charge does not finish the mark");
+            assert_eq!(
+                view.meter.outgoing_edge_checks,
+                checks + 1,
+                "pulse(1) charges one edge"
+            );
+            assert_eq!(view.meter.sweep_edge_checks, 0, "a pulse must not sweep");
+            assert_eq!(
+                after_delete.map(|scan| (scan.owner, scan.cursor)),
+                Some((graph.owner.slot(), suffix_index))
+            );
+            assert_eq!(parked.meter().parked_rescan_cursor_repairs, 1);
+            assert_eq!(parked.meter().parked_cursor_repairs, 0);
+        });
+        finish_published(&mut host);
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            assert!(
+                heap.alive(suffix),
+                "the published sweep keeps the marked suffix"
+            );
+            assert!(
+                !heap.alive(graph.pending_value),
+                "the deleted value is not kept"
+            );
+            assert!(!heap.alive(graph.dust), "sweep released an unmarked node");
+            assert!(!heap.alive(graph.foreign));
+            assert_eq!(heap.edge(graph.owner, KEY_Z)?, Some(suffix));
+            assert_eq!(heap.edge(graph.owner, KEY_Y)?, None);
+            Ok(())
+        })
+        .expect("published");
+    });
+}
+
+#[test]
+fn rescan_reuse_keeps_the_owner_suffix() {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        let graph = open_rescan_owner(&mut host, true);
+        let suffix = graph.suffix.expect("suffix");
+        resume_weak(&mut host, |parked| {
+            let (record, suffix_index) = pause_rescan(parked, &graph);
+            let suffix_index = suffix_index.expect("suffix record");
+            parked
+                .delete_field(graph.owner, KEY_Y)
+                .expect("delete the pending record");
+            let barriers = parked.meter().parked_barrier_marks;
+            let writes = parked.meter().parked_edge_writes;
+            let checks = parked.meter().outgoing_edge_checks;
+            parked
+                .write_field(graph.donor, KEY_W, graph.foreign)
+                .expect("another owner reuses the freed record");
+            let reused = parked
+                .field_index(graph.donor, KEY_W)
+                .expect("reused record");
+            assert_eq!(
+                reused, record,
+                "the free list reuses the deleted physical index"
+            );
+            assert!(
+                !parked.marked(graph.foreign),
+                "the ordinary write does not mark the foreign target"
+            );
+            assert_eq!(
+                parked.meter().parked_barrier_marks,
+                barriers,
+                "the insert is not a strong barrier"
+            );
+            assert_eq!(parked.meter().parked_edge_writes, writes + 1);
+            assert_eq!(
+                parked.meter().outgoing_edge_checks,
+                checks,
+                "the write does not scan"
+            );
+            assert_eq!(
+                parked.stats().live_roots,
+                4,
+                "the foreign target is not a root"
+            );
+            let after_delete = parked.pending_rescan();
+            let view = parked.pulse(1);
+            assert!(
+                parked.marked(suffix),
+                "this pulse marks the original suffix, not the reused owner; foreign marked={}, cursor {after_delete:?}, reused {reused}",
+                parked.marked(graph.foreign)
+            );
+            assert!(
+                !parked.marked(graph.foreign),
+                "the foreign target stays unmarked"
+            );
+            assert!(!view.finished, "one edge charge does not finish the mark");
+            assert_eq!(
+                view.meter.outgoing_edge_checks,
+                checks + 1,
+                "pulse(1) charges one edge"
+            );
+            assert_eq!(
+                after_delete.map(|scan| (scan.owner, scan.cursor)),
+                Some((graph.owner.slot(), suffix_index))
+            );
+            assert_eq!(parked.meter().parked_rescan_cursor_repairs, 1);
+            assert_eq!(parked.meter().parked_cursor_repairs, 0);
+        });
+        finish_published(&mut host);
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            assert!(
+                heap.alive(suffix),
+                "the published sweep keeps the marked suffix"
+            );
+            assert!(!heap.alive(graph.foreign), "the foreign target is cleared");
+            assert!(!heap.alive(graph.donor));
+            assert!(!heap.alive(graph.pending_value));
+            assert!(!heap.alive(graph.dust), "sweep released an unmarked node");
+            assert_eq!(heap.edge(graph.owner, KEY_Z)?, Some(suffix));
+            Ok(())
+        })
+        .expect("published");
+    });
+}
+
+#[test]
+fn rescan_tail_delete_ends_the_scan() {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        let graph = open_rescan_owner(&mut host, false);
+        let mut after_delete = None;
+        let mut repairs = 0u64;
+        let mut ordinary = 0u64;
+        resume_weak(&mut host, |parked| {
+            let (record, suffix) = pause_rescan(parked, &graph);
+            assert!(suffix.is_none(), "the tail fixture has no successor");
+            let next = parked.with_saved_heap(|heap| heap.edge_slots[record as usize].next);
+            assert_eq!(next, None, "the pending record is the chain tail");
+            parked
+                .delete_field(graph.owner, KEY_Y)
+                .expect("delete the tail record");
+            after_delete = parked.pending_rescan();
+            repairs = parked.meter().parked_rescan_cursor_repairs;
+            ordinary = parked.meter().parked_cursor_repairs;
+            // Leave the mark parked. The host pulse is the one that would read the freed tail.
+        });
+        finish_published(&mut host);
+        assert!(
+            after_delete.is_none(),
+            "deleting the tail ends the rescan, got {after_delete:?}"
+        );
+        assert_eq!(repairs, 1, "the tail repair is one rescan cursor repair");
+        assert_eq!(ordinary, 0, "the ordinary cursor was not on this record");
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            assert!(
+                !heap.alive(graph.pending_value),
+                "the deleted tail is not kept"
+            );
+            assert!(!heap.alive(graph.dust), "sweep released an unmarked node");
+            assert!(
+                !heap.alive(graph.foreign),
+                "the tail delete marks nothing extra"
+            );
+            assert!(!heap.alive(graph.donor));
+            Ok(())
+        })
+        .expect("published");
+    });
+}
+
+#[test]
+fn rescan_unrelated_delete_leaves_the_cursor() {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        let graph = open_rescan_owner(&mut host, true);
+        let suffix = graph.suffix.expect("suffix");
+        resume_weak(&mut host, |parked| {
+            let (record, _) = pause_rescan(parked, &graph);
+            let before = parked.pending_rescan();
+            parked
+                .with_saved_heap(|heap| {
+                    heap.set_named_scalar(graph.sentinel, "pending", Value::Null)
+                })
+                .expect("ordinary nil write on another owner");
+            let after = parked.pending_rescan();
+            assert_eq!(after.map(|scan| scan.cursor), Some(record));
+            assert!(
+                same_pending(before, after),
+                "a miss does not move the rescan cursor"
+            );
+            assert_eq!(parked.meter().parked_rescan_cursor_repairs, 0);
+            assert_eq!(parked.meter().parked_cursor_repairs, 0);
+            let checks = parked.meter().outgoing_edge_checks;
+            let view = parked.pulse(1);
+            assert!(
+                parked.marked(graph.pending_value),
+                "the pending record is still charged"
+            );
+            assert!(!parked.marked(graph.foreign));
+            assert!(!view.finished, "one edge charge does not finish the mark");
+            assert_eq!(view.meter.outgoing_edge_checks, checks + 1);
+            assert_eq!(view.meter.sweep_edge_checks, 0);
+        });
+        finish_published(&mut host);
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            assert!(heap.alive(graph.pending_value));
+            assert!(
+                heap.alive(suffix),
+                "the missed delete does not drop the suffix"
+            );
+            assert!(!heap.alive(graph.dust));
+            assert!(!heap.alive(graph.foreign));
+            Ok(())
+        })
+        .expect("published");
+    });
+}

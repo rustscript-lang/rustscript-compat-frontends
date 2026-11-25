@@ -357,6 +357,17 @@ impl<'a> ParkedMark<'a> {
         })
     }
 
+    /// Owner and record the weak-to-strong rescan will charge next.
+    /// Independent of [`Self::pending`]. Absent unless that scan is paused
+    /// on a record. This reads two fields and does not move either cursor.
+    pub(super) fn pending_rescan(&self) -> Option<PendingScan> {
+        let state = self.heap.mark.as_ref()?;
+        Some(PendingScan {
+            owner: state.rescan_owner?,
+            cursor: state.rescan_cursor?,
+        })
+    }
+
     pub(super) fn marked(&self, table: TableRef) -> bool {
         self.heap
             .slots
@@ -1574,22 +1585,31 @@ impl LuaHeap {
         self.mark = Some(state);
     }
 
-    /// Advances a parked gray cursor when `unlink_at` removes its record.
-    /// One field compare. No chain, root, or slot walk.
+    /// Advances a parked gray cursor, a parked rescan cursor, or both, when
+    /// `unlink_at` removes that record. Two independent field compares. No
+    /// chain, root, or slot walk.
     pub(super) fn repair_parked_cursor(&mut self, owner: u32, index: u32, next: Option<u32>) {
         let Some(state) = self.mark.as_mut() else {
             return;
         };
-        if state.owner != Some(owner) || state.cursor != Some(index) {
-            return;
+        if state.owner == Some(owner) && state.cursor == Some(index) {
+            if next.is_some() {
+                state.cursor = next;
+            } else {
+                state.owner = None;
+                state.cursor = None;
+            }
+            self.scan.parked_cursor_repairs += 1;
         }
-        if next.is_some() {
-            state.cursor = next;
-        } else {
-            state.owner = None;
-            state.cursor = None;
+        if state.rescan_owner == Some(owner) && state.rescan_cursor == Some(index) {
+            if next.is_some() {
+                state.rescan_cursor = next;
+            } else {
+                state.rescan_owner = None;
+                state.rescan_cursor = None;
+            }
+            self.scan.parked_rescan_cursor_repairs += 1;
         }
-        self.scan.parked_cursor_repairs += 1;
     }
 
     pub(super) fn drain_mark(&mut self) -> MarkSnapshot {

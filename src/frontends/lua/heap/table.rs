@@ -633,6 +633,10 @@ pub struct ScanMeter {
     /// Parked gray cursors advanced inside `unlink_at` after it has read the
     /// old successor. Not a pulse unit. A full collect leaves this at zero.
     pub parked_cursor_repairs: u64,
+    /// Parked rescan cursors advanced inside `unlink_at` after it has read the
+    /// old successor. Independent of `parked_cursor_repairs`. Not a pulse unit.
+    /// A full collect leaves this at zero.
+    pub parked_rescan_cursor_repairs: u64,
     /// Fixed root slots updated through `store_root` while a mark is parked.
     /// Not a pulse unit. A full collect leaves this at zero.
     pub parked_root_writes: u64,
