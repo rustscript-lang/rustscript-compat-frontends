@@ -12,7 +12,10 @@
 //! that quota before the node is released.
 //!
 //! A bare userdata keeps its existing semantics: no guest carrier, finalizer,
-//! metatable, or Core token. The private host path in this module also issues
+//! environment, or Core token. The private pending-finalizer slice adds one
+//! optional metatable reference and a retained state for a live unmarked
+//! typed userdata; neither is a guest metamethod or a callback path. The
+//! private host path in this module also issues
 //! a separate `resource<lua.userdata>` capability for one userdata node. Its
 //! heap slot stores the raw Core handle and the payload stores the exact Lua
 //! domain, kind, slot, and generation, so the checked borrow rejects a wrong
@@ -22,6 +25,22 @@
 //! a table token and clears the exact binding before weak publication and
 //! Release. A pure `LuaHeap` sweep refuses a dead slot that still carries a
 //! bound token instead of skipping it.
+//!
+//! The private pending-finalizer slice has one selecting entry,
+//! [`collect_pending_finalizers`]. After the ordinary mark converges it scans
+//! every slot once, retains live unmarked typed userdata whose metatable has a
+//! raw non-nil `__gc` field, and marks the userdata so the ordinary gray pass
+//! follows its userdata-to-metatable strong edge and the metatable's own
+//! strong entries. A retained userdata keeps its original generation, typed
+//! payload, and Core token. At weak publication a weak value that names it is
+//! cleared, while a weak key keeps the entry and its scalar; a sweep with no
+//! dead slot still runs the Owners walk when a pending finalizer needs that
+//! publication. Ordinary collections never select; they offer every existing
+//! record as a host-retained edge, so no live token is closed or orphaned
+//! while it waits for a consumer. No callback, resurrection, guest step, or
+//! production entry is added here. The test-only retirement control consumes
+//! one record so a later collection can close the token and advance the slot
+//! generation; it is not a finalizer.
 //!
 //! Borrowed from the ES5 heap at `3e348a010bc8d84baa5b7d1169a5f50aeb4e46ec`
 //! `src/javascript/heap.rs`: slot plus generation handles, explicit root
@@ -63,6 +82,8 @@ mod table;
 
 pub use handle::{ClosureRef, HandleKind, TableRef, UpvalueRef, UserdataRef};
 pub use resource::{LuaTableResource, LuaUserdataResource};
+#[cfg(test)]
+pub(crate) use table::SelectingPendingMark;
 pub use table::{
     CellValue, CollectReport, GuestClass, HeapError, HeapLimits, HeapStats, LuaHeap, ObserveFault,
     PublishedRead, RootFrameId, ScanMeter,
@@ -522,12 +543,16 @@ pub fn collect(host: &mut HostContext) -> Result<table::CollectReport, HeapError
     with_heap(host, |heap| Ok(heap.sweep_marked(marked.modes)))
 }
 
-/// Publish stopped before release, or the heap had no dead slot to publish.
+/// Publish stopped before release, or the heap had no weak edge to publish.
 #[derive(Debug)]
 pub(crate) enum PublishedBoundary {
-    /// No dead slot. Sweep finished and recorded the one report.
+    /// Neither a dead slot nor a retained pending finalizer needs a weak
+    /// publication. Sweep finished and recorded the one report.
     Completed(table::CollectReport),
     /// Weak edges are published. Dead slots are still physical. No report.
+    /// `window_heads`/`window_edges` are the actual Owners walk, which can
+    /// be non-empty with no dead slot when a pending finalizer's weak value
+    /// is cleared.
     Published {
         window_heads: u64,
         window_edges: u64,
@@ -583,6 +608,112 @@ fn close_then_halt_at_publish(
             window_edges: edges,
         },
     })
+}
+
+/// Private single-shot collector for the pending-finalizer slice.
+///
+/// Phases and boundaries, in order:
+/// 1. Refuse a saved mark or saved release tail. No heap installs one.
+/// 2. Run one ordinary non-moving mark with the same roots, registered
+///    reservation offer, and pending-record offers. A parked mark is dropped,
+///    as in [`collect`].
+/// 3. After the ordinary gray, rescan, and late work empties, scan every slot
+///    once. Select each live, unmarked userdata that binds a typed Core token
+///    and whose metatable has a raw non-nil `__gc` field. Mark it through the
+///    ordinary target follow; the next gray pass follows its metatable edge
+///    and the metatable's own strong entries. A slot already pending or
+///    settled by the explicit retirement control is not selected again.
+/// 4. Enumerate pending-close candidates as usual. A selected userdata is
+///    marked, so it is not in that list and its token stays bound.
+/// 5. Borrow every pending record with its exact `lua.userdata` token and
+///    require the payload to name the same slot and generation. A mismatch
+///    returns before any close or publish.
+/// 6. Close each doomed token synchronously and confirm `Ready`.
+/// 7. Run the Owners walk once. Weak values that name a retained pending
+///    userdata are published as gaps; weak keys keep the entry and its
+///    scalar because the selected object is marked. A dead slot is not
+///    required for this step. Store the Release/Roots tail and return
+///    [`PublishedBoundary::Published`]; a heap with neither a dead slot nor a
+///    pending finalizer finishes and returns
+///    [`PublishedBoundary::Completed`].
+///
+/// Release and Roots do not run here. The caller finishes them with
+/// [`resume_published_sweep`]. No callback, resurrection, guest step, or
+/// production entry is added. The records are retained by later ordinary
+/// collections until the test-only explicit retirement control consumes one.
+pub(crate) fn collect_pending_finalizers(
+    host: &mut HostContext,
+) -> Result<PublishedBoundary, HeapError> {
+    let Some(heap) = host.scope_state::<LuaHeap>() else {
+        return Err(HeapError::SweepDenied);
+    };
+    if heap.has_sweep_tail() {
+        return Err(HeapError::SweepPending);
+    }
+    if heap.has_saved_mark() {
+        return Err(HeapError::MarkActive);
+    }
+    let base = with_heap(host, |heap| Ok(heap.pending_finalizer_count()))?;
+    let marked = with_heap(host, |heap| Ok(heap.mark_and_pending_tokens()))?;
+    if let Err(error) = verify_pending_finalizers(host) {
+        // This is the owner-verification preflight's own transaction: remove
+        // only the records and flags appended by this selecting pass. Earlier
+        // valid records are untouched, no doomed token has been closed yet,
+        // and no weak edge has been published, so the two later failure
+        // prefixes are not mixed into this rollback.
+        with_heap(host, |heap| {
+            heap.discard_pending_finalizers_from(base);
+            Ok(())
+        })?;
+        return Err(error);
+    }
+    close_then_halt_at_publish(host, marked)
+}
+
+/// Borrows each pending record with its concrete `lua.userdata` key and
+/// checks that the payload names the same slot and generation.
+///
+/// The borrow ends before the next record. This runs after the selecting mark
+/// and before any doomed token closes or any weak edge is published. A
+/// missing or wrong token returns [`HeapError::TokenMismatch`] or the real
+/// scope error; no record is mutated. The caller then discards only the
+/// records appended by this pass.
+fn verify_pending_finalizers(host: &HostContext) -> Result<(), HeapError> {
+    let Some(heap) = host.scope_state::<LuaHeap>() else {
+        return Err(HeapError::SweepDenied);
+    };
+    let records = heap.pending_finalizer_records();
+    for (raw, slot, generation) in records {
+        let handle = vm::ResourceHandle::from_raw(raw).map_err(|_| HeapError::CarrierOutOfRange)?;
+        let borrowed = host
+            .borrow_resource_with_key::<LuaUserdataResource>(handle, &LuaUserdataResource::key())
+            .map_err(HeapError::from_scope)?;
+        let payload = borrowed.get().userdata();
+        if payload.domain() != heap.domain()
+            || payload.slot() != slot
+            || payload.generation() != generation
+            || payload.kind() != HandleKind::Userdata
+        {
+            return Err(HeapError::TokenMismatch);
+        }
+    }
+    Ok(())
+}
+
+/// Test-only explicit retirement control for one pending finalizer.
+///
+/// This is the current consumer stand-in for a later real finalizer call: it
+/// removes the record, clears the pending flag, and marks that generation as
+/// settled without closing the token or running guest code. Selection will
+/// not pick the settled object again; a later collection may then close that
+/// token and advance the slot generation. It is not a callback and does not
+/// fabricate a close status.
+#[cfg(test)]
+pub fn retire_pending_finalizer_test_control(
+    host: &mut HostContext,
+    userdata: UserdataRef,
+) -> Result<(), HeapError> {
+    with_heap(host, |heap| heap.retire_pending_finalizer(userdata))
 }
 
 /// Continues a published sweep this scope already saved. Does not install a

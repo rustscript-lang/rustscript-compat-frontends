@@ -18,8 +18,10 @@
 //! readable, and the same Owners walker publishes once when it finishes,
 //! still short of Release. That window's heads and edges are the walk it
 //! actually did. They are not a `pulse(1)` bound. Guest lookup on the entry
-//! rejects a handle already judged dead. A sweep with no dead slot never
-//! enters Owners and does not invent a publish window.
+//! rejects a handle already judged dead. A sweep with no dead slot and no
+//! retained pending finalizer never enters Owners and does not invent a
+//! publish window; a retained pending finalizer forces the Owners walk so its
+//! weak values can be cleared even when every retained slot stays live.
 
 use super::{
     CollectReport, EdgeKey, EdgeValue, GuestClass, HandleKind, HeapError, LuaHeap, MarkSnapshot,
@@ -41,6 +43,10 @@ pub(super) struct SweepSession<'a> {
     cursor: Option<u32>,
     marked_nodes: u32,
     live_roots: u32,
+    /// At least one live slot is a retained pending finalizer. Such a slot is
+    /// not dead, but weak values that name it must still be published, so
+    /// Select enters Snapshot and Owners even when the dead list is empty.
+    pending_present: bool,
     report: Option<CollectReport>,
     pulse_spent: SweepUnits,
 }
@@ -49,6 +55,10 @@ struct SweepSlot {
     marked: bool,
     kind: HandleKind,
     generation: u32,
+    /// The slot was selected as a pending finalizer when this mark finished.
+    /// A weak value in a marked weak table still treats it as value-dead; a
+    /// weak key keeps the entry because the slot is retained and marked.
+    pending: bool,
     /// Generation whose parsed mode this slot held when the mark finished.
     /// A metatable reused after that parse does not inherit the old mode.
     mode_generation: u32,
@@ -342,6 +352,7 @@ impl<'a> SweepSession<'a> {
             cursor: None,
             marked_nodes: 0,
             live_roots: 0,
+            pending_present: false,
             report: None,
             pulse_spent: SweepUnits::default(),
         }
@@ -387,8 +398,8 @@ impl<'a> SweepSession<'a> {
     }
 
     /// Walk Select and Snapshot by their real units, then stop before the
-    /// first owner unit. An empty dead set is already Roots. This does not
-    /// call `pulse`.
+    /// first owner unit. An empty dead set with no retained pending finalizer
+    /// is already Roots. This does not call `pulse`.
     pub(super) fn reach_before_owners(&mut self) -> bool {
         loop {
             match self.phase {
@@ -409,7 +420,8 @@ impl<'a> SweepSession<'a> {
     }
 
     /// Publish every owner in this same session, lend one read-only view, and
-    /// return before Release. No dead slot means no view and no callback.
+    /// return before Release. No dead slot and no retained pending finalizer
+    /// means no view and no callback.
     pub(super) fn observe_before_release<R>(
         &mut self,
         observe: impl for<'b> FnOnce(&'b PublishedRead<'b>) -> R,
@@ -476,7 +488,7 @@ impl<'a> SweepSession<'a> {
     fn step_select(&mut self) -> bool {
         if self.index >= self.heap.slots.len() {
             self.index = 0;
-            self.phase = if self.dead.is_empty() {
+            self.phase = if self.dead.is_empty() && !self.pending_present {
                 SweepPhase::Roots
             } else {
                 SweepPhase::Snapshot
@@ -503,6 +515,10 @@ impl<'a> SweepSession<'a> {
         match slot.state {
             SlotState::Live { marked: false } => {
                 assert!(
+                    !slot.pending_finalizer,
+                    "lua heap sweep selected pending-finalizer slot {index} as dead; the mark must retain every live pending record"
+                );
+                assert!(
                     slot.token.is_none(),
                     "lua heap sweep reached dead slot {index} with a bound host token; the host collector must close it and clear the binding before sweep"
                 );
@@ -517,10 +533,18 @@ impl<'a> SweepSession<'a> {
                     }),
                     "lua heap sweep reached the registered userdata reservation at slot {index}; the mark must retain it"
                 );
+                // A pending finalizer must have been marked by its record
+                // offer. If it was not, the record is stale and the slot is
+                // now genuinely dead, so the ordinary dead path applies.
                 self.dead.push(index as u32);
                 self.heap.scan.scratch.dead_slots_pushed += 1;
             }
-            SlotState::Live { marked: true } => self.marked_nodes += 1,
+            SlotState::Live { marked: true } => {
+                self.marked_nodes += 1;
+                if slot.pending_finalizer {
+                    self.pending_present = true;
+                }
+            }
             SlotState::Free | SlotState::Retired => {}
         }
         true
@@ -554,6 +578,7 @@ impl<'a> SweepSession<'a> {
             marked: matches!(slot.state, SlotState::Live { marked: true }),
             kind: slot.kind,
             generation: slot.generation,
+            pending: slot.pending_finalizer,
             mode_generation: slot.mode_generation,
             mode_round: slot.mode_round,
             mode_weak,
@@ -649,6 +674,7 @@ impl<'a> SweepSession<'a> {
             }
             EdgeValue::Userdata { slot, generation } => {
                 !self.typed(*slot, *generation, HandleKind::Userdata)
+                    || self.pending(*slot, *generation)
             }
         };
         let make_gap = owner_marked && weak && value_dead && self.guest_cursor(&edge.key);
@@ -663,7 +689,13 @@ impl<'a> SweepSession<'a> {
                     self.typed(*slot, *generation, HandleKind::Upvalue)
                 }
                 EdgeValue::Userdata { slot, generation } => {
+                    // A value-weak pending userdata is value-dead even though
+                    // it stays marked and retained. A guest-cursor key can
+                    // publish that as a gap; a bare userdata key cannot, so
+                    // the whole `kv`/`v` record is dropped instead of keeping
+                    // the retained object as a strong value.
                     self.typed(*slot, *generation, HandleKind::Userdata)
+                        && !(weak && self.pending(*slot, *generation))
                 }
             };
         let key_ok = match &edge.key {
@@ -694,6 +726,17 @@ impl<'a> SweepSession<'a> {
     fn typed(&self, slot: u32, generation: u32, kind: HandleKind) -> bool {
         self.snapshot.get(slot as usize).is_some_and(|found| {
             found.marked && found.kind == kind && found.generation == generation
+        })
+    }
+
+    /// One pending userdata generation in this sweep's snapshot.
+    ///
+    /// The slot is retained and marked, so it counts as alive for object
+    /// keys, but a weak value that names it is still published as a gap. A
+    /// stale edge to a reused generation is not pending.
+    fn pending(&self, slot: u32, generation: u32) -> bool {
+        self.snapshot.get(slot as usize).is_some_and(|found| {
+            found.pending && found.kind == HandleKind::Userdata && found.generation == generation
         })
     }
 
