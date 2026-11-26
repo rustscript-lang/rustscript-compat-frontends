@@ -25,3 +25,6 @@ mod compiler_lua_control_tests;
 
 #[path = "compiler/compiler_luajit_gc_tests.rs"]
 mod compiler_luajit_gc_tests;
+
+#[path = "compiler/compiler_lua_call_boundary_tests.rs"]
+mod compiler_lua_call_boundary_tests;

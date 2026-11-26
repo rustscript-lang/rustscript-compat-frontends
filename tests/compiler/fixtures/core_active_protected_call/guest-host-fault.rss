@@ -1,0 +1,34 @@
+// Minimal Core-level protected-call preflight, independent host-fault control.
+// Exact RSS guest input. Not compiled or run in this slice.
+//
+// `assert(false)` is a real Core host error: it returns
+// VmError::HostError("assertion failed") and aborts the whole run. It must
+// not become a guest payload, and mark(2) must never run.
+
+fn mark(phase: int) -> int;
+
+fn boom_arm(x: [int]) -> [bool, [int]] {
+    mark(1);
+    let flag = x[0] > 100;
+    assert(flag);
+    [false, x]
+}
+
+fn parent(
+    held: fn([int]) -> [bool, [int]],
+    t: [int],
+    do_call: bool,
+) -> [[bool, [int]], int, int, bool, [int]] {
+    mark(0);
+    let empty: [int] = [0];
+    let r: [bool, [int]] = if do_call => { held(t) } else => { [false, empty] };
+    mark(2);
+    let arity = len(r);
+    let tag = r[0];
+    let marker = if do_call => { 1 } else => { 0 };
+    [r, arity, marker, tag, t]
+}
+
+let t: [int] = [7, 8];
+let held: fn([int]) -> [bool, [int]] = boom_arm;
+parent(held, t, true);
