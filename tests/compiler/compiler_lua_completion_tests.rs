@@ -29,6 +29,9 @@ mod resolve;
 #[path = "compiler_lua_completion_tests/root_handoff.rs"]
 mod root_handoff;
 
+#[path = "compiler_lua_completion_tests/active_finalizer.rs"]
+mod active_finalizer;
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
