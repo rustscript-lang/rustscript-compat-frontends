@@ -1010,6 +1010,10 @@ fn step_mode_open(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
     if mode_string_len(heap, edge_index).is_some() {
         state.phase = MarkPhase::ModeBytes;
     } else {
+        // The record version was inspected here even though its value is not
+        // a mode string. First attachment must not re-read this version; a
+        // later write still bumps `mode_epoch` and registers a late parse.
+        mark_mode_checked(heap, state);
         advance_after_mode(state);
     }
     true
@@ -1042,6 +1046,7 @@ fn step_mode_byte(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
 
 fn finish_mode_parse(heap: &mut LuaHeap, state: &mut MarkState) {
     let parsed = state.pending_mode;
+    mark_mode_checked(heap, state);
     if parsed.keys || parsed.values {
         if state.modes.is_none() {
             state.init_at = 0;
@@ -1108,6 +1113,22 @@ fn store_mode(heap: &mut LuaHeap, state: &mut MarkState, parsed: WeakMode) {
     let slot = state.mode_owner as u32;
     let generation = heap.slots[state.mode_owner].generation;
     store_cache_mode(heap, state, slot, generation, parsed);
+}
+
+/// Records the exact direct `__mode` record version the reset walk inspected.
+/// The walk reads the string even when it names no weak side, so this stamp is
+/// what tells a later first attachment that this field version is already
+/// consumed. It deliberately does not touch `mode_generation`, `mode_round`,
+/// or the weak bits: those remain the parsed weak-mode cache, and a write
+/// after this read must still admit a late parse that sees, for example, an
+/// `x -> v` rewrite before the owner opens.
+fn mark_mode_checked(heap: &mut LuaHeap, state: &MarkState) {
+    let Some(stored) = heap.slots.get_mut(state.mode_owner) else {
+        return;
+    };
+    stored.mode_checked_generation = stored.generation;
+    stored.mode_checked_round = state.rescan_epoch;
+    stored.mode_checked_epoch = stored.mode_epoch;
 }
 
 fn advance_after_mode(state: &mut MarkState) {
@@ -2864,16 +2885,25 @@ impl LuaHeap {
     /// round. The setter only links the slot into the intrusive late parse
     /// queue; it reads no byte and performs no tree operation. A metatable
     /// already parsed in this round, or with no direct mode record, needs no
-    /// registration, and an already queued slot keeps its one entry.
+    /// registration, and an already queued slot keeps its one entry. A field
+    /// version the reset walk already inspected at its current record version
+    /// also needs no second read, even when the bytes named a strong mode and
+    /// left no weak cache: the checked field version and an effective weak
+    /// mode are different observations. A rewrite bumps `mode_epoch`, so that
+    /// later version still registers here (or on the write path).
     pub(super) fn note_attached_mode(&mut self, slot: u32, generation: u32) {
         let Some(mut state) = self.mark.take() else {
             return;
         };
         if state.write_barriers_open() {
             let needs_read = self.slots.get(slot as usize).is_some_and(|stored| {
+                let checked = stored.mode_checked_generation == generation
+                    && stored.mode_checked_round == state.rescan_epoch
+                    && stored.mode_checked_epoch == stored.mode_epoch;
                 stored.kind == HandleKind::Table
                     && stored.generation == generation
                     && stored.mode_edge.is_some()
+                    && !checked
                     && (stored.mode_generation != generation
                         || stored.mode_round != state.rescan_epoch)
             });

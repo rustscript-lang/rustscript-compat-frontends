@@ -15266,6 +15266,212 @@ fn late_first_attachment_parsed_at_reset_control_clears_the_weak_value() {
 }
 
 // ---------------------------------------------------------------------------
+// Review 6ca8874, item 1: a strong `__mode` consumed by Reset must not be
+// queued again by the first attachment. The inspected field version and an
+// effective weak-mode cache are different observations.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug)]
+enum ResetCheckedStrongArm {
+    /// Business: an unrelated metatable is attached at Reset, so the slot walk
+    /// consumes the prewritten `x` on a metatable that is still unattached.
+    /// That metatable is then attached to a queued owner during Gray, its
+    /// field is rewritten to `v` in place, and the owner has not opened yet.
+    UnrelatedAttachThenFirstAttach,
+    /// Control: the same metatable is attached to the owner at Reset. The
+    /// walk consumes `x` there, and the Gray rewrite to `v` is read without a
+    /// first-attachment registration.
+    AttachedAtReset,
+}
+
+struct ResetCheckedStrongGraph {
+    mt: TableRef,
+    owner: TableRef,
+    gate: TableRef,
+    gate_record: u32,
+    value: TableRef,
+    child: TableRef,
+    orphan: TableRef,
+    /// The independent Reset-time attachment. Both slots stay unrooted: they
+    /// only make the Reset slot walk read every direct mode edge.
+    keeper: Option<(TableRef, TableRef)>,
+}
+
+fn plant_reset_checked_strong(
+    heap: &mut LuaHeap,
+    arm: ResetCheckedStrongArm,
+) -> Result<ResetCheckedStrongGraph, HeapError> {
+    let mt = heap.alloc()?;
+    heap.set_mode_scalar(mt, Value::string("x"))?;
+    let owner = heap.alloc()?;
+    let value = heap.alloc()?;
+    let child = heap.alloc()?;
+    let orphan = heap.alloc()?;
+    heap.set_named_edge(owner, "subj", value)?;
+    heap.set_named_edge(value, "next", child)?;
+    let keeper = if matches!(arm, ResetCheckedStrongArm::UnrelatedAttachThenFirstAttach) {
+        let keeper_owner = heap.alloc()?;
+        let keeper_mt = heap.alloc()?;
+        heap.set_metatable(keeper_owner, Some(keeper_mt))?;
+        Some((keeper_owner, keeper_mt))
+    } else {
+        heap.set_metatable(owner, Some(mt))?;
+        None
+    };
+    let gate = heap.alloc()?;
+    heap.set_named_scalar(gate, "g0", Value::Bool(true))?;
+    heap.set_named_scalar(gate, "g1", Value::Bool(true))?;
+    let (_, gate_record) = heap
+        .locate_named(gate.slot(), "g1")
+        .expect("gate g1 record");
+    let frame = heap.enter_roots(2)?;
+    heap.write_root(frame, 0, owner)?;
+    heap.write_root(frame, 1, gate)?;
+    Ok(ResetCheckedStrongGraph {
+        mt,
+        owner,
+        gate,
+        gate_record,
+        value,
+        child,
+        orphan,
+        keeper,
+    })
+}
+
+fn run_reset_checked_strong(arm: ResetCheckedStrongArm) {
+    let mut heap = LuaHeap::new(limits(24, 8, 32));
+    let graph = plant_reset_checked_strong(&mut heap, arm).expect("plant reset-checked strong");
+    assert_eq!(
+        heap.metatable_edges, 1,
+        "exactly one metatable is attached when Reset runs"
+    );
+    assert!(
+        heap.slots[graph.mt.slot() as usize].mode_edge.is_some(),
+        "the metatable carries a direct __mode record"
+    );
+    heap.take_scan_meter();
+    let mut parked = ParkedMark::start(&mut heap).expect("start reset-checked strong mark");
+    pause_at(&mut parked, graph.gate.slot(), graph.gate_record);
+    assert!(parked.marked(graph.owner), "the owner is queued");
+    assert!(
+        parked.pending().map(|scan| scan.owner) != Some(graph.owner.slot()),
+        "the owner has not opened yet"
+    );
+    assert!(
+        !parked.marked(graph.value) && !parked.marked(graph.child),
+        "the weak value and its successor start white"
+    );
+    assert!(
+        parked.meter().weak_mode_bytes >= 1,
+        "the Reset slot walk really consumed the prewritten x byte"
+    );
+    assert_eq!(
+        parked.with_saved_heap(|heap| heap.named_value(graph.mt, "__mode")),
+        Ok(Value::string("x")),
+        "the raw field really holds x before the attach or rewrite"
+    );
+    let attach_registrations = match arm {
+        ResetCheckedStrongArm::UnrelatedAttachThenFirstAttach => {
+            let before = parked.meter().mode_late_registrations;
+            parked
+                .with_saved_heap(|heap| heap.set_metatable(graph.owner, Some(graph.mt)))
+                .expect("first attachment during Gray");
+            let added = parked.meter().mode_late_registrations - before;
+            assert!(added <= 1, "one attachment queues at most one late read");
+            if added > 0 {
+                // Freeze the `6ca8874` path: let the redundant read finish so
+                // the in-place rewrite is attempted after its strong stamp.
+                pulse_until_late_parsed(&mut parked);
+            }
+            added
+        }
+        ResetCheckedStrongArm::AttachedAtReset => 0,
+    };
+    assert_eq!(
+        parked.with_saved_heap(|heap| heap.named_value(graph.mt, "__mode")),
+        Ok(Value::string("x")),
+        "the attach did not change the raw field"
+    );
+    let registrations_before_write = parked.meter().mode_late_registrations;
+    parked
+        .with_saved_heap(|heap| heap.set_mode_scalar(graph.mt, Value::string("v")))
+        .expect("rewrite the direct field to v in place");
+    assert_eq!(
+        parked.with_saved_heap(|heap| heap.named_value(graph.mt, "__mode")),
+        Ok(Value::string("v")),
+        "the raw field really holds the rewritten v"
+    );
+    let write_registrations = parked.meter().mode_late_registrations - registrations_before_write;
+    assert!(
+        write_registrations <= 1,
+        "one rewrite queues at most one late read"
+    );
+    let parsed_before_write = parked.meter().mode_late_parsed;
+    if write_registrations > 0 {
+        pulse_until_late_parsed(&mut parked);
+        assert_eq!(
+            parked.meter().mode_late_parsed - parsed_before_write,
+            1,
+            "the in-place rewrite is read exactly once"
+        );
+    }
+    assert!(
+        parked.pending().map(|scan| scan.owner) != Some(graph.owner.slot()),
+        "the parse did not open the owner"
+    );
+    assert!(
+        !parked.marked(graph.value) && !parked.marked(graph.child),
+        "the unscanned owner's weak value and successor stay white"
+    );
+    let _ = finish(&mut parked);
+    parked.complete().expect("sweep reset-checked strong mark");
+    drop(parked);
+
+    assert!(heap.alive(graph.owner), "the rooted owner survives");
+    assert!(heap.alive(graph.mt), "the attached metatable survives");
+    assert!(
+        !heap.alive(graph.value),
+        "the unscanned owner must read the late v and clear its value \
+         (attach registrations {attach_registrations}, write registrations {write_registrations})"
+    );
+    assert!(
+        !heap.alive(graph.child),
+        "the strong successor clears with it"
+    );
+    assert!(!heap.alive(graph.orphan), "the independent orphan clears");
+    assert_eq!(
+        heap.named_edge(graph.owner, "subj"),
+        Ok(None),
+        "the weak entry clears at entry level"
+    );
+    assert_eq!(
+        attach_registrations, 0,
+        "a Reset-inspected field version needs no first-attachment re-read"
+    );
+    assert_eq!(
+        write_registrations, 1,
+        "the x -> v rewrite must be read before the owner opens"
+    );
+    if let Some((keeper_owner, keeper_mt)) = graph.keeper {
+        assert!(
+            !heap.alive(keeper_owner) && !heap.alive(keeper_mt),
+            "the independent Reset-time attachment is not rooted"
+        );
+    }
+}
+
+#[test]
+fn late_first_attachment_does_not_reread_a_reset_checked_strong_mode() {
+    run_reset_checked_strong(ResetCheckedStrongArm::UnrelatedAttachThenFirstAttach);
+}
+
+#[test]
+fn late_first_attachment_reset_control_reads_an_in_place_rewrite() {
+    run_reset_checked_strong(ResetCheckedStrongArm::AttachedAtReset);
+}
+
+// ---------------------------------------------------------------------------
 // Review ba3c944, item 2: a same-tuple rescan must re-read the mode before the
 // next record is charged.
 // ---------------------------------------------------------------------------
@@ -16147,5 +16353,179 @@ fn abandoned_mark_clears_a_pending_replay_target_tag() {
         heap.slots[reused.slot() as usize].late_target_epoch,
         0,
         "reuse starts with no inherited replay tag"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Review 6ca8874, late replay capacity: a replay-marked target is not a
+// subgraph scan. Its own out-edge must still charge and expand the ordinary
+// queue, including after a peer target is unlinked from the replay list.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn late_replay_target_expands_its_out_edge_after_a_peer_is_released() {
+    let mut heap = LuaHeap::new(limits(48, 16, 72));
+    let (fixture, mut parked) = plant_deferred_boundary(&mut heap);
+    pause_at(&mut parked, fixture.gate.slot(), fixture.gate_record);
+    let mt = parked
+        .with_saved_heap(|heap| heap.alloc())
+        .expect("out-edge metatable");
+    parked
+        .with_saved_heap(|heap| heap.set_mode_scalar(mt, Value::string("x")))
+        .expect("pending strong mode");
+    parked
+        .with_saved_heap(|heap| heap.set_metatable(fixture.owner, Some(mt)))
+        .expect("attach the pending metatable");
+    let peer = parked
+        .with_saved_heap(|heap| heap.alloc())
+        .expect("released peer target");
+    let target = parked
+        .with_saved_heap(|heap| heap.alloc())
+        .expect("surviving late target");
+    let successor = parked
+        .with_saved_heap(|heap| heap.alloc())
+        .expect("white successor");
+    parked
+        .with_saved_heap(|heap| heap.set_named_edge(target, "next", successor))
+        .expect("the target's only out-edge");
+    parked
+        .with_saved_heap(|heap| heap.set_object_edge(fixture.owner, peer, target))
+        .expect("queue the object key and table value");
+    let target_record = parked
+        .with_saved_heap(|heap| {
+            heap.locate_named(target.slot(), "next")
+                .map(|(_, index)| index)
+        })
+        .expect("target next record");
+    assert!(
+        !parked.marked(peer) && !parked.marked(target) && !parked.marked(successor),
+        "both replay targets and the successor start white"
+    );
+
+    pulse_until_late_parsed(&mut parked);
+    consume_one_deferred(&mut parked, "out-edge owner check");
+    assert!(
+        !parked.marked(successor),
+        "the queued edge record does not scan the target"
+    );
+    let before = parked.meter();
+    let view = parked.pulse(1);
+    assert!(!view.finished, "the cycle finished on the replay unit");
+    assert_eq!(
+        view.meter.mode_late_deferred - before.mode_late_deferred,
+        1,
+        "the object edge is one deferred replay unit"
+    );
+    assert_eq!(
+        view.meter.scratch.work_pushed - before.scratch.work_pushed,
+        2,
+        "the key and the value are both newly marked"
+    );
+    assert!(parked.marked(peer) && parked.marked(target));
+    assert!(
+        !parked.marked(successor),
+        "replay marking the late target is not a subgraph scan"
+    );
+    let tags = parked.with_saved_heap(|heap| {
+        (
+            heap.slots[peer.slot() as usize].late_target_epoch,
+            heap.slots[target.slot() as usize].late_target_epoch,
+        )
+    });
+    assert_ne!(tags.0, 0, "the peer is linked on the replay list");
+    assert_ne!(tags.1, 0, "the late target is linked on the replay list");
+
+    parked
+        .with_saved_heap(|heap| heap.rollback(peer))
+        .expect("release the peer target before it opens");
+    let released = parked.with_saved_heap(|heap| {
+        let slot = &heap.slots[peer.slot() as usize];
+        (
+            slot.late_target_epoch,
+            slot.late_target_prev,
+            slot.late_target_next,
+        )
+    });
+    assert_eq!(
+        released,
+        (0, None, None),
+        "release unlinks the peer from the replay list"
+    );
+    let survivor = parked.with_saved_heap(|heap| {
+        let slot = &heap.slots[target.slot() as usize];
+        (
+            slot.late_target_epoch,
+            slot.late_target_prev,
+            slot.late_target_next,
+        )
+    });
+    assert!(
+        survivor.0 != 0 && survivor.1.is_none() && survivor.2.is_none(),
+        "the surviving target becomes the repaired head and tail"
+    );
+
+    // Ordinary work runs first; the surviving replay target must still open
+    // after the ordinary queue drains.
+    let mut opened = false;
+    for _ in 0..HARNESS_BOUND {
+        if parked.pending().map(|scan| (scan.owner, scan.cursor))
+            == Some((target.slot(), target_record))
+        {
+            opened = true;
+            break;
+        }
+        assert!(
+            !parked.marked(successor),
+            "nothing marks the successor before the target opens"
+        );
+        let view = parked.pulse(1);
+        assert!(
+            !view.finished,
+            "the cycle finished before the target opened"
+        );
+    }
+    assert!(opened, "the surviving replay target actually opens");
+    assert!(parked.marked(target));
+    assert!(
+        !parked.marked(successor),
+        "opening the owner has not charged its out-edge yet"
+    );
+    let (gray_len, _) = gray_shape(&mut parked);
+    let before = parked.meter();
+    let view = parked.pulse(1);
+    assert!(
+        !view.finished,
+        "the cycle finished on the target's out-edge"
+    );
+    assert_eq!(
+        view.meter.outgoing_edge_checks - before.outgoing_edge_checks,
+        1,
+        "the surviving target charges exactly one out-edge"
+    );
+    assert_eq!(
+        view.meter.scratch.work_pushed - before.scratch.work_pushed,
+        1,
+        "the white successor is newly marked by that out-edge"
+    );
+    assert_eq!(
+        gray_shape(&mut parked).0,
+        gray_len + 1,
+        "the ordinary queue actually expands"
+    );
+    assert!(parked.marked(successor));
+
+    let _ = finish(&mut parked);
+    parked.complete().expect("sweep out-edge replay mark");
+    drop(parked);
+    assert!(!heap.alive(peer), "the released peer clears");
+    assert!(
+        heap.alive(target) && heap.alive(successor),
+        "the surviving target and its scanned successor are marked"
+    );
+    assert!(heap.alive(fixture.owner) && heap.alive(fixture.gate) && heap.alive(mt));
+    assert_eq!(
+        heap.named_edge(target, "next"),
+        Ok(Some(successor)),
+        "the strong successor edge stays live"
     );
 }

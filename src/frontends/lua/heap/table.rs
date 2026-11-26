@@ -284,6 +284,15 @@ struct Slot {
     /// vector; this slot field replaces the old record-keyed map, so a late
     /// parse neither inserts into a tree nor queries one.
     mode_weak: WeakMode,
+    /// Current direct `__mode` record version inspected by this round's reset
+    /// walk, including a read whose bytes name no weak side. This is not a
+    /// weak-mode cache: `mode_generation` and `mode_round` above stay unset
+    /// for a strong read. The triple only lets a first attachment skip a
+    /// second read of the same field version. A later write bumps `mode_epoch`
+    /// and is still registered and read late.
+    mode_checked_generation: u32,
+    mode_checked_round: u64,
+    mode_checked_epoch: u32,
     /// This table is linked in the saved mark's late-mode parse queue. The
     /// links live on the slot, so a setter append and a release unlink are
     /// constant work and allocate nothing.
@@ -1071,6 +1080,9 @@ impl LuaHeap {
         slot.mode_generation = 0;
         slot.mode_round = 0;
         slot.mode_weak = WeakMode::default();
+        slot.mode_checked_generation = 0;
+        slot.mode_checked_round = 0;
+        slot.mode_checked_epoch = 0;
         slot.late_mode_epoch = 0;
         slot.late_mode_prev = None;
         slot.late_mode_next = None;
@@ -1109,6 +1121,9 @@ impl LuaHeap {
             mode_generation: 0,
             mode_round: 0,
             mode_weak: WeakMode::default(),
+            mode_checked_generation: 0,
+            mode_checked_round: 0,
+            mode_checked_epoch: 0,
             late_mode_epoch: 0,
             late_mode_prev: None,
             late_mode_next: None,
@@ -3264,6 +3279,9 @@ impl LuaHeap {
         slot.mode_generation = 0;
         slot.mode_round = 0;
         slot.mode_weak = WeakMode::default();
+        slot.mode_checked_generation = 0;
+        slot.mode_checked_round = 0;
+        slot.mode_checked_epoch = 0;
         slot.discover_generation = 0;
         slot.discover_batch = 0;
         slot.discover_round = 0;
