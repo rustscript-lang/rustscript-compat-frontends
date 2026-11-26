@@ -77,6 +77,11 @@ pub(super) struct MarkState {
     late_target_head: Option<u32>,
     late_target_tail: Option<u32>,
     index: usize,
+    /// Set when the root enumeration has offered the exact registered
+    /// userdata reservation to the mark. That reservation is not a guest
+    /// value and does not enter `roots`; it is one host-retained edge checked
+    /// once per mark after the explicit roots.
+    pending_reservation_checked: bool,
     mode_edge: Option<u32>,
     mode_owner: usize,
     byte_at: usize,
@@ -214,6 +219,7 @@ impl MarkState {
             late_target_head: None,
             late_target_tail: None,
             index: 0,
+            pending_reservation_checked: false,
             mode_edge: None,
             mode_owner: 0,
             byte_at: 0,
@@ -1807,6 +1813,21 @@ fn schedule_started_owner(heap: &mut LuaHeap, state: &mut MarkState, owner: u32)
 
 fn step_root(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
     if state.index >= heap.roots.len() {
+        // The exact registered userdata reservation is a host-retained edge,
+        // not a guest root: offer it once after the explicit roots. An empty
+        // (unregistered) reservation is not retained. The record and slot
+        // identity reads are one node-slot visit; the ordinary mark update
+        // and any owner scan follow the same units as a rooted node.
+        if !state.pending_reservation_checked {
+            state.pending_reservation_checked = true;
+            if let Some(slot) = heap.registered_pending_userdata_slot() {
+                heap.scan.node_slot_visits += 1;
+                if heap.mark_new(slot) {
+                    state.gray.push(slot);
+                }
+                return true;
+            }
+        }
         state.phase = MarkPhase::Gray;
         return false;
     }

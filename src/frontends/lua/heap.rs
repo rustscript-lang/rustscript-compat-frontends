@@ -163,11 +163,18 @@ pub(super) fn publish_table(host: &mut HostContext) -> Result<(TableRef, i64), H
 /// requires [`vm::resource::CloseProgress::Ready`], and confirms the handle is
 /// retired before it rolls the Lua slot back. If that close is not confirmed,
 /// the reservation stays with its staged raw handle and its generation is not
-/// advanced; the private test retry entry closes that same token. An ordinary
-/// borrow never accepts the staged record.
+/// advanced. A normal collection retains that exact reservation: the shared
+/// mark offers it as a host-retained edge and the pending-close enumeration
+/// ignores the unpublished token. The next call to this function recovers it
+/// before reserving again: the typed payload must name the exact userdata,
+/// the same token is closed synchronously and confirmed retired, and only
+/// then is the record cleared and the slot generation returned. A failed
+/// recovery keeps the record for a later attempt. An ordinary borrow never
+/// accepts the staged record.
 /// `LuaUserdataResource` has no asynchronous close path: the default
 /// synchronous close returns `Ready`, and `Pending` is an error here.
 pub fn publish_userdata(host: &mut HostContext) -> Result<UserdataRef, HeapError> {
+    recover_pending_userdata(host)?;
     let userdata = with_heap(host, LuaHeap::reserve_userdata)?;
     let resource = match host.push_resource(LuaUserdataResource::new(userdata)) {
         Ok(resource) => resource,
@@ -194,6 +201,34 @@ pub fn publish_userdata(host: &mut HostContext) -> Result<UserdataRef, HeapError
         return rollback_registered_userdata(host, userdata, handle, error);
     }
     Ok(userdata)
+}
+
+/// Recovers a reservation left by a refused registered rollback before the
+/// next issuance reserves again.
+///
+/// The record and its live slot are validated first. For a registered
+/// reservation, the typed payload must name the exact userdata, then that same
+/// token is closed and confirmed retired before the record is cleared and the
+/// slot generation returned. A close failure or owner mismatch keeps the
+/// record, so a later call can retry it. An unregistered empty reservation has
+/// no Core token: it is rolled back in O(1) without a close. No record is a
+/// no-op. The whole recovery is one record check, one exact typed borrow, one
+/// synchronous close, and one O(1) rollback: it adds no scan unit, no graph
+/// search, and no owner walk.
+fn recover_pending_userdata(host: &mut HostContext) -> Result<(), HeapError> {
+    let Some((userdata, raw)) = with_heap(host, |heap| heap.pending_userdata_reservation())? else {
+        return Ok(());
+    };
+    if let Some(raw) = raw {
+        let handle = vm::ResourceHandle::from_raw(raw).map_err(|_| HeapError::CarrierOutOfRange)?;
+        let owner = checked_userdata_payload(host, handle)?;
+        if owner != userdata {
+            return Err(HeapError::TokenMismatch);
+        }
+        close_confirmed_token::<LuaUserdataResource>(host, handle)?;
+    }
+    with_heap(host, |heap| heap.rollback_empty_userdata(userdata))?;
+    Ok(())
 }
 
 /// Borrows the typed resource token recorded for `userdata`.
@@ -305,8 +340,10 @@ pub fn pending_userdata_raw(
 
 /// Retries one registered userdata rollback after a refused attempt. It reads
 /// the staged raw handle and closes that same Core token, then releases the
-/// empty reservation. Test-only entry; the production issuer has no live
-/// refusal path that would leave such a record.
+/// empty reservation. Test-only immediate entry: the production recovery is
+/// the next [`publish_userdata`] call, which validates the exact owner and
+/// performs the same close and generation return. Normal collections retain
+/// the record this entry consumes.
 #[cfg(test)]
 pub fn retry_pending_userdata_rollback(
     host: &mut HostContext,
@@ -378,8 +415,9 @@ pub fn last_userdata_post_register_failure(
 /// [`rollback_registered_userdata`] control flow. With no armed refusal it
 /// closes and confirms that same token and rolls the slot back. With the
 /// one-shot refusal armed it returns before the close and keeps the staged
-/// raw, so the retry can close the same token. It never fabricates a handle
-/// and never skips the real rollback.
+/// raw. A normal collection then retains that exact registration, and the
+/// next [`publish_userdata`] call recovers it through the production path.
+/// It never fabricates a handle and never skips the real rollback.
 #[cfg(test)]
 pub fn publish_userdata_after_register_failure(
     host: &mut HostContext,

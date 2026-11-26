@@ -493,6 +493,10 @@ impl<'a> SweepSession<'a> {
                     self.heap.slots[index].token.is_none(),
                     "lua heap sweep reached dead slot {index} with a bound host token; the host collector must close it and clear the binding before sweep"
                 );
+                assert!(
+                    self.heap.registered_pending_userdata_slot() != Some(index as u32),
+                    "lua heap sweep reached the registered userdata reservation at slot {index}; the mark must retain it"
+                );
                 self.dead.push(index as u32);
                 self.heap.scan.scratch.dead_slots_pushed += 1;
             }

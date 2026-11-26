@@ -973,6 +973,52 @@ fn host_collect_closes_bound_userdata_before_the_shared_select() {
     });
 }
 
+/// An unregistered empty reservation owns no Core token and is not retained.
+/// A normal collection releases its slot and clears the record, so the next
+/// reservation is accepted at the next generation instead of being blocked
+/// by an empty record that could never be closed.
+#[test]
+fn unregistered_empty_userdata_reservation_is_collected_and_cleared() {
+    crate::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits()).expect("install");
+        let empty =
+            heap::with_heap(&mut host, |heap| heap.reserve_userdata()).expect("empty reservation");
+        let slot = empty.slot();
+        let generation = empty.generation();
+        assert!(heap::with_heap(&mut host, |heap| Ok(heap.userdata_alive(empty))).expect("live"));
+        let record = heap::with_heap(&mut host, |heap| heap.pending_userdata_reservation())
+            .expect("record read")
+            .expect("stored record");
+        assert_eq!(record.0, empty);
+        assert_eq!(record.1, None, "the reservation is not registered");
+
+        let report = heap::with_heap(&mut host, |heap| Ok(heap.collect())).expect("pure collect");
+        assert_eq!(report.live_nodes, 0);
+        assert!(
+            !heap::with_heap(&mut host, |heap| Ok(heap.userdata_alive(empty))).expect("collected")
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| Ok(heap
+                .slot_generation(slot)
+                .expect("slot")))
+            .expect("generation"),
+            generation + 1
+        );
+        assert!(
+            heap::with_heap(&mut host, |heap| heap.pending_userdata_reservation())
+                .expect("record read")
+                .is_none(),
+            "the collection clears the empty reservation record"
+        );
+
+        let next =
+            heap::with_heap(&mut host, |heap| heap.reserve_userdata()).expect("next reservation");
+        assert_eq!(next.slot(), slot);
+        assert_eq!(next.generation(), generation + 1);
+    });
+}
+
 fn doomed_slot_of(heap: &LuaHeap, slot: u32) -> u32 {
     heap.slot_generation(slot).expect("slot exists")
 }

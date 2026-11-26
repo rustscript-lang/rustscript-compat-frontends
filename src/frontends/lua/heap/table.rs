@@ -931,7 +931,11 @@ pub struct LuaHeap {
     payload_bytes: u64,
     /// The single userdata slot the typed issuer has reserved, before its
     /// Core token is published. The raw field appears only after the real
-    /// Core registration succeeded. Ordinary borrows do not read this record.
+    /// Core registration succeeded. Ordinary borrows and the pending-close
+    /// enumeration do not read this record, so a staged token is never a
+    /// guest value. A completed mark retains a registered (`raw` is `Some`)
+    /// reservation as a host edge, and the next normal issuance closes and
+    /// releases it before reserving again.
     pending_userdata: Option<PendingUserdata>,
     /// Owner chains opened by the legacy table rollback edge walk.
     /// Test-only observation: an empty userdata reservation rollback must
@@ -2991,6 +2995,73 @@ impl LuaHeap {
         Ok(())
     }
 
+    /// The exact reservation this heap is holding, if any.
+    ///
+    /// Returns the private handle and the staged Core raw (`None` before a
+    /// successful registration). The record is only returned when it names a
+    /// live, empty userdata at its recorded generation, of kind userdata,
+    /// with no published token, edge, metatable, mode pointer, or carrier.
+    /// Recovery validates the exact owner before it closes the staged token,
+    /// and must not close a token for a record whose slot it cannot release.
+    /// A saved mark or a saved release tail owns the graph, so both refuse
+    /// recovery before any close: the caller keeps the record unchanged.
+    /// This is one record check, not a heap scan.
+    pub(super) fn pending_userdata_reservation(
+        &self,
+    ) -> Result<Option<(UserdataRef, Option<u64>)>, HeapError> {
+        let Some(pending) = self.pending_userdata else {
+            return Ok(None);
+        };
+        self.ensure_sweep_open()?;
+        if self.mark.is_some() {
+            return Err(HeapError::MarkDenied);
+        }
+        let Some(slot) = self.slots.get(pending.slot as usize) else {
+            return Err(HeapError::StaleHandle);
+        };
+        if slot.generation != pending.generation
+            || slot.kind != HandleKind::Userdata
+            || slot.token.is_some()
+            || slot.edge_head.is_some()
+            || slot.edge_tail.is_some()
+            || slot.metatable.is_some()
+            || slot.mode_edge.is_some()
+            || slot.carrier.is_some()
+            || !matches!(slot.state, SlotState::Live { .. })
+        {
+            return Err(HeapError::StaleHandle);
+        }
+        Ok(Some((
+            UserdataRef::userdata(self.domain, pending.slot, pending.generation),
+            pending.raw,
+        )))
+    }
+
+    /// The slot of a registered reservation that the current mark must
+    /// retain, if the record still names the exact live userdata.
+    ///
+    /// A registered reservation (`raw` is `Some`) is a host-retained node: it
+    /// is not published and not guest-visible, but a normal collection must
+    /// not release its slot or strand its Core token without the record that
+    /// can close it. An unregistered empty reservation (`raw` is `None`) is
+    /// not retained: it owns no Core resource, and a collection may reclaim
+    /// it. Domain is the heap's own, so checking the record plus this slot is
+    /// the whole identity check. This does not search other slots.
+    fn registered_pending_userdata_slot(&self) -> Option<u32> {
+        let pending = self.pending_userdata?;
+        pending.raw?;
+        let slot = self.slots.get(pending.slot as usize)?;
+        if slot.generation == pending.generation
+            && slot.kind == HandleKind::Userdata
+            && slot.token.is_none()
+            && matches!(slot.state, SlotState::Live { .. })
+        {
+            Some(pending.slot)
+        } else {
+            None
+        }
+    }
+
     /// The staged Core raw handle for one exact reservation, before publish.
     ///
     /// Test-only: the private retry entry reads it to close the same token
@@ -3505,6 +3576,16 @@ impl LuaHeap {
                 && self.slots[index as usize].edge_tail.is_none(),
             "owner chain must already be unlinked; release does not scan edges"
         );
+        if self.pending_userdata.is_some_and(|pending| {
+            pending.slot == index && pending.generation == self.slots[index as usize].generation
+        }) {
+            debug_assert!(
+                self.pending_userdata
+                    .is_some_and(|pending| pending.raw.is_none()),
+                "a registered userdata reservation reached release without its mark retention"
+            );
+            self.pending_userdata = None;
+        }
         let mark = self.mark.as_mut();
         mark::release_rescan_slot(mark, &mut self.slots, index);
         let mark = self.mark.as_mut();

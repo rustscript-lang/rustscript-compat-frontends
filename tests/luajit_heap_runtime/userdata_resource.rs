@@ -789,7 +789,143 @@ fn refused_rollback_retains_pending_raw_and_retries_the_same_token() {
             1
         );
 
-        // The retry reads the same staged raw and closes that exact token.
+        // A normal full host collection in this same VM must retain the
+        // registered reservation. Its slot is not a guest value, but the
+        // staged raw is a real open Core token that only this record can
+        // close. Root the control first so it stays live while an independent
+        // unrooted orphan proves the collection really ran.
+        let frame = heap::with_heap(&mut host, |heap| {
+            let frame = heap.enter_roots(1)?;
+            heap.write_userdata_root(frame, 0, control)?;
+            Ok(frame)
+        })
+        .expect("control root");
+        let orphan =
+            heap::with_heap(&mut host, LuaHeap::alloc_userdata).expect("independent orphan");
+        let stats_before_collect = heap::stats(&mut host).expect("before collect");
+        assert_eq!(
+            stats_before_collect.live_nodes, 3,
+            "control, reservation, and orphan are the live slots"
+        );
+
+        let report = heap::collect(&mut host).expect("full host collection");
+        assert_eq!(
+            report.live_nodes, 2,
+            "the rooted control and the host-retained reservation stay live"
+        );
+        assert_eq!(
+            report.marked_nodes, 2,
+            "the reservation is marked by the host record, not by a guest root"
+        );
+        assert_eq!(report.live_roots, 1);
+        assert!(
+            !heap::with_heap(&mut host, |heap| Ok(heap.userdata_alive(orphan)))
+                .expect("orphan state"),
+            "the collection completed and released the independent orphan"
+        );
+
+        // The refused reservation keeps its exact slot, generation, and raw
+        // handle across the collection. Nothing here publishes it: the
+        // ordinary borrow still refuses the staged record.
+        assert!(
+            heap::with_heap(&mut host, |heap| Ok(heap.userdata_alive(witness.userdata)))
+                .expect("reservation state"),
+            "the registered reservation survives a normal collection"
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| Ok(slot_generation(heap, witness.slot)))
+                .expect("generation after collect"),
+            1,
+            "the collection does not advance the reservation slot"
+        );
+        assert_eq!(
+            heap::pending_userdata_raw(&mut host, witness.userdata).expect("staged after collect"),
+            Some(witness.raw),
+            "the staged raw handle is still the same one"
+        );
+        assert!(
+            userdata_token_open(&host, witness.raw),
+            "the Core token stays open across the collection"
+        );
+        assert_eq!(
+            host.resource_count(),
+            resources_before + 1,
+            "the staged Core token is still registered"
+        );
+        assert_eq!(
+            heap::borrow_published_userdata(&host, witness.userdata),
+            Err(HeapError::StaleHandle),
+            "the staged record is still not a published guest value"
+        );
+        assert_eq!(
+            heap::borrow_published_userdata(&host, control).expect("rooted control"),
+            control
+        );
+        assert!(userdata_token_open(&host, control_raw));
+
+        // The next normal issuance recovers the earlier registration before
+        // it reserves: it verifies the exact payload owner, closes that token
+        // synchronously, and only then clears the record and returns the
+        // generation. The new userdata takes the same slot at generation 2.
+        let reused = heap::publish_userdata(&mut host).expect("next publish recovers");
+        assert_eq!(reused.slot(), witness.slot);
+        assert_eq!(reused.generation(), 2);
+        let reused_raw = bound_raw(&mut host, reused);
+        assert_ne!(reused_raw, witness.raw);
+        assert!(userdata_token_open(&host, reused_raw));
+        assert!(
+            !userdata_token_open(&host, witness.raw),
+            "recovery closed the earlier raw handle"
+        );
+        assert_eq!(
+            host.resource_count(),
+            resources_before + 1,
+            "the earlier token returned its Core slot before the new one was issued"
+        );
+        assert!(
+            !heap::with_heap(&mut host, |heap| Ok(heap.userdata_alive(witness.userdata)))
+                .expect("old handle state"),
+            "recovery released the earlier reservation"
+        );
+        assert_eq!(
+            heap::pending_userdata_raw(&mut host, witness.userdata)
+                .expect("no staged record after recovery"),
+            None
+        );
+        assert_eq!(
+            heap::borrow_published_userdata(&host, reused).expect("new token open"),
+            reused
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| Ok(slot_generation(heap, witness.slot)))
+                .expect("generation after recovery"),
+            2
+        );
+        assert_eq!(heap::borrow_published_userdata(&host, control), Ok(control));
+        assert!(userdata_token_open(&host, control_raw));
+        heap::with_heap(&mut host, |heap| heap.leave_roots(frame)).expect("leave roots");
+    });
+}
+
+/// The private immediate retry still closes the same staged token without a
+/// collection. It is a test-only entry: the production recovery is the next
+/// normal `publish_userdata` call proved above.
+#[test]
+fn refused_rollback_immediate_retry_still_uses_the_private_entry() {
+    crate::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, room()).expect("install");
+        let resources_before = host.resource_count();
+
+        heap::arm_userdata_rollback_refusal(&mut host).expect("arm refusal");
+        heap::publish_userdata_after_register_failure(&mut host).expect_err("refused rollback");
+        let witness = heap::last_userdata_post_register_failure(&host).expect("refusal witness");
+        assert_eq!(witness.pending_raw, Some(witness.raw));
+        assert_eq!(
+            witness.close, None,
+            "a controlled refusal is not a fabricated Pending close"
+        );
+
         let generation = heap::retry_pending_userdata_rollback(&mut host, witness.userdata)
             .expect("retry the same token");
         assert_eq!(generation, 2);
@@ -807,18 +943,83 @@ fn refused_rollback_retains_pending_raw_and_retries_the_same_token() {
             !heap::with_heap(&mut host, |heap| Ok(heap.userdata_alive(witness.userdata)))
                 .expect("released")
         );
+    });
+}
 
-        // The released slot is reissued at the next generation.
-        let reused = heap::publish_userdata(&mut host).expect("reissue the released slot");
+/// A saved private step cycle uses the same mark and shared Select as the
+/// full collector. The host-retained reservation must survive that phased
+/// path too, and the next normal issuance must recover it.
+#[test]
+fn refused_rollback_survives_a_saved_step_cycle_and_next_publish_recovers() {
+    crate::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, room()).expect("install");
+        let control = heap::publish_userdata(&mut host).expect("control userdata");
+        let control_raw = bound_raw(&mut host, control);
+        let resources_before = host.resource_count();
+
+        heap::arm_userdata_rollback_refusal(&mut host).expect("arm refusal");
+        heap::publish_userdata_after_register_failure(&mut host).expect_err("refused rollback");
+        let witness = heap::last_userdata_post_register_failure(&host).expect("refusal witness");
+        assert_eq!(witness.pending_raw, Some(witness.raw));
+        assert_eq!(witness.close, None);
+
+        let frame = heap::with_heap(&mut host, |heap| {
+            let frame = heap.enter_roots(1)?;
+            heap.write_userdata_root(frame, 0, control)?;
+            Ok(frame)
+        })
+        .expect("control root");
+        let orphan =
+            heap::with_heap(&mut host, LuaHeap::alloc_userdata).expect("independent orphan");
+
+        heap::open_fixed_step(&mut host).expect("open saved mark");
+        let report = loop {
+            match heap::step_fixed_frames(&mut host, 1).expect("step") {
+                heap::StepOutcome::Paused { .. } | heap::StepOutcome::Published { .. } => {}
+                heap::StepOutcome::Completed(report) => break report,
+            }
+        };
+        assert_eq!(report.live_nodes, 2);
+        assert_eq!(report.marked_nodes, 2);
+        assert!(
+            !heap::with_heap(&mut host, |heap| Ok(heap.userdata_alive(orphan)))
+                .expect("orphan state"),
+            "the step cycle released the independent orphan"
+        );
+        assert!(
+            heap::with_heap(&mut host, |heap| Ok(heap.userdata_alive(witness.userdata)))
+                .expect("reservation state"),
+            "the registered reservation survives the saved step cycle"
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| Ok(slot_generation(heap, witness.slot)))
+                .expect("generation after step cycle"),
+            1
+        );
+        assert_eq!(
+            heap::pending_userdata_raw(&mut host, witness.userdata).expect("staged after step"),
+            Some(witness.raw)
+        );
+        assert!(userdata_token_open(&host, witness.raw));
+        assert_eq!(host.resource_count(), resources_before + 1);
+        assert_eq!(
+            heap::borrow_published_userdata(&host, witness.userdata),
+            Err(HeapError::StaleHandle)
+        );
+
+        let reused = heap::publish_userdata(&mut host).expect("next publish recovers");
         assert_eq!(reused.slot(), witness.slot);
         assert_eq!(reused.generation(), 2);
-        let reused_raw = bound_raw(&mut host, reused);
-        assert!(userdata_token_open(&host, reused_raw));
+        assert!(!userdata_token_open(&host, witness.raw));
+        assert_eq!(host.resource_count(), resources_before + 1);
         assert_eq!(
-            heap::borrow_published_userdata(&host, control).expect("control still open"),
-            control
+            heap::borrow_published_userdata(&host, reused).expect("new token open"),
+            reused
         );
+        assert_eq!(heap::borrow_published_userdata(&host, control), Ok(control));
         assert!(userdata_token_open(&host, control_raw));
+        heap::with_heap(&mut host, |heap| heap.leave_roots(frame)).expect("leave roots");
     });
 }
 
