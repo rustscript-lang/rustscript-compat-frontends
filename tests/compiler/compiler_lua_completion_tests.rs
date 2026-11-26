@@ -383,6 +383,28 @@ struct Run {
     ticks: Vec<String>,
     exit: CompletionExit,
     call_sites: Vec<DecodedCallSite>,
+    capture_plans: Vec<CapturePlan>,
+}
+
+/// The fixed Core's capture decision for one closure prototype, read from the
+/// compiled program. `Copy` keeps the source binding usable; `Move` detaches
+/// it at `BindCallable` time.
+#[derive(Clone, Debug)]
+struct CapturePlan {
+    source_slots: Vec<u16>,
+    modes: Vec<vm::CaptureBindingMode>,
+}
+
+fn capture_plans(program: &Program) -> Vec<CapturePlan> {
+    program
+        .callable_prototypes
+        .iter()
+        .filter(|prototype| !prototype.capture_modes.is_empty())
+        .map(|plan| CapturePlan {
+            source_slots: plan.capture_source_slots.clone(),
+            modes: plan.capture_modes.clone(),
+        })
+        .collect()
 }
 
 fn drive_fixture(name: &str) -> Run {
@@ -390,6 +412,7 @@ fn drive_fixture(name: &str) -> Run {
     let compiled = vm::compile_source_file_with_options(&path, candidate_options())
         .unwrap_or_else(|error| panic!("{name}: candidate compile failed: {error:?}"));
     let call_sites = decoded_call_sites(&compiled.program);
+    let capture_plans = capture_plans(&compiled.program);
     let mut vm = Vm::new_with_jit_config(
         compiled.program,
         vm::JitConfig {
@@ -439,7 +462,7 @@ fn drive_fixture(name: &str) -> Run {
         eprintln!("LUA_COMPLETION malformed-transport fixture={name} detail={detail}");
     }
     eprintln!(
-        "LUA_COMPLETION fixture={name} fuel_budget={FUEL_BUDGET} check_interval={FUEL_CHECK_INTERVAL} consumed={fuel_consumed} remaining={remaining} jit=disabled status={status_log} exit={exit:?} stack={stack:?} marks={:?}",
+        "LUA_COMPLETION fixture={name} fuel_budget={FUEL_BUDGET} check_interval={FUEL_CHECK_INTERVAL} consumed={fuel_consumed} remaining={remaining} jit=disabled status={status_log} exit={exit:?} stack={stack:?} marks={:?} captures={capture_plans:?}",
         marks
             .iter()
             .map(|mark| mark.label.as_str())
@@ -453,6 +476,7 @@ fn drive_fixture(name: &str) -> Run {
         ticks,
         exit,
         call_sites,
+        capture_plans,
     }
 }
 
@@ -950,6 +974,173 @@ fn all_lua_multilevel_forwarding_runs() {
         &[Value::Bool(true), Value::Int(7)][..]
     );
     assert_dynamic_call_witness(&run, "leaf", 1);
+}
+
+fn count_label(run: &Run, label: &str) -> usize {
+    run.marks.iter().filter(|mark| mark.label == label).count()
+}
+
+/// The forwarding closure in the capture-order fixtures captures exactly one
+/// local: the `invoke` binding. The original binding must be copied into the
+/// closure cell, not moved out of its slot, because Lua keeps it usable.
+fn assert_single_copy_capture(run: &Run, name: &str) {
+    assert_eq!(
+        run.capture_plans.len(),
+        1,
+        "{name}: only the forwarding closure may capture: {:?}",
+        run.capture_plans
+    );
+    let plan = &run.capture_plans[0];
+    assert_eq!(
+        plan.source_slots.len(),
+        1,
+        "{name}: the forwarding closure captures one binding: {plan:?}"
+    );
+    assert_eq!(
+        plan.modes,
+        [vm::CaptureBindingMode::Copy],
+        "{name}: the captured original binding must be copied, not moved: {plan:?}"
+    );
+}
+
+/// Every executed marker must resume through exactly one decoded `CallValue`
+/// owned by the active caller frame, with the marker's return address and the
+/// expected argc. Repeated executions of the same site stay one site.
+fn assert_marker_call_site(run: &Run, mark: &MarkRecord, expected_argc: u8) {
+    let return_ip = mark
+        .last_return_ip
+        .expect("marker must resume through a CallValue continuation");
+    let matching: Vec<_> = run
+        .call_sites
+        .iter()
+        .filter(|site| {
+            site.owner == mark.parent_prototype
+                && site.return_ip == return_ip
+                && site.argc == expected_argc
+        })
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "expected one CallValue (owner={:?}, return_ip={return_ip}, argc={expected_argc}) for {}; sites={:?}",
+        mark.parent_prototype,
+        mark.label,
+        run.call_sites
+    );
+    assert_eq!(
+        matching[0].ip + 2,
+        matching[0].return_ip,
+        "CallValue carries one argc operand byte"
+    );
+}
+
+/// `direct-before.lua` is the layout control: the original `invoke` binding is
+/// called before `forward` is created, so no capture has happened yet.
+#[test]
+fn direct_before_calls_original_binding_control() {
+    let run = run_halted("direct-before.lua");
+    assert_eq!(
+        labels(&run),
+        ["invoke", "leaf", "forward", "invoke", "leaf", "done"],
+        "the original call and the forwarded call both run before done"
+    );
+    assert_eq!(
+        completed_values("direct-before.lua", &run),
+        &[Value::Bool(true), Value::Int(7), Value::Int(5)][..],
+        "pcall returns true, the forwarded 7, and the original call's 5"
+    );
+    assert_eq!(count_label(&run, "invoke"), 2, "invoke runs twice");
+    assert_eq!(count_label(&run, "leaf"), 2, "leaf runs twice");
+    assert_eq!(count_label(&run, "forward"), 1, "forward runs once");
+    let invoke_marks: Vec<_> = run
+        .marks
+        .iter()
+        .filter(|mark| mark.label == "invoke")
+        .collect();
+    for mark in &invoke_marks {
+        assert_marker_call_site(&run, mark, 2);
+    }
+    let mut invoke_callers: Vec<_> = invoke_marks
+        .iter()
+        .map(|mark| mark.parent_prototype)
+        .collect();
+    invoke_callers.sort_unstable();
+    invoke_callers.dedup();
+    assert_eq!(
+        invoke_callers.len(),
+        2,
+        "the original call and the closure-forwarded call have distinct callers"
+    );
+    for mark in run.marks.iter().filter(|mark| mark.label == "leaf") {
+        assert_marker_call_site(&run, mark, 1);
+    }
+    assert_dynamic_call_witness(&run, "leaf", 1);
+    assert_eq!(
+        payload_of("direct-before.lua", &run),
+        Value::Int(7),
+        "the last leaf argument is the forwarded 7"
+    );
+}
+
+/// `direct-after.lua` calls the original `invoke` binding after `forward` has
+/// captured it. Lua keeps that binding usable; the capture must not detach it.
+#[test]
+fn direct_after_calls_original_binding_after_capture() {
+    let run = run_halted("direct-after.lua");
+    assert_eq!(
+        labels(&run),
+        ["invoke", "leaf", "forward", "invoke", "leaf", "done"],
+        "the captured call must not break the later original call"
+    );
+    assert_eq!(
+        completed_values("direct-after.lua", &run),
+        &[Value::Bool(true), Value::Int(7), Value::Int(5)][..],
+        "pcall returns true, the forwarded 7, and the later original call's 5"
+    );
+    assert_eq!(count_label(&run, "invoke"), 2, "invoke runs twice");
+    assert_eq!(count_label(&run, "leaf"), 2, "leaf runs twice");
+    for mark in run.marks.iter().filter(|mark| mark.label == "invoke") {
+        assert_marker_call_site(&run, mark, 2);
+    }
+    for mark in run.marks.iter().filter(|mark| mark.label == "leaf") {
+        assert_marker_call_site(&run, mark, 1);
+    }
+    assert_dynamic_call_witness(&run, "leaf", 1);
+    assert_single_copy_capture(&run, "direct-after.lua");
+    assert_eq!(payload_of("direct-after.lua", &run), Value::Int(7));
+}
+
+/// `protected-after.lua` wraps the post-capture original binding call in
+/// `pcall`. The direct protected call succeeds and contributes its Boolean.
+#[test]
+fn protected_after_calls_original_binding_after_capture() {
+    let run = run_halted("protected-after.lua");
+    assert_eq!(
+        labels(&run),
+        ["invoke", "leaf", "forward", "invoke", "leaf", "done"],
+        "the protected original call and the forwarded call both run"
+    );
+    assert_eq!(
+        completed_values("protected-after.lua", &run),
+        &[
+            Value::Bool(true),
+            Value::Int(7),
+            Value::Int(5),
+            Value::Bool(true)
+        ][..],
+        "forward pcall succeeds, then the protected original call returns true and 5"
+    );
+    assert_eq!(count_label(&run, "invoke"), 2, "invoke runs twice");
+    assert_eq!(count_label(&run, "leaf"), 2, "leaf runs twice");
+    for mark in run.marks.iter().filter(|mark| mark.label == "invoke") {
+        assert_marker_call_site(&run, mark, 2);
+    }
+    for mark in run.marks.iter().filter(|mark| mark.label == "leaf") {
+        assert_marker_call_site(&run, mark, 1);
+    }
+    assert_dynamic_call_witness(&run, "leaf", 1);
+    assert_single_copy_capture(&run, "protected-after.lua");
+    assert_eq!(payload_of("protected-after.lua", &run), Value::Int(7));
 }
 
 #[test]

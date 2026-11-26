@@ -631,6 +631,43 @@ impl<'a> Lower<'a> {
         Ok(target)
     }
 
+    /// A nested Lua function reaches an outer callable through a capture copy.
+    /// The fixed Core classifies a capture by scanning the closure body for a
+    /// read of the captured slot, and `Expr::LocalCall` names its callee slot
+    /// without counting as a read. Left implicit, the capture falls back to
+    /// `Move`, which detaches the original Lua binding even though Lua keeps
+    /// that binding usable after the closure is created. Return an explicit
+    /// by-value copy the call performs (`.copy()`, a `ToOwned` read) as the
+    /// callee slot, so the capture is classified `Copy` and the original
+    /// binding survives.
+    fn captured_callee_slot(
+        &mut self,
+        binding: usize,
+        span: Span,
+    ) -> Result<(LocalSlot, Option<Stmt>), ParseError> {
+        let slot = self.slot_for(binding)?;
+        let Some(captured) = self
+            .frames
+            .last()
+            .expect("completion frame")
+            .captures
+            .get(&binding)
+            .copied()
+        else {
+            return Ok((slot, None));
+        };
+        let copy = self.alloc_temp("callee_copy")?;
+        Ok((
+            copy,
+            Some(Stmt::Let {
+                index: copy,
+                declared_schema: None,
+                expr: Expr::ToOwned(Box::new(Expr::Var(captured))),
+                line: self.line(span),
+            }),
+        ))
+    }
+
     fn alloc_temp(&mut self, role: &str) -> Result<LocalSlot, ParseError> {
         let name = format!("$lua_completion_tmp_{role}_{}", self.temp);
         self.temp += 1;
@@ -969,12 +1006,17 @@ impl<'a> Lower<'a> {
     ) -> Result<(CallClass, Expr), ParseError> {
         if let Some(binding) = self.use_binding(name) {
             let proof = self.proof_for(binding, name.span)?;
-            let slot = self.slot_for(binding)?;
+            let (slot, copy) = self.captured_callee_slot(binding, span)?;
             let adapted = self.adapt_arguments(args, proof.arity, span)?;
-            return Ok((
-                CallClass::Lua,
-                Expr::LocalCall(slot, Vec::new(), adapted, None),
-            ));
+            let call = Expr::LocalCall(slot, Vec::new(), adapted, None);
+            let value = match copy {
+                Some(stmt) => Expr::Block {
+                    stmts: vec![stmt],
+                    expr: Box::new(call),
+                },
+                None => call,
+            };
+            return Ok((CallClass::Lua, value));
         }
         if name.is("pcall") {
             return self.lower_pcall(args, span);
@@ -1055,12 +1097,17 @@ impl<'a> Lower<'a> {
                         self.fail(name.span, "pcall target is not a proven Lua callable")
                     })?;
                     let proof = self.proof_for(binding, name.span)?;
-                    let slot = self.slot_for(binding)?;
+                    let (slot, copy) = self.captured_callee_slot(binding, span)?;
                     let adapted = self.adapt_arguments(forwarded, proof.arity, span)?;
-                    Ok((
-                        CallClass::Pcall,
-                        Expr::LocalCall(slot, Vec::new(), adapted, None),
-                    ))
+                    let call = Expr::LocalCall(slot, Vec::new(), adapted, None);
+                    let value = match copy {
+                        Some(stmt) => Expr::Block {
+                            stmts: vec![stmt],
+                            expr: Box::new(call),
+                        },
+                        None => call,
+                    };
+                    Ok((CallClass::Pcall, value))
                 }
                 LuaExpr::Function { body, .. } => {
                     let closure = self.lower_function(body, None)?;
