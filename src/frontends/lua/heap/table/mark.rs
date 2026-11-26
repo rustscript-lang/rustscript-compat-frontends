@@ -340,8 +340,8 @@ impl<'a> MarkSession<'a> {
 
     /// One ordinary mark, plus one selection scan after the ordinary work
     /// empties. Only the private pending-finalizer entry uses this starter.
-    /// The scan starts from an empty settlement rollback list; a previous
-    /// pulse-only selecting mark leaves its list here, and its flags stay.
+    /// The scan starts from an empty settlement journal; a previous pulse-only
+    /// selecting mark leaves its chain head here, and its flags stay.
     pub(super) fn start_selecting_pending(heap: &'a mut LuaHeap) -> Self {
         heap.clear_selecting_settlements();
         let session = Self::start(heap);

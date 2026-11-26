@@ -276,9 +276,21 @@ struct Slot {
     /// Selection must not pick the object again, and a later raw `__gc` on
     /// the same generation does not queue it. The flag never marks the object
     /// and never keeps it alive; it only makes a live marked generation
-    /// value-dead for weak-value publication. Release and slot reuse clear
-    /// the flag.
+    /// value-dead for weak-value publication and for a hash value of a
+    /// `k`-only weak table. Release and slot reuse clear the flag.
     finalizer_settled: bool,
+    /// Next slot in the current selecting pass's settlement journal, if this
+    /// slot is a journal node. The links live on the slots, so one settlement
+    /// is a constant number of slot writes and never grows or copies a vector.
+    /// A link left by an earlier pass is unreachable: the head is reset to
+    /// `None` when that pass starts or publishes, and a new append overwrites
+    /// this field before the slot can join the current chain. Release does not
+    /// read the journal; slot reuse clears both fields with the slot record.
+    settlement_next: Option<u32>,
+    /// Exact generation journalled by this node. Together with the slot index
+    /// this is the identity the rollback re-checks before clearing
+    /// `finalizer_settled`; zero means no current journal identity.
+    settlement_generation: u32,
     /// Cached raw `__gc` lookup result when this table slot is a candidate
     /// metatable. Valid only with `pending_gc_generation` and
     /// `pending_gc_round`; a cache hit reads no edge record. A reused slot or
@@ -841,6 +853,16 @@ pub struct ScanMeter {
     /// One per uncached candidate metatable. A cache hit does not increment
     /// this and does not re-walk the chain.
     pub pending_finalizer_gc_lookups: u64,
+    /// Test-only: settlement journal node appends performed by the selecting
+    /// scan. One per settled identity and at most one per `pulse(1)` unit.
+    /// No vector growth or prefix copy participates.
+    #[cfg(test)]
+    pub settlement_journal_appends: u64,
+    /// Test-only: settlement journal nodes actually visited by a failed-pass
+    /// rollback. One per node this pass appended; a successful publication
+    /// and Release visit no node and leave this at zero.
+    #[cfg(test)]
+    pub settlement_journal_visits: u64,
     /// Test-only: pending-queue records visited by Release after a dead-slot
     /// release. The bounded per-slot invariant must keep this at zero; the
     /// ordinary release path reads only the released slot's own fields.
@@ -916,19 +938,6 @@ pub(super) struct MarkSnapshot {
 pub(super) struct DoomedMark {
     pub(super) tokens: Vec<DoomedToken>,
     pub(super) modes: MarkSnapshot,
-}
-
-/// One white userdata identity settled by the selecting pass.
-///
-/// Upstream `lj_gc_separateudata` sets the finalized flag for a white
-/// userdata whose metatable has no raw `__gc` and does not put it on the
-/// finalizer queue. The flag is per heap identity: the exact slot and
-/// generation. It is not a queue record, is not a mark, and does not keep the
-/// object alive. A later raw `__gc` on that generation does not queue it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct SettledFinalizer {
-    pub(super) slot: u32,
-    pub(super) generation: u32,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1015,14 +1024,21 @@ pub struct LuaHeap {
     /// [`PendingQueue`]'s counted boundary, including the test-only release
     /// meter. No call site counts by hand.
     pending_finalizers: PendingQueue,
-    /// Identities settled by the current selecting mark pass, in scan order.
+    /// Head and length of the current selecting pass's settlement journal.
     ///
-    /// This is the rollback record for [`Self::finalizer_settled`], not a
-    /// queue and not a root. The selecting mark clears it before its scan; a
-    /// verification or doomed-close failure clears exactly those flags before
-    /// returning, and a successful publication drops the list. A pulse-only
-    /// test mark leaves it here until the next selecting mark starts.
-    selecting_settlements: Vec<SettledFinalizer>,
+    /// Each node is a live userdata slot whose `settlement_next` links the
+    /// previous head and whose `settlement_generation` names the exact
+    /// identity. An append is one flag write, one link write, one generation
+    /// write, and one head write: a constant upper bound per `pulse(1)`
+    /// settlement unit, with no vector growth or prefix copy. A successful
+    /// publication drops the journal by resetting these fields; it does not
+    /// visit the links, and Release does not read them. A failed pass walks
+    /// exactly its own chain, clears those flags, and stops. That rollback
+    /// work is charged to the failure path, never to the next mark's first
+    /// pulse and never to Release.
+    settlement_head: Option<u32>,
+    #[cfg(test)]
+    settlement_journal_len: u32,
     /// Owner chains opened by the legacy table rollback edge walk.
     /// Test-only observation: an empty userdata reservation rollback must
     /// leave this unchanged, so its work stays independent of the graph size.
@@ -1040,6 +1056,12 @@ pub struct LuaHeap {
     /// adds none. The pairs are `(metatable_slot, edge_record_index)`.
     #[cfg(test)]
     pending_gc_edge_trace: std::cell::RefCell<Vec<(u32, u32)>>,
+    /// Test-only: identities actually visited by a failed settlement
+    /// journal rollback, in visit order. A successful pass and Release leave
+    /// it empty, so the trace distinguishes precise cleanup from a drain
+    /// deferred to the next pulse or to Release.
+    #[cfg(test)]
+    settlement_journal_trace: std::cell::RefCell<Vec<(u32, u32)>>,
     /// Test-only anti-control for the secondary propagation. When armed, a
     /// selected pending userdata is still marked and protected, but its
     /// metatable edge is not followed while its owner head is scanned. This
@@ -1350,13 +1372,17 @@ impl LuaHeap {
             payload_bytes: 0,
             pending_userdata: None,
             pending_finalizers: PendingQueue::default(),
-            selecting_settlements: Vec::new(),
+            settlement_head: None,
+            #[cfg(test)]
+            settlement_journal_len: 0,
             #[cfg(test)]
             rollback_owner_visits: 0,
             #[cfg(test)]
             selection_slot_trace: std::cell::RefCell::new(Vec::new()),
             #[cfg(test)]
             pending_gc_edge_trace: std::cell::RefCell::new(Vec::new()),
+            #[cfg(test)]
+            settlement_journal_trace: std::cell::RefCell::new(Vec::new()),
             #[cfg(test)]
             skip_pending_finalizer_metatable: false,
             #[cfg(test)]
@@ -1450,6 +1476,8 @@ impl LuaHeap {
         slot.metatable = None;
         slot.pending_finalizer = false;
         slot.finalizer_settled = false;
+        slot.settlement_next = None;
+        slot.settlement_generation = 0;
         slot.pending_gc_generation = 0;
         slot.pending_gc_round = 0;
         slot.pending_gc_non_nil = false;
@@ -1496,6 +1524,8 @@ impl LuaHeap {
             metatable: None,
             pending_finalizer: false,
             finalizer_settled: false,
+            settlement_next: None,
+            settlement_generation: 0,
             pending_gc_generation: 0,
             pending_gc_round: 0,
             pending_gc_non_nil: false,
@@ -3653,9 +3683,10 @@ impl LuaHeap {
     /// Upstream `lj_gc_separateudata` marks such a white userdata finalized
     /// without queueing it. This writes the same per-identity state on the
     /// exact slot generation: no queue record, no mark, and no retention.
-    /// The rollback list keeps the identity so a failure before weak
-    /// publication can clear only this pass's flags. The live-token,
-    /// unmarked, userdata, and generation checks mirror
+    /// The same call links the identity into this pass's intrusive settlement
+    /// journal, one slot node and one head update, so the rollback record is
+    /// constant work per pulse unit and never grows or copies a vector. The
+    /// live-token, unmarked, userdata, and generation checks mirror
     /// [`Self::commit_pending_finalizer`]; a candidate that changed during
     /// the walk is not settled.
     pub(super) fn settle_pending_finalizer(&mut self, candidate: &PendingCandidate) -> bool {
@@ -3672,40 +3703,74 @@ impl LuaHeap {
         {
             return false;
         }
-        self.slots[index].finalizer_settled = true;
-        self.selecting_settlements.push(SettledFinalizer {
-            slot: candidate.slot,
-            generation: candidate.generation,
-        });
+        let generation = candidate.generation;
+        let head = self.settlement_head;
+        let slot = &mut self.slots[index];
+        slot.finalizer_settled = true;
+        slot.settlement_generation = generation;
+        slot.settlement_next = head;
+        self.settlement_head = Some(candidate.slot);
+        #[cfg(test)]
+        {
+            self.settlement_journal_len += 1;
+            self.scan.settlement_journal_appends += 1;
+        }
         true
     }
 
-    /// Clears settlements from a previous pulse-only selecting mark, before
-    /// the next selecting scan starts. The published pass already dropped its
-    /// own list after a successful boundary.
+    /// Drops the current journal before a new selecting scan starts, or after
+    /// a successful publication.
+    ///
+    /// This drops the head only. The links and generation stamps stay on the
+    /// slots, but they are unreachable: a later append overwrites the next
+    /// link before the slot can join the new chain, and slot reuse clears both
+    /// fields. A successful pass therefore performs no per-node work here and
+    /// no node visit is charged to Release or to the next mark's first pulse.
     pub(super) fn clear_selecting_settlements(&mut self) {
-        self.selecting_settlements.clear();
+        self.settlement_head = None;
+        #[cfg(test)]
+        {
+            self.settlement_journal_len = 0;
+        }
     }
 
     /// Clears exactly the settlement flags named by the current failed pass
-    /// and drops the rollback list.
+    /// and drops the journal.
     ///
-    /// Each entry is re-checked against the live slot generation and the
-    /// userdata kind. A slot that changed, was already pending, or was
-    /// settled by an earlier pass is not touched, so valid previous-cycle
-    /// state and a pending record's flag survive the rollback.
+    /// The walk follows this pass's intrusive chain, one slot node at a time,
+    /// and touches no other node. Each entry is re-checked against the live
+    /// slot generation and the userdata kind. A slot that changed, was already
+    /// pending, or was settled by an earlier pass is not cleared, so valid
+    /// previous-cycle state and a pending record's flag survive the rollback.
+    /// The journal head and length are dropped before the walk, so a refused
+    /// or interrupted pass cannot leave a partially reachable chain.
     pub(super) fn discard_settlements(&mut self) {
-        for entry in self.selecting_settlements.drain(..) {
-            let Some(slot) = self.slots.get_mut(entry.slot as usize) else {
-                continue;
+        let mut cursor = self.settlement_head.take();
+        #[cfg(test)]
+        {
+            self.settlement_journal_len = 0;
+        }
+        while let Some(index) = cursor {
+            let Some(slot) = self.slots.get_mut(index as usize) else {
+                break;
             };
-            if slot.generation == entry.generation
+            let next = slot.settlement_next.take();
+            let generation = std::mem::take(&mut slot.settlement_generation);
+            #[cfg(test)]
+            {
+                self.scan.settlement_journal_visits += 1;
+                self.settlement_journal_trace
+                    .borrow_mut()
+                    .push((index, generation));
+            }
+            if slot.generation == generation
                 && slot.kind == HandleKind::Userdata
                 && slot.finalizer_settled
                 && !slot.pending_finalizer
             {
                 slot.finalizer_settled = false;
             }
+            cursor = next;
         }
     }
 
@@ -4269,6 +4334,38 @@ impl LuaHeap {
     #[cfg(test)]
     pub(crate) fn clear_pending_gc_edge_trace(&mut self) {
         self.pending_gc_edge_trace.borrow_mut().clear();
+    }
+
+    /// Identities currently linked in the settlement journal, from the head.
+    /// Test-only: the walk observes membership and does not count as a
+    /// rollback visit or as a successful-pass drain.
+    #[cfg(test)]
+    pub(crate) fn settlement_journal_members(&self) -> Vec<(u32, u32)> {
+        let mut members = Vec::new();
+        let mut cursor = self.settlement_head;
+        while let Some(index) = cursor {
+            let Some(slot) = self.slots.get(index as usize) else {
+                break;
+            };
+            members.push((index, slot.settlement_generation));
+            cursor = slot.settlement_next;
+        }
+        members
+    }
+
+    /// Number of identities currently linked in the settlement journal.
+    /// Test-only.
+    #[cfg(test)]
+    pub(crate) fn settlement_journal_len(&self) -> u32 {
+        self.settlement_journal_len
+    }
+
+    /// Takes the identities actually visited by a failed-pass journal
+    /// rollback, in visit order. Test-only; a successful pass and Release
+    /// leave the trace empty.
+    #[cfg(test)]
+    pub(crate) fn take_settlement_journal_trace(&mut self) -> Vec<(u32, u32)> {
+        std::mem::take(&mut *self.settlement_journal_trace.borrow_mut())
     }
 
     /// Current occupancy. Peaks count storage, not only live objects.

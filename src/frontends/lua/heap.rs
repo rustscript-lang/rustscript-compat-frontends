@@ -40,7 +40,10 @@
 //!
 //! At weak publication a weak value that names a retained pending userdata or
 //! a live settled generation is cleared, while a weak key keeps the entry and
-//! its scalar only when the object is actually marked. A sweep with no dead
+//! its scalar only when the object is actually marked. A `k`-only table also
+//! clears a pending or settled userdata value from its string-keyed and
+//! object-keyed hash entries; numeric keys keep the previous strong-value rule
+//! because this representation has no array/hash split. A sweep with no dead
 //! slot still runs the Owners walk when a pending finalizer or a marked
 //! settled generation needs that publication. Ordinary collections never
 //! select; they offer every existing record as a host-retained edge, so no
