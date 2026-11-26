@@ -15,18 +15,18 @@
 //! ride with the edge or the owner head. A zero budget does not read the graph.
 //!
 //! A safepoint root batch is not one of those units. `accept_root_batch` is
-//! open only in Roots or Gray: phase, then root quota, then every typed
-//! handle, before any mark. Those prechecks do not increment the scan meter.
-//! Success hands each entry to the existing gray queue. It does not write a
-//! root slot, open a frame, copy the batch, or spend pulse budget.
+//! open in Roots, Gray, or the late sub-phase: phase, then root quota, then
+//! every typed handle, before any mark. Those prechecks do not increment the
+//! scan meter. Success hands each entry to the existing gray queue. It does
+//! not write a root slot, open a frame, copy the batch, or spend pulse budget.
 //!
 //! A positive `pulse_with_root_batch` refuses Done or a missing mark before
 //! it reads the batch. It then uses that same quota and handle check and
-//! advances with the ordinary stepper. Roots or Gray, including a same-pulse
-//! entry from Start, Reset, or Mode, commit once before any root or gray
-//! step. A budget that runs out before Roots does not commit. The next call,
-//! including one after park and resume, reads only the batch it was given.
-//! Zero budget only observes.
+//! advances with the ordinary stepper. An accepting phase, including the
+//! late sub-phase and a same-pulse entry from Start, Reset, or Mode, commits
+//! once before any root, gray, or late step. A budget that runs out before an
+//! accepting phase does not commit. The next call, including one after park
+//! and resume, reads only the batch it was given. Zero budget only observes.
 //!
 //! `ParkedMark::advance_with_root_batch` and the host continuation share
 //! [`LuaHeap::advance_saved_mark_with_root_batch`]. That primitive checks the
@@ -594,13 +594,14 @@ impl<'a> ParkedMark<'a> {
 
     /// Accepts a borrowed root batch in this exclusive window.
     ///
-    /// Open only in Roots or Gray. Checks run in order: phase, then
-    /// `roots.len() + batch.len()` (no overflow, and not above `limits.roots`;
-    /// reserved empty slots and duplicate entries count), then each handle
-    /// through `require_live`, `require_closure`, or `require_upvalue`. Those
-    /// calls keep `WrongDomain`, `WrongKind`, and `StaleHandle`. The precheck
-    /// reads are not scan visits. A refusal does not mark, enqueue, move a
-    /// cursor, write a root slot, or change a success meter.
+    /// Open in Roots, Gray, or the late sub-phase. Checks run in order: phase,
+    /// then `roots.len() + batch.len()` (no overflow, and not above
+    /// `limits.roots`; reserved empty slots and duplicate entries count), then
+    /// each handle through `require_live`, `require_closure`, or
+    /// `require_upvalue`. Those calls keep `WrongDomain`, `WrongKind`, and
+    /// `StaleHandle`. The precheck reads are not scan visits. A refusal does
+    /// not mark, enqueue, move a cursor, write a root slot, or change a
+    /// success meter.
     ///
     /// Success hands each accepted entry, including a duplicate or an
     /// already-marked handle, to the existing gray queue through
@@ -1378,11 +1379,34 @@ fn apply_edge_check(
     heap.scan.mode_late_deferred += 1;
 }
 
+fn clear_late_slot(stored: &mut Slot) {
+    stored.late_mode_epoch = 0;
+    stored.late_mode_prev = None;
+    stored.late_mode_next = None;
+    stored.late_owner_epoch = 0;
+    stored.late_owner_old = None;
+    stored.late_owner_new = None;
+    stored.late_owner_prev = None;
+    stored.late_owner_next = None;
+}
+
+fn clear_late_edge(record: &mut super::EdgeSlot) {
+    record.late_epoch = 0;
+    record.late_owner = 0;
+    record.late_value = None;
+    record.late_key = None;
+    record.late_prev = None;
+    record.late_next = None;
+}
+
 /// Remove a released slot from both intrusive late queues. A tag from an
 /// older epoch is not in the current list. A released slot must never stay
 /// queued: reuse would otherwise inherit queue membership or parse state.
 pub(super) fn release_late_slot(state: Option<&mut MarkState>, slots: &mut [Slot], index: u32) {
     let Some(state) = state else {
+        if let Some(stored) = slots.get_mut(index as usize) {
+            clear_late_slot(stored);
+        }
         return;
     };
     let epoch = state.rescan_epoch;
@@ -1442,14 +1466,7 @@ pub(super) fn release_late_slot(state: Option<&mut MarkState>, slots: &mut [Slot
         }
     }
     if let Some(stored) = slots.get_mut(index as usize) {
-        stored.late_mode_epoch = 0;
-        stored.late_mode_prev = None;
-        stored.late_mode_next = None;
-        stored.late_owner_epoch = 0;
-        stored.late_owner_old = None;
-        stored.late_owner_new = None;
-        stored.late_owner_prev = None;
-        stored.late_owner_next = None;
+        clear_late_slot(stored);
     }
 }
 
@@ -1460,6 +1477,9 @@ pub(super) fn release_late_edge(
     index: u32,
 ) {
     let Some(state) = mark else {
+        if let Some(record) = edge_slots.get_mut(index as usize) {
+            clear_late_edge(record);
+        }
         return;
     };
     let epoch = state.rescan_epoch;
@@ -1487,12 +1507,7 @@ pub(super) fn release_late_edge(
         }
     }
     if let Some(record) = edge_slots.get_mut(index as usize) {
-        record.late_epoch = 0;
-        record.late_owner = 0;
-        record.late_value = None;
-        record.late_key = None;
-        record.late_prev = None;
-        record.late_next = None;
+        clear_late_edge(record);
     }
 }
 
