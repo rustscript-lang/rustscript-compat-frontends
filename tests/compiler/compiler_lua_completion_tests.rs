@@ -335,9 +335,6 @@ enum CompletionExit {
     VmFailure(VmError),
     /// The underlying VM reported a status other than `Halted`.
     VmStatus(VmStatus),
-    /// The pre-consumer candidate exit: `Halted` plus the raw private array.
-    /// This records the old behavior during the RED run.
-    LegacyHalted { stack: Vec<Value> },
     /// The stack did not match the private transport; fail closed.
     MalformedTransport { detail: String },
 }
@@ -363,8 +360,8 @@ fn consume_completion_exit(status: Result<VmStatus, VmError>, stack: Vec<Value>)
     };
     match items.first() {
         Some(Value::Bool(true)) => CompletionExit::Values(items[1..].to_vec()),
-        Some(Value::Bool(false)) if items.len() == 2 => CompletionExit::LegacyHalted {
-            stack: stack.clone(),
+        Some(Value::Bool(false)) if items.len() == 2 => CompletionExit::Uncaught {
+            payload: items[1].clone(),
         },
         Some(Value::Bool(false)) => CompletionExit::MalformedTransport {
             detail: format!("error completion must carry exactly one payload: {items:?}"),
