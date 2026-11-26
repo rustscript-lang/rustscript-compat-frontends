@@ -11,6 +11,18 @@
 //! closes each swept node's token through the scope close contract and returns
 //! that quota before the node is released.
 //!
+//! A bare userdata keeps its existing semantics: no guest carrier, finalizer,
+//! metatable, or Core token. The private host path in this module also issues
+//! a separate `resource<lua.userdata>` capability for one userdata node. Its
+//! heap slot stores the raw Core handle and the payload stores the exact Lua
+//! domain, kind, slot, and generation, so the checked borrow rejects a wrong
+//! heap, kind, key, generation, or same-type token for another object. The
+//! close is synchronous (`Ready`); a `Pending` result is an error. The host
+//! collector closes that token through the same `retire_doomed_token` path as
+//! a table token and clears the exact binding before weak publication and
+//! Release. A pure `LuaHeap` sweep refuses a dead slot that still carries a
+//! bound token instead of skipping it.
+//!
 //! Borrowed from the ES5 heap at `3e348a010bc8d84baa5b7d1169a5f50aeb4e46ec`
 //! `src/javascript/heap.rs`: slot plus generation handles, explicit root
 //! frames, and non-moving mark/sweep. The guest table check uses the issued
@@ -49,8 +61,8 @@ mod resource;
 #[path = "heap/table.rs"]
 mod table;
 
-pub use handle::{ClosureRef, HandleKind, TableRef, UpvalueRef};
-pub use resource::LuaTableResource;
+pub use handle::{ClosureRef, HandleKind, TableRef, UpvalueRef, UserdataRef};
+pub use resource::{LuaTableResource, LuaUserdataResource};
 pub use table::{
     CellValue, CollectReport, GuestClass, HeapError, HeapLimits, HeapStats, LuaHeap, ObserveFault,
     PublishedRead, RootFrameId, ScanMeter,
@@ -135,6 +147,195 @@ pub(super) fn publish_table(host: &mut HostContext) -> Result<(TableRef, i64), H
     Ok((table, raw))
 }
 
+/// Allocates one bare userdata and publishes its private typed resource token.
+///
+/// The Lua slot is reserved before `HostContext::push_resource`. A refused
+/// insert rolls back only that empty reservation, so a Lua quota or phase
+/// refusal never registers a Core resource. After registration this borrows
+/// the token with the exact `lua.userdata` key and confirms that its payload
+/// names this exact userdata (domain, kind, slot, and generation) before it
+/// records the raw handle on the slot. The returned handle is published only
+/// after both directions of that binding exist.
+///
+/// A later failure closes the registered token through `close_resource`,
+/// requires [`vm::resource::CloseProgress::Ready`], and confirms the handle is
+/// retired before it rolls the Lua slot back. If that close is not confirmed,
+/// the reservation stays and its generation is not advanced.
+/// `LuaUserdataResource` has no asynchronous close path: the default
+/// synchronous close returns `Ready`, and `Pending` is an error here.
+pub fn publish_userdata(host: &mut HostContext) -> Result<UserdataRef, HeapError> {
+    let userdata = with_heap(host, LuaHeap::alloc_userdata)?;
+    let resource = match host.push_resource(LuaUserdataResource::new(userdata)) {
+        Ok(resource) => resource,
+        Err(error) => {
+            with_heap(host, |heap| heap.rollback_userdata(userdata))?;
+            return Err(HeapError::from_scope(error));
+        }
+    };
+    let handle = resource.handle();
+    let raw = handle.raw();
+    let payload = match checked_userdata_payload(host, handle) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return rollback_registered_userdata(host, userdata, handle, error);
+        }
+    };
+    if payload != userdata {
+        return rollback_registered_userdata(host, userdata, handle, HeapError::TokenMismatch);
+    }
+    if let Err(error) = with_heap(host, |heap| heap.bind_userdata_token(userdata, raw)) {
+        return rollback_registered_userdata(host, userdata, handle, error);
+    }
+    Ok(userdata)
+}
+
+/// Borrows the typed resource token recorded for `userdata`.
+///
+/// The Lua handle is checked against the installed heap domain, live slot,
+/// generation, and kind. The stored raw handle is then validated by the Core
+/// resource table (arena, slot generation, concrete `TypeId`, and the exact
+/// `lua.userdata` key). Finally the payload must name this same userdata, so a
+/// same-type token for another object is refused even though its key matches.
+/// A missing heap is [`HeapError::SweepDenied`]; a foreign Lua heap is
+/// [`HeapError::WrongDomain`]; a stale or unbound Lua slot is
+/// [`HeapError::StaleHandle`]; a payload for another object is
+/// [`HeapError::TokenMismatch`].
+pub fn borrow_published_userdata(
+    host: &HostContext,
+    userdata: UserdataRef,
+) -> Result<UserdataRef, HeapError> {
+    let Some(heap) = host.scope_state::<LuaHeap>() else {
+        return Err(HeapError::SweepDenied);
+    };
+    if userdata.domain() != heap.domain() {
+        return Err(HeapError::WrongDomain);
+    }
+    let raw = heap.published_userdata_token(userdata)?;
+    let handle = vm::ResourceHandle::from_raw(raw).map_err(|_| HeapError::CarrierOutOfRange)?;
+    let borrowed = host
+        .borrow_resource_with_key::<LuaUserdataResource>(handle, &LuaUserdataResource::key())
+        .map_err(HeapError::from_scope)?;
+    if borrowed.get().userdata() != userdata {
+        return Err(HeapError::TokenMismatch);
+    }
+    Ok(userdata)
+}
+
+/// Borrows one registered userdata token with the exact key and copies its
+/// payload out. The borrow ends here, so a caller can close or roll back the
+/// same `HostContext` on the error path.
+fn checked_userdata_payload(
+    host: &HostContext,
+    handle: vm::ResourceHandle,
+) -> Result<UserdataRef, HeapError> {
+    let borrowed = host
+        .borrow_resource_with_key::<LuaUserdataResource>(handle, &LuaUserdataResource::key())
+        .map_err(HeapError::from_scope)?;
+    Ok(borrowed.get().userdata())
+}
+
+/// Closes one registered userdata token and confirms that a second close sees
+/// it retired. A failure returns the close error and does not roll the slot
+/// back; the caller keeps the reservation and does not advance its generation.
+fn rollback_registered_userdata(
+    host: &mut HostContext,
+    userdata: UserdataRef,
+    handle: vm::ResourceHandle,
+    error: HeapError,
+) -> Result<UserdataRef, HeapError> {
+    close_confirmed_token::<LuaUserdataResource>(host, handle)?;
+    with_heap(host, |heap| heap.rollback_userdata(userdata))?;
+    Err(error)
+}
+
+/// Closes one typed token, requires the synchronous result, and confirms that
+/// the handle is retired. A Pending close is an error: these types have no
+/// asynchronous close path.
+fn close_confirmed_token<T: vm::resource::HostResource>(
+    host: &mut HostContext,
+    handle: vm::ResourceHandle,
+) -> Result<(), HeapError> {
+    match host.close_resource::<T>(handle, vm::ResourceCloseReason::Requested) {
+        Ok(vm::resource::CloseProgress::Ready) => {}
+        Ok(_) => {
+            return Err(HeapError::Scope(
+                "lua typed resource close did not finish synchronously".to_string(),
+            ));
+        }
+        Err(error) => return Err(HeapError::from_scope(error)),
+    }
+    match host.close_resource::<T>(handle, vm::ResourceCloseReason::Requested) {
+        Err(error) if retired_token(&error) => Ok(()),
+        Ok(_) => Err(HeapError::Scope(
+            "lua typed resource close did not stay closed".to_string(),
+        )),
+        Err(error) => Err(HeapError::from_scope(error)),
+    }
+}
+
+/// One controlled userdata failure after registration, for the private test
+/// injection. It records the real Core handle and the resource count on both
+/// sides of the confirmed close.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UserdataPostRegisterFailure {
+    pub raw: u64,
+    pub registered_count: usize,
+    pub closed_count: usize,
+    pub close: vm::resource::CloseProgress,
+    pub slot: u32,
+    pub generation_after: u32,
+}
+
+/// The witness from the last [`publish_userdata_after_register_failure`] call.
+#[cfg(test)]
+pub fn last_userdata_post_register_failure(
+    host: &HostContext,
+) -> Option<UserdataPostRegisterFailure> {
+    host.scope_state::<UserdataPostRegisterFailure>().copied()
+}
+
+/// Test-only injection: registers a real userdata token, then fails before the
+/// slot binding is published. It closes and confirms that same token with the
+/// production helper, rolls the slot back, and records the witness. This never
+/// fabricates a handle and never skips the real rollback.
+#[cfg(test)]
+pub fn publish_userdata_after_register_failure(
+    host: &mut HostContext,
+) -> Result<UserdataRef, HeapError> {
+    let userdata = with_heap(host, LuaHeap::alloc_userdata)?;
+    let resource = match host.push_resource(LuaUserdataResource::new(userdata)) {
+        Ok(resource) => resource,
+        Err(error) => {
+            with_heap(host, |heap| heap.rollback_userdata(userdata))?;
+            return Err(HeapError::from_scope(error));
+        }
+    };
+    let handle = resource.handle();
+    let raw = handle.raw();
+    let registered_count = host.resource_count();
+    close_confirmed_token::<LuaUserdataResource>(host, handle)?;
+    let closed_count = host.resource_count();
+    let generation_after = with_heap(host, |heap| heap.rollback_userdata(userdata))?;
+    let witness = UserdataPostRegisterFailure {
+        raw,
+        registered_count,
+        closed_count,
+        close: vm::resource::CloseProgress::Ready,
+        slot: userdata.slot(),
+        generation_after,
+    };
+    if let Some(stored) = host.scope_state_mut::<UserdataPostRegisterFailure>() {
+        *stored = witness;
+    } else {
+        host.scope_state_or_insert_with(|| witness)
+            .map_err(HeapError::from_scope)?;
+    }
+    Err(HeapError::Scope(
+        "injected userdata failure after registration".to_string(),
+    ))
+}
+
 /// Runs `body` against the scope heap, creating it with production limits if
 /// this scope has not been installed yet.
 pub fn with_heap<T>(
@@ -169,9 +370,13 @@ pub fn with_heap<T>(
 /// obstacle, and it does not close the suffix or return the prefix quota a
 /// second time. Removing the obstacle is outside this collector.
 ///
-/// `LuaTableResource` uses the default synchronous close, which returns Ready.
-/// A Pending result is an error. This type has no path that starts an
-/// asynchronous close, and this collector does not add one.
+/// `LuaTableResource` and `LuaUserdataResource` use the default synchronous
+/// close, which returns Ready. A Pending result is an error. These types have
+/// no path that starts an asynchronous close, and this collector does not add
+/// one. On error the already closed prefix is real: its bindings stay cleared,
+/// but the failing token and the whole unclosed suffix keep their bindings,
+/// no weak edge is published, no release tail is saved, and no generation is
+/// advanced.
 pub fn collect(host: &mut HostContext) -> Result<table::CollectReport, HeapError> {
     if host
         .scope_state::<LuaHeap>()
@@ -188,7 +393,7 @@ pub fn collect(host: &mut HostContext) -> Result<table::CollectReport, HeapError
 
 /// Publish stopped before release, or the heap had no dead slot to publish.
 #[derive(Debug)]
-enum PublishedBoundary {
+pub(crate) enum PublishedBoundary {
     /// No dead slot. Sweep finished and recorded the one report.
     Completed(table::CollectReport),
     /// Weak edges are published. Dead slots are still physical. No report.
@@ -201,7 +406,7 @@ enum PublishedBoundary {
 /// A saved published sweep that this call did not finish, or the one report
 /// from the tail that did finish.
 #[derive(Debug)]
-enum PublishedResume {
+pub(crate) enum PublishedResume {
     /// The tail is still saved. This call did not finish the sweep.
     Paused,
     /// The tail finished in this call. The report was recorded once.
@@ -212,7 +417,9 @@ enum PublishedResume {
 ///
 /// Does not take an observer. A parked mark is refused and left in place.
 /// Close failure publishes nothing and saves no tail.
-fn collect_until_published(host: &mut HostContext) -> Result<PublishedBoundary, HeapError> {
+pub(crate) fn collect_until_published(
+    host: &mut HostContext,
+) -> Result<PublishedBoundary, HeapError> {
     let Some(heap) = host.scope_state::<LuaHeap>() else {
         return Err(HeapError::SweepDenied);
     };
@@ -254,7 +461,7 @@ fn close_then_halt_at_publish(
 /// reading the graph. A positive budget spends that many release or root units
 /// on the same machine as a full sweep. The one report is returned only when
 /// the tail finishes, and that tail is then gone.
-fn resume_published_sweep(
+pub(crate) fn resume_published_sweep(
     host: &mut HostContext,
     budget: u64,
 ) -> Result<PublishedResume, HeapError> {
@@ -526,7 +733,7 @@ pub fn publish_automatic_release_table(
             .store_release_top_root(slot, table)
     };
     if let Err(error) = stored {
-        close_confirmed_token(host, handle)?;
+        close_confirmed_token::<LuaTableResource>(host, handle)?;
         host.scope_state_mut::<LuaHeap>()
             .expect("committed late node keeps the installed heap")
             .undo_committed_late(table)?;
@@ -544,34 +751,11 @@ fn rollback_unbound_release(
     handle: vm::ResourceHandle,
     error: HeapError,
 ) -> Result<Option<Value>, HeapError> {
-    close_confirmed_token(host, handle)?;
+    close_confirmed_token::<LuaTableResource>(host, handle)?;
     host.scope_state_mut::<LuaHeap>()
         .expect("unbound reservation keeps the installed heap")
         .abandon_late(reservation);
     Err(error)
-}
-
-#[cfg(test)]
-fn close_confirmed_token(
-    host: &mut HostContext,
-    handle: vm::ResourceHandle,
-) -> Result<(), HeapError> {
-    match host.close_resource::<LuaTableResource>(handle, vm::ResourceCloseReason::Requested) {
-        Ok(vm::resource::CloseProgress::Ready) => {}
-        Ok(_) => {
-            return Err(HeapError::Scope(
-                "lua table close did not finish synchronously".to_string(),
-            ));
-        }
-        Err(error) => return Err(HeapError::from_scope(error)),
-    }
-    match host.close_resource::<LuaTableResource>(handle, vm::ResourceCloseReason::Requested) {
-        Err(error) if retired_lua_token(&error) => Ok(()),
-        Ok(_) => Err(HeapError::Scope(
-            "lua table close did not stay closed".to_string(),
-        )),
-        Err(error) => Err(HeapError::from_scope(error)),
-    }
 }
 
 /// True when `slot` can receive one automatic empty table on the saved Release tail.
@@ -768,27 +952,44 @@ fn close_then_sweep_observing<R>(
 }
 
 fn retire_doomed_token(host: &mut HostContext, token: table::DoomedToken) -> Result<(), HeapError> {
+    match token.kind {
+        HandleKind::Table => retire_typed_token::<LuaTableResource>(host, token),
+        HandleKind::Userdata => retire_typed_token::<LuaUserdataResource>(host, token),
+        HandleKind::Closure | HandleKind::Upvalue => Err(HeapError::WrongKind),
+    }
+}
+
+/// Closes one doomed token through the concrete resource type that the slot
+/// kind owns. The slot, generation, kind, and raw handle were captured at mark
+/// time; the clear primitive rechecks that exact identity and leaves a reused
+/// successor alone. A Pending close is an error and does not clear the binding
+/// or release the slot. `ResourceAlreadyClosed` and `ResourceStale` retire the
+/// token only when [`table::LuaHeap::clear_exact_token`] confirms the binding.
+fn retire_typed_token<T: vm::resource::HostResource>(
+    host: &mut HostContext,
+    token: table::DoomedToken,
+) -> Result<(), HeapError> {
     let handle =
         vm::ResourceHandle::from_raw(token.raw).map_err(|_| HeapError::CarrierOutOfRange)?;
     with_heap(host, |heap| {
         heap.note_token_close();
         Ok(())
     })?;
-    match host.close_resource::<LuaTableResource>(handle, vm::ResourceCloseReason::Requested) {
+    match host.close_resource::<T>(handle, vm::ResourceCloseReason::Requested) {
         Ok(progress) => {
             if progress != vm::resource::CloseProgress::Ready {
                 return Err(HeapError::Scope(
-                    "lua table close did not finish synchronously".to_string(),
+                    "lua typed resource close did not finish synchronously".to_string(),
                 ));
             }
-            with_heap(host, |heap| {
-                let _cleared = heap.clear_exact_token(token);
-                Ok(())
-            })?;
+            let cleared = with_heap(host, |heap| Ok(heap.clear_exact_token(token)))?;
+            if !cleared {
+                return Err(HeapError::StaleHandle);
+            }
             Ok(())
         }
         Err(error) => {
-            if !retired_lua_token(&error) {
+            if !retired_token(&error) {
                 return Err(HeapError::from_scope(error));
             }
             let cleared = with_heap(host, |heap| Ok(heap.clear_exact_token(token)))?;
@@ -801,7 +1002,7 @@ fn retire_doomed_token(host: &mut HostContext, token: table::DoomedToken) -> Res
     }
 }
 
-fn retired_lua_token(error: &vm::HostContextError) -> bool {
+fn retired_token(error: &vm::HostContextError) -> bool {
     match error.kind() {
         vm::HostContextErrorKind::Scope(vm::execution_scope::ExecutionScopeError::Resource(
             resource,

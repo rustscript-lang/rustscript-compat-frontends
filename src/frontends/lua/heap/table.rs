@@ -85,6 +85,9 @@ pub enum HeapError {
     WrongDomain,
     /// The handle kind is not a table.
     WrongKind,
+    /// The bound token has the right type and key, but its payload names a
+    /// different object of that type.
+    TokenMismatch,
     /// `write_root` ran with no open frame.
     NoRootFrame,
     /// The frame id is not the current top frame, or its index is out of range.
@@ -128,6 +131,7 @@ impl fmt::Display for HeapError {
             Self::StaleHandle => write!(formatter, "stale lua table handle"),
             Self::WrongDomain => write!(formatter, "lua table handle is from another heap"),
             Self::WrongKind => write!(formatter, "lua handle is not a table"),
+            Self::TokenMismatch => write!(formatter, "typed token names another object"),
             Self::NoRootFrame => write!(formatter, "no lua root frame"),
             Self::StaleFrame => write!(formatter, "stale lua root frame"),
             Self::CarrierOutOfRange => write!(formatter, "lua resource carrier out of range"),
@@ -834,13 +838,15 @@ pub struct ScanScratch {
     pub owner_rescan_pushed: u64,
 }
 
-/// A stored token identified while marking. Close checks this slot and
-/// generation directly; it does not search the slot vector.
+/// A stored token identified while marking. Close checks this slot,
+/// generation, and kind directly; it does not search the slot vector. The
+/// kind selects the concrete typed resource that owns the raw handle.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct DoomedToken {
     pub(super) raw: u64,
     pub(super) slot: u32,
     pub(super) generation: u32,
+    pub(super) kind: HandleKind,
 }
 
 /// Parsed weak modes for one collect. Built during the clear-mark slot walk
@@ -1207,7 +1213,7 @@ impl LuaHeap {
     pub fn rollback(&mut self, handle: TableRef) -> Result<(), HeapError> {
         self.require_live(handle)?;
         self.ensure_sweep_open()?;
-        self.clear_roots_to(handle);
+        self.clear_rooted_to(Rooted::Table(handle));
         self.remove_edges_touching(handle.slot());
         self.release_slot(handle.slot());
         Ok(())
@@ -2842,6 +2848,66 @@ impl LuaHeap {
             .ok_or(HeapError::StaleHandle)
     }
 
+    /// Records the typed token that owns `userdata`. The handle is not
+    /// installed as a root.
+    ///
+    /// The caller must already have confirmed that the raw handle names this
+    /// exact userdata through its typed resource payload. The issuer does that
+    /// check before binding; this raw write cannot repeat it without a
+    /// `HostContext`.
+    pub(crate) fn bind_userdata_token(
+        &mut self,
+        userdata: UserdataRef,
+        raw: u64,
+    ) -> Result<(), HeapError> {
+        self.require_userdata(userdata)?;
+        let index = userdata.slot() as usize;
+        if self.slots[index].token.is_some() {
+            return Err(HeapError::StaleHandle);
+        }
+        self.ensure_sweep_open()?;
+        self.slots[index].token = Some(raw);
+        Ok(())
+    }
+
+    /// The raw token stored for one live typed userdata.
+    ///
+    /// A missing binding is [`HeapError::StaleHandle`]. A handle from another
+    /// domain, of another kind, or at an old generation is rejected first.
+    pub(crate) fn published_userdata_token(&self, userdata: UserdataRef) -> Result<u64, HeapError> {
+        self.require_userdata(userdata)?;
+        self.slots[userdata.slot() as usize]
+            .token
+            .ok_or(HeapError::StaleHandle)
+    }
+
+    /// Clears the token stored on `userdata` without searching other slots.
+    /// Does not close a host resource and does not sweep. The host collector
+    /// uses [`Self::clear_exact_token`] instead.
+    pub(crate) fn unbind_userdata_token(&mut self, userdata: UserdataRef) -> Result<(), HeapError> {
+        self.require_userdata(userdata)?;
+        self.ensure_sweep_open()?;
+        self.slots[userdata.slot() as usize].token = None;
+        Ok(())
+    }
+
+    /// Releases one userdata node the caller already reserved and returns the
+    /// slot generation after release.
+    ///
+    /// This is the rollback for the typed issuer: a foreign or stale handle is
+    /// refused before any change. It clears roots and incident edges, then
+    /// releases the slot so the next issuance takes the next generation (or
+    /// the slot retires at the generation cap). The caller must close a
+    /// registered token and confirm that close before it reaches this method.
+    pub(super) fn rollback_userdata(&mut self, handle: UserdataRef) -> Result<u32, HeapError> {
+        self.require_userdata(handle)?;
+        self.ensure_sweep_open()?;
+        self.clear_rooted_to(Rooted::Userdata(handle));
+        self.remove_edges_touching(handle.slot());
+        self.release_slot(handle.slot());
+        Ok(self.slots[handle.slot() as usize].generation)
+    }
+
     /// Clears the token stored on `table` without searching other slots.
     /// Does not close a host resource and does not sweep. Collection uses
     /// [`Self::clear_exact_token`] instead.
@@ -2858,12 +2924,15 @@ impl LuaHeap {
         self.scan.token_closes += 1;
     }
 
-    /// Clears `token` only when that exact slot and generation still store it.
-    /// A reused slot, including a successor, is left alone.
+    /// Clears `token` only when that exact slot, generation, kind, and raw
+    /// handle still store it. A reused slot, including a successor, is left
+    /// alone.
     pub(super) fn clear_exact_token(&mut self, token: DoomedToken) -> bool {
         self.scan.token_slot_checks += 1;
         let matches = self.slots.get(token.slot as usize).is_some_and(|slot| {
-            slot.generation == token.generation && slot.token == Some(token.raw)
+            slot.generation == token.generation
+                && slot.kind == token.kind
+                && slot.token == Some(token.raw)
         });
         if !matches {
             return false;
@@ -3041,11 +3110,19 @@ impl LuaHeap {
     ///
     /// A saved published tail is drained first, then this starts a fresh cycle.
     /// This is the pure-heap collector. A host heap must use `heap::collect`,
-    /// which closes tokens before [`Self::sweep_marked`]. Calling this on a
-    /// host heap would skip that close.
+    /// which closes tokens before [`Self::sweep_marked`]. A dead slot that
+    /// still stores a bound host token is refused instead of released, so this
+    /// path cannot skip a typed resource.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an unmarked live slot still carries a bound token. This
+    /// method has no `HostContext`, so it cannot close that resource. The host
+    /// collector closes every doomed token first and clears the binding.
     pub fn collect(&mut self) -> CollectReport {
         self.drain_sweep_tail();
         let modes = self.mark_reachable();
+        self.assert_no_bound_dead_slots();
         self.sweep_marked(modes)
     }
 
@@ -3059,6 +3136,24 @@ impl LuaHeap {
         let mut session = SweepSession::start(self, modes);
         session.drain();
         session.report()
+    }
+
+    /// A dead slot that still stores a host token cannot be released without
+    /// closing that token. Host collectors clear every doomed binding before
+    /// sweep; a direct pure-heap sweep refuses instead of leaking the resource.
+    #[track_caller]
+    fn assert_no_bound_dead_slots(&self) {
+        let bound = self
+            .slots
+            .iter()
+            .filter(|slot| {
+                matches!(slot.state, SlotState::Live { marked: false }) && slot.token.is_some()
+            })
+            .count();
+        assert!(
+            bound == 0,
+            "lua heap pure sweep reached {bound} dead slot(s) with a bound host token; use heap::collect so the token is closed first"
+        );
     }
 
     /// Refuses a parked mark without clearing it. Otherwise the same fresh
@@ -3121,6 +3216,23 @@ impl LuaHeap {
     /// Reports whether `handle` names a live bare userdata in this heap.
     pub fn userdata_alive(&self, handle: UserdataRef) -> bool {
         self.require_userdata(handle).is_ok()
+    }
+
+    /// Generation stored in one slot, if that slot exists. Test-only: the
+    /// generation check for a live handle is its own typed accessor.
+    #[cfg(test)]
+    pub(crate) fn slot_generation(&self, slot: u32) -> Option<u32> {
+        self.slots
+            .get(slot as usize)
+            .map(|stored| stored.generation)
+    }
+
+    /// Whether one slot is physically live. Test-only.
+    #[cfg(test)]
+    pub(crate) fn slot_is_live(&self, slot: u32) -> bool {
+        self.slots
+            .get(slot as usize)
+            .is_some_and(|stored| matches!(stored.state, SlotState::Live { .. }))
     }
 
     /// Current occupancy. Peaks count storage, not only live objects.
@@ -3321,9 +3433,9 @@ impl LuaHeap {
         debug_assert!(self.slots[slot as usize].edge_tail.is_none());
     }
 
-    fn clear_roots_to(&mut self, handle: TableRef) {
+    fn clear_rooted_to(&mut self, rooted: Rooted) {
         for root in &mut self.roots {
-            if *root == Some(Rooted::Table(handle)) {
+            if *root == Some(rooted) {
                 *root = None;
             }
         }

@@ -11,6 +11,8 @@ mod heap;
 mod owner_adjacency;
 #[path = "luajit_heap_runtime/mod.rs"]
 mod support;
+#[path = "luajit_heap_runtime/userdata_resource.rs"]
+mod userdata_resource;
 #[path = "luajit_heap_runtime/value_boundary_tests.rs"]
 mod value_boundary_tests;
 

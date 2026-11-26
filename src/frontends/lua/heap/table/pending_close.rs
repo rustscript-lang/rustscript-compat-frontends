@@ -2,9 +2,10 @@
 //!
 //! The session holds the heap borrow. A pulse spends one scan unit before it
 //! checks one slot. Budget 0 checks nothing and appends nothing. Only a live,
-//! unmarked slot with a token is appended, in ascending slot index order.
-//! `Vec` growth above that append is not a scan unit and is not a wall-clock
-//! bound.
+//! unmarked slot with a token is appended, in ascending slot index order. Each
+//! candidate keeps the slot kind so the host collector closes the concrete
+//! typed resource that owns the raw handle. `Vec` growth above that append is
+//! not a scan unit and is not a wall-clock bound.
 //!
 //! `finish` is the only handoff. It returns the tokens and the original mark
 //! snapshot, and it refuses an unfinished scan. Drop does not sweep and does
@@ -94,6 +95,7 @@ impl<'a> PendingCloseSession<'a> {
                 raw,
                 slot: index as u32,
                 generation: slot.generation,
+                kind: slot.kind,
             });
             self.heap.scan.scratch.pending_close_pushed += 1;
             self.pulse_pushed += 1;
