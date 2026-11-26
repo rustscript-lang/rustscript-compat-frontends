@@ -77,6 +77,23 @@ fn finish_release(host: &mut vm::HostContext<'_>) -> heap::CollectReport {
     }
 }
 
+/// The panic text of a caught shared-Select refusal. The private heap uses
+/// string payloads for its exact diagnostics.
+fn panic_text(result: std::thread::Result<()>) -> String {
+    match result {
+        Ok(()) => panic!("expected the shared Select to refuse the pending slot"),
+        Err(payload) => {
+            if let Some(text) = payload.downcast_ref::<String>() {
+                text.clone()
+            } else if let Some(text) = payload.downcast_ref::<&'static str>() {
+                (*text).to_owned()
+            } else {
+                panic!("panic payload was not a string")
+            }
+        }
+    }
+}
+
 struct Lattice {
     userdata: UserdataRef,
     userdata_raw: u64,
@@ -1190,13 +1207,18 @@ fn pending_slot_forced_into_reclaim_is_refused_before_weak_publication() {
         .expect("arm reclaim control");
         let _ = heap::take_scan_meter(&mut host);
 
-        let refused = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let slot = lattice.userdata.slot();
+        let message = panic_text(std::panic::catch_unwind(AssertUnwindSafe(|| {
             let _ = heap::collect_pending_finalizers(&mut host);
-        }))
-        .is_err();
-        assert!(
-            refused,
-            "shared Select must reject a true pending slot before Snapshot or Owners"
+        })));
+        assert_eq!(
+            message,
+            format!(
+                "lua heap sweep selected pending-finalizer slot {slot} as dead; \
+                 the mark must retain every live pending record"
+            ),
+            "the shared Select must refuse the pending slot with its own diagnostic, \
+             not with the adjacent bound-token assertion"
         );
         let meter = heap::take_scan_meter(&mut host).expect("refusal meter");
         assert_eq!(meter.token_closes, 0, "refusal is before any close");
@@ -1457,6 +1479,377 @@ fn shared_metatable_raw_gc_chain_is_read_once_for_multiple_candidates() {
         receipt = Some(());
     });
     receipt.expect("shared arm");
+}
+
+/// One `pulse(1)` of the real selecting mark.
+///
+/// `edges` is the delta between the cumulative pending-`__gc` edge meter
+/// before and after this one call. The before/after values are kept so a
+/// failure shows the real access boundary, not only a sum after a drain.
+struct PulseStep {
+    finished: bool,
+    before_edges: u64,
+    after_edges: u64,
+    edges: u64,
+    scan_slots: u64,
+    lookups: u64,
+    selected: u64,
+    owner_heads: u64,
+    outgoing_edges: u64,
+}
+
+/// Drives the private selecting mark one charged unit at a time. Each call
+/// records the real edge meter at its own start and end.
+fn pulse_steps(heap: &mut heap::LuaHeap, limit: usize) -> (Vec<PulseStep>, ScanMeter) {
+    let mut session = heap::SelectingPendingMark::start(heap);
+    let mut previous = session.meter();
+    let mut steps = Vec::new();
+    for _ in 0..limit {
+        let before = previous;
+        let (finished, after) = session.pulse(1);
+        steps.push(PulseStep {
+            finished,
+            before_edges: before.pending_finalizer_gc_edge_checks,
+            after_edges: after.pending_finalizer_gc_edge_checks,
+            edges: after.pending_finalizer_gc_edge_checks - before.pending_finalizer_gc_edge_checks,
+            scan_slots: after.pending_finalizer_scan_slots - before.pending_finalizer_scan_slots,
+            lookups: after.pending_finalizer_gc_lookups - before.pending_finalizer_gc_lookups,
+            selected: after.pending_finalizers_selected - before.pending_finalizers_selected,
+            owner_heads: after.owner_head_checks - before.owner_head_checks,
+            outgoing_edges: after.outgoing_edge_checks - before.outgoing_edge_checks,
+        });
+        previous = after;
+        if finished {
+            return (steps, after);
+        }
+    }
+    panic!("selecting mark did not finish within {limit} pulses");
+}
+
+/// Checks the one-record-per-call boundary on a real pulse trace. A lookup
+/// start and a cursor exhaustion are uncharged transitions; neither may hide
+/// a fabricated edge read.
+fn assert_single_edge_per_pulse(steps: &[PulseStep], expected_edges: u64) {
+    let mut starts = 0;
+    let mut total = 0;
+    for (index, step) in steps.iter().enumerate() {
+        assert_eq!(
+            step.after_edges - step.before_edges,
+            step.edges,
+            "pulse {index} lost its real before/after edge delta"
+        );
+        assert!(
+            step.edges <= 1,
+            "pulse {index} read {} pending-__gc edge records; one pulse spends one unit",
+            step.edges
+        );
+        if step.lookups == 1 {
+            starts += 1;
+            assert_eq!(
+                step.edges, 0,
+                "pulse {index} opened a lookup and must not also read a record"
+            );
+        }
+        if step.edges == 1 {
+            assert_eq!(
+                step.lookups, 0,
+                "pulse {index} read a record while opening a lookup"
+            );
+        }
+        total += step.edges;
+    }
+    assert_eq!(
+        starts, 1,
+        "one uncached metatable starts exactly one lookup"
+    );
+    assert_eq!(
+        total, expected_edges,
+        "the real reads cover the chain prefix"
+    );
+}
+
+struct PulsedChain {
+    steps: Vec<PulseStep>,
+    meter: ScanMeter,
+    metatable_slot: u32,
+    trace: Vec<(u32, u32)>,
+    token_open: bool,
+    pending: bool,
+    records: usize,
+}
+
+/// A real 24-record metatable chain with `__gc` at `gc_at`, driven by the
+/// private selecting mark through `pulse(1)`.
+fn pulsed_chain_arm(length: usize, gc_at: Option<usize>) -> PulsedChain {
+    let mut out = None;
+    crate::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits()).expect("install");
+        let userdata = heap::publish_userdata(&mut host).expect("userdata");
+        let raw = bound_raw(&mut host, userdata);
+        let metatable_slot = heap::with_heap(&mut host, |heap| {
+            let metatable = raw_gc_chain(heap, length, gc_at)?;
+            heap.set_userdata_metatable(userdata, Some(metatable))?;
+            let weak = weak_table(heap, "v")?;
+            heap.set_number_userdata(weak, 1.0, userdata)?;
+            let frame = heap.enter_roots(1)?;
+            heap.write_root(frame, 0, weak)?;
+            Ok(metatable.slot())
+        })
+        .expect("chain lattice");
+        let (steps, meter, trace, pending, records) = heap::with_heap(&mut host, |heap| {
+            let _ = heap.take_scan_meter();
+            let (steps, meter) = pulse_steps(heap, 20_000);
+            let trace = heap.pending_gc_edge_trace();
+            let pending = heap.slot_pending_finalizer(userdata)?;
+            let records = heap.pending_finalizer_records().len();
+            Ok((steps, meter, trace, pending, records))
+        })
+        .expect("pulse chain");
+        out = Some(PulsedChain {
+            steps,
+            meter,
+            metatable_slot,
+            trace,
+            token_open: userdata_token_open(&host, raw),
+            pending,
+            records,
+        });
+    });
+    out.expect("pulsed chain arm")
+}
+
+#[test]
+fn raw_gc_pulses_read_at_most_one_edge_record_at_chain_head_and_tail() {
+    let head = pulsed_chain_arm(24, Some(0));
+    assert_single_edge_per_pulse(&head.steps, 1);
+    assert_eq!(head.meter.pending_finalizers_selected, 1);
+    assert_eq!(head.meter.pending_finalizer_gc_lookups, 1);
+    assert_eq!(head.meter.pending_finalizer_gc_edge_checks, 1);
+    assert_eq!(head.trace.len(), 1);
+    assert!(
+        head.trace
+            .iter()
+            .all(|(slot, _)| *slot == head.metatable_slot)
+    );
+    assert!(head.pending && head.token_open && head.records == 1);
+    let start = head
+        .steps
+        .iter()
+        .position(|step| step.lookups == 1)
+        .expect("head lookup start");
+    assert_eq!(head.steps[start].edges, 0);
+    assert_eq!(head.steps[start].selected, 0);
+    assert_eq!(head.steps[start + 1].edges, 1);
+    assert_eq!(head.steps[start + 1].selected, 1);
+
+    let tail = pulsed_chain_arm(24, Some(23));
+    assert_single_edge_per_pulse(&tail.steps, 24);
+    assert_eq!(tail.meter.pending_finalizers_selected, 1);
+    assert_eq!(tail.meter.pending_finalizer_gc_lookups, 1);
+    assert_eq!(tail.meter.pending_finalizer_gc_edge_checks, 24);
+    assert_eq!(tail.trace.len(), 24);
+    assert!(
+        tail.trace
+            .iter()
+            .all(|(slot, _)| *slot == tail.metatable_slot)
+    );
+    assert!(tail.pending && tail.token_open && tail.records == 1);
+    assert_eq!(
+        tail.steps.iter().filter(|step| step.edges == 1).count(),
+        24,
+        "each chain record is read by its own pulse"
+    );
+    let last_edge = tail
+        .steps
+        .iter()
+        .rposition(|step| step.edges == 1)
+        .expect("tail edge read");
+    assert_eq!(
+        tail.steps[last_edge].selected, 1,
+        "the matching tail record commits on the same one-record pulse"
+    );
+}
+
+#[test]
+fn raw_gc_pulse_exhaustion_of_a_missing_chain_reads_no_edge() {
+    let missing = pulsed_chain_arm(24, None);
+    assert_single_edge_per_pulse(&missing.steps, 24);
+    assert_eq!(missing.meter.pending_finalizers_selected, 0);
+    assert_eq!(missing.meter.pending_finalizer_gc_lookups, 1);
+    assert_eq!(missing.meter.pending_finalizer_gc_edge_checks, 24);
+    assert_eq!(missing.trace.len(), 24);
+    assert!(
+        missing
+            .trace
+            .iter()
+            .all(|(slot, _)| *slot == missing.metatable_slot)
+    );
+    assert!(!missing.pending && missing.token_open && missing.records == 0);
+    let last_edge = missing
+        .steps
+        .iter()
+        .rposition(|step| step.edges == 1)
+        .expect("missing chain edge read");
+    let exhaustion = &missing.steps[last_edge + 1];
+    assert_eq!(exhaustion.edges, 0, "running off the chain reads no record");
+    assert_eq!(exhaustion.lookups, 0, "exhaustion starts no second lookup");
+    assert_eq!(exhaustion.scan_slots, 0, "exhaustion is not a slot unit");
+    assert_eq!(exhaustion.selected, 0, "a missing chain selects nothing");
+}
+
+struct PulsedPair {
+    steps: Vec<PulseStep>,
+    meter: ScanMeter,
+    metatable_slot: u32,
+    first_slot: u32,
+    second_slot: u32,
+    last_slot: u32,
+    trace: Vec<(u32, u32)>,
+    first_open: bool,
+    second_open: bool,
+    first_pending: bool,
+    second_pending: bool,
+    records: usize,
+}
+
+/// Two userdata that share one 24-record metatable and occupy the final two
+/// slots. Both survive to the selection; the second is a same-round cache hit.
+fn pulsed_shared_pair_arm() -> PulsedPair {
+    let mut out = None;
+    crate::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits()).expect("install");
+        let (metatable, first_weak, second_weak) = heap::with_heap(&mut host, |heap| {
+            let metatable = raw_gc_chain(heap, 24, Some(23))?;
+            let first_weak = weak_table(heap, "v")?;
+            let second_weak = weak_table(heap, "v")?;
+            Ok((metatable, first_weak, second_weak))
+        })
+        .expect("shared tables");
+        let first = heap::publish_userdata(&mut host).expect("first");
+        let first_raw = bound_raw(&mut host, first);
+        let second = heap::publish_userdata(&mut host).expect("second");
+        let second_raw = bound_raw(&mut host, second);
+        let (first_slot, second_slot, last_slot) = heap::with_heap(&mut host, |heap| {
+            heap.set_userdata_metatable(first, Some(metatable))?;
+            heap.set_userdata_metatable(second, Some(metatable))?;
+            heap.set_number_userdata(first_weak, 1.0, first)?;
+            heap.set_number_userdata(second_weak, 1.0, second)?;
+            let frame = heap.enter_roots(2)?;
+            heap.write_root(frame, 0, first_weak)?;
+            heap.write_root(frame, 1, second_weak)?;
+            Ok((first.slot(), second.slot(), heap.stats().node_slots))
+        })
+        .expect("shared lattice");
+        let (steps, meter, trace, first_pending, second_pending, records) =
+            heap::with_heap(&mut host, |heap| {
+                let _ = heap.take_scan_meter();
+                let (steps, meter) = pulse_steps(heap, 40_000);
+                let trace = heap.pending_gc_edge_trace();
+                let first_pending = heap.slot_pending_finalizer(first)?;
+                let second_pending = heap.slot_pending_finalizer(second)?;
+                let records = heap.pending_finalizer_records().len();
+                Ok((steps, meter, trace, first_pending, second_pending, records))
+            })
+            .expect("shared pulses");
+        out = Some(PulsedPair {
+            steps,
+            meter,
+            metatable_slot: metatable.slot(),
+            first_slot,
+            second_slot,
+            last_slot,
+            trace,
+            first_open: userdata_token_open(&host, first_raw),
+            second_open: userdata_token_open(&host, second_raw),
+            first_pending,
+            second_pending,
+            records,
+        });
+    });
+    out.expect("pulsed shared pair arm")
+}
+
+#[test]
+fn raw_gc_pulse_shared_metatable_hits_cache_without_an_edge_read() {
+    let pair = pulsed_shared_pair_arm();
+    assert_single_edge_per_pulse(&pair.steps, 24);
+    assert_eq!(pair.meter.pending_finalizers_selected, 2);
+    assert_eq!(pair.meter.pending_finalizer_gc_lookups, 1);
+    assert_eq!(pair.meter.pending_finalizer_gc_edge_checks, 24);
+    assert_eq!(pair.trace.len(), 24);
+    assert!(
+        pair.trace
+            .iter()
+            .all(|(slot, _)| *slot == pair.metatable_slot)
+    );
+    assert!(pair.first_open && pair.second_open);
+    assert!(pair.first_pending && pair.second_pending);
+    assert_eq!(pair.records, 2);
+    assert_eq!(
+        pair.last_slot,
+        pair.second_slot + 1,
+        "the two candidates are the final slots"
+    );
+    assert_eq!(pair.first_slot + 1, pair.second_slot);
+
+    let pending_start = pair
+        .steps
+        .iter()
+        .position(|step| step.scan_slots > 0)
+        .expect("pending scan start");
+    let first_selected = pair
+        .steps
+        .iter()
+        .position(|step| step.selected > 0)
+        .expect("first candidate selected");
+    let second_selected = pair
+        .steps
+        .iter()
+        .enumerate()
+        .skip(first_selected + 1)
+        .find(|(_, step)| step.selected > 0)
+        .map(|(index, _)| index)
+        .expect("second candidate selected");
+    assert!(pending_start < first_selected && first_selected < second_selected);
+    assert!(
+        pair.steps[pending_start..=second_selected]
+            .iter()
+            .all(|step| step.owner_heads == 0),
+        "the complete candidate batch is read before Gray opens an owner"
+    );
+    assert_eq!(pair.steps[second_selected].scan_slots, 1);
+    assert_eq!(
+        pair.steps[second_selected].lookups, 0,
+        "the shared metatable already has a result for this round"
+    );
+    assert_eq!(
+        pair.steps[second_selected].edges, 0,
+        "a same-generation cache hit reads no edge record"
+    );
+    assert_eq!(pair.steps[second_selected].selected, 1);
+    assert_eq!(
+        pair.steps.iter().filter(|step| step.edges == 1).count(),
+        24,
+        "the shared chain is paid for once, one record per pulse"
+    );
+    let after: Vec<&PulseStep> = pair.steps[second_selected + 1..].iter().collect();
+    assert!(
+        after
+            .iter()
+            .all(|step| step.edges == 0 && step.lookups == 0),
+        "the cache hit and the following Gray pass fabricate no pending edge read"
+    );
+    assert!(
+        after.iter().any(|step| step.owner_heads > 0),
+        "Gray runs only after both candidates were selected"
+    );
+    assert!(
+        after.iter().any(|step| step.outgoing_edges > 0),
+        "the Gray pass scans the selected metatable's own edges"
+    );
+    assert!(pair.steps.last().expect("shared last pulse").finished);
 }
 
 struct LinkedReceipt {

@@ -993,7 +993,11 @@ pub struct LuaHeap {
     /// clears the slot flag; a later collection may then close the token and
     /// release the slot. A valid record's slot is retained and cannot reach
     /// Release, so there is no release-time queue repair.
-    pending_finalizers: Vec<PendingFinalizer>,
+    ///
+    /// The storage is private: every record read goes through
+    /// [`PendingQueue`]'s counted boundary, including the test-only release
+    /// meter. No call site counts by hand.
+    pending_finalizers: PendingQueue,
     /// Owner chains opened by the legacy table rollback edge walk.
     /// Test-only observation: an empty userdata reservation rollback must
     /// leave this unchanged, so its work stays independent of the graph size.
@@ -1026,18 +1030,123 @@ pub struct LuaHeap {
     reclaim_pending_slot: Option<u32>,
 }
 
-/// One typed userdata retained after the ordinary mark converged.
-///
-/// `raw` is the exact Core handle still bound in `slot`; the selection and
-/// the host pre-publication check both read that same binding, so a record
-/// cannot name a different object. The record is not a root vector entry and
-/// is not a guest value.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PendingFinalizer {
-    slot: u32,
-    generation: u32,
-    raw: u64,
+mod pending_queue {
+    /// One typed userdata retained after the ordinary mark converged.
+    ///
+    /// `raw` is the exact Core handle still bound in `slot`; the selection and
+    /// the host pre-publication check both read that same binding, so a record
+    /// cannot name a different object. The record is not a root vector entry
+    /// and is not a guest value.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) struct PendingFinalizer {
+        pub(super) slot: u32,
+        pub(super) generation: u32,
+        pub(super) raw: u64,
+    }
+
+    /// Private storage for retained pending-finalizer records.
+    ///
+    /// The vector is not exposed. Every read of a stored record goes through
+    /// one of the accessors below, which is also the single place where the
+    /// test-only release meter observes a real queue read. No caller outside
+    /// this module can index the vector: the field is private here and no
+    /// iterator over the raw storage is exported.
+    ///
+    /// A read is one record handed to the caller: `get` yields one, `iter`
+    /// counts each yielded item, `remove` counts the removed record, and
+    /// `split_off_from` counts every removed record. `len` touches only the
+    /// vector header, and `push` writes; neither is a record read.
+    #[derive(Default)]
+    pub(super) struct PendingQueue {
+        records: Vec<PendingFinalizer>,
+        /// Test-only count of records read through this boundary.
+        #[cfg(test)]
+        reads: std::cell::Cell<u64>,
+    }
+
+    impl PendingQueue {
+        pub(super) fn len(&self) -> usize {
+            self.records.len()
+        }
+
+        pub(super) fn push(&mut self, record: PendingFinalizer) {
+            self.records.push(record);
+        }
+
+        /// One stored record by position. The hit is one queue read.
+        pub(super) fn get(&self, index: usize) -> Option<&PendingFinalizer> {
+            let record = self.records.get(index)?;
+            self.record_read();
+            Some(record)
+        }
+
+        /// Iterates stored records in order. Each yielded record is one read.
+        pub(super) fn iter(&self) -> PendingQueueIter<'_> {
+            PendingQueueIter {
+                queue: self,
+                next: 0,
+            }
+        }
+
+        /// Removes one record by position. The removed record is one read.
+        pub(super) fn remove(&mut self, index: usize) -> Option<PendingFinalizer> {
+            if index >= self.records.len() {
+                return None;
+            }
+            let record = self.records.remove(index);
+            self.record_read();
+            Some(record)
+        }
+
+        /// Removes and returns every record from `base` onward. Each removed
+        /// record is one read; an out-of-range base reads no record.
+        pub(super) fn split_off_from(&mut self, base: usize) -> Vec<PendingFinalizer> {
+            if base >= self.records.len() {
+                return Vec::new();
+            }
+            let removed = self.records.split_off(base);
+            for _ in &removed {
+                self.record_read();
+            }
+            removed
+        }
+
+        /// Returns the reads since the previous take and clears the count.
+        #[cfg(test)]
+        pub(super) fn take_reads(&mut self) -> u64 {
+            let reads = self.reads.get();
+            self.reads.set(0);
+            reads
+        }
+
+        #[cfg(test)]
+        fn record_read(&self) {
+            self.reads.set(self.reads.get() + 1);
+        }
+
+        #[cfg(not(test))]
+        fn record_read(&self) {}
+    }
+
+    /// Counted iterator over the private queue. It yields borrowed records
+    /// only, so the caller never reaches the vector itself.
+    pub(super) struct PendingQueueIter<'a> {
+        queue: &'a PendingQueue,
+        next: usize,
+    }
+
+    impl<'a> Iterator for PendingQueueIter<'a> {
+        type Item = &'a PendingFinalizer;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            let record = self.queue.records.get(self.next)?;
+            self.next += 1;
+            self.queue.record_read();
+            Some(record)
+        }
+    }
 }
+use pending_queue::{PendingFinalizer, PendingQueue};
 
 /// One userdata that passed the slot-local selection checks and whose
 /// metatable's raw `__gc` field still has to be resolved by a metered walk.
@@ -1133,7 +1242,7 @@ impl LuaHeap {
             sweep_tail: None,
             payload_bytes: 0,
             pending_userdata: None,
-            pending_finalizers: Vec::new(),
+            pending_finalizers: PendingQueue::default(),
             #[cfg(test)]
             rollback_owner_visits: 0,
             #[cfg(test)]
@@ -1149,8 +1258,18 @@ impl LuaHeap {
 
     /// Returns the counts since the previous take and clears them.
     /// Does not collect, and does not record this read as collection work.
+    ///
+    /// The pending-queue read count is folded in from the queue's own access
+    /// boundary. There is no separate call-site accounting: a scan that reads
+    /// stored records is visible here even when it was added later.
     pub fn take_scan_meter(&mut self) -> ScanMeter {
         let meter = self.scan;
+        #[cfg(test)]
+        let meter = {
+            let mut meter = meter;
+            meter.pending_release_queue_reads += self.pending_finalizers.take_reads();
+            meter
+        };
         self.scan = ScanMeter::default();
         meter
     }
@@ -3420,7 +3539,8 @@ impl LuaHeap {
         true
     }
 
-    /// Number of pending-finalizer records. Does not read the graph.
+    /// Number of pending-finalizer records. Does not read the graph or a
+    /// stored record; it reads only the queue length.
     pub(super) fn pending_finalizer_count(&self) -> usize {
         self.pending_finalizers.len()
     }
@@ -3434,7 +3554,7 @@ impl LuaHeap {
         if base >= self.pending_finalizers.len() {
             return;
         }
-        let discarded: Vec<PendingFinalizer> = self.pending_finalizers.drain(base..).collect();
+        let discarded: Vec<PendingFinalizer> = self.pending_finalizers.split_off_from(base);
         for pending in discarded {
             let Some(slot) = self.slots.get_mut(pending.slot as usize) else {
                 continue;
@@ -3675,7 +3795,6 @@ impl LuaHeap {
     pub fn scan_meter(&self) -> ScanMeter {
         self.scan
     }
-
     /// The table in one frame slot, if that slot holds a table. Does not scan.
     #[cfg(test)]
     pub fn rooted_table(
@@ -4471,6 +4590,36 @@ fn replaced_table_target(key: &EdgeKey, old_gap: bool, value: &EdgeValue) -> Opt
     match value {
         EdgeValue::Table { slot, generation } => Some((*slot, *generation)),
         _ => None,
+    }
+}
+
+/// Test-only facade over the private selecting mark.
+///
+/// The pulse witness drives the real mark one charged unit at a time, so it
+/// can read the real pending-`__gc` edge meter before and after every call.
+/// It does not publish weak edges, close a token, or run a callback.
+#[cfg(test)]
+pub(crate) struct SelectingPendingMark<'a> {
+    session: MarkSession<'a>,
+}
+
+#[cfg(test)]
+impl<'a> SelectingPendingMark<'a> {
+    pub(crate) fn start(heap: &'a mut LuaHeap) -> Self {
+        Self {
+            session: MarkSession::start_selecting_pending(heap),
+        }
+    }
+
+    /// Copies the cumulative meter without changing mark state.
+    pub(crate) fn meter(&self) -> ScanMeter {
+        self.session.meter()
+    }
+
+    /// Runs one unit and returns `(finished, cumulative meter)`.
+    pub(crate) fn pulse(&mut self, budget: u64) -> (bool, ScanMeter) {
+        let view = self.session.pulse(budget);
+        (view.finished, view.meter)
     }
 }
 

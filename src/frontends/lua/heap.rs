@@ -82,6 +82,8 @@ mod table;
 
 pub use handle::{ClosureRef, HandleKind, TableRef, UpvalueRef, UserdataRef};
 pub use resource::{LuaTableResource, LuaUserdataResource};
+#[cfg(test)]
+pub(crate) use table::SelectingPendingMark;
 pub use table::{
     CellValue, CollectReport, GuestClass, HeapError, HeapLimits, HeapStats, LuaHeap, ObserveFault,
     PublishedRead, RootFrameId, ScanMeter,
