@@ -3353,10 +3353,12 @@ fn settled_generation_reclears_a_reinserted_weak_value_while_rooted() {
 ///
 /// Upstream `gc_clearweak` checks every hash node of a marked weak table, not
 /// only a value-weak one (`lj_gc.c:456-470,488-497`). This heap has one owner
-/// chain, so string and object keys are the hash branches it can prove. A
-/// numeric key may name a dense array slot in LuaJIT; that split is outside
-/// this slice, so numeric-keyed values keep the previous rule and are not
-/// claimed here.
+/// chain, so string keys (including the reserved guest `__mode` field),
+/// object keys, and the deterministic numeric hash keys (negative and
+/// non-integer values) are the branches it can prove. Zero, negative zero,
+/// and positive integers may name a dense array slot in LuaJIT; that split is
+/// outside this slice, so those numeric values keep the previous rule and are
+/// not claimed here.
 #[test]
 fn settled_generation_clears_k_hash_values_while_strong_controls_keep() {
     crate::support::with_idle_vm(|vm| {
@@ -3546,6 +3548,431 @@ fn settled_generation_clears_k_hash_values_while_strong_controls_keep() {
             .expect("leave pending k roots");
         heap::with_heap(&mut host, |heap| heap.leave_roots(seed.weak_frame))
             .expect("leave weak roots");
+    });
+}
+
+/// One target key and the real `next` pair that follows it. The target value
+/// is a scalar when the pair is captured; the caller then replaces it with a
+/// userdata in the same record.
+struct CursorPair {
+    table: TableRef,
+    cursor: Value,
+    successor: Value,
+    successor_value: Value,
+}
+
+#[derive(Clone, Copy)]
+enum CursorKey {
+    Named(&'static str),
+    Number(f64),
+}
+
+/// Creates one `k`-only table with a scalar target and a scalar successor,
+/// walks both with the real guest `next`, and returns the original cursor and
+/// the successor pair. The caller changes the target record to a userdata
+/// afterwards, so the published continuation starts from a genuinely obtained
+/// key rather than a constructed or rawget-derived value.
+fn build_cursor_pair(
+    heap: &mut heap::LuaHeap,
+    key: CursorKey,
+    target_seed: &str,
+    successor_name: &str,
+    successor_value: &str,
+) -> Result<CursorPair, HeapError> {
+    let table = weak_table(heap, "k")?;
+    match key {
+        CursorKey::Named(name) => {
+            heap.set_named_scalar(table, name, Value::string(target_seed))?;
+        }
+        CursorKey::Number(number) => {
+            heap.set_number_scalar(table, number, Value::string(target_seed))?;
+        }
+    }
+    heap.set_named_scalar(table, successor_name, Value::string(successor_value))?;
+    let (cursor, seed_value) = heap
+        .next_guest(table, &Value::Null)?
+        .expect("the pre-write scalar target is the first entry");
+    assert!(
+        matches!(seed_value, Value::String(_)),
+        "the captured target is the pre-write scalar"
+    );
+    let (successor, successor_value) = heap
+        .next_guest(table, &cursor)?
+        .expect("the real next reaches the scalar successor");
+    assert!(
+        matches!(successor_value, Value::String(_)),
+        "the successor is the pre-write scalar"
+    );
+    Ok(CursorPair {
+        table,
+        cursor,
+        successor,
+        successor_value,
+    })
+}
+
+/// A pending and a settled userdata are value-dead in a `k`-only table under
+/// the reserved guest `__mode` field, a negative integer, and a non-integer
+/// hash key. The three classes are separate records, so each clearing is
+/// reached on its own. Zero, negative zero, and positive integers are not
+/// classified by number type: their array/hash split depends on the actual
+/// table layout this slice does not model, so they keep the previous
+/// strong-value rule. A non-finalized userdata and an ordinary strong table
+/// keep the same object. Boolean keys have no representation here.
+///
+/// A settled and a queued identity must first be produced by a real cycle:
+/// a rooted `k` table's strong value would keep a fresh userdata marked, so
+/// it could never become white. The publication checked here is the first
+/// one that carries these hash edges after that settlement cycle.
+#[test]
+fn k_hash_clears_mode_field_and_deterministic_numbers_only() {
+    crate::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        let seed = seed_settlement(&mut host, SettlementArm::Linked, false);
+        let boundary = publish_boundary(&mut host);
+        assert!(
+            matches!(boundary, PublishedBoundary::Published { .. }),
+            "the linked settlement cycle really queues A and settles B"
+        );
+        assert!(pending_flag(&mut host, seed.a));
+        assert!(finalizer_settled(&mut host, seed.b));
+        let _ = finish_release(&mut host);
+        assert!(userdata_token_open(&host, seed.a_raw));
+        assert!(userdata_token_open(&host, seed.b_raw));
+
+        let normal = heap::publish_userdata(&mut host).expect("non-finalized userdata");
+        let normal_raw = bound_raw(&mut host, normal);
+        let (k_table, strong, mode_meta) = heap::with_heap(&mut host, |heap| {
+            let k_table = weak_table(heap, "k")?;
+            heap.set_named_userdata(k_table, "__mode", seed.a)?;
+            heap.set_number_userdata(k_table, -17.0, seed.b)?;
+            heap.set_number_userdata(k_table, 17.5, seed.a)?;
+            heap.set_named_userdata(k_table, "normal", normal)?;
+            heap.set_userdata_key_scalar(k_table, seed.b, Value::string("B-key"))?;
+            heap.set_number_userdata(k_table, 1.0, seed.b)?;
+            heap.set_number_userdata(k_table, 0.0, seed.b)?;
+            let strong = heap.alloc()?;
+            heap.set_named_userdata(strong, "plain", seed.b)?;
+            let mode_meta = heap.metatable(k_table)?.expect("k table metatable");
+            Ok((k_table, strong, mode_meta))
+        })
+        .expect("k hash lattice");
+        let frame = heap::with_heap(&mut host, |heap| {
+            let frame = heap.enter_roots(2)?;
+            heap.write_root(frame, 0, k_table)?;
+            heap.write_root(frame, 1, strong)?;
+            Ok(frame)
+        })
+        .expect("k hash roots");
+
+        // Before the publication that first carries these records, every
+        // claimed entry holds the finalized identity and the anti-controls
+        // hold theirs.
+        heap::with_heap(&mut host, |heap| {
+            assert_eq!(
+                heap.named_value(k_table, "__mode"),
+                Err(HeapError::WrongKind),
+                "the reserved __mode record holds the pending A"
+            );
+            assert_eq!(heap.number_userdata(k_table, -17.0), Ok(Some(seed.b)));
+            assert_eq!(heap.number_userdata(k_table, 17.5), Ok(Some(seed.a)));
+            assert_eq!(
+                heap.named_value(k_table, "normal"),
+                Err(HeapError::WrongKind),
+                "the non-finalized value is present"
+            );
+            assert_eq!(heap.number_userdata(k_table, 1.0), Ok(Some(seed.b)));
+            assert_eq!(heap.number_userdata(k_table, 0.0), Ok(Some(seed.b)));
+            assert_eq!(
+                heap.userdata_key_value(k_table, seed.b),
+                Ok(Value::string("B-key")),
+                "B is a marked weak key of the same table"
+            );
+            assert_eq!(
+                heap.named_value(strong, "plain"),
+                Err(HeapError::WrongKind),
+                "the ordinary strong table keeps B"
+            );
+            Ok(())
+        })
+        .expect("before first publication");
+
+        let boundary = publish_boundary(&mut host);
+        assert!(
+            matches!(boundary, PublishedBoundary::Published { .. }),
+            "the pending and settled identities force a real weak publication"
+        );
+        assert!(pending_flag(&mut host, seed.a));
+        assert!(finalizer_settled(&mut host, seed.b));
+
+        heap::with_heap(&mut host, |heap| {
+            assert_eq!(
+                heap.named_value(k_table, "__mode"),
+                Ok(Value::Null),
+                "the pending A under the guest __mode string key is cleared"
+            );
+            assert_eq!(
+                heap.number_value(k_table, -17.0),
+                Ok(Value::Null),
+                "the settled B under a negative integer hash key is cleared"
+            );
+            assert_eq!(
+                heap.number_value(k_table, 17.5),
+                Ok(Value::Null),
+                "the pending A under a non-integer hash key is cleared"
+            );
+            assert_eq!(
+                heap.named_value(k_table, "normal"),
+                Err(HeapError::WrongKind),
+                "a non-finalized userdata value stays"
+            );
+            assert_eq!(
+                heap.number_userdata(k_table, 1.0),
+                Ok(Some(seed.b)),
+                "a positive integer stays on the unclaimed array/hash branch"
+            );
+            assert_eq!(
+                heap.number_userdata(k_table, 0.0),
+                Ok(Some(seed.b)),
+                "zero stays on the unclaimed array/hash branch"
+            );
+            assert_eq!(
+                heap.number_userdata(k_table, -0.0),
+                Ok(Some(seed.b)),
+                "-0 selects the same zero record and also stays"
+            );
+            assert_eq!(
+                heap.userdata_key_value(k_table, seed.b),
+                Ok(Value::string("B-key")),
+                "clearing the __mode value does not change the weak-key side"
+            );
+            assert_eq!(
+                heap.named_value(mode_meta, "__mode"),
+                Ok(Value::string("k")),
+                "the metatable still declares the k-only mode"
+            );
+            assert_eq!(
+                heap.named_value(strong, "plain"),
+                Err(HeapError::WrongKind),
+                "an ordinary strong table keeps the settled object"
+            );
+            Ok(())
+        })
+        .expect("after first publication");
+
+        assert!(userdata_token_open(&host, seed.a_raw));
+        assert!(userdata_token_open(&host, seed.b_raw));
+        assert!(userdata_token_open(&host, normal_raw));
+        let _ = finish_release(&mut host);
+        assert!(alive(&mut host, k_table));
+        assert!(alive(&mut host, strong));
+        assert!(alive(&mut host, mode_meta));
+        assert_eq!(
+            slot_generation(&mut host, seed.a.slot()),
+            seed.a.generation()
+        );
+        assert_eq!(
+            slot_generation(&mut host, seed.b.slot()),
+            seed.b.generation()
+        );
+        heap::with_heap(&mut host, |heap| heap.leave_roots(frame)).expect("leave k hash roots");
+        heap::with_heap(&mut host, |heap| heap.leave_roots(seed.weak_frame))
+            .expect("leave weak roots");
+    });
+}
+
+/// In the first real published window that carries these hash edges, a
+/// cursor taken from the real guest `next` continues past a cleared hash
+/// value to the same scalar successor. The ordinary string cursor is the
+/// regression that the minimal `clear_value` mutation breaks: the value read
+/// is still nil because the record is dropped, but `next` at the original key
+/// is no longer found. The reserved guest `__mode` field keeps its guest
+/// cursor, while an ordinary internal field id stays out of guest iteration.
+///
+/// The settlement cycle runs first because a rooted `k` table's strong value
+/// would keep a fresh userdata marked. The checked publication is the first
+/// one that carries these hash edges after that cycle; the cursors are taken
+/// by the real guest `next` before each target record is changed to the
+/// finalized identity.
+#[test]
+fn k_hash_published_gaps_keep_real_cursors_to_scalar_successors() {
+    crate::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        let seed = seed_settlement(&mut host, SettlementArm::Linked, false);
+        let boundary = publish_boundary(&mut host);
+        assert!(
+            matches!(boundary, PublishedBoundary::Published { .. }),
+            "the linked settlement cycle really queues A and settles B"
+        );
+        assert!(pending_flag(&mut host, seed.a));
+        assert!(finalizer_settled(&mut host, seed.b));
+        let _ = finish_release(&mut host);
+        let (string_pair, mode_pair, negative_pair, fraction_pair) =
+            heap::with_heap(&mut host, |heap| {
+                let string_pair = build_cursor_pair(
+                    heap,
+                    CursorKey::Named("field"),
+                    "seed-one",
+                    "after-string",
+                    "string-tail",
+                )?;
+                let mode_pair = build_cursor_pair(
+                    heap,
+                    CursorKey::Named("__mode"),
+                    "seed-two",
+                    "after-mode",
+                    "mode-tail",
+                )?;
+                let negative_pair = build_cursor_pair(
+                    heap,
+                    CursorKey::Number(-17.0),
+                    "seed-three",
+                    "after-negative",
+                    "negative-tail",
+                )?;
+                let fraction_pair = build_cursor_pair(
+                    heap,
+                    CursorKey::Number(17.5),
+                    "seed-four",
+                    "after-fraction",
+                    "fraction-tail",
+                )?;
+                Ok((string_pair, mode_pair, negative_pair, fraction_pair))
+            })
+            .expect("cursor lattice");
+
+        // The cursors are the real guest keys the pre-write next returned.
+        assert_eq!(string_pair.cursor, Value::string("field"));
+        assert_eq!(mode_pair.cursor, Value::string("__mode"));
+        assert_eq!(negative_pair.cursor, Value::Float(-17.0));
+        assert_eq!(fraction_pair.cursor, Value::Float(17.5));
+
+        let (mode_meta, weak_key_value) = heap::with_heap(&mut host, |heap| {
+            heap.set_named_userdata(string_pair.table, "field", seed.a)?;
+            heap.set_named_userdata(mode_pair.table, "__mode", seed.b)?;
+            heap.set_number_userdata(negative_pair.table, -17.0, seed.a)?;
+            heap.set_number_userdata(fraction_pair.table, 17.5, seed.b)?;
+            heap.set_userdata_key_scalar(mode_pair.table, seed.b, Value::string("mode-key"))?;
+            let mode_meta = heap
+                .metatable(mode_pair.table)?
+                .expect("mode table metatable");
+            let weak_key_value = heap.userdata_key_value(mode_pair.table, seed.b)?;
+            Ok((mode_meta, weak_key_value))
+        })
+        .expect("replace targets");
+        assert_eq!(weak_key_value, Value::string("mode-key"));
+
+        let frame = heap::with_heap(&mut host, |heap| {
+            let frame = heap.enter_roots(4)?;
+            heap.write_root(frame, 0, string_pair.table)?;
+            heap.write_root(frame, 1, mode_pair.table)?;
+            heap.write_root(frame, 2, negative_pair.table)?;
+            heap.write_root(frame, 3, fraction_pair.table)?;
+            Ok(frame)
+        })
+        .expect("cursor roots");
+
+        heap::with_heap(&mut host, |heap| {
+            assert_eq!(
+                heap.named_value(string_pair.table, "field"),
+                Err(HeapError::WrongKind)
+            );
+            assert_eq!(
+                heap.named_value(mode_pair.table, "__mode"),
+                Err(HeapError::WrongKind)
+            );
+            assert_eq!(
+                heap.number_userdata(negative_pair.table, -17.0),
+                Ok(Some(seed.a))
+            );
+            assert_eq!(
+                heap.number_userdata(fraction_pair.table, 17.5),
+                Ok(Some(seed.b))
+            );
+            Ok(())
+        })
+        .expect("userdata targets before publication");
+
+        let boundary = publish_boundary(&mut host);
+        assert!(
+            matches!(boundary, PublishedBoundary::Published { .. }),
+            "the first real publication that carries the cursor tables"
+        );
+        assert!(pending_flag(&mut host, seed.a));
+        assert!(finalizer_settled(&mut host, seed.b));
+
+        heap::with_heap(&mut host, |heap| {
+            assert_eq!(
+                heap.named_value(string_pair.table, "field"),
+                Ok(Value::Null),
+                "rawget of the cleared string hash value is nil"
+            );
+            assert_eq!(
+                heap.named_value(mode_pair.table, "__mode"),
+                Ok(Value::Null),
+                "rawget of the cleared reserved __mode value is nil"
+            );
+            assert_eq!(
+                heap.number_value(negative_pair.table, -17.0),
+                Ok(Value::Null),
+                "rawget of the cleared negative hash value is nil"
+            );
+            assert_eq!(
+                heap.number_value(fraction_pair.table, 17.5),
+                Ok(Value::Null),
+                "rawget of the cleared non-integer hash value is nil"
+            );
+            for pair in [&string_pair, &mode_pair, &negative_pair, &fraction_pair] {
+                assert_eq!(
+                    heap.next_guest(pair.table, &pair.cursor),
+                    Ok(Some((pair.successor.clone(), pair.successor_value.clone()))),
+                    "the original cursor continues at the same scalar successor"
+                );
+            }
+            assert_eq!(
+                heap.named_value(mode_meta, "__mode"),
+                Ok(Value::string("k")),
+                "clearing the table's own __mode entry leaves the metatable mode"
+            );
+            assert_eq!(
+                heap.userdata_key_value(mode_pair.table, seed.b),
+                Ok(Value::string("mode-key")),
+                "the marked weak key still keeps its scalar value"
+            );
+            Ok(())
+        })
+        .expect("published cursor continuation");
+
+        assert!(userdata_token_open(&host, seed.a_raw));
+        assert!(userdata_token_open(&host, seed.b_raw));
+        let _ = finish_release(&mut host);
+        for pair in [&string_pair, &mode_pair, &negative_pair, &fraction_pair] {
+            assert!(alive(&mut host, pair.table));
+        }
+        assert!(alive(&mut host, mode_meta));
+        heap::with_heap(&mut host, |heap| heap.leave_roots(frame)).expect("leave cursor roots");
+        heap::with_heap(&mut host, |heap| heap.leave_roots(seed.weak_frame))
+            .expect("leave weak roots");
+
+        // The reserved `__mode` field is the only internal field id that
+        // guest iteration renders. Field id 1 stays internal: a table whose
+        // first entry is that field is not guest-iterable, so no internal
+        // field is exposed as a key.
+        let internal = heap::with_heap(&mut host, |heap| {
+            let table = heap.alloc()?;
+            heap.set_field_scalar(table, 1, Value::string("internal"))?;
+            Ok(table)
+        })
+        .expect("internal field table");
+        assert_eq!(
+            heap::with_heap(
+                &mut host,
+                |heap| Ok(heap.next_guest(internal, &Value::Null))
+            )
+            .expect("internal field iteration"),
+            Err(HeapError::NextUnsupported),
+            "an ordinary internal field id is not a guest key"
+        );
     });
 }
 

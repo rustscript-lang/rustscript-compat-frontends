@@ -718,13 +718,24 @@ impl<'a> SweepSession<'a> {
         // finalized userdata with no queue record (settled).
         //
         // This heap has one owner chain and does not model LuaJIT's dense
-        // array part. A string key is always a hash key and an object key is
-        // always a hash key, so those two branches are claimed. A numeric key
-        // may name a dense array slot in LuaJIT and this slice does not carry
-        // the array/hash split, so numeric-keyed values keep the previous
-        // strong-value rule. The LuaJIT number-key evidence is therefore not
-        // claimed here.
-        let hash_key = matches!(edge.key, EdgeKey::Utf8(_) | EdgeKey::Object { .. });
+        // array part. A guest string key (an ordinary name or the reserved
+        // `__mode` field, which `EdgeKey::named` stores as field id 0) and an
+        // object key are always hash keys, so those branches are claimed. A
+        // numeric key may name a dense array slot in LuaJIT: a negative
+        // number or a non-integer is never an integer array index, so those
+        // are hash keys; zero, negative zero, and positive integers can be
+        // array slots or hash nodes depending on the real array part, which
+        // this slice does not carry, so they keep the previous strong-value
+        // rule. Boolean keys have no representation here. The LuaJIT
+        // positive-integer evidence is therefore not claimed.
+        let hash_key = match &edge.key {
+            EdgeKey::Utf8(_) | EdgeKey::Object { .. } => true,
+            EdgeKey::Field(field) => *field == LuaHeap::MODE_FIELD,
+            EdgeKey::Number(bits) => {
+                let number = f64::from_bits(*bits);
+                number < 0.0 || number.fract() != 0.0
+            }
+        };
         let finalized_value = match &edge.value {
             EdgeValue::Userdata { slot, generation } => {
                 self.pending(*slot, *generation) || self.settled(*slot, *generation)
@@ -919,10 +930,16 @@ impl<'a> SweepSession<'a> {
         Some((live, stored.generation))
     }
 
+    /// Whether a cleared value under this key can stay as a cursor gap.
+    ///
+    /// The reserved `__mode` field is the one internal field id that is a
+    /// guest-visible string key: `guest_key` renders it as "__mode" and a
+    /// stored `__mode` name matches that field, so a real `next` cursor can
+    /// continue past it. Every other internal field id is not a guest key.
     fn guest_cursor(&self, key: &EdgeKey) -> bool {
         match key {
             EdgeKey::Utf8(_) | EdgeKey::Number(_) => true,
-            EdgeKey::Field(_) => false,
+            EdgeKey::Field(field) => *field == LuaHeap::MODE_FIELD,
             EdgeKey::Object {
                 slot,
                 generation,
