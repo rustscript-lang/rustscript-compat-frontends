@@ -170,6 +170,12 @@ fn sparse_free_hole_is_visited_and_skipped_for_tokens() {
     assert_eq!(done.tokens[1].raw, 9);
     assert_eq!(done.tokens[1].slot, 2);
     assert_eq!(done.tokens[1].generation, right.generation());
+    // Both raw values were numeric stand-ins, not Core resources. The shared
+    // selection now refuses a dead slot that still carries a token, so the
+    // simulated bindings are withdrawn after the enumeration witness and
+    // before the sweep. The real negative control lives on a typed userdata.
+    heap.unbind_token(left).expect("withdraw left stand-in");
+    heap.unbind_token(right).expect("withdraw right stand-in");
     let report = heap.sweep_marked(done.modes);
     assert_eq!(report.live_nodes, 0);
     assert_eq!(heap.stats().live_nodes, 0);
@@ -232,6 +238,10 @@ fn marked_survivor_token_is_not_pending_close() {
     assert_eq!(done.tokens[0].raw, 200);
     assert_eq!(done.tokens[0].slot, doomed.slot());
     assert_eq!(done.tokens[0].generation, doomed.generation());
+    // The doomed raw was a numeric stand-in. The rooted survivor keeps its
+    // 100 binding; only the simulated dead binding is withdrawn so the shared
+    // selection can release the tokenless dead slot.
+    heap.unbind_token(doomed).expect("withdraw doomed stand-in");
     let report = heap.sweep_marked(done.modes);
     assert_eq!(report.live_nodes, 1);
     assert!(heap.alive(survivor));

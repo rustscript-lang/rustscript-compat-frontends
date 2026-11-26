@@ -149,31 +149,38 @@ pub(super) fn publish_table(host: &mut HostContext) -> Result<(TableRef, i64), H
 
 /// Allocates one bare userdata and publishes its private typed resource token.
 ///
-/// The Lua slot is reserved before `HostContext::push_resource`. A refused
-/// insert rolls back only that empty reservation, so a Lua quota or phase
-/// refusal never registers a Core resource. After registration this borrows
-/// the token with the exact `lua.userdata` key and confirms that its payload
-/// names this exact userdata (domain, kind, slot, and generation) before it
-/// records the raw handle on the slot. The returned handle is published only
-/// after both directions of that binding exist.
+/// The Lua slot is reserved with an exact reservation record before
+/// `HostContext::push_resource`. A refused insert rolls back only that empty
+/// reservation in O(1), so a Lua quota or phase refusal never registers a
+/// Core resource and never scans the graph. After registration this stores
+/// the raw handle on the reservation (not in the published slot binding),
+/// borrows the token with the exact `lua.userdata` key, and confirms that its
+/// payload names this exact userdata (domain, kind, slot, and generation)
+/// before it publishes the slot binding. The returned handle is published
+/// only after both directions of that binding exist.
 ///
 /// A later failure closes the registered token through `close_resource`,
 /// requires [`vm::resource::CloseProgress::Ready`], and confirms the handle is
 /// retired before it rolls the Lua slot back. If that close is not confirmed,
-/// the reservation stays and its generation is not advanced.
+/// the reservation stays with its staged raw handle and its generation is not
+/// advanced; the private test retry entry closes that same token. An ordinary
+/// borrow never accepts the staged record.
 /// `LuaUserdataResource` has no asynchronous close path: the default
 /// synchronous close returns `Ready`, and `Pending` is an error here.
 pub fn publish_userdata(host: &mut HostContext) -> Result<UserdataRef, HeapError> {
-    let userdata = with_heap(host, LuaHeap::alloc_userdata)?;
+    let userdata = with_heap(host, LuaHeap::reserve_userdata)?;
     let resource = match host.push_resource(LuaUserdataResource::new(userdata)) {
         Ok(resource) => resource,
         Err(error) => {
-            with_heap(host, |heap| heap.rollback_userdata(userdata))?;
+            with_heap(host, |heap| heap.rollback_empty_userdata(userdata))?;
             return Err(HeapError::from_scope(error));
         }
     };
     let handle = resource.handle();
     let raw = handle.raw();
+    if let Err(error) = with_heap(host, |heap| heap.stage_userdata_token(userdata, raw)) {
+        return rollback_registered_userdata(host, userdata, handle, error);
+    }
     let payload = match checked_userdata_payload(host, handle) {
         Ok(payload) => payload,
         Err(error) => {
@@ -235,17 +242,80 @@ fn checked_userdata_payload(
 }
 
 /// Closes one registered userdata token and confirms that a second close sees
-/// it retired. A failure returns the close error and does not roll the slot
-/// back; the caller keeps the reservation and does not advance its generation.
+/// it retired. If the close is not confirmed, the reservation keeps its staged
+/// raw handle and its generation, so the private retry can close the same
+/// token. A controlled test refusal returns before any close is attempted.
 fn rollback_registered_userdata(
     host: &mut HostContext,
     userdata: UserdataRef,
     handle: vm::ResourceHandle,
     error: HeapError,
 ) -> Result<UserdataRef, HeapError> {
+    #[cfg(test)]
+    if take_userdata_rollback_refusal(host) {
+        return Err(HeapError::Scope(
+            "injected userdata rollback refusal before close".to_string(),
+        ));
+    }
     close_confirmed_token::<LuaUserdataResource>(host, handle)?;
-    with_heap(host, |heap| heap.rollback_userdata(userdata))?;
+    with_heap(host, |heap| heap.rollback_empty_userdata(userdata))?;
     Err(error)
+}
+
+/// One-shot test hook consumed by the real [`rollback_registered_userdata`]
+/// control flow. It refuses that rollback before the first close. It is not a
+/// `Pending` close and never fabricates a Core progress value.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+struct UserdataRollbackRefusal {
+    armed: bool,
+}
+
+/// Arms the one-shot refusal for the next registered userdata rollback.
+#[cfg(test)]
+pub fn arm_userdata_rollback_refusal(host: &mut HostContext) -> Result<(), HeapError> {
+    if let Some(stored) = host.scope_state_mut::<UserdataRollbackRefusal>() {
+        stored.armed = true;
+        return Ok(());
+    }
+    host.scope_state_or_insert_with(|| UserdataRollbackRefusal { armed: true })
+        .map(|_| ())
+        .map_err(HeapError::from_scope)
+}
+
+#[cfg(test)]
+fn take_userdata_rollback_refusal(host: &mut HostContext) -> bool {
+    let Some(stored) = host.scope_state_mut::<UserdataRollbackRefusal>() else {
+        return false;
+    };
+    let armed = stored.armed;
+    stored.armed = false;
+    armed
+}
+
+/// Reads the staged (unpublished) raw handle for one exact reservation.
+/// Test-only: an ordinary borrow never accepts this record.
+#[cfg(test)]
+pub fn pending_userdata_raw(
+    host: &mut HostContext,
+    userdata: UserdataRef,
+) -> Result<Option<u64>, HeapError> {
+    with_heap(host, |heap| Ok(heap.pending_userdata_token(userdata).ok()))
+}
+
+/// Retries one registered userdata rollback after a refused attempt. It reads
+/// the staged raw handle and closes that same Core token, then releases the
+/// empty reservation. Test-only entry; the production issuer has no live
+/// refusal path that would leave such a record.
+#[cfg(test)]
+pub fn retry_pending_userdata_rollback(
+    host: &mut HostContext,
+    userdata: UserdataRef,
+) -> Result<u32, HeapError> {
+    let raw = with_heap(host, |heap| heap.pending_userdata_token(userdata))?;
+    let handle = vm::ResourceHandle::from_raw(raw).map_err(|_| HeapError::CarrierOutOfRange)?;
+    close_confirmed_token::<LuaUserdataResource>(host, handle)?;
+    with_heap(host, |heap| heap.rollback_empty_userdata(userdata))
 }
 
 /// Closes one typed token, requires the synchronous result, and confirms that
@@ -274,17 +344,25 @@ fn close_confirmed_token<T: vm::resource::HostResource>(
 }
 
 /// One controlled userdata failure after registration, for the private test
-/// injection. It records the real Core handle and the resource count on both
-/// sides of the confirmed close.
+/// injection. It records the real Core handle, the resource count on both
+/// sides, and whether the real rollback completed or retained the staged raw.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UserdataPostRegisterFailure {
+    /// The reserved Lua handle, still live and unpublished on the refusal path.
+    pub userdata: UserdataRef,
     pub raw: u64,
     pub registered_count: usize,
-    pub closed_count: usize,
-    pub close: vm::resource::CloseProgress,
+    pub ended_count: usize,
+    /// `Some(Ready)` only when this call actually completed the synchronous
+    /// close. `None` means the one-shot refusal returned before any close:
+    /// this witness never reports a fabricated `Pending`.
+    pub close: Option<vm::resource::CloseProgress>,
+    /// The staged raw retained for a retry when the rollback was refused.
+    pub pending_raw: Option<u64>,
     pub slot: u32,
-    pub generation_after: u32,
+    /// Generation after the call: advanced only when the slot was released.
+    pub generation: u32,
 }
 
 /// The witness from the last [`publish_userdata_after_register_failure`] call.
@@ -295,35 +373,51 @@ pub fn last_userdata_post_register_failure(
     host.scope_state::<UserdataPostRegisterFailure>().copied()
 }
 
-/// Test-only injection: registers a real userdata token, then fails before the
-/// slot binding is published. It closes and confirms that same token with the
-/// production helper, rolls the slot back, and records the witness. This never
-/// fabricates a handle and never skips the real rollback.
+/// Test-only injection: registers a real userdata token, stages its raw, then
+/// fails before the slot binding is published and runs the real
+/// [`rollback_registered_userdata`] control flow. With no armed refusal it
+/// closes and confirms that same token and rolls the slot back. With the
+/// one-shot refusal armed it returns before the close and keeps the staged
+/// raw, so the retry can close the same token. It never fabricates a handle
+/// and never skips the real rollback.
 #[cfg(test)]
 pub fn publish_userdata_after_register_failure(
     host: &mut HostContext,
 ) -> Result<UserdataRef, HeapError> {
-    let userdata = with_heap(host, LuaHeap::alloc_userdata)?;
+    let userdata = with_heap(host, LuaHeap::reserve_userdata)?;
     let resource = match host.push_resource(LuaUserdataResource::new(userdata)) {
         Ok(resource) => resource,
         Err(error) => {
-            with_heap(host, |heap| heap.rollback_userdata(userdata))?;
+            with_heap(host, |heap| heap.rollback_empty_userdata(userdata))?;
             return Err(HeapError::from_scope(error));
         }
     };
     let handle = resource.handle();
     let raw = handle.raw();
+    with_heap(host, |heap| heap.stage_userdata_token(userdata, raw))?;
     let registered_count = host.resource_count();
-    close_confirmed_token::<LuaUserdataResource>(host, handle)?;
-    let closed_count = host.resource_count();
-    let generation_after = with_heap(host, |heap| heap.rollback_userdata(userdata))?;
+    let outcome = rollback_registered_userdata(
+        host,
+        userdata,
+        handle,
+        HeapError::Scope("injected userdata failure after registration".to_string()),
+    );
+    let ended_count = host.resource_count();
+    let pending_raw = pending_userdata_raw(host, userdata)?;
+    let generation = with_heap(host, |heap| {
+        Ok(heap.slot_generation(userdata.slot()).unwrap_or(0))
+    })?;
+    let close = (pending_raw.is_none() && ended_count + 1 == registered_count)
+        .then_some(vm::resource::CloseProgress::Ready);
     let witness = UserdataPostRegisterFailure {
+        userdata,
         raw,
         registered_count,
-        closed_count,
-        close: vm::resource::CloseProgress::Ready,
+        ended_count,
+        close,
+        pending_raw,
         slot: userdata.slot(),
-        generation_after,
+        generation,
     };
     if let Some(stored) = host.scope_state_mut::<UserdataPostRegisterFailure>() {
         *stored = witness;
@@ -331,9 +425,8 @@ pub fn publish_userdata_after_register_failure(
         host.scope_state_or_insert_with(|| witness)
             .map_err(HeapError::from_scope)?;
     }
-    Err(HeapError::Scope(
-        "injected userdata failure after registration".to_string(),
-    ))
+    outcome?;
+    unreachable!("rollback_registered_userdata always returns its failure")
 }
 
 /// Runs `body` against the scope heap, creating it with production limits if
@@ -954,9 +1047,80 @@ fn close_then_sweep_observing<R>(
 fn retire_doomed_token(host: &mut HostContext, token: table::DoomedToken) -> Result<(), HeapError> {
     match token.kind {
         HandleKind::Table => retire_typed_token::<LuaTableResource>(host, token),
-        HandleKind::Userdata => retire_typed_token::<LuaUserdataResource>(host, token),
+        HandleKind::Userdata => retire_userdata_token(host, token),
         HandleKind::Closure | HandleKind::Upvalue => Err(HeapError::WrongKind),
     }
+}
+
+/// Closes one doomed userdata token after confirming that the open resource
+/// payload names the exact Lua slot the mark captured.
+///
+/// The slot must still store the captured raw handle at the same generation.
+/// The typed borrow validates the Core arena, generation, concrete `TypeId`,
+/// and the `lua.userdata` key, and its payload must equal the handle derived
+/// from that slot record. A same-type token for another (even rooted) userdata
+/// is [`HeapError::TokenMismatch`] and is not closed. The read-only borrow is
+/// released before the close runs. An already-retired handle keeps the
+/// existing clear-or-error branch. A `Pending` result is an error.
+fn retire_userdata_token(
+    host: &mut HostContext,
+    token: table::DoomedToken,
+) -> Result<(), HeapError> {
+    let handle =
+        vm::ResourceHandle::from_raw(token.raw).map_err(|_| HeapError::CarrierOutOfRange)?;
+    let expected = with_heap(host, |heap| heap.bound_userdata_for_token(&token))?;
+    let retired = match host
+        .borrow_resource_with_key::<LuaUserdataResource>(handle, &LuaUserdataResource::key())
+    {
+        Ok(borrowed) => {
+            if borrowed.get().userdata() != expected {
+                return Err(HeapError::TokenMismatch);
+            }
+            None
+        }
+        Err(error) => {
+            if !retired_token(&error) {
+                return Err(HeapError::from_scope(error));
+            }
+            Some(error)
+        }
+    };
+    if let Some(error) = retired {
+        let cleared = with_heap(host, |heap| Ok(heap.clear_exact_token(token)))?;
+        return if cleared {
+            Ok(())
+        } else {
+            Err(HeapError::from_scope(error))
+        };
+    }
+    with_heap(host, |heap| {
+        heap.note_token_close();
+        Ok(())
+    })?;
+    match host.close_resource::<LuaUserdataResource>(handle, vm::ResourceCloseReason::Requested) {
+        Ok(vm::resource::CloseProgress::Ready) => {}
+        Ok(_) => {
+            return Err(HeapError::Scope(
+                "lua typed resource close did not finish synchronously".to_string(),
+            ));
+        }
+        Err(error) => {
+            if !retired_token(&error) {
+                return Err(HeapError::from_scope(error));
+            }
+            let cleared = with_heap(host, |heap| Ok(heap.clear_exact_token(token)))?;
+            return if cleared {
+                Ok(())
+            } else {
+                Err(HeapError::from_scope(error))
+            };
+        }
+    }
+    let cleared = with_heap(host, |heap| Ok(heap.clear_exact_token(token)))?;
+    if !cleared {
+        return Err(HeapError::StaleHandle);
+    }
+    Ok(())
 }
 
 /// Closes one doomed token through the concrete resource type that the slot
@@ -1006,7 +1170,8 @@ fn retired_token(error: &vm::HostContextError) -> bool {
     match error.kind() {
         vm::HostContextErrorKind::Scope(vm::execution_scope::ExecutionScopeError::Resource(
             resource,
-        )) => matches!(
+        ))
+        | vm::HostContextErrorKind::Resource(resource) => matches!(
             resource.code(),
             vm::resource::ResourceErrorCode::ResourceAlreadyClosed
                 | vm::resource::ResourceErrorCode::ResourceStale

@@ -513,6 +513,141 @@ fn capacity_refusal_rolls_back_only_the_empty_reservation() {
 }
 
 #[test]
+fn capacity_refusal_rollback_work_is_independent_of_graph_size() {
+    crate::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(
+            &mut host,
+            HeapLimits {
+                nodes: 2048,
+                roots: 8,
+                edges: 4096,
+                max_generation: 8,
+            },
+        )
+        .expect("install");
+        let small_left = heap::with_heap(&mut host, LuaHeap::alloc).expect("small left");
+        let small_right = heap::with_heap(&mut host, LuaHeap::alloc).expect("small right");
+        let frame = heap::with_heap(&mut host, |heap| {
+            heap.set_edge(small_left, 1, small_right)?;
+            let frame = heap.enter_roots(2)?;
+            heap.write_root(frame, 0, small_left)?;
+            heap.write_root(frame, 1, small_right)?;
+            Ok(frame)
+        })
+        .expect("small graph");
+
+        let freed = host
+            .push_resource(crate::UnrelatedHostResource)
+            .expect("spare resource");
+        while host.resource_count() < vm::resource::handle::DEFAULT_MAX_RESOURCES {
+            host.push_resource(crate::UnrelatedHostResource)
+                .expect("fill resource table");
+        }
+
+        let before_small = heap::stats(&mut host).expect("small before");
+        let small_probe =
+            heap::with_heap(&mut host, |heap| Ok(heap.rollback_owner_visits())).expect("probe");
+        let error = heap::publish_userdata(&mut host).expect_err("full Core");
+        match &error {
+            HeapError::Scope(message) if message.contains("resource_limit_exceeded") => {}
+            other => panic!("expected the real Core capacity refusal, got {other:?}"),
+        }
+        let small_visits = heap::with_heap(&mut host, |heap| Ok(heap.rollback_owner_visits()))
+            .expect("probe")
+            - small_probe;
+        let after_small = heap::stats(&mut host).expect("small after");
+        assert_eq!(
+            after_small.node_slots,
+            before_small.node_slots + 1,
+            "the Lua slot was reserved before push_resource refused"
+        );
+        assert_eq!(after_small.live_nodes, before_small.live_nodes);
+        assert_eq!(after_small.live_roots, before_small.live_roots);
+        assert_eq!(after_small.live_edges, before_small.live_edges);
+        assert_eq!(
+            small_visits, 0,
+            "an empty reservation rollback must not open any owner chain"
+        );
+
+        // Grow the graph to hundreds of slots and edges while Core stays full.
+        let mut previous = small_right;
+        let mut first_large = None;
+        for _ in 0..512 {
+            let table = heap::with_heap(&mut host, LuaHeap::alloc).expect("large table");
+            heap::with_heap(&mut host, |heap| heap.set_edge(previous, 2, table))
+                .expect("chain edge");
+            first_large.get_or_insert(table);
+            previous = table;
+        }
+        let large_before = heap::stats(&mut host).expect("large before");
+        let large_probe =
+            heap::with_heap(&mut host, |heap| Ok(heap.rollback_owner_visits())).expect("probe");
+        let error = heap::publish_userdata(&mut host).expect_err("full Core, large graph");
+        match &error {
+            HeapError::Scope(message) if message.contains("resource_limit_exceeded") => {}
+            other => panic!("expected the real Core capacity refusal, got {other:?}"),
+        }
+        let large_visits = heap::with_heap(&mut host, |heap| Ok(heap.rollback_owner_visits()))
+            .expect("probe")
+            - large_probe;
+        let large_after = heap::stats(&mut host).expect("large after");
+        assert_eq!(
+            large_visits, small_visits,
+            "the empty reservation rollback work must not scale with the graph"
+        );
+        assert_eq!(large_visits, 0);
+        assert_eq!(large_after.node_slots, large_before.node_slots + 1);
+        assert_eq!(large_after.live_nodes, large_before.live_nodes);
+        assert_eq!(large_after.live_roots, large_before.live_roots);
+        assert_eq!(large_after.live_edges, large_before.live_edges);
+
+        // The existing graph and its roots are untouched.
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| heap.rooted_table(frame, 0)),
+            Ok(Some(small_left))
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| heap.rooted_table(frame, 1)),
+            Ok(Some(small_right))
+        );
+        assert!(heap::with_heap(&mut host, |heap| Ok(heap.alive(small_left))).expect("alive"));
+        assert!(heap::with_heap(&mut host, |heap| Ok(heap.alive(small_right))).expect("alive"));
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| heap.edge(small_left, 1)),
+            Ok(Some(small_right))
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| heap.edge(small_right, 2)),
+            Ok(first_large)
+        );
+        assert_eq!(
+            host.resource_count(),
+            vm::resource::handle::DEFAULT_MAX_RESOURCES
+        );
+
+        // The empty slot still returns per generation: the next issuance
+        // takes the same slot at generation 2 once one Core slot is free.
+        host.close_resource::<crate::UnrelatedHostResource>(
+            freed.handle(),
+            vm::ResourceCloseReason::Requested,
+        )
+        .expect("free one Core slot");
+        let reused = heap::publish_userdata(&mut host).expect("reuse the refused slot");
+        assert_eq!(reused.generation(), 2);
+        assert_eq!(
+            heap::borrow_published_userdata(&host, reused).expect("new token open"),
+            reused
+        );
+        assert_eq!(
+            host.resource_count(),
+            vm::resource::handle::DEFAULT_MAX_RESOURCES
+        );
+        let _ = frame;
+    });
+}
+
+#[test]
 fn post_registration_failure_closes_confirmed_then_releases_the_slot() {
     crate::support::with_idle_vm(|vm| {
         let mut host = vm.host_context();
@@ -542,9 +677,14 @@ fn post_registration_failure_closes_confirmed_then_releases_the_slot() {
         let witness =
             heap::last_userdata_post_register_failure(&host).expect("post-registration witness");
         assert_eq!(witness.registered_count, resources_before + 1);
-        assert_eq!(witness.closed_count, resources_before);
-        assert_eq!(witness.close, vm::resource::CloseProgress::Ready);
-        assert_eq!(witness.generation_after, 2);
+        assert_eq!(witness.ended_count, resources_before);
+        assert_eq!(
+            witness.close,
+            Some(vm::resource::CloseProgress::Ready),
+            "the real rollback completed with the synchronous close"
+        );
+        assert_eq!(witness.pending_raw, None);
+        assert_eq!(witness.generation, 2);
         assert_eq!(witness.slot, stats_before.node_slots);
         assert!(
             !userdata_token_open(&host, witness.raw),
@@ -571,13 +711,114 @@ fn post_registration_failure_closes_confirmed_then_releases_the_slot() {
 
         let reused = heap::publish_userdata(&mut host).expect("reuse failed slot");
         assert_eq!(reused.slot(), witness.slot);
-        assert_eq!(reused.generation(), witness.generation_after);
+        assert_eq!(reused.generation(), witness.generation);
         assert_ne!(bound_raw(&mut host, reused), witness.raw);
         assert_eq!(
             heap::borrow_published_userdata(&host, reused).expect("new token open"),
             reused
         );
         let _ = frame;
+    });
+}
+
+#[test]
+fn refused_rollback_retains_pending_raw_and_retries_the_same_token() {
+    crate::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, room()).expect("install");
+        let control = heap::publish_userdata(&mut host).expect("control userdata");
+        let control_raw = bound_raw(&mut host, control);
+        let resources_before = host.resource_count();
+
+        heap::arm_userdata_rollback_refusal(&mut host).expect("arm refusal");
+        let error =
+            heap::publish_userdata_after_register_failure(&mut host).expect_err("refused rollback");
+        match &error {
+            HeapError::Scope(message) => assert!(
+                message.contains("rollback refusal before close"),
+                "unexpected refusal: {message}"
+            ),
+            other => panic!("expected the injected rollback refusal, got {other:?}"),
+        }
+        let witness = heap::last_userdata_post_register_failure(&host).expect("refusal witness");
+        assert_eq!(
+            witness.registered_count,
+            resources_before + 1,
+            "a real Core registration happened before the refusal"
+        );
+        assert_eq!(
+            witness.ended_count,
+            resources_before + 1,
+            "the refused rollback closes nothing"
+        );
+        assert_eq!(
+            witness.close, None,
+            "a controlled refusal is not a fabricated Pending close"
+        );
+        assert_eq!(
+            witness.pending_raw,
+            Some(witness.raw),
+            "the registered raw handle is retained for a retry"
+        );
+        assert_eq!(
+            witness.generation, 1,
+            "the refusal does not advance the slot"
+        );
+        assert_eq!(
+            host.resource_count(),
+            resources_before + 1,
+            "the registered token is still open"
+        );
+        assert!(userdata_token_open(&host, witness.raw));
+        assert_eq!(
+            heap::pending_userdata_raw(&mut host, witness.userdata).expect("staged query"),
+            Some(witness.raw)
+        );
+        assert_eq!(
+            heap::borrow_published_userdata(&host, witness.userdata),
+            Err(HeapError::StaleHandle),
+            "the ordinary borrow never accepts the staged record"
+        );
+        assert!(
+            heap::with_heap(&mut host, |heap| Ok(heap.userdata_alive(witness.userdata)))
+                .expect("reservation stays live")
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| Ok(slot_generation(heap, witness.slot)))
+                .expect("generation"),
+            1
+        );
+
+        // The retry reads the same staged raw and closes that exact token.
+        let generation = heap::retry_pending_userdata_rollback(&mut host, witness.userdata)
+            .expect("retry the same token");
+        assert_eq!(generation, 2);
+        assert!(
+            !userdata_token_open(&host, witness.raw),
+            "the same Core token is retired"
+        );
+        assert_eq!(host.resource_count(), resources_before);
+        assert_eq!(
+            heap::pending_userdata_raw(&mut host, witness.userdata)
+                .expect("no staged record after release"),
+            None
+        );
+        assert!(
+            !heap::with_heap(&mut host, |heap| Ok(heap.userdata_alive(witness.userdata)))
+                .expect("released")
+        );
+
+        // The released slot is reissued at the next generation.
+        let reused = heap::publish_userdata(&mut host).expect("reissue the released slot");
+        assert_eq!(reused.slot(), witness.slot);
+        assert_eq!(reused.generation(), 2);
+        let reused_raw = bound_raw(&mut host, reused);
+        assert!(userdata_token_open(&host, reused_raw));
+        assert_eq!(
+            heap::borrow_published_userdata(&host, control).expect("control still open"),
+            control
+        );
+        assert!(userdata_token_open(&host, control_raw));
     });
 }
 
@@ -854,6 +1095,163 @@ fn step_collect_closes_before_release_then_reissues_the_same_slots() {
 }
 
 #[test]
+fn step_from_saved_mark_publishes_then_releases_the_same_slots() {
+    crate::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        let graph = seed(&mut host);
+        let resources_before = host.resource_count();
+        let live_userdata_raw = bound_raw(&mut host, graph.live_userdata);
+        let doomed_userdata_slot = graph.doomed_userdata.slot();
+        let doomed_userdata_generation = graph.doomed_userdata.generation();
+        let doomed_table_slot = graph.doomed_table.slot();
+        let doomed_table_generation = graph.doomed_table.generation();
+        let _ = heap::take_scan_meter(&mut host);
+
+        heap::open_fixed_step(&mut host).expect("save the mark");
+        let first = heap::step_fixed_frames(&mut host, 1).expect("one mark unit");
+        assert!(
+            matches!(first, heap::StepOutcome::Paused { tail: false }),
+            "budget 1 must pause inside the saved mark, got {first:?}"
+        );
+        let paused_meter = heap::take_scan_meter(&mut host).expect("pause meter");
+        assert_eq!(
+            paused_meter.token_closes, 0,
+            "a paused mark has closed nothing"
+        );
+        assert!(userdata_token_open(&host, graph.doomed_userdata_raw));
+        assert!(table_token_open(&host, graph.doomed_table_raw));
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| heap.number_userdata(graph.owner, 1.0))
+                .expect("weak value"),
+            Some(graph.doomed_userdata),
+            "no weak edge is published while the mark is paused"
+        );
+        assert!(!heap::saved_sweep_tail(&mut host).expect("no tail yet"));
+
+        let mut published = None;
+        for _ in 0..512 {
+            match heap::step_fixed_frames(&mut host, 1).expect("mark step") {
+                heap::StepOutcome::Paused { tail: false } => {}
+                outcome @ heap::StepOutcome::Published { .. } => {
+                    published = Some(outcome);
+                    break;
+                }
+                other => panic!("the saved mark must publish, got {other:?}"),
+            }
+        }
+        assert!(
+            matches!(published, Some(heap::StepOutcome::Published { .. })),
+            "the saved mark must reach Published"
+        );
+        let publish_meter = heap::take_scan_meter(&mut host).expect("publish meter");
+        assert_eq!(publish_meter.token_closes, 2);
+        assert!(publish_meter.sweep_edge_checks > 0, "weak edges published");
+        assert_eq!(host.resource_count(), resources_before - 2);
+        assert!(!userdata_token_open(&host, graph.doomed_userdata_raw));
+        assert!(!table_token_open(&host, graph.doomed_table_raw));
+        assert!(userdata_token_open(&host, live_userdata_raw));
+        assert!(heap::saved_sweep_tail(&mut host).expect("published tail"));
+        assert_eq!(heap::stats(&mut host).expect("stats").collections, 0);
+
+        // Dead slots are still physical at the same generation: Release has
+        // not run yet.
+        assert!(
+            heap::with_heap(&mut host, |heap| Ok(
+                heap.userdata_alive(graph.doomed_userdata)
+            ))
+            .expect("physical userdata")
+        );
+        assert!(
+            heap::with_heap(&mut host, |heap| Ok(heap.alive(graph.doomed_table)))
+                .expect("physical table")
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| Ok(slot_generation(
+                heap,
+                doomed_userdata_slot
+            )))
+            .expect("userdata generation"),
+            doomed_userdata_generation
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| Ok(slot_generation(
+                heap,
+                doomed_table_slot
+            )))
+            .expect("table generation"),
+            doomed_table_generation
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| heap.number_userdata(graph.owner, 1.0))
+                .expect("weak userdata cleared"),
+            None
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| heap.number_value(graph.owner, 2.0))
+                .expect("weak table cleared"),
+            Value::Null
+        );
+
+        let mut finished = None;
+        for _ in 0..64 {
+            match heap::step_fixed_frames(&mut host, 4).expect("release step") {
+                heap::StepOutcome::Paused { tail: true } => {}
+                heap::StepOutcome::Completed(report) => {
+                    finished = Some(report);
+                    break;
+                }
+                other => panic!("the release tail must complete, got {other:?}"),
+            }
+        }
+        let report = finished.expect("the release tail must finish");
+        assert_eq!(report.live_nodes, 4);
+        assert!(!heap::saved_sweep_tail(&mut host).expect("tail drained"));
+        assert!(
+            !heap::with_heap(&mut host, |heap| Ok(
+                heap.userdata_alive(graph.doomed_userdata)
+            ))
+            .expect("released userdata")
+        );
+        assert!(
+            !heap::with_heap(&mut host, |heap| Ok(heap.alive(graph.doomed_table)))
+                .expect("released table")
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| Ok(slot_generation(
+                heap,
+                doomed_userdata_slot
+            )))
+            .expect("userdata next generation"),
+            doomed_userdata_generation + 1
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| Ok(slot_generation(
+                heap,
+                doomed_table_slot
+            )))
+            .expect("table next generation"),
+            doomed_table_generation + 1
+        );
+
+        let reused = heap::publish_userdata(&mut host).expect("reissue");
+        assert_eq!(reused.generation(), 2);
+        assert!(reused.slot() == doomed_userdata_slot || reused.slot() == doomed_table_slot);
+        let reused_frame = heap::with_heap(&mut host, |heap| {
+            let frame = heap.enter_roots(1)?;
+            heap.write_userdata_root(frame, 0, reused)?;
+            Ok(frame)
+        })
+        .expect("root reissue");
+        assert_eq!(
+            heap::borrow_published_userdata(&host, reused).expect("new token open"),
+            reused
+        );
+        let _ = reused_frame;
+        let _ = graph.frame;
+    });
+}
+
+#[test]
 fn pure_heap_collect_refuses_a_bound_token_instead_of_skipping_it() {
     crate::support::with_idle_vm(|vm| {
         let mut host = vm.host_context();
@@ -1021,6 +1419,175 @@ fn failed_userdata_close_keeps_failure_and_suffix_bindings() {
                 .expect("suffix released")
         );
         assert!(table_token_open(&host, table_raw));
+        let _ = frame;
+    });
+}
+
+/// P1: a doomed slot may be misbound to an *open, same-type* token that
+/// belongs to another rooted userdata. The collector must read the typed
+/// payload before closing, refuse the wrong owner, and keep the control
+/// resource, the failing binding, and the suffix intact. After an explicit
+/// legal rebind the same VM must collect and publish normally.
+#[test]
+fn same_type_token_from_another_rooted_userdata_is_refused_before_close() {
+    crate::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, room()).expect("install");
+        let control = heap::publish_userdata(&mut host).expect("control userdata");
+        let control_raw = bound_raw(&mut host, control);
+        let doomed = heap::publish_userdata(&mut host).expect("doomed userdata");
+        let doomed_raw = bound_raw(&mut host, doomed);
+        let suffix = heap::publish_userdata(&mut host).expect("suffix userdata");
+        let suffix_raw = bound_raw(&mut host, suffix);
+        let doomed_generation =
+            heap::with_heap(&mut host, |heap| Ok(slot_generation(heap, doomed.slot())))
+                .expect("doomed generation");
+        let suffix_generation =
+            heap::with_heap(&mut host, |heap| Ok(slot_generation(heap, suffix.slot())))
+                .expect("suffix generation");
+        let (owner, frame) = heap::with_heap(&mut host, |heap| {
+            let meta = heap.alloc()?;
+            heap.set_mode_scalar(meta, Value::string("v"))?;
+            let owner = heap.alloc()?;
+            heap.set_metatable(owner, Some(meta))?;
+            heap.set_number_userdata(owner, 1.0, doomed)?;
+            heap.set_number_userdata(owner, 2.0, suffix)?;
+            let frame = heap.enter_roots(3)?;
+            heap.write_root(frame, 0, meta)?;
+            heap.write_root(frame, 1, owner)?;
+            heap.write_userdata_root(frame, 2, control)?;
+            Ok((owner, frame))
+        })
+        .expect("fixture");
+
+        // The doomed slot stores the control object's real token. The concrete
+        // type and the catalog key both match; only the payload owner differs.
+        heap::with_heap(&mut host, |heap| {
+            heap.unbind_userdata_token(doomed)?;
+            heap.bind_userdata_token(doomed, control_raw)
+        })
+        .expect("same-type misbind");
+        let resources_before = host.resource_count();
+        let stats_before = heap::stats(&mut host).expect("before");
+        let _ = heap::take_scan_meter(&mut host);
+
+        let error = heap::collect(&mut host).expect_err("a foreign owner token");
+        assert_eq!(
+            error,
+            HeapError::TokenMismatch,
+            "the payload owner must be checked before close"
+        );
+        assert_eq!(
+            heap::take_scan_meter(&mut host)
+                .expect("refusal meter")
+                .token_closes,
+            0,
+            "the refusal happens before any close attempt"
+        );
+        assert!(
+            userdata_token_open(&host, control_raw),
+            "the control resource is still open"
+        );
+        assert!(
+            userdata_token_open(&host, doomed_raw),
+            "the doomed object's own token was not touched"
+        );
+        assert!(userdata_token_open(&host, suffix_raw));
+        assert_eq!(
+            host.resource_count(),
+            resources_before,
+            "no resource was closed"
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| heap.published_userdata_token(doomed))
+                .expect("failing binding stays"),
+            control_raw
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| heap.published_userdata_token(suffix))
+                .expect("suffix binding stays"),
+            suffix_raw
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| {
+                Ok((
+                    slot_generation(heap, doomed.slot()),
+                    slot_generation(heap, suffix.slot()),
+                ))
+            })
+            .expect("generations"),
+            (doomed_generation, suffix_generation),
+            "a refused close does not advance a generation"
+        );
+        assert!(
+            heap::with_heap(&mut host, |heap| Ok(heap.userdata_alive(doomed)))
+                .expect("doomed physical"),
+            "the failing item stays physical"
+        );
+        assert!(
+            heap::with_heap(&mut host, |heap| Ok(heap.userdata_alive(suffix)))
+                .expect("suffix physical")
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| heap.number_userdata(owner, 1.0))
+                .expect("doomed weak value"),
+            Some(doomed),
+            "no weak edge is published"
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| heap.number_userdata(owner, 2.0))
+                .expect("suffix weak value"),
+            Some(suffix)
+        );
+        assert_eq!(heap::stats(&mut host).expect("stats").collections, 0);
+        assert!(!heap::saved_sweep_tail(&mut host).expect("no tail"));
+        assert_eq!(
+            heap::stats(&mut host).expect("occupancy").live_nodes,
+            stats_before.live_nodes
+        );
+
+        // Restore the doomed slot's own binding and retry in the same VM.
+        heap::with_heap(&mut host, |heap| {
+            heap.unbind_userdata_token(doomed)?;
+            heap.bind_userdata_token(doomed, doomed_raw)
+        })
+        .expect("restore legal binding");
+        let report = heap::collect(&mut host).expect("retry closes the real owners");
+        assert_eq!(report.live_nodes, 3, "meta, owner, and the rooted control");
+        assert!(
+            !userdata_token_open(&host, doomed_raw),
+            "the doomed owner token is closed on retry"
+        );
+        assert!(!userdata_token_open(&host, suffix_raw));
+        assert!(
+            userdata_token_open(&host, control_raw),
+            "the control token is never closed"
+        );
+        assert_eq!(
+            heap::borrow_published_userdata(&host, control).expect("control still borrowable"),
+            control
+        );
+        assert_eq!(host.resource_count(), resources_before - 2);
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| {
+                Ok((
+                    slot_generation(heap, doomed.slot()),
+                    slot_generation(heap, suffix.slot()),
+                ))
+            })
+            .expect("next generations"),
+            (doomed_generation + 1, suffix_generation + 1)
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| heap.number_userdata(owner, 1.0))
+                .expect("doomed cleared"),
+            None
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| heap.number_userdata(owner, 2.0))
+                .expect("suffix cleared"),
+            None
+        );
         let _ = frame;
     });
 }

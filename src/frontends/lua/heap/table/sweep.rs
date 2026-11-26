@@ -489,6 +489,10 @@ impl<'a> SweepSession<'a> {
         self.pulse_spent.selection += 1;
         match self.heap.slots[index].state {
             SlotState::Live { marked: false } => {
+                assert!(
+                    self.heap.slots[index].token.is_none(),
+                    "lua heap sweep reached dead slot {index} with a bound host token; the host collector must close it and clear the binding before sweep"
+                );
                 self.dead.push(index as u32);
                 self.heap.scan.scratch.dead_slots_pushed += 1;
             }

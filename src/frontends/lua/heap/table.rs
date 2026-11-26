@@ -929,6 +929,25 @@ pub struct LuaHeap {
     /// String and byte lengths stored in edge records. Not Vec capacity, not
     /// Core locals, and not a second scan of `edges`.
     payload_bytes: u64,
+    /// The single userdata slot the typed issuer has reserved, before its
+    /// Core token is published. The raw field appears only after the real
+    /// Core registration succeeded. Ordinary borrows do not read this record.
+    pending_userdata: Option<PendingUserdata>,
+    /// Owner chains opened by the legacy table rollback edge walk.
+    /// Test-only observation: an empty userdata reservation rollback must
+    /// leave this unchanged, so its work stays independent of the graph size.
+    #[cfg(test)]
+    rollback_owner_visits: u64,
+}
+
+/// One typed-issuer userdata reservation, keyed by its exact slot and
+/// generation. `raw` is the registered Core handle that a published binding
+/// does not yet own.
+#[derive(Clone, Copy, Debug)]
+struct PendingUserdata {
+    slot: u32,
+    generation: u32,
+    raw: Option<u64>,
 }
 
 /// Positive finite integer key that can sit in a 1-based prefix.
@@ -1002,6 +1021,9 @@ impl LuaHeap {
             rescan_epoch: 0,
             sweep_tail: None,
             payload_bytes: 0,
+            pending_userdata: None,
+            #[cfg(test)]
+            rollback_owner_visits: 0,
         }
     }
 
@@ -2866,6 +2888,17 @@ impl LuaHeap {
             return Err(HeapError::StaleHandle);
         }
         self.ensure_sweep_open()?;
+        if let Some(pending) = self.pending_userdata
+            && pending.slot == userdata.slot()
+        {
+            if pending.generation != userdata.generation() {
+                return Err(HeapError::StaleHandle);
+            }
+            if pending.raw.is_some_and(|staged| staged != raw) {
+                return Err(HeapError::TokenMismatch);
+            }
+            self.pending_userdata = None;
+        }
         self.slots[index].token = Some(raw);
         Ok(())
     }
@@ -2881,6 +2914,33 @@ impl LuaHeap {
             .ok_or(HeapError::StaleHandle)
     }
 
+    /// The exact live userdata that one mark-time token record still names.
+    ///
+    /// The collector reads this before it closes a userdata resource: the slot
+    /// must be live at the captured generation and kind and must still store
+    /// the captured raw handle. This is one slot identity read, counted in
+    /// `token_slot_checks`; it does not search the slot vector.
+    pub(super) fn bound_userdata_for_token(
+        &mut self,
+        token: &DoomedToken,
+    ) -> Result<UserdataRef, HeapError> {
+        self.scan.token_slot_checks += 1;
+        let matches = self.slots.get(token.slot as usize).is_some_and(|slot| {
+            slot.generation == token.generation
+                && slot.kind == HandleKind::Userdata
+                && slot.token == Some(token.raw)
+                && matches!(slot.state, SlotState::Live { .. })
+        });
+        if !matches {
+            return Err(HeapError::StaleHandle);
+        }
+        Ok(UserdataRef::userdata(
+            self.domain,
+            token.slot,
+            token.generation,
+        ))
+    }
+
     /// Clears the token stored on `userdata` without searching other slots.
     /// Does not close a host resource and does not sweep. The host collector
     /// uses [`Self::clear_exact_token`] instead.
@@ -2891,21 +2951,100 @@ impl LuaHeap {
         Ok(())
     }
 
-    /// Releases one userdata node the caller already reserved and returns the
-    /// slot generation after release.
+    /// Reserves one userdata slot for the typed issuer and records the exact
+    /// reservation. The record is not a published binding: an ordinary borrow,
+    /// the pending-close enumeration, and the sweep do not read it.
     ///
-    /// This is the rollback for the typed issuer: a foreign or stale handle is
-    /// refused before any change. It clears roots and incident edges, then
-    /// releases the slot so the next issuance takes the next generation (or
-    /// the slot retires at the generation cap). The caller must close a
-    /// registered token and confirm that close before it reaches this method.
-    pub(super) fn rollback_userdata(&mut self, handle: UserdataRef) -> Result<u32, HeapError> {
+    /// A later failure can roll this slot back with
+    /// [`Self::rollback_empty_userdata`], which validates the record and the
+    /// empty slot in O(1) and does not scan the roots or the owner chains.
+    pub(super) fn reserve_userdata(&mut self) -> Result<UserdataRef, HeapError> {
+        if self.pending_userdata.is_some() {
+            return Err(HeapError::Scope(
+                "a userdata reservation is already in flight".to_string(),
+            ));
+        }
+        let userdata = self.alloc_userdata()?;
+        self.pending_userdata = Some(PendingUserdata {
+            slot: userdata.slot(),
+            generation: userdata.generation(),
+            raw: None,
+        });
+        Ok(userdata)
+    }
+
+    /// Attaches the registered Core raw handle to the exact reservation,
+    /// before the slot binding is published.
+    pub(super) fn stage_userdata_token(
+        &mut self,
+        userdata: UserdataRef,
+        raw: u64,
+    ) -> Result<(), HeapError> {
+        self.require_userdata(userdata)?;
+        let Some(pending) = self.pending_userdata.as_mut() else {
+            return Err(HeapError::StaleHandle);
+        };
+        if pending.slot != userdata.slot() || pending.generation != userdata.generation() {
+            return Err(HeapError::StaleHandle);
+        }
+        pending.raw = Some(raw);
+        Ok(())
+    }
+
+    /// The staged Core raw handle for one exact reservation, before publish.
+    ///
+    /// Test-only: the private retry entry reads it to close the same token
+    /// after a refused rollback. An ordinary borrow never accepts it.
+    #[cfg(test)]
+    pub(super) fn pending_userdata_token(&self, userdata: UserdataRef) -> Result<u64, HeapError> {
+        self.require_userdata(userdata)?;
+        let Some(pending) = self.pending_userdata else {
+            return Err(HeapError::StaleHandle);
+        };
+        if pending.slot != userdata.slot() || pending.generation != userdata.generation() {
+            return Err(HeapError::StaleHandle);
+        }
+        pending.raw.ok_or(HeapError::StaleHandle)
+    }
+
+    /// Releases one empty userdata reservation made by
+    /// [`Self::reserve_userdata`] and returns the slot generation after
+    /// release.
+    ///
+    /// The exact pending record must still name this slot and generation, and
+    /// the slot itself must carry no binding, edge, metatable, mode pointer,
+    /// or carrier. Those checks are O(1): this call does not walk the roots or
+    /// the owner chains, and it is not a rollback for an arbitrary published
+    /// userdata. The next issuance takes the next generation (or the slot
+    /// retires at the generation cap).
+    pub(super) fn rollback_empty_userdata(
+        &mut self,
+        handle: UserdataRef,
+    ) -> Result<u32, HeapError> {
         self.require_userdata(handle)?;
         self.ensure_sweep_open()?;
-        self.clear_rooted_to(Rooted::Userdata(handle));
-        self.remove_edges_touching(handle.slot());
+        let index = handle.slot() as usize;
+        let Some(pending) = self.pending_userdata else {
+            return Err(HeapError::StaleHandle);
+        };
+        if pending.slot != handle.slot() || pending.generation != handle.generation() {
+            return Err(HeapError::StaleHandle);
+        }
+        let slot = &self.slots[index];
+        if slot.token.is_some()
+            || slot.edge_head.is_some()
+            || slot.edge_tail.is_some()
+            || slot.metatable.is_some()
+            || slot.mode_edge.is_some()
+            || slot.carrier.is_some()
+        {
+            return Err(HeapError::Scope(
+                "userdata rollback is only valid for an empty reservation".to_string(),
+            ));
+        }
+        self.pending_userdata = None;
         self.release_slot(handle.slot());
-        Ok(self.slots[handle.slot() as usize].generation)
+        Ok(self.slots[index].generation)
     }
 
     /// Clears the token stored on `table` without searching other slots.
@@ -3111,18 +3250,19 @@ impl LuaHeap {
     /// A saved published tail is drained first, then this starts a fresh cycle.
     /// This is the pure-heap collector. A host heap must use `heap::collect`,
     /// which closes tokens before [`Self::sweep_marked`]. A dead slot that
-    /// still stores a bound host token is refused instead of released, so this
-    /// path cannot skip a typed resource.
+    /// still stores a bound host token is refused by the shared sweep
+    /// selection, before weak publication or release, so this path cannot
+    /// skip a typed resource.
     ///
     /// # Panics
     ///
-    /// Panics when an unmarked live slot still carries a bound token. This
-    /// method has no `HostContext`, so it cannot close that resource. The host
-    /// collector closes every doomed token first and clears the binding.
+    /// Panics when the shared selection step reaches an unmarked live slot
+    /// that still carries a bound host token. This method has no
+    /// `HostContext`, so it cannot close that resource. The host collector
+    /// closes every doomed token first and clears the binding.
     pub fn collect(&mut self) -> CollectReport {
         self.drain_sweep_tail();
         let modes = self.mark_reachable();
-        self.assert_no_bound_dead_slots();
         self.sweep_marked(modes)
     }
 
@@ -3131,29 +3271,13 @@ impl LuaHeap {
     /// [`SweepSession`] drains the same sweep used by [`Self::collect`] and
     /// by [`MarkSession::sweep`]. `heap::collect` reaches it through this
     /// function after tokens close. The report is built once, after the drain.
-    /// This function does not return a partial sweep.
+    /// This function does not return a partial sweep. The shared selection
+    /// step refuses (panics on) a dead slot that still stores a host token:
+    /// a host caller must close and clear every doomed binding first.
     pub(super) fn sweep_marked(&mut self, modes: MarkSnapshot) -> CollectReport {
         let mut session = SweepSession::start(self, modes);
         session.drain();
         session.report()
-    }
-
-    /// A dead slot that still stores a host token cannot be released without
-    /// closing that token. Host collectors clear every doomed binding before
-    /// sweep; a direct pure-heap sweep refuses instead of leaking the resource.
-    #[track_caller]
-    fn assert_no_bound_dead_slots(&self) {
-        let bound = self
-            .slots
-            .iter()
-            .filter(|slot| {
-                matches!(slot.state, SlotState::Live { marked: false }) && slot.token.is_some()
-            })
-            .count();
-        assert!(
-            bound == 0,
-            "lua heap pure sweep reached {bound} dead slot(s) with a bound host token; use heap::collect so the token is closed first"
-        );
     }
 
     /// Refuses a parked mark without clearing it. Otherwise the same fresh
@@ -3233,6 +3357,13 @@ impl LuaHeap {
         self.slots
             .get(slot as usize)
             .is_some_and(|stored| matches!(stored.state, SlotState::Live { .. }))
+    }
+
+    /// Owner chains the legacy rollback edge walk opened since the heap was
+    /// created. Test-only observation for the empty-reservation rollback.
+    #[cfg(test)]
+    pub(crate) fn rollback_owner_visits(&self) -> u64 {
+        self.rollback_owner_visits
     }
 
     /// Current occupancy. Peaks count storage, not only live objects.
@@ -3408,6 +3539,10 @@ impl LuaHeap {
 
     fn remove_edges_touching(&mut self, slot: u32) {
         for owner in 0..self.slots.len() {
+            #[cfg(test)]
+            {
+                self.rollback_owner_visits += 1;
+            }
             let mut prev = None;
             let mut cursor = self.slots[owner].edge_head;
             while let Some(index) = cursor {

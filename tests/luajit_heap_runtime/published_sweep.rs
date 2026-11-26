@@ -23,11 +23,12 @@
 //! `clear_exact_token` is the close primitive. Host collect is refused before
 //! it runs, so a saved tail never reaches it.
 
-use super::ParkedMark;
+use super::{MarkSession, ParkedMark};
 use vm::Value;
 
 use crate::heap::{
     self, HeapError, HeapLimits, LuaHeap, PublishedBoundary, PublishedResume, ScanMeter, TableRef,
+    UserdataRef,
 };
 
 fn limits() -> HeapLimits {
@@ -773,4 +774,205 @@ fn published_resume_matches_a_full_collect() {
     assert_eq!(resumed.0, 0.0, "rawlen ignores the cleared weak number");
     assert!(resumed.1 && resumed.2 && resumed.3);
     assert_ne!(resumed.4, 1, "both paths released the dead slot");
+}
+
+fn publish_userdata_resource(host: &mut vm::HostContext<'_>) -> (UserdataRef, u64) {
+    let userdata = heap::publish_userdata(host).expect("typed userdata");
+    let raw = heap::with_heap(host, |heap| heap.published_userdata_token(userdata))
+        .expect("bound userdata token");
+    (userdata, raw)
+}
+
+fn userdata_token_open(host: &vm::HostContext<'_>, raw: u64) -> bool {
+    let handle = vm::ResourceHandle::from_raw(raw).expect("valid userdata handle");
+    host.typed_resource_with_key::<heap::LuaUserdataResource>(
+        handle,
+        &heap::LuaUserdataResource::key(),
+    )
+    .is_ok()
+}
+
+/// The shared Select boundary also covers `MarkSession::sweep`, a pure-heap
+/// bypass that never runs the host close step. The refusal must leave the
+/// binding, generation, slot, and both real Core resources intact.
+#[test]
+fn pure_mark_session_sweep_refuses_a_bound_userdata_token() {
+    crate::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits()).expect("install");
+        let (control, control_raw) = publish_userdata_resource(&mut host);
+        let (doomed, doomed_raw) = publish_userdata_resource(&mut host);
+        let doomed_slot = doomed.slot();
+        let doomed_generation = doomed.generation();
+        let frame = heap::with_heap(&mut host, |heap| {
+            let frame = heap.enter_roots(1)?;
+            heap.write_userdata_root(frame, 0, control)?;
+            Ok(frame)
+        })
+        .expect("root control");
+        let resources_before = host.resource_count();
+
+        let refused = heap::with_heap(&mut host, |heap| {
+            let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut mark = MarkSession::start(heap);
+                mark.drain();
+                let _ = mark.sweep();
+            }))
+            .is_err();
+            Ok(refused)
+        })
+        .expect("pure mark session");
+        assert!(
+            refused,
+            "a dead slot with a bound token must be refused before release"
+        );
+        assert_eq!(
+            host.resource_count(),
+            resources_before,
+            "the pure sweep did not close either resource"
+        );
+        assert!(userdata_token_open(&host, control_raw));
+        assert!(userdata_token_open(&host, doomed_raw));
+        assert!(
+            heap::with_heap(&mut host, |heap| Ok(heap.userdata_alive(doomed)))
+                .expect("doomed physical"),
+            "refusal must not release the slot"
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| Ok(doomed_slot_of(heap, doomed_slot)))
+                .expect("generation"),
+            doomed_generation
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| heap.published_userdata_token(doomed))
+                .expect("binding intact"),
+            doomed_raw
+        );
+        assert_eq!(
+            heap::stats(&mut host).expect("stats").collections,
+            0,
+            "refusal must not record a collection"
+        );
+        assert!(!heap::saved_sweep_tail(&mut host).expect("no tail"));
+        let _ = frame;
+    });
+}
+
+/// `ParkedMark::complete` is the second pure-heap route to `sweep_marked`.
+/// It must refuse for the same real bound token and leave the same state.
+#[test]
+fn pure_parked_mark_complete_refuses_a_bound_userdata_token() {
+    crate::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits()).expect("install");
+        let (control, control_raw) = publish_userdata_resource(&mut host);
+        let (doomed, doomed_raw) = publish_userdata_resource(&mut host);
+        let doomed_slot = doomed.slot();
+        let doomed_generation = doomed.generation();
+        let frame = heap::with_heap(&mut host, |heap| {
+            let frame = heap.enter_roots(1)?;
+            heap.write_userdata_root(frame, 0, control)?;
+            Ok(frame)
+        })
+        .expect("root control");
+        let resources_before = host.resource_count();
+
+        let refused = heap::with_heap(&mut host, |heap| {
+            let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut parked = ParkedMark::start(heap).expect("parked mark");
+                for _ in 0..64 {
+                    if parked.pulse(1).finished {
+                        break;
+                    }
+                }
+                let _ = parked.complete();
+            }))
+            .is_err();
+            Ok(refused)
+        })
+        .expect("parked complete");
+        assert!(
+            refused,
+            "ParkedMark::complete must not release a bound dead slot"
+        );
+        assert_eq!(host.resource_count(), resources_before);
+        assert!(userdata_token_open(&host, control_raw));
+        assert!(userdata_token_open(&host, doomed_raw));
+        assert!(
+            heap::with_heap(&mut host, |heap| Ok(heap.userdata_alive(doomed)))
+                .expect("doomed physical")
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| Ok(doomed_slot_of(heap, doomed_slot)))
+                .expect("generation"),
+            doomed_generation
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| heap.published_userdata_token(doomed))
+                .expect("binding intact"),
+            doomed_raw
+        );
+        assert_eq!(heap::stats(&mut host).expect("stats").collections, 0);
+        let _ = frame;
+    });
+}
+
+/// Host collection is the positive control: it closes the doomed userdata
+/// token before the shared Select, so the same slot is accepted for release.
+#[test]
+fn host_collect_closes_bound_userdata_before_the_shared_select() {
+    crate::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits()).expect("install");
+        let (control, control_raw) = publish_userdata_resource(&mut host);
+        let (doomed, doomed_raw) = publish_userdata_resource(&mut host);
+        let doomed_slot = doomed.slot();
+        let doomed_generation = doomed.generation();
+        let (owner, frame) = heap::with_heap(&mut host, |heap| {
+            let meta = heap.alloc()?;
+            heap.set_mode_scalar(meta, Value::string("v"))?;
+            let owner = heap.alloc()?;
+            heap.set_metatable(owner, Some(meta))?;
+            heap.set_number_userdata(owner, 1.0, doomed)?;
+            let frame = heap.enter_roots(3)?;
+            heap.write_root(frame, 0, meta)?;
+            heap.write_root(frame, 1, owner)?;
+            heap.write_userdata_root(frame, 2, control)?;
+            Ok((owner, frame))
+        })
+        .expect("fixture");
+        let resources_before = host.resource_count();
+        let _ = heap::take_scan_meter(&mut host);
+
+        let report = heap::collect(&mut host).expect("host collect closes first");
+        assert_eq!(report.live_nodes, 3, "meta, owner, and the rooted control");
+        assert_eq!(
+            heap::take_scan_meter(&mut host)
+                .expect("meter")
+                .token_closes,
+            1,
+            "one close for the doomed userdata"
+        );
+        assert!(!userdata_token_open(&host, doomed_raw));
+        assert!(userdata_token_open(&host, control_raw));
+        assert_eq!(host.resource_count(), resources_before - 1);
+        assert!(
+            !heap::with_heap(&mut host, |heap| Ok(heap.userdata_alive(doomed))).expect("released")
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| Ok(doomed_slot_of(heap, doomed_slot)))
+                .expect("next generation"),
+            doomed_generation + 1
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| heap.number_userdata(owner, 1.0))
+                .expect("weak cleared"),
+            None
+        );
+        let _ = frame;
+    });
+}
+
+fn doomed_slot_of(heap: &LuaHeap, slot: u32) -> u32 {
+    heap.slot_generation(slot).expect("slot exists")
 }
