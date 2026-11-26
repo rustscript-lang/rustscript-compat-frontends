@@ -23,7 +23,7 @@
 
 use super::{
     CollectReport, EdgeKey, EdgeValue, GuestClass, HandleKind, HeapError, LuaHeap, MarkSnapshot,
-    ScanMeter, SlotState, TableRef,
+    ScanMeter, SlotState, TableRef, WeakMode,
 };
 use vm::Value;
 
@@ -52,6 +52,14 @@ struct SweepSlot {
     /// Generation whose parsed mode this slot held when the mark finished.
     /// A metatable reused after that parse does not inherit the old mode.
     mode_generation: u32,
+    /// Mark round that wrote the parse. A reset cache or a late parse from an
+    /// earlier round is not a current observation.
+    mode_round: u64,
+    /// The resolved weak bits for this slot, captured at the snapshot unit.
+    /// Sweep reads this record only; it does not query the indexed vector or
+    /// any record-keyed store. Both reset-parsed and late-parsed modes arrive
+    /// here through the same charged slot visit.
+    mode_weak: WeakMode,
 }
 
 enum SweepPhase {
@@ -500,11 +508,27 @@ impl<'a> SweepSession<'a> {
         let index = self.index;
         self.index += 1;
         let slot = &self.heap.slots[index];
+        // The snapshot unit is where the mode is resolved. The indexed vector
+        // covers the reset-sized prefix; a late parse outside it lives in the
+        // slot's own weak bits. Both are accepted only with the snapshot's
+        // round and the slot's generation, so a reused or stale parse reads
+        // as strong here. Sweep itself only reads this array.
+        let mode_weak =
+            if slot.mode_generation == slot.generation && slot.mode_round == self.modes.round {
+                match self.modes.modes.as_ref().and_then(|modes| modes.get(index)) {
+                    Some(mode) => *mode,
+                    None => slot.mode_weak,
+                }
+            } else {
+                WeakMode::default()
+            };
         self.snapshot.push(SweepSlot {
             marked: matches!(slot.state, SlotState::Live { marked: true }),
             kind: slot.kind,
             generation: slot.generation,
             mode_generation: slot.mode_generation,
+            mode_round: slot.mode_round,
+            mode_weak,
         });
         self.heap.scan.node_slot_visits += 1;
         self.heap.scan.scratch.sweep_bitmap_inited += 1;
@@ -554,17 +578,10 @@ impl<'a> SweepSession<'a> {
         if !mt.marked || mt.kind != HandleKind::Table || mt.generation != mt_generation {
             return false;
         }
-        if let Some((generation, mode)) = self.modes.late_modes.get(&mt_slot) {
-            return *generation == mt_generation && mode.values;
-        }
-        if mt.mode_generation != mt_generation {
+        if mt.mode_generation != mt_generation || mt.mode_round != self.modes.round {
             return false;
         }
-        self.modes
-            .modes
-            .as_ref()
-            .and_then(|modes| modes.get(mt_slot as usize))
-            .is_some_and(|mode| mode.values)
+        mt.mode_weak.values
     }
 
     fn step_edge(&mut self) -> bool {

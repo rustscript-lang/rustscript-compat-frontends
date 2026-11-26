@@ -278,6 +278,12 @@ struct Slot {
     /// rebuilt each round, but the slot generation survives; a stamp from an
     /// earlier round is not a current observation of the direct field.
     mode_round: u64,
+    /// Parsed weak bits for a slot outside the reset-sized `modes` vector.
+    /// Written together with `mode_generation` and `mode_round`; that triple
+    /// is the parse identity. The reset parse of an indexed slot stays in the
+    /// vector; this slot field replaces the old record-keyed map, so a late
+    /// parse neither inserts into a tree nor queries one.
+    mode_weak: WeakMode,
     /// This table is linked in the saved mark's late-mode parse queue. The
     /// links live on the slot, so a setter append and a release unlink are
     /// constant work and allocate nothing.
@@ -296,9 +302,12 @@ struct Slot {
     late_owner_prev: Option<u32>,
     late_owner_next: Option<u32>,
     /// Deleted-mode discovery stamp for a slot past the reset-sized sidecar.
-    /// `discover_batch == 0` is unarmed.
+    /// `discover_batch == 0` is unarmed. `discover_round` rejects a stamp from
+    /// an earlier mark: batch numbers restart at one, and a same-generation
+    /// metatable can outlive the mark that armed the stamp.
     discover_generation: u32,
     discover_batch: u32,
+    discover_round: u64,
     /// Mark epoch in which this owner's ordinary scan opened a weak side.
     /// Zero means no current-cycle weak start; an older epoch is inert. Set on
     /// the target slot only, so a grown slot needs no vector entry.
@@ -309,6 +318,13 @@ struct Slot {
     rescan_prev: Option<u32>,
     /// Next rescan-queue node. `None` at the tail or when not queued.
     rescan_next: Option<u32>,
+    /// This marked target is linked in the current mark's deferred-replay
+    /// queue. The links live on the slot, so a replay append is constant work
+    /// and never pushes the shared Gray `Vec`. A tag from an older mark is
+    /// inert; release unlinks the slot before reuse.
+    late_target_epoch: u64,
+    late_target_prev: Option<u32>,
+    late_target_next: Option<u32>,
 }
 
 /// Empty slot reserved for one late table. It is not a handle and cannot be
@@ -819,14 +835,16 @@ pub(super) struct DoomedToken {
 }
 
 /// Parsed weak modes for one collect. Built during the clear-mark slot walk
-/// from each table's direct `__mode` pointer, then borrowed by sweep. A close
-/// error before sweep drops it with the mark result, so the next collect
-/// parses again. It is not stored on the heap.
+/// from each table's direct `__mode` pointer, and resolved into one value per
+/// snapshot record for sweep. A close error before sweep drops it with the
+/// mark result, so the next collect parses again. It is not stored on the
+/// heap.
 pub(super) struct MarkSnapshot {
     modes: Option<Vec<WeakMode>>,
-    /// Late parsed modes outside the reset-sized `modes` vector, keyed by
-    /// metatable slot with the generation that owned the parse.
-    late_modes: std::collections::BTreeMap<u32, (u32, WeakMode)>,
+    /// Mark round that owns the parsed modes. A slot record carries the round
+    /// that wrote its parse, so a reused generation or an earlier round
+    /// cannot contribute a stale weak bit to this snapshot.
+    round: u64,
 }
 
 /// Doomed host tokens, plus the modes sweep needs after those tokens close.
@@ -1052,6 +1070,7 @@ impl LuaHeap {
         slot.mode_epoch = 0;
         slot.mode_generation = 0;
         slot.mode_round = 0;
+        slot.mode_weak = WeakMode::default();
         slot.late_mode_epoch = 0;
         slot.late_mode_prev = None;
         slot.late_mode_next = None;
@@ -1063,10 +1082,14 @@ impl LuaHeap {
         slot.late_owner_next = None;
         slot.discover_generation = 0;
         slot.discover_batch = 0;
+        slot.discover_round = 0;
         slot.rescan_epoch = 0;
         slot.rescan_queued = false;
         slot.rescan_prev = None;
         slot.rescan_next = None;
+        slot.late_target_epoch = 0;
+        slot.late_target_prev = None;
+        slot.late_target_next = None;
         Ok((index, slot.generation))
     }
 
@@ -1085,6 +1108,7 @@ impl LuaHeap {
             mode_epoch: 0,
             mode_generation: 0,
             mode_round: 0,
+            mode_weak: WeakMode::default(),
             late_mode_epoch: 0,
             late_mode_prev: None,
             late_mode_next: None,
@@ -1096,10 +1120,14 @@ impl LuaHeap {
             late_owner_next: None,
             discover_generation: 0,
             discover_batch: 0,
+            discover_round: 0,
             rescan_epoch: 0,
             rescan_queued: false,
             rescan_prev: None,
             rescan_next: None,
+            late_target_epoch: 0,
+            late_target_prev: None,
+            late_target_next: None,
         });
         self.note_node_peak();
         Ok((index, 1))
@@ -2401,6 +2429,14 @@ impl LuaHeap {
         self.ensure_sweep_open()?;
         let old_tuple = self.slots[owner.slot() as usize].metatable;
         let new_tuple = mt.map(|target| (target.slot(), target.generation()));
+        // A metatable first attached while mutation is open can have a direct
+        // `__mode` that the reset walk never read: with no metatable attached
+        // at Reset, the walk parses nothing. Register that read before the
+        // owner can be opened, and let the transition check below see the
+        // queued parse as unknown rather than as a strong default.
+        if let Some(target) = mt {
+            self.note_attached_mode(target.slot(), target.generation());
+        }
         let rescan = self.needs_owner_rescan(owner.slot(), old_tuple, new_tuple);
         let had = old_tuple.is_some();
         if had != new_tuple.is_some() {
@@ -3227,8 +3263,10 @@ impl LuaHeap {
         slot.mode_epoch = 0;
         slot.mode_generation = 0;
         slot.mode_round = 0;
+        slot.mode_weak = WeakMode::default();
         slot.discover_generation = 0;
         slot.discover_batch = 0;
+        slot.discover_round = 0;
         if slot.generation >= self.limits.max_generation {
             slot.state = SlotState::Retired;
             return;

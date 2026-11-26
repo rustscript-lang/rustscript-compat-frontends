@@ -15087,169 +15087,1065 @@ fn fill_gray_to_capacity(parked: &mut ParkedMark<'_>) -> (usize, usize) {
     }
 }
 
-/// Two real Gray capacity boundaries. The first deferred edge target is
-/// replayed when `len == cap`; its push copies the current capacity once and
-/// doubles it. The test refills that new capacity and repeats with a second
-/// live edge, so the evidence is two boundaries, not one insertion. Each
-/// late parse and deferred check is still one pulse unit; the copy is the
-/// explicit amortized tradeoff, bounded by live nodes.
-#[test]
-fn late_deferred_gray_push_reports_the_actual_capacity_boundaries() {
-    let mut heap = LuaHeap::new(limits(40, 16, 64));
-    let owner = heap.alloc().expect("owner");
-    let old = heap.alloc().expect("old value");
-    heap.set_edge(owner, KEY_X, old).expect("fixed live edge");
-    let gate = heap.alloc().expect("gate");
+// The former `late_deferred_gray_push_reports_the_actual_capacity_boundaries`
+// test encoded the rejected tradeoff: a deferred replay pushing the shared
+// Gray Vec and relocating it at a capacity boundary. The deferred replay now
+// uses an intrusive list on the slot records, so that behavior is replaced by
+// `late_deferred_key_and_value_replay_does_not_move_the_gray_vec_at_a_real_boundary`.
+
+// ---------------------------------------------------------------------------
+// Review ba3c944, item 1: a mode first attached after a zero-attachment Reset.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug)]
+enum FirstAttachArm {
+    /// Business: no metatable is attached at Reset; the metatable carries a
+    /// prewritten direct `v`; that first attachment happens while Gray is
+    /// parked before the unscanned owner opens.
+    ZeroAttachmentAttach,
+    /// Control: same heap, no attachment at all; the owner scan stays strong
+    /// and keeps its value.
+    OmittedAttachment,
+    /// Control: the same metatable is attached before Reset, so the reset
+    /// walk parses its direct mode.
+    ParsedAtReset,
+}
+
+struct FirstAttachGraph {
+    mt: TableRef,
+    owner: TableRef,
+    gate: TableRef,
+    gate_record: u32,
+    value: TableRef,
+    child: TableRef,
+}
+
+fn plant_first_attach(heap: &mut LuaHeap, attach_at_reset: bool) -> FirstAttachGraph {
+    let mt = heap.alloc().expect("first-attach metatable");
+    heap.set_mode_scalar(mt, Value::string("v"))
+        .expect("prewrite the direct v");
+    let owner = heap.alloc().expect("first-attach owner");
+    let value = heap.alloc().expect("first-attach value");
+    let child = heap.alloc().expect("first-attach child");
+    heap.set_named_edge(owner, "subj", value)
+        .expect("owner subj");
+    heap.set_named_edge(value, "next", child)
+        .expect("value next");
+    let gate = heap.alloc().expect("first-attach gate");
     heap.set_named_scalar(gate, "g0", Value::Bool(true))
-        .expect("gate record");
-    let gate_record = heap.locate_named(gate.slot(), "g0").expect("gate").1;
-    let frame = heap.enter_roots(2).expect("roots");
-    // Gray is LIFO: the gate pauses before the owner opens.
+        .expect("gate g0");
+    heap.set_named_scalar(gate, "g1", Value::Bool(true))
+        .expect("gate g1");
+    let (_, gate_record) = heap
+        .locate_named(gate.slot(), "g1")
+        .expect("gate g1 record");
+    if attach_at_reset {
+        heap.set_metatable(owner, Some(mt))
+            .expect("attach before Reset");
+    }
+    let frame = heap.enter_roots(2).expect("first-attach roots");
     heap.write_root(frame, 0, owner).expect("root owner");
     heap.write_root(frame, 1, gate).expect("root gate");
+    FirstAttachGraph {
+        mt,
+        owner,
+        gate,
+        gate_record,
+        value,
+        child,
+    }
+}
 
-    let mut boundaries = Vec::new();
-    let live_targets;
-    {
-        let mut parked = ParkedMark::start(&mut heap).expect("start mark");
-        pause_at(&mut parked, gate.slot(), gate_record);
-        assert!(parked.marked(owner));
-        assert_eq!(
-            parked.pending().map(|scan| scan.owner),
-            Some(gate.slot()),
-            "the owner is marked but not opened"
-        );
-        let m1 = parked
-            .with_saved_heap(|heap| heap.alloc())
-            .expect("grown first metatable");
-        parked
-            .with_saved_heap(|heap| heap.set_mode_scalar(m1, Value::string("x")))
-            .expect("first strong late mode");
-        parked
-            .with_saved_heap(|heap| heap.set_metatable(owner, Some(m1)))
-            .expect("attach the pending first metatable");
-        let t1 = parked
-            .with_saved_heap(|heap| heap.alloc())
-            .expect("first white target");
-        parked
-            .with_saved_heap(|heap| heap.set_edge(owner, KEY_X, t1))
-            .expect("overwrite the fixed edge while the mode is pending");
-        assert!(
-            !parked.marked(t1),
-            "the pending strong mode defers the first target"
-        );
-        pulse_until_late_parsed(&mut parked);
-        consume_one_deferred(&mut parked, "first owner check");
-        assert_eq!(
-            gray_shape(&mut parked).0,
-            2,
-            "the owner and its marked metatable are queued"
-        );
-        let before_shape = fill_gray_to_capacity(&mut parked);
-        assert_eq!(
-            before_shape,
-            (before_shape.0, before_shape.0),
-            "the gray stack is exactly at its capacity before the deferred push"
-        );
-        assert!(!parked.marked(t1));
-        let before = parked.meter();
-        let view = parked.pulse(1);
-        assert!(!view.finished, "the gate work remains after one replay");
-        let now = view.meter;
-        assert_eq!(
-            now.mode_late_deferred - before.mode_late_deferred,
-            1,
-            "the pulse consumed exactly one deferred edge record"
-        );
-        assert_eq!(
-            now.scratch.work_pushed - before.scratch.work_pushed,
-            1,
-            "the deferred replay marked exactly one target"
-        );
-        assert!(parked.marked(t1));
-        let after_shape = gray_shape(&mut parked);
-        assert_eq!(
-            after_shape.0,
-            before_shape.0 + 1,
-            "one target joined the gray stack"
-        );
-        assert!(
-            after_shape.1 > before_shape.1,
-            "the push crossed a real capacity boundary: before={:?} after={:?}",
-            before_shape,
-            after_shape
-        );
-        boundaries.push((before_shape, after_shape));
-
-        let m2 = parked
-            .with_saved_heap(|heap| heap.alloc())
-            .expect("grown second metatable");
-        parked
-            .with_saved_heap(|heap| heap.set_mode_scalar(m2, Value::string("x")))
-            .expect("second strong late mode");
-        parked
-            .with_saved_heap(|heap| heap.set_metatable(owner, Some(m2)))
-            .expect("attach the pending second metatable");
-        let t2 = parked
-            .with_saved_heap(|heap| heap.alloc())
-            .expect("second white target");
-        parked
-            .with_saved_heap(|heap| heap.set_edge(owner, KEY_X, t2))
-            .expect("overwrite the same live edge again");
-        assert!(
-            !parked.marked(t2),
-            "the pending mode defers the second target"
-        );
-        pulse_until_late_parsed(&mut parked);
-        consume_one_deferred(&mut parked, "second owner check");
-        let refilled = fill_gray_to_capacity(&mut parked);
-        assert_eq!(
-            refilled,
-            (refilled.0, refilled.0),
-            "the grown stack is refilled to its new capacity before the second replay"
-        );
-        assert!(!parked.marked(t2));
-        let before = parked.meter();
-        let view = parked.pulse(1);
-        assert!(!view.finished);
-        let now = view.meter;
-        assert_eq!(
-            now.mode_late_deferred - before.mode_late_deferred,
-            1,
-            "the second replay consumed one deferred edge record"
-        );
-        assert_eq!(now.scratch.work_pushed - before.scratch.work_pushed, 1);
-        assert!(parked.marked(t2));
-        let after_shape = gray_shape(&mut parked);
-        assert_eq!(after_shape.0, refilled.0 + 1);
-        assert!(
-            after_shape.1 > refilled.1,
-            "the second push crossed another real capacity boundary: before={:?} after={:?}",
-            refilled,
-            after_shape
-        );
-        boundaries.push((refilled, after_shape));
-
-        let mut view = parked.pulse(64);
-        while !view.finished {
-            view = parked.pulse(64);
+fn run_first_attach(arm: FirstAttachArm) {
+    let mut heap = LuaHeap::new(limits(20, 8, 32));
+    let graph = plant_first_attach(&mut heap, matches!(arm, FirstAttachArm::ParsedAtReset));
+    match arm {
+        FirstAttachArm::ZeroAttachmentAttach | FirstAttachArm::OmittedAttachment => {
+            assert_eq!(
+                heap.metatable_edges, 0,
+                "no metatable is attached when Reset runs"
+            );
         }
-        parked.complete().expect("sweep the capacity mark");
-        live_targets = Some((m1, m2, t1, t2));
+        FirstAttachArm::ParsedAtReset => assert_eq!(heap.metatable_edges, 1),
+    }
+    assert!(
+        heap.slots[graph.mt.slot() as usize].mode_edge.is_some(),
+        "the metatable carries a direct __mode record"
+    );
+    heap.take_scan_meter();
+    let mut registrations = 0u64;
+    let mut events = 0u64;
+    {
+        let mut parked = ParkedMark::start(&mut heap).expect("start first-attach mark");
+        pause_at(&mut parked, graph.gate.slot(), graph.gate_record);
+        assert!(parked.marked(graph.owner), "the owner is queued");
+        assert!(!parked.marked(graph.value), "its weak value starts white");
+        assert!(
+            parked.pending().map(|scan| scan.owner) != Some(graph.owner.slot()),
+            "the owner has not opened yet"
+        );
+        let before = parked.meter();
+        match arm {
+            FirstAttachArm::ZeroAttachmentAttach => {
+                parked
+                    .with_saved_heap(|heap| heap.set_metatable(graph.owner, Some(graph.mt)))
+                    .expect("first attachment during Gray");
+                assert_eq!(
+                    parked.with_saved_heap(|heap| heap.named_value(graph.mt, "__mode")),
+                    Ok(Value::string("v")),
+                    "the raw field really holds v"
+                );
+                let after = parked.meter();
+                registrations = after.mode_late_registrations - before.mode_late_registrations;
+                events = after.mode_late_events - before.mode_late_events;
+            }
+            FirstAttachArm::OmittedAttachment | FirstAttachArm::ParsedAtReset => {
+                assert_eq!(
+                    parked.meter().mode_late_registrations,
+                    before.mode_late_registrations,
+                    "this arm attaches nothing during Gray"
+                );
+            }
+        }
+        let _ = finish(&mut parked);
+        parked.complete().expect("sweep first-attach mark");
+    }
+    match arm {
+        FirstAttachArm::ZeroAttachmentAttach => {
+            assert!(
+                !heap.alive(graph.value),
+                "a mode first attached after a zero-attachment Reset must clear the weak value"
+            );
+            assert!(!heap.alive(graph.child), "its strong successor clears");
+            assert_eq!(heap.named_edge(graph.owner, "subj"), Ok(None));
+            assert_eq!(
+                registrations, 1,
+                "the first attachment registers exactly one late parse"
+            );
+            assert_eq!(
+                events, 1,
+                "the first attachment records the owner transition while the mode is unknown"
+            );
+        }
+        FirstAttachArm::OmittedAttachment => {
+            assert!(
+                heap.alive(graph.value),
+                "without an attachment the owner scan stays strong"
+            );
+            assert!(heap.alive(graph.child));
+            assert_eq!(heap.named_edge(graph.owner, "subj"), Ok(Some(graph.value)));
+        }
+        FirstAttachArm::ParsedAtReset => {
+            assert!(
+                !heap.alive(graph.value),
+                "an attachment present at Reset is parsed there"
+            );
+            assert!(!heap.alive(graph.child));
+            assert_eq!(heap.named_edge(graph.owner, "subj"), Ok(None));
+        }
+    }
+    assert!(heap.alive(graph.owner));
+    if !matches!(arm, FirstAttachArm::OmittedAttachment) {
+        assert!(heap.alive(graph.mt));
+    }
+}
+
+#[test]
+fn late_first_attachment_after_a_zero_attachment_reset_reads_the_prewritten_v() {
+    run_first_attach(FirstAttachArm::ZeroAttachmentAttach);
+}
+
+#[test]
+fn late_first_attachment_omitted_control_keeps_the_strong_value() {
+    run_first_attach(FirstAttachArm::OmittedAttachment);
+}
+
+#[test]
+fn late_first_attachment_parsed_at_reset_control_clears_the_weak_value() {
+    run_first_attach(FirstAttachArm::ParsedAtReset);
+}
+
+// ---------------------------------------------------------------------------
+// Review ba3c944, item 2: a same-tuple rescan must re-read the mode before the
+// next record is charged.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug)]
+enum SameTupleRescanArm {
+    /// Business: the rescan opened strong; `v` is written on the same
+    /// metatable tuple and parsed before the first record is charged.
+    LateWeakSameTuple,
+    /// Control: the same write is strong (`x`); the rescan stays strong.
+    LateStrongSameTuple,
+    /// Control: no rewrite; the strong rescan keeps its cached strength.
+    NoRewrite,
+}
+
+fn run_same_tuple_rescan(arm: SameTupleRescanArm) {
+    let mut heap = LuaHeap::new(limits(16, 8, 24));
+    let graph = plant_shared_mode_graph(&mut heap).expect("plant shared mode graph");
+    let mut parked = ParkedMark::start(&mut heap).expect("start same-tuple rescan mark");
+    pause_after_both_weak_edges(&mut parked, &graph);
+    parked
+        .with_saved_heap(|heap| -> Result<(), HeapError> {
+            heap.set_metatable(graph.left, Some(graph.strong_mt))?;
+            heap.set_metatable(graph.right, Some(graph.strong_mt))?;
+            Ok(())
+        })
+        .expect("switch both owners to the strong metatable");
+    let mut opened = false;
+    for _ in 0..HARNESS_BOUND {
+        if let Some(pending) = parked.pending_rescan()
+            && pending.owner == graph.left.slot()
+            && pending.cursor == graph.left_value_record
+        {
+            opened = true;
+            break;
+        }
+        assert!(
+            !parked.pulse(1).finished,
+            "the cycle finished before the left rescan reached its first record"
+        );
+    }
+    assert!(
+        opened,
+        "the left rescan head must be open right before its value record"
+    );
+    assert!(
+        !parked.marked(graph.left_value),
+        "the left target is white when the rescan head opens"
+    );
+    assert!(
+        parked.marked(graph.right_value) && parked.marked(graph.right_child),
+        "the right owner already resumed strong before the same-tuple write"
+    );
+
+    let parsed_before = parked.meter().mode_late_parsed;
+    if !matches!(arm, SameTupleRescanArm::NoRewrite) {
+        let mode = match arm {
+            SameTupleRescanArm::LateWeakSameTuple => "v",
+            SameTupleRescanArm::LateStrongSameTuple => "x",
+            SameTupleRescanArm::NoRewrite => unreachable!(),
+        };
+        parked
+            .with_saved_heap(|heap| heap.set_mode_scalar(graph.strong_mt, Value::string(mode)))
+            .expect("write the same metatable tuple");
+        while parked.meter().mode_late_parsed == parsed_before {
+            let view = parked.pulse(1);
+            assert!(!view.finished, "the cycle finished inside the mode parse");
+        }
+        assert_eq!(
+            parked.meter().mode_late_parsed - parsed_before,
+            1,
+            "one parse store for the same-tuple write"
+        );
+        assert_eq!(
+            parked
+                .pending_rescan()
+                .map(|scan| (scan.owner, scan.cursor)),
+            Some((graph.left.slot(), graph.left_value_record)),
+            "the parse did not consume the rescan record"
+        );
     }
 
-    let (m1, m2, t1, t2) = live_targets.expect("capacity targets");
-    assert!(heap.alive(owner) && heap.alive(gate));
-    assert!(heap.alive(m1) && heap.alive(m2));
-    assert!(heap.alive(t1) && heap.alive(t2));
+    let edges_before = parked.meter().outgoing_edge_checks;
+    let view = parked.pulse(1);
     assert_eq!(
-        heap.edge(owner, KEY_X),
-        Ok(Some(t2)),
-        "the fixed edge keeps its latest strong target"
+        view.meter.outgoing_edge_checks - edges_before,
+        1,
+        "the rescan record is the single charged unit"
     );
-    assert!(boundaries.len() == 2);
-    eprintln!("observed gray capacity shapes: {boundaries:?}");
-    // The copy cost of each boundary pulse is at most the old capacity, and
-    // the geometric growth keeps the total copied elements linear in live
-    // pushes.
+    let expect_weak = matches!(arm, SameTupleRescanArm::LateWeakSameTuple);
+    if expect_weak {
+        assert!(
+            !parked.marked(graph.left_value),
+            "the same-tuple v must be re-read; the white record target stays white"
+        );
+    } else {
+        assert!(
+            parked.marked(graph.left_value),
+            "a strong rescan keeps its target marked"
+        );
+    }
+    let _ = finish(&mut parked);
+    parked.complete().expect("sweep same-tuple rescan mark");
+    drop(parked);
+
+    assert!(heap.alive(graph.left) && heap.alive(graph.right));
+    assert!(heap.alive(graph.right_value) && heap.alive(graph.right_child));
+    if expect_weak {
+        assert!(
+            !heap.alive(graph.left_value) && !heap.alive(graph.left_child),
+            "the strong rescan must resume weak after the same-tuple v"
+        );
+        assert_eq!(heap.named_edge(graph.left, "subj"), Ok(None));
+        assert_eq!(
+            heap.named_edge(graph.right, "subj"),
+            Ok(Some(graph.right_value)),
+            "the already-rescanned right side keeps its marked value"
+        );
+    } else {
+        assert!(
+            heap.alive(graph.left_value) && heap.alive(graph.left_child),
+            "the left graph survives a strong same-tuple mode"
+        );
+        assert_eq!(
+            heap.named_edge(graph.left, "subj"),
+            Ok(Some(graph.left_value))
+        );
+    }
+    assert!(!heap.alive(graph.orphan));
+}
+
+#[test]
+fn same_tuple_rescan_reads_a_late_v_before_the_next_record() {
+    run_same_tuple_rescan(SameTupleRescanArm::LateWeakSameTuple);
+}
+
+#[test]
+fn same_tuple_rescan_late_strong_control_keeps_the_target() {
+    run_same_tuple_rescan(SameTupleRescanArm::LateStrongSameTuple);
+}
+
+#[test]
+fn same_tuple_rescan_no_rewrite_control_keeps_the_target() {
+    run_same_tuple_rescan(SameTupleRescanArm::NoRewrite);
+}
+
+// ---------------------------------------------------------------------------
+// Review ba3c944, item 3: a deletion stamp from an earlier round must not
+// shadow a same-generation k -> v transition.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug)]
+enum DeletionStampArm {
+    /// Business: round 1 arms the deletion stamp on the live metatable; in
+    /// round 2 its direct field is `k` before the owner scan, then the owner
+    /// is moved to a `v` metatable.
+    StaleStampSameMetatable,
+    /// Control: the same transition uses a fresh `k` metatable created in
+    /// round 2, so no earlier stamp applies.
+    FreshKMetatable,
+}
+
+struct StampFixture {
+    m: TableRef,
+    owner: TableRef,
+    gate: TableRef,
+    gate_record: u32,
+}
+
+fn plant_stamp_fixture(heap: &mut LuaHeap) -> StampFixture {
+    let m = heap.alloc().expect("stamp metatable");
+    let owner = heap.alloc().expect("stamp owner");
+    heap.set_metatable(owner, Some(m))
+        .expect("attach the empty mode metatable before round 1");
+    let gate = heap.alloc().expect("stamp gate");
+    heap.set_named_scalar(gate, "g0", Value::Bool(true))
+        .expect("gate g0");
+    heap.set_named_scalar(gate, "g1", Value::Bool(true))
+        .expect("gate g1");
+    let (_, gate_record) = heap
+        .locate_named(gate.slot(), "g1")
+        .expect("gate g1 record");
+    let frame = heap.enter_roots(3).expect("stamp roots");
+    heap.write_root(frame, 0, owner).expect("root owner");
+    heap.write_root(frame, 1, m).expect("root metatable");
+    heap.write_root(frame, 2, gate).expect("root gate");
+    StampFixture {
+        m,
+        owner,
+        gate,
+        gate_record,
+    }
+}
+
+/// Round 1: with no metatable attached at Reset, a prewritten `v` is parsed
+/// late on `m`, then the direct field is deleted. The delete arms the
+/// slot-fallback discovery stamp for `m`'s generation.
+fn arm_stale_deletion_stamp(heap: &mut LuaHeap, fixture: &StampFixture) {
+    let mut parked = ParkedMark::start(heap).expect("start stamp round");
+    pause_at(&mut parked, fixture.gate.slot(), fixture.gate_record);
+    assert!(parked.marked(fixture.owner) && parked.marked(fixture.m));
+    parked
+        .with_saved_heap(|heap| heap.set_mode_scalar(fixture.m, Value::string("v")))
+        .expect("write the round-1 v");
+    let parsed_before = parked.meter().mode_late_parsed;
+    while parked.meter().mode_late_parsed == parsed_before {
+        let view = parked.pulse(1);
+        assert!(
+            !view.finished,
+            "the cycle finished inside the round-1 parse"
+        );
+    }
+    parked
+        .with_saved_heap(|heap| heap.set_mode_scalar(fixture.m, Value::Null))
+        .expect("delete the direct mode");
+    parked.with_saved_heap(|heap| {
+        let slot = &heap.slots[fixture.m.slot() as usize];
+        assert_eq!(slot.discover_generation, fixture.m.generation());
+        assert!(
+            slot.discover_batch != 0,
+            "the deleted-mode stamp is armed on the slot fallback"
+        );
+    });
+    let _ = finish(&mut parked);
+    parked.complete().expect("sweep stamp round");
+    drop(parked);
+    assert!(heap.alive(fixture.m) && heap.alive(fixture.owner) && heap.alive(fixture.gate));
+}
+
+fn run_deletion_stamp(arm: DeletionStampArm) {
+    let mut heap = LuaHeap::new(limits(32, 8, 48));
+    let fixture = plant_stamp_fixture(&mut heap);
+    arm_stale_deletion_stamp(&mut heap, &fixture);
+    heap.take_scan_meter();
+
+    let key = heap.alloc().expect("stamp object key");
+    let child = heap.alloc().expect("stamp key child");
+    heap.set_named_edge(key, "next", child)
+        .expect("key successor");
+
+    let current = match arm {
+        DeletionStampArm::StaleStampSameMetatable => fixture.m,
+        DeletionStampArm::FreshKMetatable => heap.alloc().expect("fresh k metatable"),
+    };
+    let mut parked = ParkedMark::start(&mut heap).expect("start stamp round two");
+    pause_at(&mut parked, fixture.gate.slot(), fixture.gate_record);
+    assert!(
+        parked.marked(fixture.owner),
+        "the owner is queued before the round-two mode write"
+    );
+    assert!(
+        parked.pending().map(|scan| scan.owner) != Some(fixture.owner.slot()),
+        "the owner has not opened yet"
+    );
+    match arm {
+        DeletionStampArm::StaleStampSameMetatable => {
+            parked
+                .with_saved_heap(|heap| heap.set_mode_scalar(fixture.m, Value::string("k")))
+                .expect("write the round-two k on the stamped metatable");
+        }
+        DeletionStampArm::FreshKMetatable => {
+            parked
+                .with_saved_heap(|heap| -> Result<(), HeapError> {
+                    heap.set_mode_scalar(current, Value::string("k"))?;
+                    heap.set_metatable(fixture.owner, Some(current))
+                })
+                .expect("write and attach the fresh k metatable while its mode is queued");
+        }
+    }
+    let parsed_before = parked.meter().mode_late_parsed;
+    while parked.meter().mode_late_parsed == parsed_before {
+        let view = parked.pulse(1);
+        assert!(
+            !view.finished,
+            "the cycle finished inside the round-two k parse"
+        );
+    }
+    if matches!(arm, DeletionStampArm::FreshKMetatable) {
+        // The attach queued one deferred owner check. It is not the k -> v
+        // transition we are measuring.
+        let deferred_now = parked.meter().mode_late_deferred;
+        while parked.meter().mode_late_deferred == deferred_now {
+            let view = parked.pulse(1);
+            assert!(!view.finished, "the cycle finished inside the attach check");
+        }
+    }
+    let schedules_before = parked.meter().owner_rescan_schedules;
+
+    parked
+        .with_saved_heap(|heap| heap.set_object_scalar(fixture.owner, key, Value::string("ok")))
+        .expect("write the object key while the k mode is known");
+    let record = parked
+        .object_index(fixture.owner, key)
+        .expect("object key record");
+    assert!(
+        !parked.marked(key),
+        "a keys-weak mode must leave the object key white before the owner opens"
+    );
+
+    let mut opened = false;
+    for _ in 0..HARNESS_BOUND {
+        if let Some(pending) = parked.pending()
+            && pending.owner == fixture.owner.slot()
+            && pending.cursor == record
+        {
+            opened = true;
+            break;
+        }
+        assert!(
+            !parked.pulse(1).finished,
+            "the cycle finished before the owner opened on its key record"
+        );
+    }
+    assert!(
+        opened,
+        "the owner must open on the object-key record under k"
+    );
+    let _ = parked.pulse(1);
+    assert!(
+        !parked.marked(key),
+        "charging the key record under k must not mark the weak key"
+    );
+
+    let final_mt = parked
+        .with_saved_heap(|heap| heap.alloc())
+        .expect("final v metatable");
+    parked
+        .with_saved_heap(|heap| heap.set_mode_scalar(final_mt, Value::string("v")))
+        .expect("prewrite the final v");
+    parked
+        .with_saved_heap(|heap| heap.set_metatable(fixture.owner, Some(final_mt)))
+        .expect("move the owner to the v metatable");
+    assert_eq!(
+        parked.meter().owner_rescan_schedules,
+        schedules_before,
+        "an unresolved final mode defers the transition check"
+    );
+    let deferred_now = parked.meter().mode_late_deferred;
+    while parked.meter().mode_late_deferred == deferred_now {
+        let view = parked.pulse(1);
+        assert!(
+            !view.finished,
+            "the cycle finished inside the final v parse"
+        );
+    }
+    let schedules_after_check = parked.meter().owner_rescan_schedules - schedules_before;
+
+    let _ = finish(&mut parked);
+    parked.complete().expect("sweep stamp round two");
+    drop(parked);
+
+    assert_eq!(heap.metatable(fixture.owner), Ok(Some(final_mt)));
+    assert!(heap.alive(fixture.owner) && heap.alive(fixture.m) && heap.alive(final_mt));
+    let keep_key = matches!(arm, DeletionStampArm::FreshKMetatable) || schedules_after_check == 1;
+    if keep_key {
+        assert!(
+            heap.alive(key),
+            "{arm:?}: the original strong key must survive the k -> v transition"
+        );
+        assert!(
+            heap.alive(child),
+            "{arm:?}: the key's descendant must survive"
+        );
+        assert_eq!(
+            heap.find_key(fixture.owner.slot(), &super::EdgeKey::object(key)),
+            Some(record),
+            "{arm:?}: the current edge keeps the original record"
+        );
+    } else {
+        assert!(
+            !heap.alive(key),
+            "{arm:?}: the stale deletion stamp shadowed the k -> v transition"
+        );
+        assert!(!heap.alive(child));
+        assert_eq!(
+            heap.find_key(fixture.owner.slot(), &super::EdgeKey::object(key)),
+            None
+        );
+    }
+    if matches!(arm, DeletionStampArm::StaleStampSameMetatable) {
+        assert_eq!(
+            schedules_after_check, 1,
+            "the same-generation k -> v transition must schedule one strong rescan"
+        );
+    }
+    assert!(heap.alive(fixture.gate), "the gate is rooted");
+}
+
+#[test]
+fn stale_deletion_stamp_does_not_shadow_a_same_generation_k_to_v_transition() {
+    run_deletion_stamp(DeletionStampArm::StaleStampSameMetatable);
+}
+
+#[test]
+fn fresh_k_metatable_control_keeps_the_original_key_across_k_to_v() {
+    run_deletion_stamp(DeletionStampArm::FreshKMetatable);
+}
+
+// ---------------------------------------------------------------------------
+// Review ba3c944, item 4: a deferred edge payload queued while the mode was
+// unknown must be updated or cancelled by a later known-mode overwrite.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug)]
+enum ObsoleteEventArm {
+    ReplaceWithTable,
+    ReplaceWithScalar,
+    KeepTheOldTarget,
+}
+
+fn run_obsolete_deferred_event(arm: ObsoleteEventArm) {
+    let mut heap = LuaHeap::new(limits(20, 8, 32));
+    let owner = heap.alloc().expect("event owner");
+    let old = heap.alloc().expect("event old value");
+    let first = heap.alloc().expect("event first replacement");
+    let second = heap.alloc().expect("event second replacement");
+    heap.set_named_edge(owner, "subj", old)
+        .expect("fixed live event edge");
+    let mt = heap.alloc().expect("event metatable");
+    let gate = heap.alloc().expect("event gate");
+    heap.set_named_scalar(gate, "g0", Value::Bool(true))
+        .expect("gate g0");
+    heap.set_named_scalar(gate, "g1", Value::Bool(true))
+        .expect("gate g1");
+    let (_, gate_record) = heap
+        .locate_named(gate.slot(), "g1")
+        .expect("gate g1 record");
+    let frame = heap.enter_roots(2).expect("event roots");
+    heap.write_root(frame, 0, owner).expect("root owner");
+    heap.write_root(frame, 1, gate).expect("root gate");
+    let record = heap
+        .locate_named(owner.slot(), "subj")
+        .expect("event subj record")
+        .1;
+
+    let mut parked = ParkedMark::start(&mut heap).expect("start event mark");
+    pause_at(&mut parked, gate.slot(), gate_record);
+    assert!(parked.marked(owner));
+    // Queue the live target while the owner's metatable mode is unknown.
+    parked
+        .with_saved_heap(|heap| heap.set_mode_scalar(mt, Value::string("x")))
+        .expect("write the pending strong mode");
+    parked
+        .with_saved_heap(|heap| heap.set_metatable(owner, Some(mt)))
+        .expect("attach the pending strong metatable");
+    parked
+        .with_saved_heap(|heap| heap.set_named_edge(owner, "subj", first))
+        .expect("write the first target while the mode is unknown");
+    assert!(
+        !parked.marked(first),
+        "the unknown mode defers the first target"
+    );
+    assert_eq!(
+        parked.with_saved_heap(|heap| heap.edge_slots[record as usize].late_value),
+        Some((first.slot(), first.generation())),
+        "the first target really sits on the queued record"
+    );
+
+    // Finish the strong parse, but do not consume the deferred edge event yet.
+    let parsed_before = parked.meter().mode_late_parsed;
+    while parked.meter().mode_late_parsed == parsed_before {
+        let view = parked.pulse(1);
+        assert!(!view.finished, "the cycle finished inside the event parse");
+    }
+    assert_eq!(
+        parked.meter().mode_late_deferred,
+        0,
+        "the deferred edge event has not been consumed yet"
+    );
+    let events_before = parked.meter().mode_late_events;
+    match arm {
+        ObsoleteEventArm::ReplaceWithTable => {
+            parked
+                .with_saved_heap(|heap| heap.set_named_edge(owner, "subj", second))
+                .expect("replace the live edge with the second table");
+        }
+        ObsoleteEventArm::ReplaceWithScalar => {
+            parked
+                .with_saved_heap(|heap| {
+                    heap.set_named_scalar(owner, "subj", Value::string("scalar"))
+                })
+                .expect("replace the live edge with a non-nil scalar");
+        }
+        ObsoleteEventArm::KeepTheOldTarget => {}
+    }
+    let events_after = parked.meter().mode_late_events;
+    let payload_after_rewrite =
+        parked.with_saved_heap(|heap| heap.edge_slots[record as usize].late_value);
+
+    pulse_until_late_quiet(&mut parked);
+    let _ = finish(&mut parked);
+    parked.complete().expect("sweep obsolete-event mark");
+    drop(parked);
+
+    match arm {
+        ObsoleteEventArm::KeepTheOldTarget => {
+            assert!(
+                heap.alive(first),
+                "the live first target is retained when nothing overwrites it"
+            );
+            assert!(!heap.alive(second));
+            assert_eq!(heap.named_edge(owner, "subj"), Ok(Some(first)));
+            assert_eq!(
+                payload_after_rewrite,
+                Some((first.slot(), first.generation()))
+            );
+        }
+        ObsoleteEventArm::ReplaceWithTable => {
+            assert!(
+                !heap.alive(first),
+                "an overwritten deferred target must not be replayed after its parse"
+            );
+            assert!(heap.alive(second), "the live replacement survives");
+            assert_eq!(heap.named_edge(owner, "subj"), Ok(Some(second)));
+            assert_eq!(
+                payload_after_rewrite,
+                Some((second.slot(), second.generation())),
+                "the queued payload is updated in place to the live replacement"
+            );
+        }
+        ObsoleteEventArm::ReplaceWithScalar => {
+            assert!(
+                !heap.alive(first),
+                "a table payload replaced by a non-nil scalar must not be replayed"
+            );
+            assert!(!heap.alive(second));
+            assert_eq!(
+                heap.named_value(owner, "subj"),
+                Ok(Value::string("scalar")),
+                "the live scalar edge keeps its value"
+            );
+            assert_eq!(
+                payload_after_rewrite, None,
+                "the queued table payload is cancelled"
+            );
+        }
+    }
+    assert_eq!(
+        events_after, events_before,
+        "{arm:?}: a known-mode overwrite creates no second deferred event"
+    );
+    assert_eq!(
+        heap.locate_named(owner.slot(), "subj")
+            .map(|(_, index)| index),
+        Some(record),
+        "{arm:?}: the live edge keeps its record identity"
+    );
+    assert!(!heap.alive(old), "the overwritten original value clears");
+    assert!(heap.alive(owner) && heap.alive(gate) && heap.alive(mt));
+}
+
+#[test]
+fn known_mode_rewrite_cancels_an_obsolete_deferred_table_payload() {
+    run_obsolete_deferred_event(ObsoleteEventArm::ReplaceWithTable);
+}
+
+#[test]
+fn known_mode_scalar_rewrite_cancels_an_obsolete_deferred_table_payload() {
+    run_obsolete_deferred_event(ObsoleteEventArm::ReplaceWithScalar);
+}
+
+#[test]
+fn known_mode_no_rewrite_control_keeps_the_queued_live_target() {
+    run_obsolete_deferred_event(ObsoleteEventArm::KeepTheOldTarget);
+}
+
+// ---------------------------------------------------------------------------
+// Review ba3c944, budget: deferred key+value replay must not push the shared
+// Gray Vec at a real capacity boundary.
+// ---------------------------------------------------------------------------
+
+struct DeferredBoundaryFixture {
+    owner: TableRef,
+    gate: TableRef,
+    gate_record: u32,
+}
+
+fn plant_deferred_boundary(heap: &mut LuaHeap) -> (DeferredBoundaryFixture, ParkedMark<'_>) {
+    let owner = heap.alloc().expect("boundary owner");
+    let old = heap.alloc().expect("boundary old value");
+    heap.set_named_edge(owner, "subj", old)
+        .expect("fixed boundary edge");
+    let gate = heap.alloc().expect("boundary gate");
+    heap.set_named_scalar(gate, "g0", Value::Bool(true))
+        .expect("gate g0");
+    heap.set_named_scalar(gate, "g1", Value::Bool(true))
+        .expect("gate g1");
+    let (_, gate_record) = heap
+        .locate_named(gate.slot(), "g1")
+        .expect("gate g1 record");
+    let frame = heap.enter_roots(2).expect("boundary roots");
+    heap.write_root(frame, 0, owner).expect("root owner");
+    heap.write_root(frame, 1, gate).expect("root gate");
+    let _ = heap.take_scan_meter();
+    (
+        DeferredBoundaryFixture {
+            owner,
+            gate,
+            gate_record,
+        },
+        ParkedMark::start(heap).expect("start boundary mark"),
+    )
+}
+
+#[test]
+fn late_deferred_key_and_value_replay_does_not_move_the_gray_vec_at_a_real_boundary() {
+    let mut heap = LuaHeap::new(limits(64, 16, 96));
+    let (fixture, mut parked) = plant_deferred_boundary(&mut heap);
+    pause_at(&mut parked, fixture.gate.slot(), fixture.gate_record);
+    assert!(parked.marked(fixture.owner));
+    let mt = parked
+        .with_saved_heap(|heap| heap.alloc())
+        .expect("boundary metatable");
+    parked
+        .with_saved_heap(|heap| heap.set_mode_scalar(mt, Value::string("x")))
+        .expect("write the pending strong mode");
+    parked
+        .with_saved_heap(|heap| heap.set_metatable(fixture.owner, Some(mt)))
+        .expect("attach the pending strong metatable");
+    let key = parked
+        .with_saved_heap(|heap| heap.alloc())
+        .expect("boundary object key");
+    let value = parked
+        .with_saved_heap(|heap| heap.alloc())
+        .expect("boundary table value");
+    parked
+        .with_saved_heap(|heap| heap.set_object_edge(fixture.owner, key, value))
+        .expect("insert the table key and value while the mode is pending");
+    let record = parked
+        .object_index(fixture.owner, key)
+        .expect("queued object record");
+    assert!(
+        !parked.marked(key) && !parked.marked(value),
+        "both object targets start white"
+    );
+    assert_eq!(
+        parked.with_saved_heap(|heap| heap.edge_slots[record as usize].late_key),
+        Some((key.slot(), key.generation()))
+    );
+    assert_eq!(
+        parked.with_saved_heap(|heap| heap.edge_slots[record as usize].late_value),
+        Some((value.slot(), value.generation()))
+    );
+
+    pulse_until_late_parsed(&mut parked);
+    consume_one_deferred(&mut parked, "boundary owner check");
+    assert!(
+        !parked.marked(key) && !parked.marked(value),
+        "the edge event is still queued after the owner check"
+    );
+
+    let before_shape = fill_gray_to_capacity(&mut parked);
+    assert_eq!(
+        (before_shape.0, before_shape.1),
+        (before_shape.0, before_shape.0),
+        "the shared Gray Vec is exactly at its capacity before the replay"
+    );
+    let before = parked.meter();
+    let view = parked.pulse(1);
+    assert_eq!(
+        view.meter.mode_late_deferred - before.mode_late_deferred,
+        1,
+        "the pulse consumes exactly one deferred edge record"
+    );
+    assert_eq!(
+        view.meter.scratch.work_pushed - before.scratch.work_pushed,
+        2,
+        "the key and the value are both newly marked"
+    );
+    assert!(parked.marked(key) && parked.marked(value));
+    let (key_tag, value_tag) = parked.with_saved_heap(|heap| {
+        (
+            heap.slots[key.slot() as usize].late_target_epoch,
+            heap.slots[value.slot() as usize].late_target_epoch,
+        )
+    });
+    assert_ne!(key_tag, 0, "the replay links the key target on its slot");
+    assert_ne!(
+        value_tag, 0,
+        "the replay links the value target on its slot"
+    );
+    let after_shape = gray_shape(&mut parked);
+    assert_eq!(
+        after_shape, before_shape,
+        "the deferred key+value replay must not push the shared Gray Vec; \
+         a push at len == cap would relocate the stored segment"
+    );
+
+    let edges_before = parked.meter().outgoing_edge_checks;
+    let view = parked.pulse(1);
+    assert_eq!(
+        view.meter.outgoing_edge_checks - edges_before,
+        1,
+        "ordinary Gray still advances one edge after the replay"
+    );
+
+    let _ = finish(&mut parked);
+    parked.complete().expect("sweep boundary mark");
+    drop(parked);
+    assert!(heap.alive(fixture.owner) && heap.alive(fixture.gate) && heap.alive(mt));
+    assert!(
+        heap.alive(key) && heap.alive(value),
+        "both deferred targets are marked before Done"
+    );
+    assert_eq!(
+        heap.find_key(fixture.owner.slot(), &super::EdgeKey::object(key)),
+        Some(record),
+        "the live object edge keeps its record"
+    );
+}
+
+#[test]
+fn late_deferred_replay_skips_an_already_marked_value_target() {
+    let mut heap = LuaHeap::new(limits(48, 16, 72));
+    let (fixture, mut parked) = plant_deferred_boundary(&mut heap);
+    pause_at(&mut parked, fixture.gate.slot(), fixture.gate_record);
+    let mt = parked
+        .with_saved_heap(|heap| heap.alloc())
+        .expect("marked metatable");
+    parked
+        .with_saved_heap(|heap| heap.set_mode_scalar(mt, Value::string("x")))
+        .expect("pending strong mode");
+    parked
+        .with_saved_heap(|heap| heap.set_metatable(fixture.owner, Some(mt)))
+        .expect("attach");
+    let key = parked
+        .with_saved_heap(|heap| heap.alloc())
+        .expect("marked object key");
+    let value = parked
+        .with_saved_heap(|heap| heap.alloc())
+        .expect("premarked value");
+    parked
+        .with_saved_heap(|heap| heap.set_object_edge(fixture.owner, key, value))
+        .expect("queued insert");
+    parked
+        .accept_root_batch(&[super::Rooted::Table(value)])
+        .expect("mark the value target through the root batch");
+    assert!(parked.marked(value));
+    pulse_until_late_parsed(&mut parked);
+    consume_one_deferred(&mut parked, "marked owner check");
+    let before = parked.meter();
+    let view = parked.pulse(1);
+    assert_eq!(view.meter.mode_late_deferred - before.mode_late_deferred, 1);
+    assert_eq!(
+        view.meter.scratch.work_pushed - before.scratch.work_pushed,
+        1,
+        "only the key is newly marked; the value target was already marked"
+    );
+    assert!(parked.marked(key) && parked.marked(value));
+    let _ = finish(&mut parked);
+    parked.complete().expect("sweep marked-target mark");
+    drop(parked);
+    assert!(heap.alive(key) && heap.alive(value));
+}
+
+#[test]
+fn release_of_a_pending_replay_target_clears_its_queue_tag_and_reuse_is_clean() {
+    let mut heap = LuaHeap::new(limits(48, 16, 72));
+    let (fixture, mut parked) = plant_deferred_boundary(&mut heap);
+    pause_at(&mut parked, fixture.gate.slot(), fixture.gate_record);
+    let mt = parked
+        .with_saved_heap(|heap| heap.alloc())
+        .expect("release metatable");
+    parked
+        .with_saved_heap(|heap| heap.set_mode_scalar(mt, Value::string("x")))
+        .expect("pending strong mode");
+    parked
+        .with_saved_heap(|heap| heap.set_metatable(fixture.owner, Some(mt)))
+        .expect("attach");
+    let key = parked
+        .with_saved_heap(|heap| heap.alloc())
+        .expect("release object key");
+    let doomed = parked
+        .with_saved_heap(|heap| heap.alloc())
+        .expect("pending doomed value");
+    parked
+        .with_saved_heap(|heap| heap.set_object_edge(fixture.owner, key, doomed))
+        .expect("queued insert");
+    pulse_until_late_parsed(&mut parked);
+    consume_one_deferred(&mut parked, "release owner check");
+    let view = parked.pulse(1);
+    assert_eq!(
+        view.meter.mode_late_deferred, 2,
+        "the owner check and the edge event are consumed before the target release"
+    );
+    assert!(parked.marked(key) && parked.marked(doomed));
+    parked
+        .with_saved_heap(|heap| heap.rollback(doomed))
+        .expect("release the pending target before it opens");
+    assert!(
+        !parked.with_saved_heap(|heap| heap.alive(doomed)),
+        "the pending target is really released"
+    );
+    let released_tags = parked.with_saved_heap(|heap| {
+        let slot = &heap.slots[doomed.slot() as usize];
+        (
+            slot.late_target_epoch,
+            slot.late_target_prev,
+            slot.late_target_next,
+        )
+    });
+    assert_eq!(
+        released_tags,
+        (0, None, None),
+        "release unlinks the pending target and clears its queue tag"
+    );
+    let reused = parked
+        .with_saved_heap(|heap| heap.alloc())
+        .expect("reuse the released slot");
+    assert_eq!(reused.slot(), doomed.slot());
+    assert_ne!(reused.generation(), doomed.generation());
+    let reused_tag =
+        parked.with_saved_heap(|heap| heap.slots[reused.slot() as usize].late_target_epoch);
+    assert_eq!(reused_tag, 0, "reuse inherits no replay tag");
+    parked
+        .accept_root_batch(&[super::Rooted::Table(reused)])
+        .expect("root the reused slot");
+    let _ = finish(&mut parked);
+    parked.complete().expect("sweep released-target mark");
+    drop(parked);
+    assert!(!heap.alive(doomed), "the released pending target clears");
+    assert!(heap.alive(reused), "the reused slot survives");
+    assert!(heap.alive(key), "the key marked by the replay survives");
+}
+
+#[test]
+fn abandoned_mark_clears_a_pending_replay_target_tag() {
+    let mut heap = LuaHeap::new(limits(48, 16, 72));
+    let (fixture, mut parked) = plant_deferred_boundary(&mut heap);
+    pause_at(&mut parked, fixture.gate.slot(), fixture.gate_record);
+    let mt = parked
+        .with_saved_heap(|heap| heap.alloc())
+        .expect("abandon metatable");
+    parked
+        .with_saved_heap(|heap| heap.set_mode_scalar(mt, Value::string("x")))
+        .expect("pending strong mode");
+    parked
+        .with_saved_heap(|heap| heap.set_metatable(fixture.owner, Some(mt)))
+        .expect("attach");
+    let key = parked
+        .with_saved_heap(|heap| heap.alloc())
+        .expect("abandon object key");
+    let doomed = parked
+        .with_saved_heap(|heap| heap.alloc())
+        .expect("abandon doomed value");
+    parked
+        .with_saved_heap(|heap| heap.set_object_edge(fixture.owner, key, doomed))
+        .expect("queued insert");
+    pulse_until_late_parsed(&mut parked);
+    consume_one_deferred(&mut parked, "abandon owner check");
+    let _ = parked.pulse(1);
+    assert!(parked.marked(key) && parked.marked(doomed));
+    let linked = parked.with_saved_heap(|heap| {
+        (
+            heap.slots[key.slot() as usize].late_target_epoch,
+            heap.slots[doomed.slot() as usize].late_target_epoch,
+        )
+    });
+    assert_ne!(linked.0, 0);
+    assert_ne!(linked.1, 0);
+    // Dropping without `park` abandons the saved mark. The old-epoch target
+    // tags stay inert and release must clear them.
+    drop(parked);
+    heap.rollback(doomed)
+        .expect("release the abandoned pending target");
+    let released = (
+        heap.slots[doomed.slot() as usize].late_target_epoch,
+        heap.slots[doomed.slot() as usize].late_target_prev,
+        heap.slots[doomed.slot() as usize].late_target_next,
+    );
+    assert_eq!(
+        released,
+        (0, None, None),
+        "release under no mark clears the abandoned replay tag"
+    );
+    let reused = heap.alloc().expect("reuse the abandoned slot");
+    assert_eq!(reused.slot(), doomed.slot());
+    assert_eq!(
+        heap.slots[reused.slot() as usize].late_target_epoch,
+        0,
+        "reuse starts with no inherited replay tag"
+    );
 }
