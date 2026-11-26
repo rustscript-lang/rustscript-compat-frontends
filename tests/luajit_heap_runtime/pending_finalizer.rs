@@ -1955,3 +1955,1146 @@ fn linked_candidates_select_in_both_slot_orders_and_respect_a_rooted_target() {
         assert_eq!(rooted.records_after, 1);
     }
 }
+
+// -- White userdata with no raw `__gc` -------------------------------------
+//
+// The upstream `lj_gc_separateudata` pass runs before the second mark. A white
+// userdata whose metatable has no raw `__gc` is marked finalized but is not
+// put on the mmudata queue. The finalized flag has two consequences:
+//   * a later raw `__gc` installed on the same metatable never queues that
+//     generation (LuaJIT collects it as ordinary garbage); and
+//   * while the object is alive through another edge, weak *values* naming it
+//     are cleared even though weak *keys* are kept.
+// The Rust slice keeps the existing candidate filter: a live, unmarked,
+// token-bound userdata with a live table metatable. A userdata with no
+// metatable is not widened into this slice; it has no raw `__gc` site here.
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SettlementArm {
+    /// B is only reachable through A's metatable and has no raw `__gc`.
+    Linked,
+    /// B has an ordinary strong root in the first round and no raw `__gc`.
+    OrdinaryRoot,
+    /// B has a raw non-nil `__gc` field before the first round.
+    Preinstalled,
+}
+
+struct SettlementSeed {
+    a: UserdataRef,
+    a_raw: u64,
+    a_metatable: TableRef,
+    a_graph: TableRef,
+    a_graph_tail: TableRef,
+    b: UserdataRef,
+    b_raw: u64,
+    b_metatable: TableRef,
+    b_graph: TableRef,
+    b_graph_tail: TableRef,
+    orphan: TableRef,
+    weak_values: TableRef,
+    weak_keys: TableRef,
+    weak_frame: RootFrameId,
+    b_strong_frame: Option<RootFrameId>,
+}
+
+fn settlement_limits() -> HeapLimits {
+    HeapLimits {
+        nodes: 64,
+        roots: 8,
+        edges: 128,
+        max_generation: 8,
+    }
+}
+
+fn finalizer_settled(host: &mut vm::HostContext<'_>, userdata: UserdataRef) -> bool {
+    heap::with_heap(host, |heap| heap.slot_finalizer_settled(userdata)).expect("settled flag")
+}
+
+fn weak_value(host: &mut vm::HostContext<'_>, table: TableRef, key: f64) -> Option<UserdataRef> {
+    heap::with_heap(host, |heap| heap.number_userdata(table, key)).expect("weak value")
+}
+
+fn weak_key(host: &mut vm::HostContext<'_>, table: TableRef, key: UserdataRef) -> Value {
+    heap::with_heap(host, |heap| heap.userdata_key_value(table, key)).expect("weak key")
+}
+
+/// A's metatable has a raw `__gc = false` and strongly links B. B's metatable
+/// is empty for the linked and ordinary-root arms, and holds the same raw
+/// `false` for the preinstalled arm. Neither B nor its metatable is rooted in
+/// the linked and preinstalled arms. The weak tables are the only roots; the
+/// ordinary-root arm adds one separate B root that its test releases later.
+fn seed_settlement(
+    host: &mut vm::HostContext<'_>,
+    arm: SettlementArm,
+    b_first: bool,
+) -> SettlementSeed {
+    heap::install(host, settlement_limits()).expect("install");
+    let (a, a_raw, b, b_raw) = if b_first {
+        let b = heap::publish_userdata(host).expect("B");
+        let b_raw = bound_raw(host, b);
+        let a = heap::publish_userdata(host).expect("A");
+        let a_raw = bound_raw(host, a);
+        (a, a_raw, b, b_raw)
+    } else {
+        let a = heap::publish_userdata(host).expect("A");
+        let a_raw = bound_raw(host, a);
+        let b = heap::publish_userdata(host).expect("B");
+        let b_raw = bound_raw(host, b);
+        (a, a_raw, b, b_raw)
+    };
+    let (
+        a_metatable,
+        a_graph,
+        a_graph_tail,
+        b_metatable,
+        b_graph,
+        b_graph_tail,
+        orphan,
+        weak_values,
+        weak_keys,
+        weak_frame,
+    ) = heap::with_heap(host, |heap| {
+        let a_metatable = heap.alloc()?;
+        heap.set_named_scalar(a_metatable, "__gc", Value::Bool(false))?;
+        let a_graph = heap.alloc()?;
+        let a_graph_tail = heap.alloc()?;
+        heap.set_named_edge(a_metatable, "graph", a_graph)?;
+        heap.set_named_edge(a_graph, "next", a_graph_tail)?;
+        heap.set_named_edge(a_graph_tail, "next", a_graph)?;
+        heap.set_number_userdata(a_metatable, 9.0, b)?;
+        heap.set_userdata_metatable(a, Some(a_metatable))?;
+
+        let b_metatable = heap.alloc()?;
+        if arm == SettlementArm::Preinstalled {
+            heap.set_named_scalar(b_metatable, "__gc", Value::Bool(false))?;
+        }
+        let b_graph = heap.alloc()?;
+        let b_graph_tail = heap.alloc()?;
+        heap.set_named_edge(b_metatable, "graph", b_graph)?;
+        heap.set_named_edge(b_graph, "next", b_graph_tail)?;
+        heap.set_named_edge(b_graph_tail, "next", b_graph)?;
+        heap.set_userdata_metatable(b, Some(b_metatable))?;
+
+        let orphan = heap.alloc()?;
+        heap.set_edge(orphan, 1, orphan)?;
+
+        let weak_values = weak_table(heap, "v")?;
+        heap.set_number_userdata(weak_values, 1.0, a)?;
+        heap.set_number_userdata(weak_values, 2.0, b)?;
+        heap.set_number_edge(weak_values, 3.0, orphan)?;
+        let weak_keys = weak_table(heap, "k")?;
+        heap.set_userdata_key_scalar(weak_keys, a, Value::string("A"))?;
+        heap.set_userdata_key_scalar(weak_keys, b, Value::string("B"))?;
+
+        let weak_frame = heap.enter_roots(2)?;
+        heap.write_root(weak_frame, 0, weak_values)?;
+        heap.write_root(weak_frame, 1, weak_keys)?;
+        Ok((
+            a_metatable,
+            a_graph,
+            a_graph_tail,
+            b_metatable,
+            b_graph,
+            b_graph_tail,
+            orphan,
+            weak_values,
+            weak_keys,
+            weak_frame,
+        ))
+    })
+    .expect("settlement lattice");
+
+    let b_strong_frame = if arm == SettlementArm::OrdinaryRoot {
+        let frame = heap::with_heap(host, |heap| {
+            let frame = heap.enter_roots(1)?;
+            heap.write_userdata_root(frame, 0, b)?;
+            Ok(frame)
+        })
+        .expect("B strong root");
+        Some(frame)
+    } else {
+        None
+    };
+
+    SettlementSeed {
+        a,
+        a_raw,
+        a_metatable,
+        a_graph,
+        a_graph_tail,
+        b,
+        b_raw,
+        b_metatable,
+        b_graph,
+        b_graph_tail,
+        orphan,
+        weak_values,
+        weak_keys,
+        weak_frame,
+        b_strong_frame,
+    }
+}
+
+/// A, B's metatable, and both cyclic strong graph pairs are observable
+/// through real stored edges. B's graph is reachable only through the second
+/// mark's userdata-to-metatable edge when B has no ordinary root.
+fn assert_settlement_graph_alive(host: &mut vm::HostContext<'_>, seed: &SettlementSeed) {
+    assert_eq!(
+        heap::with_heap(host, |heap| heap.userdata_metatable(seed.a)).expect("A metatable"),
+        Some(seed.a_metatable)
+    );
+    assert_eq!(
+        heap::with_heap(host, |heap| heap.userdata_metatable(seed.b)).expect("B metatable"),
+        Some(seed.b_metatable)
+    );
+    assert_eq!(
+        heap::with_heap(host, |heap| heap.number_userdata(seed.a_metatable, 9.0))
+            .expect("A -> B edge"),
+        Some(seed.b)
+    );
+    assert_eq!(
+        heap::with_heap(host, |heap| heap.named_edge(seed.a_metatable, "graph")).expect("A graph"),
+        Some(seed.a_graph)
+    );
+    assert_eq!(
+        heap::with_heap(host, |heap| heap.named_edge(seed.a_graph, "next")).expect("A graph tail"),
+        Some(seed.a_graph_tail)
+    );
+    assert_eq!(
+        heap::with_heap(host, |heap| heap.named_edge(seed.a_graph_tail, "next"))
+            .expect("A graph cycle"),
+        Some(seed.a_graph)
+    );
+    assert_eq!(
+        heap::with_heap(host, |heap| heap.named_edge(seed.b_metatable, "graph")).expect("B graph"),
+        Some(seed.b_graph)
+    );
+    assert_eq!(
+        heap::with_heap(host, |heap| heap.named_edge(seed.b_graph, "next")).expect("B graph tail"),
+        Some(seed.b_graph_tail)
+    );
+    assert_eq!(
+        heap::with_heap(host, |heap| heap.named_edge(seed.b_graph_tail, "next"))
+            .expect("B graph cycle"),
+        Some(seed.b_graph)
+    );
+    for table in [
+        seed.a_metatable,
+        seed.a_graph,
+        seed.a_graph_tail,
+        seed.b_metatable,
+        seed.b_graph,
+        seed.b_graph_tail,
+    ] {
+        assert!(
+            alive(host, table),
+            "the strong subgraph of A and B stays alive"
+        );
+    }
+}
+
+fn assert_first_settlement_publication(
+    host: &mut vm::HostContext<'_>,
+    seed: &SettlementSeed,
+    arm: SettlementArm,
+) {
+    let _ = heap::take_scan_meter(host);
+    let boundary = publish_boundary(host);
+    assert!(matches!(boundary, PublishedBoundary::Published { .. }));
+    let records = pending_records(host);
+    assert!(
+        records
+            .iter()
+            .any(|record| record.1 == seed.a.slot() && record.2 == seed.a.generation()),
+        "A has a raw __gc and enters the pending queue"
+    );
+    assert!(
+        !finalizer_settled(host, seed.a),
+        "a queued finalizer is pending, not settled"
+    );
+    match arm {
+        SettlementArm::Linked => {
+            assert!(
+                finalizer_settled(host, seed.b),
+                "a linked white B with no raw __gc must be settled before the second mark"
+            );
+            assert_eq!(
+                records.len(),
+                1,
+                "linked B must not enter the pending queue; it survives only through A's metatable"
+            );
+        }
+        SettlementArm::OrdinaryRoot => {
+            assert!(
+                !finalizer_settled(host, seed.b),
+                "B was already marked from an ordinary root, so the white-userdata pass must skip it"
+            );
+            assert_eq!(records.len(), 1);
+        }
+        SettlementArm::Preinstalled => {
+            assert!(
+                !finalizer_settled(host, seed.b),
+                "a raw non-nil __gc is queued, not settled"
+            );
+            assert_eq!(records.len(), 2);
+            assert!(
+                records
+                    .iter()
+                    .any(|record| record.1 == seed.b.slot() && record.2 == seed.b.generation()),
+                "preinstalled B is enqueued in the first round"
+            );
+        }
+    }
+
+    assert_eq!(
+        weak_value(host, seed.weak_values, 1.0),
+        None,
+        "A's weak value is cleared"
+    );
+    match arm {
+        SettlementArm::OrdinaryRoot => assert_eq!(
+            weak_value(host, seed.weak_values, 2.0),
+            Some(seed.b),
+            "B's weak value survives while B has an ordinary strong root"
+        ),
+        SettlementArm::Linked | SettlementArm::Preinstalled => assert_eq!(
+            weak_value(host, seed.weak_values, 2.0),
+            None,
+            "a live finalized B is value-dead even when its weak value entry is marked"
+        ),
+    }
+    assert_eq!(
+        weak_value(host, seed.weak_values, 3.0),
+        None,
+        "the independent orphan is value-dead"
+    );
+    assert_eq!(
+        weak_key(host, seed.weak_keys, seed.a),
+        Value::string("A"),
+        "A is marked, so its weak key stays readable"
+    );
+    assert_eq!(
+        weak_key(host, seed.weak_keys, seed.b),
+        Value::string("B"),
+        "B is marked, so its weak key stays readable even when finalized"
+    );
+
+    assert!(userdata_token_open(host, seed.a_raw));
+    assert!(
+        userdata_token_open(host, seed.b_raw),
+        "B's original token must stay open while its generation is marked"
+    );
+    assert_eq!(
+        slot_generation(host, seed.b.slot()),
+        seed.b.generation(),
+        "settlement never advances the generation"
+    );
+    assert_settlement_graph_alive(host, seed);
+}
+
+fn assert_release_after_settlement(host: &mut vm::HostContext<'_>, seed: &SettlementSeed) {
+    let report = finish_release(host);
+    assert_eq!(report.live_nodes, 12);
+    assert!(!alive(host, seed.orphan));
+    assert_eq!(
+        slot_generation(host, seed.orphan.slot()),
+        seed.orphan.generation() + 1
+    );
+    assert_eq!(slot_generation(host, seed.a.slot()), seed.a.generation());
+    assert_eq!(slot_generation(host, seed.b.slot()), seed.b.generation());
+    assert!(userdata_token_open(host, seed.a_raw));
+    assert!(userdata_token_open(host, seed.b_raw));
+    assert_settlement_graph_alive(host, seed);
+}
+
+#[test]
+fn linked_white_without_raw_gc_settles_under_second_mark_and_never_requeues() {
+    for b_first in [false, true] {
+        crate::support::with_idle_vm(|vm| {
+            let mut host = vm.host_context();
+            let seed = seed_settlement(&mut host, SettlementArm::Linked, b_first);
+            assert_first_settlement_publication(&mut host, &seed, SettlementArm::Linked);
+            assert_release_after_settlement(&mut host, &seed);
+
+            // After Release, write a real non-nil raw `__gc` through the
+            // original metatable field. No Lua callback runs in this Rust
+            // heap; the write is the same non-nil field the positive control
+            // uses. Consume A's pending record and drop its graph, then run
+            // the next ordinary selection cycle.
+            heap::with_heap(&mut host, |heap| {
+                heap.set_named_scalar(seed.b_metatable, "__gc", Value::Bool(false))
+            })
+            .expect("install raw __gc after release");
+            heap::retire_pending_finalizer_test_control(&mut host, seed.a).expect("consume A");
+            assert!(pending_records(&mut host).is_empty());
+
+            let boundary = publish_boundary(&mut host);
+            assert!(
+                matches!(boundary, PublishedBoundary::Published { .. }),
+                "the settled pair is ordinary dead garbage in the next cycle"
+            );
+            assert!(
+                pending_records(&mut host).is_empty(),
+                "linked B must not be requeued because a raw __gc appears after its settlement"
+            );
+            assert!(
+                !userdata_token_open(&host, seed.b_raw),
+                "settled B is really closed when it next dies"
+            );
+            assert!(
+                !userdata_token_open(&host, seed.a_raw),
+                "A was already consumed and now closes as ordinary garbage"
+            );
+            assert_eq!(weak_value(&mut host, seed.weak_values, 2.0), None);
+            assert_eq!(
+                weak_key(&mut host, seed.weak_keys, seed.b),
+                Value::Null,
+                "the dead B key is cleared in the next cycle"
+            );
+            let report = finish_release(&mut host);
+            assert_eq!(
+                report.live_nodes, 4,
+                "only the two weak tables and their two modes remain"
+            );
+            assert_eq!(
+                slot_generation(&mut host, seed.b.slot()),
+                seed.b.generation() + 1,
+                "B's slot really advances"
+            );
+            assert_eq!(
+                slot_generation(&mut host, seed.a.slot()),
+                seed.a.generation() + 1
+            );
+            heap::with_heap(&mut host, |heap| heap.leave_roots(seed.weak_frame))
+                .expect("leave weak roots");
+        });
+    }
+}
+
+#[test]
+fn ordinary_root_white_without_raw_gc_is_not_settled_and_queues_next_round() {
+    crate::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        let seed = seed_settlement(&mut host, SettlementArm::OrdinaryRoot, false);
+        assert_first_settlement_publication(&mut host, &seed, SettlementArm::OrdinaryRoot);
+        assert_release_after_settlement(&mut host, &seed);
+
+        heap::retire_pending_finalizer_test_control(&mut host, seed.a).expect("consume A");
+        heap::with_heap(&mut host, |heap| {
+            heap.set_named_scalar(seed.b_metatable, "__gc", Value::Bool(false))
+        })
+        .expect("install raw __gc after release");
+        let b_frame = seed.b_strong_frame.expect("ordinary-root arm");
+        heap::with_heap(&mut host, |heap| heap.leave_roots(b_frame))
+            .expect("release B's control root");
+
+        let _ = heap::take_scan_meter(&mut host);
+        let boundary = publish_boundary(&mut host);
+        assert!(matches!(boundary, PublishedBoundary::Published { .. }));
+        assert_eq!(
+            pending_records(&mut host),
+            vec![(seed.b_raw, seed.b.slot(), seed.b.generation())],
+            "without a prior settlement B enters the queue in the next round"
+        );
+        assert!(pending_flag(&mut host, seed.b));
+        assert!(!finalizer_settled(&mut host, seed.b));
+        assert!(userdata_token_open(&host, seed.b_raw));
+        assert_eq!(
+            slot_generation(&mut host, seed.b.slot()),
+            seed.b.generation()
+        );
+        assert_eq!(
+            weak_value(&mut host, seed.weak_values, 2.0),
+            None,
+            "the queued B's weak value is cleared at this publication"
+        );
+        assert_eq!(
+            weak_key(&mut host, seed.weak_keys, seed.b),
+            Value::string("B")
+        );
+        finish_release(&mut host);
+
+        heap::retire_pending_finalizer_test_control(&mut host, seed.b).expect("consume B");
+        let boundary = publish_boundary(&mut host);
+        assert!(matches!(boundary, PublishedBoundary::Published { .. }));
+        assert!(pending_records(&mut host).is_empty());
+        assert!(!userdata_token_open(&host, seed.b_raw));
+        finish_release(&mut host);
+        assert_eq!(
+            slot_generation(&mut host, seed.b.slot()),
+            seed.b.generation() + 1
+        );
+        heap::with_heap(&mut host, |heap| heap.leave_roots(seed.weak_frame))
+            .expect("leave weak roots");
+    });
+}
+
+#[test]
+fn preinstalled_raw_gc_white_is_queued_in_the_first_round() {
+    crate::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        let seed = seed_settlement(&mut host, SettlementArm::Preinstalled, false);
+        assert_first_settlement_publication(&mut host, &seed, SettlementArm::Preinstalled);
+        assert_release_after_settlement(&mut host, &seed);
+
+        heap::retire_pending_finalizer_test_control(&mut host, seed.a).expect("consume A");
+        heap::retire_pending_finalizer_test_control(&mut host, seed.b).expect("consume B");
+        assert!(pending_records(&mut host).is_empty());
+
+        let boundary = publish_boundary(&mut host);
+        assert!(matches!(boundary, PublishedBoundary::Published { .. }));
+        assert!(
+            pending_records(&mut host).is_empty(),
+            "a consumed preinstalled generation is not queued again"
+        );
+        assert!(!userdata_token_open(&host, seed.a_raw));
+        assert!(!userdata_token_open(&host, seed.b_raw));
+        finish_release(&mut host);
+        assert_eq!(
+            slot_generation(&mut host, seed.b.slot()),
+            seed.b.generation() + 1
+        );
+        heap::with_heap(&mut host, |heap| heap.leave_roots(seed.weak_frame))
+            .expect("leave weak roots");
+    });
+}
+
+#[test]
+fn missing_raw_gc_on_a_shared_metatable_settles_every_white_identity() {
+    crate::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, settlement_limits()).expect("install");
+        let (b_first, b_first_raw) = {
+            let b = heap::publish_userdata(&mut host).expect("B1");
+            (b, bound_raw(&mut host, b))
+        };
+        let (b_second, b_second_raw) = {
+            let b = heap::publish_userdata(&mut host).expect("B2");
+            (b, bound_raw(&mut host, b))
+        };
+        let a = heap::publish_userdata(&mut host).expect("A");
+        let a_raw = bound_raw(&mut host, a);
+        let (a_metatable, shared, shared_graph, weak_values, weak_keys, frame) =
+            heap::with_heap(&mut host, |heap| {
+                let a_metatable = heap.alloc()?;
+                heap.set_named_scalar(a_metatable, "__gc", Value::Bool(false))?;
+                heap.set_named_userdata(a_metatable, "first", b_first)?;
+                heap.set_named_userdata(a_metatable, "second", b_second)?;
+                heap.set_userdata_metatable(a, Some(a_metatable))?;
+
+                let shared = heap.alloc()?;
+                let shared_graph = heap.alloc()?;
+                heap.set_named_edge(shared, "graph", shared_graph)?;
+                heap.set_userdata_metatable(b_first, Some(shared))?;
+                heap.set_userdata_metatable(b_second, Some(shared))?;
+
+                let weak_values = weak_table(heap, "v")?;
+                heap.set_number_userdata(weak_values, 1.0, b_first)?;
+                heap.set_number_userdata(weak_values, 2.0, b_second)?;
+                heap.set_number_userdata(weak_values, 3.0, a)?;
+                let weak_keys = weak_table(heap, "k")?;
+                heap.set_userdata_key_scalar(weak_keys, b_first, Value::string("B1"))?;
+                heap.set_userdata_key_scalar(weak_keys, b_second, Value::string("B2"))?;
+                let frame = heap.enter_roots(2)?;
+                heap.write_root(frame, 0, weak_values)?;
+                heap.write_root(frame, 1, weak_keys)?;
+                Ok((
+                    a_metatable,
+                    shared,
+                    shared_graph,
+                    weak_values,
+                    weak_keys,
+                    frame,
+                ))
+            })
+            .expect("shared metatable lattice");
+
+        let boundary = publish_boundary(&mut host);
+        assert!(matches!(boundary, PublishedBoundary::Published { .. }));
+        assert_eq!(
+            pending_records(&mut host),
+            vec![(a_raw, a.slot(), a.generation())]
+        );
+        assert!(
+            finalizer_settled(&mut host, b_first),
+            "the first shared-metatable identity is settled on the lookup miss"
+        );
+        assert!(
+            finalizer_settled(&mut host, b_second),
+            "a cached negative raw __gc result must still settle every later white identity"
+        );
+        assert_eq!(weak_value(&mut host, weak_values, 1.0), None);
+        assert_eq!(weak_value(&mut host, weak_values, 2.0), None);
+        assert_eq!(weak_key(&mut host, weak_keys, b_first), Value::string("B1"));
+        assert_eq!(
+            weak_key(&mut host, weak_keys, b_second),
+            Value::string("B2")
+        );
+        assert!(userdata_token_open(&host, b_first_raw));
+        assert!(userdata_token_open(&host, b_second_raw));
+        assert!(alive(&mut host, a_metatable));
+        assert!(alive(&mut host, shared));
+        assert!(alive(&mut host, shared_graph));
+        finish_release(&mut host);
+        heap::with_heap(&mut host, |heap| heap.leave_roots(frame)).expect("leave roots");
+    });
+}
+
+#[test]
+fn missing_and_nil_raw_gc_settle_without_reading_an_index_chain() {
+    crate::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, settlement_limits()).expect("install");
+        let missing = heap::publish_userdata(&mut host).expect("missing");
+        let missing_raw = bound_raw(&mut host, missing);
+        let nil = heap::publish_userdata(&mut host).expect("nil");
+        let nil_raw = bound_raw(&mut host, nil);
+        let (missing_metatable, index_table, nil_metatable, weak_values, frame) =
+            heap::with_heap(&mut host, |heap| {
+                // The only `__gc` reachable from the missing arm is through
+                // `__index`. The raw lookup must not follow it.
+                let missing_metatable = heap.alloc()?;
+                let index_meta = heap.alloc()?;
+                let index_table = heap.alloc()?;
+                heap.set_named_scalar(index_table, "__gc", Value::Bool(false))?;
+                heap.set_named_edge(index_meta, "__index", index_table)?;
+                heap.set_metatable(missing_metatable, Some(index_meta))?;
+                heap.set_userdata_metatable(missing, Some(missing_metatable))?;
+
+                // The nil arm stores the raw field itself as nil.
+                let nil_metatable = heap.alloc()?;
+                heap.set_named_scalar(nil_metatable, "__gc", Value::Null)?;
+                heap.set_userdata_metatable(nil, Some(nil_metatable))?;
+
+                let weak_values = weak_table(heap, "v")?;
+                heap.set_number_userdata(weak_values, 1.0, missing)?;
+                heap.set_number_userdata(weak_values, 2.0, nil)?;
+                let frame = heap.enter_roots(1)?;
+                heap.write_root(frame, 0, weak_values)?;
+                Ok((
+                    missing_metatable,
+                    index_table,
+                    nil_metatable,
+                    weak_values,
+                    frame,
+                ))
+            })
+            .expect("missing and nil lattice");
+
+        let boundary = publish_boundary(&mut host);
+        assert!(matches!(boundary, PublishedBoundary::Published { .. }));
+        assert!(pending_records(&mut host).is_empty());
+        assert!(
+            finalizer_settled(&mut host, missing),
+            "an absent raw __gc settles the white userdata without following __index"
+        );
+        assert!(
+            finalizer_settled(&mut host, nil),
+            "a stored nil raw __gc settles the white userdata"
+        );
+        assert!(
+            !userdata_token_open(&host, missing_raw),
+            "settlement is not retention: the unreached missing arm dies in this cycle"
+        );
+        assert!(!userdata_token_open(&host, nil_raw));
+        assert_eq!(weak_value(&mut host, weak_values, 1.0), None);
+        assert_eq!(weak_value(&mut host, weak_values, 2.0), None);
+        assert!(alive(&mut host, missing_metatable));
+        assert!(alive(&mut host, index_table));
+        assert!(alive(&mut host, nil_metatable));
+        let report = finish_release(&mut host);
+        assert_eq!(report.live_nodes, 2, "the weak table and its mode");
+        assert!(!alive(&mut host, missing_metatable));
+        assert!(!alive(&mut host, index_table));
+        assert!(!alive(&mut host, nil_metatable));
+        assert_eq!(
+            slot_generation(&mut host, missing.slot()),
+            missing.generation() + 1
+        );
+        assert_eq!(slot_generation(&mut host, nil.slot()), nil.generation() + 1);
+        heap::with_heap(&mut host, |heap| heap.leave_roots(frame)).expect("leave roots");
+    });
+}
+
+/// One typed userdata with a live metatable that has no direct raw `__gc`,
+/// its own real token, and one rooted weak-value table.
+struct MissingEligible {
+    userdata: UserdataRef,
+    raw: u64,
+    metatable: TableRef,
+    weak_values: TableRef,
+}
+
+fn publish_missing_eligible(host: &mut vm::HostContext<'_>) -> MissingEligible {
+    let userdata = heap::publish_userdata(host).expect("missing-raw userdata");
+    let raw = bound_raw(host, userdata);
+    let (metatable, weak_values) = heap::with_heap(host, |heap| {
+        let metatable = heap.alloc()?;
+        heap.set_named_scalar(metatable, "f0", Value::string("not __gc"))?;
+        heap.set_userdata_metatable(userdata, Some(metatable))?;
+        let weak_values = weak_table(heap, "v")?;
+        heap.set_number_userdata(weak_values, 1.0, userdata)?;
+        Ok((metatable, weak_values))
+    })
+    .expect("missing-raw lattice");
+    MissingEligible {
+        userdata,
+        raw,
+        metatable,
+        weak_values,
+    }
+}
+
+/// Rollback at the pre-close typed-owner check. A prior pending record and a
+/// prior settled-but-rooted identity survive the failed batch; the new
+/// settlements are removed. After the same-type misbinding is fixed, a retry
+/// in the same `HostContext` selects the previously settled identities as
+/// ordinary raw-`__gc` candidates.
+#[test]
+fn settlement_rolls_back_at_owner_verification_and_retry_selects() {
+    crate::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, settlement_limits()).expect("install");
+
+        // A valid previous-cycle pending record.
+        let prior = publish_eligible(&mut host);
+        let prior_frame = heap::with_heap(&mut host, |heap| {
+            let frame = heap.enter_roots(1)?;
+            heap.write_root(frame, 0, prior.weak_values)?;
+            Ok(frame)
+        })
+        .expect("prior roots");
+        let boundary = publish_boundary(&mut host);
+        assert!(matches!(boundary, PublishedBoundary::Published { .. }));
+        finish_release(&mut host);
+        assert_eq!(
+            pending_records(&mut host),
+            vec![(
+                prior.raw,
+                prior.userdata.slot(),
+                prior.userdata.generation()
+            )]
+        );
+
+        // A previous-cycle settled identity S, reachable only through A0's
+        // metatable during its settling pass and then kept alive by a real
+        // root. Its settled flag is valid prior state.
+        let a0 = heap::publish_userdata(&mut host).expect("A0");
+        let a0_raw = bound_raw(&mut host, a0);
+        let s = heap::publish_userdata(&mut host).expect("S");
+        let s_raw = bound_raw(&mut host, s);
+        let (a0_metatable, s_metatable) = heap::with_heap(&mut host, |heap| {
+            let a0_metatable = heap.alloc()?;
+            heap.set_named_scalar(a0_metatable, "__gc", Value::Bool(false))?;
+            heap.set_named_userdata(a0_metatable, "child", s)?;
+            heap.set_userdata_metatable(a0, Some(a0_metatable))?;
+            let s_metatable = heap.alloc()?;
+            heap.set_userdata_metatable(s, Some(s_metatable))?;
+            Ok((a0_metatable, s_metatable))
+        })
+        .expect("prior settled lattice");
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| heap.userdata_metatable(a0)).expect("A0 metatable"),
+            Some(a0_metatable)
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| heap.userdata_metatable(s)).expect("S metatable"),
+            Some(s_metatable)
+        );
+        let boundary = publish_boundary(&mut host);
+        assert!(matches!(boundary, PublishedBoundary::Published { .. }));
+        finish_release(&mut host);
+        assert!(
+            finalizer_settled(&mut host, s),
+            "S was settled by the previous selecting pass"
+        );
+        assert_eq!(pending_records(&mut host).len(), 2);
+        let s_frame = heap::with_heap(&mut host, |heap| {
+            let frame = heap.enter_roots(1)?;
+            heap.write_userdata_root(frame, 0, s)?;
+            Ok(frame)
+        })
+        .expect("S root");
+
+        // The failed batch: A is a real raw-`__gc` candidate selected before
+        // C1 and C2, which have no raw field. B owns the real token used for
+        // the same-type misbinding.
+        let b = heap::publish_userdata(&mut host).expect("token owner B");
+        let b_raw = bound_raw(&mut host, b);
+        let b_frame = heap::with_heap(&mut host, |heap| {
+            let frame = heap.enter_roots(1)?;
+            heap.write_userdata_root(frame, 0, b)?;
+            Ok(frame)
+        })
+        .expect("B root");
+        let a = publish_eligible(&mut host);
+        let c_first = publish_missing_eligible(&mut host);
+        let c_second = publish_missing_eligible(&mut host);
+        assert!(
+            a.userdata.slot() < c_first.userdata.slot()
+                && c_first.userdata.slot() < c_second.userdata.slot(),
+            "A is doomed before the two new settlements, so the ordinary control fails before closing them"
+        );
+        let c_frame = heap::with_heap(&mut host, |heap| {
+            let frame = heap.enter_roots(2)?;
+            heap.write_root(frame, 0, c_first.weak_values)?;
+            heap.write_root(frame, 1, c_second.weak_values)?;
+            Ok(frame)
+        })
+        .expect("C roots");
+        heap::with_heap(&mut host, |heap| {
+            heap.unbind_userdata_token(a.userdata)?;
+            heap.bind_userdata_token(a.userdata, b_raw)
+        })
+        .expect("same-type misbind");
+
+        let _ = heap::take_scan_meter(&mut host);
+        let error = heap::collect_pending_finalizers(&mut host).expect_err("foreign owner");
+        assert_eq!(error, HeapError::TokenMismatch);
+        let meter = heap::take_scan_meter(&mut host).expect("refusal meter");
+        assert_eq!(meter.token_closes, 0, "verification fails before close");
+        assert_eq!(
+            pending_records(&mut host),
+            vec![
+                (
+                    prior.raw,
+                    prior.userdata.slot(),
+                    prior.userdata.generation()
+                ),
+                (a0_raw, a0.slot(), a0.generation())
+            ],
+            "the prior records survive; the new batch record is removed"
+        );
+        assert!(pending_flag(&mut host, prior.userdata));
+        assert!(pending_flag(&mut host, a0));
+        assert!(!pending_flag(&mut host, a.userdata));
+        assert!(
+            !finalizer_settled(&mut host, c_first.userdata),
+            "a pre-publication verification failure must roll back the new settlement"
+        );
+        assert!(!finalizer_settled(&mut host, c_second.userdata));
+        assert!(
+            finalizer_settled(&mut host, s),
+            "valid prior settled state is not erased by a failed new batch"
+        );
+        assert!(!heap::saved_sweep_tail(&mut host).expect("no tail"));
+        assert_eq!(
+            weak_value(&mut host, c_first.weak_values, 1.0),
+            Some(c_first.userdata),
+            "no weak publication on a verification failure"
+        );
+        assert_eq!(
+            weak_value(&mut host, c_second.weak_values, 1.0),
+            Some(c_second.userdata)
+        );
+        assert!(userdata_token_open(&host, a.raw));
+        assert!(userdata_token_open(&host, c_first.raw));
+        assert!(userdata_token_open(&host, c_second.raw));
+        assert!(userdata_token_open(&host, b_raw));
+        assert!(userdata_token_open(&host, s_raw));
+        assert_eq!(
+            slot_generation(&mut host, c_first.userdata.slot()),
+            c_first.userdata.generation()
+        );
+
+        // The ordinary entry, still carrying the same-type misbinding, must
+        // refuse before any close and publish no weak edge. A is the first
+        // doomed slot, so neither new settlement token closes.
+        let control = heap::collect(&mut host).expect_err("ordinary close rejects the misbind");
+        assert_eq!(control, HeapError::TokenMismatch);
+        assert!(userdata_token_open(&host, c_first.raw));
+        assert!(userdata_token_open(&host, c_second.raw));
+        assert!(!finalizer_settled(&mut host, c_first.userdata));
+        assert!(!finalizer_settled(&mut host, c_second.userdata));
+        assert_eq!(
+            weak_value(&mut host, c_first.weak_values, 1.0),
+            Some(c_first.userdata)
+        );
+        assert!(!heap::saved_sweep_tail(&mut host).expect("no tail after control"));
+
+        // Restore the exact binding, install the positive-control raw field
+        // on both settled candidates, and retry in the same context.
+        heap::with_heap(&mut host, |heap| {
+            heap.unbind_userdata_token(a.userdata)?;
+            heap.bind_userdata_token(a.userdata, a.raw)?;
+            heap.set_named_scalar(c_first.metatable, "__gc", Value::Bool(false))?;
+            heap.set_named_scalar(c_second.metatable, "__gc", Value::Bool(false))
+        })
+        .expect("restore and install");
+        let _ = heap::take_scan_meter(&mut host);
+        let boundary = publish_boundary(&mut host);
+        assert!(matches!(boundary, PublishedBoundary::Published { .. }));
+        let records = pending_records(&mut host);
+        for userdata in [a.userdata, c_first.userdata, c_second.userdata] {
+            assert!(
+                records
+                    .iter()
+                    .any(|record| record.1 == userdata.slot() && record.2 == userdata.generation()),
+                "the retry selects the restored candidate"
+            );
+        }
+        assert!(pending_flag(&mut host, c_first.userdata));
+        assert!(pending_flag(&mut host, c_second.userdata));
+        assert_eq!(weak_value(&mut host, c_first.weak_values, 1.0), None);
+        assert_eq!(weak_value(&mut host, c_second.weak_values, 1.0), None);
+        assert!(userdata_token_open(&host, c_first.raw));
+        assert!(userdata_token_open(&host, c_second.raw));
+        finish_release(&mut host);
+
+        for frame in [c_frame, b_frame, s_frame, prior_frame] {
+            heap::with_heap(&mut host, |heap| heap.leave_roots(frame)).expect("leave roots");
+        }
+    });
+}
+
+/// Rollback at the doomed-token close boundary. A is the retained pending
+/// record; C is settled by the same selecting pass. D is doomed with C's real
+/// same-type token, so the close verifier fails after selection. The failure
+/// must remove only C's new settlement, preserve A's record and the prior
+/// state, publish nothing, and allow the same context to select C after the
+/// binding is fixed and a raw `__gc` is installed.
+#[test]
+fn settlement_rolls_back_at_doomed_close_and_retry_selects() {
+    crate::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, settlement_limits()).expect("install");
+        let a = heap::publish_userdata(&mut host).expect("A");
+        let a_raw = bound_raw(&mut host, a);
+        let (a_metatable, weak_values, weak_keys, frame) = heap::with_heap(&mut host, |heap| {
+            let a_metatable = heap.alloc()?;
+            heap.set_named_scalar(a_metatable, "__gc", Value::Bool(false))?;
+            heap.set_userdata_metatable(a, Some(a_metatable))?;
+            let weak_values = weak_table(heap, "v")?;
+            heap.set_number_userdata(weak_values, 1.0, a)?;
+            let weak_keys = weak_table(heap, "k")?;
+            heap.set_userdata_key_scalar(weak_keys, a, Value::string("A"))?;
+            let frame = heap.enter_roots(2)?;
+            heap.write_root(frame, 0, weak_values)?;
+            heap.write_root(frame, 1, weak_keys)?;
+            Ok((a_metatable, weak_values, weak_keys, frame))
+        })
+        .expect("A lattice");
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| heap.userdata_metatable(a)).expect("A metatable"),
+            Some(a_metatable)
+        );
+
+        // D is published before C and is the first doomed slot. Its slot is
+        // temporarily bound to C's real token, so the doomed close sees a
+        // same-type payload mismatch for D.
+        let d = heap::publish_userdata(&mut host).expect("D");
+        let d_raw = bound_raw(&mut host, d);
+        let c = publish_missing_eligible(&mut host);
+        assert!(d.slot() < c.userdata.slot());
+        heap::with_heap(&mut host, |heap| {
+            heap.unbind_userdata_token(d)?;
+            heap.bind_userdata_token(d, c.raw)
+        })
+        .expect("same-type misbind on the doomed slot");
+
+        let _ = heap::take_scan_meter(&mut host);
+        let error = heap::collect_pending_finalizers(&mut host).expect_err("doomed close mismatch");
+        assert_eq!(error, HeapError::TokenMismatch);
+        let meter = heap::take_scan_meter(&mut host).expect("close refusal meter");
+        assert_eq!(meter.token_closes, 0, "D fails before any token closes");
+        assert_eq!(
+            pending_records(&mut host),
+            vec![(a_raw, a.slot(), a.generation())],
+            "the selected A record survives a close failure"
+        );
+        assert!(pending_flag(&mut host, a));
+        assert!(
+            !finalizer_settled(&mut host, c.userdata),
+            "a failed doomed close must roll back C's new settlement"
+        );
+        assert!(!heap::saved_sweep_tail(&mut host).expect("no tail"));
+        assert_eq!(
+            weak_value(&mut host, weak_values, 1.0),
+            Some(a),
+            "A's weak value is still unpublished"
+        );
+        assert_eq!(
+            weak_value(&mut host, c.weak_values, 1.0),
+            Some(c.userdata),
+            "C's weak value is still unpublished"
+        );
+        assert_eq!(
+            weak_key(&mut host, weak_keys, a),
+            Value::string("A"),
+            "A's weak key is still unpublished"
+        );
+        assert!(userdata_token_open(&host, a_raw));
+        assert!(userdata_token_open(&host, c.raw));
+        assert!(userdata_token_open(&host, d_raw));
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| heap.published_userdata_token(d))
+                .expect("D keeps the failing binding"),
+            c.raw
+        );
+
+        // The ordinary entry with the same bad binding also refuses before
+        // making a fake record or publishing. D is the first doomed slot.
+        let control = heap::collect(&mut host).expect_err("ordinary close rejects the misbind");
+        assert_eq!(control, HeapError::TokenMismatch);
+        assert_eq!(
+            pending_records(&mut host),
+            vec![(a_raw, a.slot(), a.generation())]
+        );
+        assert!(!finalizer_settled(&mut host, c.userdata));
+        assert!(userdata_token_open(&host, c.raw));
+        assert_eq!(weak_value(&mut host, c.weak_values, 1.0), Some(c.userdata));
+        assert!(!heap::saved_sweep_tail(&mut host).expect("no tail after control"));
+
+        // Fix D, install the positive-control raw field on C, and retry.
+        heap::with_heap(&mut host, |heap| {
+            heap.unbind_userdata_token(d)?;
+            heap.bind_userdata_token(d, d_raw)?;
+            heap.set_named_scalar(c.metatable, "__gc", Value::Bool(false))
+        })
+        .expect("restore D and install C's raw __gc");
+        let _ = heap::take_scan_meter(&mut host);
+        let boundary = publish_boundary(&mut host);
+        assert!(matches!(boundary, PublishedBoundary::Published { .. }));
+        let records = pending_records(&mut host);
+        assert!(
+            records
+                .iter()
+                .any(|record| record.1 == c.userdata.slot() && record.2 == c.userdata.generation()),
+            "the retry selects C after its settlement was rolled back"
+        );
+        assert!(pending_flag(&mut host, c.userdata));
+        assert!(!finalizer_settled(&mut host, c.userdata));
+        assert!(userdata_token_open(&host, c.raw));
+        assert_eq!(
+            slot_generation(&mut host, c.userdata.slot()),
+            c.userdata.generation()
+        );
+        assert_eq!(weak_value(&mut host, c.weak_values, 1.0), None);
+        assert_eq!(
+            weak_key(&mut host, weak_keys, a),
+            Value::string("A"),
+            "A remains a marked pending key"
+        );
+        finish_release(&mut host);
+        heap::with_heap(&mut host, |heap| heap.leave_roots(frame)).expect("leave roots");
+    });
+}
+
+/// Anti-control: settlement is not a root. With A's metatable follow
+/// suppressed, the linked B has no other strong edge. B must still be
+/// settled, but its token must close and its generation must advance in the
+/// same cycle. This proves the surviving B in the main linked arm is retained
+/// by the real second mark, not by the settlement flag.
+#[test]
+fn settlement_alone_does_not_retain_a_linked_white_without_raw_gc() {
+    crate::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        let seed = seed_settlement(&mut host, SettlementArm::Linked, false);
+        heap::with_heap(&mut host, |heap| {
+            heap.arm_pending_finalizer_metatable_skip(true);
+            Ok(())
+        })
+        .expect("arm metatable skip");
+
+        let boundary = publish_boundary(&mut host);
+        assert!(matches!(boundary, PublishedBoundary::Published { .. }));
+        assert_eq!(
+            pending_records(&mut host),
+            vec![(seed.a_raw, seed.a.slot(), seed.a.generation())]
+        );
+        assert!(finalizer_settled(&mut host, seed.b));
+        assert!(
+            !userdata_token_open(&host, seed.b_raw),
+            "settlement does not retain B when the second-mark edge is suppressed"
+        );
+        assert!(userdata_token_open(&host, seed.a_raw));
+        assert_eq!(weak_value(&mut host, seed.weak_values, 2.0), None);
+        assert_eq!(
+            weak_key(&mut host, seed.weak_keys, seed.b),
+            Value::Null,
+            "an unmarked settled B does not keep its weak key"
+        );
+        finish_release(&mut host);
+        assert_eq!(
+            slot_generation(&mut host, seed.b.slot()),
+            seed.b.generation() + 1,
+            "B really dies in this cycle"
+        );
+        assert!(!alive(&mut host, seed.b_metatable));
+        assert!(!alive(&mut host, seed.b_graph));
+        assert_eq!(
+            slot_generation(&mut host, seed.a.slot()),
+            seed.a.generation()
+        );
+        assert!(userdata_token_open(&host, seed.a_raw));
+        heap::with_heap(&mut host, |heap| heap.leave_roots(seed.weak_frame))
+            .expect("leave weak roots");
+    });
+}
+
+/// Cross-round compatibility: a settled generation that is later kept alive
+/// by a real strong root is still value-dead for a fresh weak value. The
+/// second cycle removes A, so the third-cycle publication can only be forced
+/// by the settled-and-marked B, not by a pending record or a dead slot.
+#[test]
+fn settled_generation_reclears_a_reinserted_weak_value_while_rooted() {
+    crate::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        let seed = seed_settlement(&mut host, SettlementArm::Linked, false);
+        assert_first_settlement_publication(&mut host, &seed, SettlementArm::Linked);
+        assert_release_after_settlement(&mut host, &seed);
+
+        // Consume A and root B. The next cycle releases A and leaves B live
+        // and settled, with no pending record.
+        heap::retire_pending_finalizer_test_control(&mut host, seed.a).expect("consume A");
+        let b_frame = heap::with_heap(&mut host, |heap| {
+            let frame = heap.enter_roots(1)?;
+            heap.write_userdata_root(frame, 0, seed.b)?;
+            Ok(frame)
+        })
+        .expect("B control root");
+        let boundary = publish_boundary(&mut host);
+        assert!(matches!(boundary, PublishedBoundary::Published { .. }));
+        assert!(pending_records(&mut host).is_empty());
+        assert!(!userdata_token_open(&host, seed.a_raw));
+        finish_release(&mut host);
+        assert_eq!(
+            slot_generation(&mut host, seed.a.slot()),
+            seed.a.generation() + 1
+        );
+        assert!(userdata_token_open(&host, seed.b_raw));
+        assert!(finalizer_settled(&mut host, seed.b));
+
+        // No dead slot and no pending record exist now. Reinsert a real weak
+        // value through the original table field. Only B's settled generation
+        // can force the publication window.
+        heap::with_heap(&mut host, |heap| {
+            heap.set_number_userdata(seed.weak_values, 6.0, seed.b)
+        })
+        .expect("reinsert B weak value");
+        let boundary = publish_boundary(&mut host);
+        assert!(
+            matches!(boundary, PublishedBoundary::Published { .. }),
+            "a live settled generation forces weak publication with no dead slot or pending record"
+        );
+        assert_eq!(
+            weak_value(&mut host, seed.weak_values, 6.0),
+            None,
+            "a settled generation is value-dead across rounds"
+        );
+        assert_eq!(
+            weak_key(&mut host, seed.weak_keys, seed.b),
+            Value::string("B"),
+            "the real root keeps B marked, so its weak key stays"
+        );
+        assert!(userdata_token_open(&host, seed.b_raw));
+        assert_eq!(
+            slot_generation(&mut host, seed.b.slot()),
+            seed.b.generation()
+        );
+        finish_release(&mut host);
+        heap::with_heap(&mut host, |heap| heap.leave_roots(b_frame)).expect("leave B root");
+        heap::with_heap(&mut host, |heap| heap.leave_roots(seed.weak_frame))
+            .expect("leave weak roots");
+    });
+}

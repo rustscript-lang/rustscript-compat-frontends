@@ -32,15 +32,22 @@
 //! raw non-nil `__gc` field, and marks the userdata so the ordinary gray pass
 //! follows its userdata-to-metatable strong edge and the metatable's own
 //! strong entries. A retained userdata keeps its original generation, typed
-//! payload, and Core token. At weak publication a weak value that names it is
-//! cleared, while a weak key keeps the entry and its scalar; a sweep with no
-//! dead slot still runs the Owners walk when a pending finalizer needs that
-//! publication. Ordinary collections never select; they offer every existing
-//! record as a host-retained edge, so no live token is closed or orphaned
-//! while it waits for a consumer. No callback, resurrection, guest step, or
-//! production entry is added here. The test-only retirement control consumes
-//! one record so a later collection can close the token and advance the slot
-//! generation; it is not a finalizer.
+//! payload, and Core token. A white candidate whose raw `__gc` is missing, nil,
+//! or a weak-cleared gap is settled instead: that exact generation is marked
+//! finalized without a queue record and without a mark, so it is never queued
+//! again even if a raw `__gc` is installed later, and an unreachable one dies
+//! in the same cycle. Settlement is not retention.
+//!
+//! At weak publication a weak value that names a retained pending userdata or
+//! a live settled generation is cleared, while a weak key keeps the entry and
+//! its scalar only when the object is actually marked. A sweep with no dead
+//! slot still runs the Owners walk when a pending finalizer or a marked
+//! settled generation needs that publication. Ordinary collections never
+//! select; they offer every existing record as a host-retained edge, so no
+//! live token is closed or orphaned while it waits for a consumer. No
+//! callback, resurrection, guest step, or production entry is added here. The
+//! test-only retirement control consumes one record so a later collection can
+//! close the token and advance the slot generation; it is not a finalizer.
 //!
 //! Borrowed from the ES5 heap at `3e348a010bc8d84baa5b7d1169a5f50aeb4e46ec`
 //! `src/javascript/heap.rs`: slot plus generation handles, explicit root
@@ -546,13 +553,14 @@ pub fn collect(host: &mut HostContext) -> Result<table::CollectReport, HeapError
 /// Publish stopped before release, or the heap had no weak edge to publish.
 #[derive(Debug)]
 pub(crate) enum PublishedBoundary {
-    /// Neither a dead slot nor a retained pending finalizer needs a weak
-    /// publication. Sweep finished and recorded the one report.
+    /// Neither a dead slot, nor a retained pending finalizer, nor a live
+    /// settled userdata needs a weak publication. Sweep finished and
+    /// recorded the one report.
     Completed(table::CollectReport),
     /// Weak edges are published. Dead slots are still physical. No report.
     /// `window_heads`/`window_edges` are the actual Owners walk, which can
-    /// be non-empty with no dead slot when a pending finalizer's weak value
-    /// is cleared.
+    /// be non-empty with no dead slot when a pending finalizer's or a settled
+    /// userdata's weak value is cleared.
     Published {
         window_heads: u64,
         window_edges: u64,
@@ -586,19 +594,32 @@ pub(crate) fn collect_until_published(
         return Err(HeapError::MarkActive);
     }
     let marked = with_heap(host, |heap| Ok(heap.mark_and_doomed_tokens()))?;
-    close_then_halt_at_publish(host, marked)
+    close_then_halt_at_publish(host, marked, false)
 }
 
 /// Closes doomed tokens, then publishes or finishes. Same order as the
 /// original collector: a close error returns before publish, so there is no
-/// tail and no report. Pending-close enumeration already ran; per-token close
-/// and the Owners walk are not limited by a step budget.
+/// tail and no report.
+///
+/// `settle_rollback` is true only for the selecting entry. On a close error
+/// that pass's new settlement flags are returned to their previous state, just
+/// like its new pending records are handled by the caller; an already closed
+/// prefix stays closed and a pending record from an earlier pass is untouched.
 fn close_then_halt_at_publish(
     host: &mut HostContext,
     marked: table::DoomedMark,
+    settle_rollback: bool,
 ) -> Result<PublishedBoundary, HeapError> {
     for token in marked.tokens {
-        retire_doomed_token(host, token)?;
+        if let Err(error) = retire_doomed_token(host, token) {
+            if settle_rollback {
+                with_heap(host, |heap| {
+                    heap.discard_settlements();
+                    Ok(())
+                })?;
+            }
+            return Err(error);
+        }
     }
     let halt = with_heap(host, |heap| Ok(heap.halt_at_publish(marked.modes)))?;
     Ok(match halt {
@@ -621,20 +642,30 @@ fn close_then_halt_at_publish(
 ///    once. Select each live, unmarked userdata that binds a typed Core token
 ///    and whose metatable has a raw non-nil `__gc` field. Mark it through the
 ///    ordinary target follow; the next gray pass follows its metatable edge
-///    and the metatable's own strong entries. A slot already pending or
-///    settled by the explicit retirement control is not selected again.
+///    and the metatable's own strong entries. A raw field that is missing,
+///    nil, or already a weak-cleared cursor gap settles that exact white
+///    identity instead: the generation is finalized without a queue record
+///    and without a mark. A slot already pending or settled is not selected
+///    again. Candidates that share a metatable pay one lookup for that
+///    metatable per round, but each one still receives its own queue or
+///    settlement result.
 /// 4. Enumerate pending-close candidates as usual. A selected userdata is
-///    marked, so it is not in that list and its token stays bound.
+///    marked, so it is not in that list and its token stays bound. A settled
+///    userdata is not marked by the settlement, so an unreachable one is
+///    ordinary dead garbage in this same cycle.
 /// 5. Borrow every pending record with its exact `lua.userdata` token and
 ///    require the payload to name the same slot and generation. A mismatch
-///    returns before any close or publish.
-/// 6. Close each doomed token synchronously and confirm `Ready`.
+///    returns before any close or publish and rolls back this pass's new
+///    records and settlement flags.
+/// 6. Close each doomed token synchronously and confirm `Ready`. A close
+///    error also rolls back this pass's new settlement flags; an already
+///    closed prefix and earlier pending records stay as they were.
 /// 7. Run the Owners walk once. Weak values that name a retained pending
-///    userdata are published as gaps; weak keys keep the entry and its
-///    scalar because the selected object is marked. A dead slot is not
-///    required for this step. Store the Release/Roots tail and return
-///    [`PublishedBoundary::Published`]; a heap with neither a dead slot nor a
-///    pending finalizer finishes and returns
+///    userdata or a live settled generation are published as gaps; weak keys
+///    keep the entry and its scalar only when the object is marked. A dead
+///    slot is not required for this step. Store the Release/Roots tail and
+///    return [`PublishedBoundary::Published`]; a heap with no dead slot, no
+///    pending finalizer, and no live settled userdata finishes and returns
 ///    [`PublishedBoundary::Completed`].
 ///
 /// Release and Roots do not run here. The caller finishes them with
@@ -657,17 +688,24 @@ pub(crate) fn collect_pending_finalizers(
     let marked = with_heap(host, |heap| Ok(heap.mark_and_pending_tokens()))?;
     if let Err(error) = verify_pending_finalizers(host) {
         // This is the owner-verification preflight's own transaction: remove
-        // only the records and flags appended by this selecting pass. Earlier
-        // valid records are untouched, no doomed token has been closed yet,
-        // and no weak edge has been published, so the two later failure
-        // prefixes are not mixed into this rollback.
+        // only the records and settlement flags appended by this selecting
+        // pass. Earlier valid records and settled generations are untouched,
+        // no doomed token has been closed yet, and no weak edge has been
+        // published, so the two later failure prefixes are not mixed into
+        // this rollback.
         with_heap(host, |heap| {
             heap.discard_pending_finalizers_from(base);
+            heap.discard_settlements();
             Ok(())
         })?;
         return Err(error);
     }
-    close_then_halt_at_publish(host, marked)
+    let boundary = close_then_halt_at_publish(host, marked, true)?;
+    with_heap(host, |heap| {
+        heap.clear_selecting_settlements();
+        Ok(())
+    })?;
+    Ok(boundary)
 }
 
 /// Borrows each pending record with its concrete `lua.userdata` key and
@@ -811,7 +849,7 @@ fn step_private_cycle(
     let Some(marked) = marked else {
         return Ok(StepOutcome::Paused { tail: false });
     };
-    match close_then_halt_at_publish(host, marked)? {
+    match close_then_halt_at_publish(host, marked, false)? {
         PublishedBoundary::Completed(report) => Ok(StepOutcome::Completed(report)),
         PublishedBoundary::Published {
             window_heads,

@@ -18,10 +18,13 @@
 //! readable, and the same Owners walker publishes once when it finishes,
 //! still short of Release. That window's heads and edges are the walk it
 //! actually did. They are not a `pulse(1)` bound. Guest lookup on the entry
-//! rejects a handle already judged dead. A sweep with no dead slot and no
-//! retained pending finalizer never enters Owners and does not invent a
-//! publish window; a retained pending finalizer forces the Owners walk so its
-//! weak values can be cleared even when every retained slot stays live.
+//! rejects a handle already judged dead. A sweep with no dead slot, no
+//! retained pending finalizer, and no live finalized userdata never enters
+//! Owners and does not invent a publish window. A retained pending finalizer
+//! forces the Owners walk so its weak values can be cleared even when every
+//! retained slot stays live. The same is true for a settled (finalized without
+//! a queue record) generation: a weak value that names it is value-dead, so
+//! its weak value is cleared while a weak key keeps the entry.
 
 use super::{
     CollectReport, EdgeKey, EdgeValue, GuestClass, HandleKind, HeapError, LuaHeap, MarkSnapshot,
@@ -47,6 +50,11 @@ pub(super) struct SweepSession<'a> {
     /// not dead, but weak values that name it must still be published, so
     /// Select enters Snapshot and Owners even when the dead list is empty.
     pending_present: bool,
+    /// At least one live slot is a settled userdata generation. Settlement
+    /// never marks or retains the object, but a marked settled generation is
+    /// value-dead for weak publication; Owners must run even when no dead
+    /// slot and no pending record exist.
+    settled_present: bool,
     report: Option<CollectReport>,
     pulse_spent: SweepUnits,
 }
@@ -59,6 +67,10 @@ struct SweepSlot {
     /// A weak value in a marked weak table still treats it as value-dead; a
     /// weak key keeps the entry because the slot is retained and marked.
     pending: bool,
+    /// The slot generation was settled without a queue record. A weak value
+    /// in a marked weak table treats it as value-dead; a weak key keeps the
+    /// entry only when the object is actually marked.
+    settled: bool,
     /// Generation whose parsed mode this slot held when the mark finished.
     /// A metatable reused after that parse does not inherit the old mode.
     mode_generation: u32,
@@ -353,6 +365,7 @@ impl<'a> SweepSession<'a> {
             marked_nodes: 0,
             live_roots: 0,
             pending_present: false,
+            settled_present: false,
             report: None,
             pulse_spent: SweepUnits::default(),
         }
@@ -488,7 +501,7 @@ impl<'a> SweepSession<'a> {
     fn step_select(&mut self) -> bool {
         if self.index >= self.heap.slots.len() {
             self.index = 0;
-            self.phase = if self.dead.is_empty() && !self.pending_present {
+            self.phase = if self.dead.is_empty() && !self.pending_present && !self.settled_present {
                 SweepPhase::Roots
             } else {
                 SweepPhase::Snapshot
@@ -544,6 +557,9 @@ impl<'a> SweepSession<'a> {
                 if slot.pending_finalizer {
                     self.pending_present = true;
                 }
+                if slot.finalizer_settled {
+                    self.settled_present = true;
+                }
             }
             SlotState::Free | SlotState::Retired => {}
         }
@@ -579,6 +595,7 @@ impl<'a> SweepSession<'a> {
             kind: slot.kind,
             generation: slot.generation,
             pending: slot.pending_finalizer,
+            settled: slot.finalizer_settled,
             mode_generation: slot.mode_generation,
             mode_round: slot.mode_round,
             mode_weak,
@@ -675,6 +692,7 @@ impl<'a> SweepSession<'a> {
             EdgeValue::Userdata { slot, generation } => {
                 !self.typed(*slot, *generation, HandleKind::Userdata)
                     || self.pending(*slot, *generation)
+                    || self.settled(*slot, *generation)
             }
         };
         let make_gap = owner_marked && weak && value_dead && self.guest_cursor(&edge.key);
@@ -689,13 +707,15 @@ impl<'a> SweepSession<'a> {
                     self.typed(*slot, *generation, HandleKind::Upvalue)
                 }
                 EdgeValue::Userdata { slot, generation } => {
-                    // A value-weak pending userdata is value-dead even though
-                    // it stays marked and retained. A guest-cursor key can
-                    // publish that as a gap; a bare userdata key cannot, so
-                    // the whole `kv`/`v` record is dropped instead of keeping
-                    // the retained object as a strong value.
+                    // A value-weak pending or settled userdata is value-dead
+                    // even though it stays marked and retained. A guest-cursor
+                    // key can publish that as a gap; a bare userdata key
+                    // cannot, so the whole `kv`/`v` record is dropped instead
+                    // of keeping the retained object as a strong value.
                     self.typed(*slot, *generation, HandleKind::Userdata)
-                        && !(weak && self.pending(*slot, *generation))
+                        && !(weak
+                            && (self.pending(*slot, *generation)
+                                || self.settled(*slot, *generation)))
                 }
             };
         let key_ok = match &edge.key {
@@ -737,6 +757,20 @@ impl<'a> SweepSession<'a> {
     fn pending(&self, slot: u32, generation: u32) -> bool {
         self.snapshot.get(slot as usize).is_some_and(|found| {
             found.pending && found.kind == HandleKind::Userdata && found.generation == generation
+        })
+    }
+
+    /// One settled (finalized without a queue record) userdata generation in
+    /// this sweep's snapshot.
+    ///
+    /// Settlement is not retention. The weak-value rule still applies when
+    /// the object is marked through another edge or a later root, matching
+    /// the upstream finalized flag. A weak key is decided by the real mark
+    /// bit elsewhere, not by this flag. A stale edge to a reused generation is
+    /// not settled.
+    fn settled(&self, slot: u32, generation: u32) -> bool {
+        self.snapshot.get(slot as usize).is_some_and(|found| {
+            found.settled && found.kind == HandleKind::Userdata && found.generation == generation
         })
     }
 

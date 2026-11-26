@@ -340,7 +340,10 @@ impl<'a> MarkSession<'a> {
 
     /// One ordinary mark, plus one selection scan after the ordinary work
     /// empties. Only the private pending-finalizer entry uses this starter.
+    /// The scan starts from an empty settlement rollback list; a previous
+    /// pulse-only selecting mark leaves its list here, and its flags stay.
     pub(super) fn start_selecting_pending(heap: &'a mut LuaHeap) -> Self {
+        heap.clear_selecting_settlements();
         let session = Self::start(heap);
         session
             .heap
@@ -1965,8 +1968,11 @@ fn step_gray(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
 /// one metatable edge record; the result is cached on the exact metatable
 /// generation for this mark round. A positive result records the candidate and
 /// marks it through the ordinary `follow_one` path; the following Gray pass
-/// opens it as an owner and follows its metatable. The scan itself never opens
-/// an owner, walks a whole chain in one step, or clears a weak entry. The whole
+/// opens it as an owner and follows its metatable. A negative result settles
+/// that exact white identity without marking it or queueing it; a cache hit
+/// applies the same result to each later candidate that shares the metatable,
+/// so every eligible white identity is settled. The scan itself never opens an
+/// owner, walks a whole chain in one step, or clears a weak entry. The whole
 /// batch is read before Gray starts, so a metatable edge cannot mark a later
 /// candidate early. When the slot vector and every lookup finish, the phase
 /// returns to Gray; that transition is uncharged.
@@ -1987,7 +1993,30 @@ fn step_pending(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
         return true;
     };
     if let Some(non_nil) = heap.cached_pending_gc(&candidate, state.rescan_epoch) {
-        if non_nil && heap.commit_pending_finalizer(&candidate) {
+        apply_pending_gc(heap, state, &candidate, non_nil);
+        return true;
+    }
+    let cursor = heap.slots[candidate.metatable_slot as usize].edge_head;
+    heap.scan.pending_finalizer_gc_lookups += 1;
+    state.pending_lookup = Some(PendingGcLookup { candidate, cursor });
+    true
+}
+
+/// Applies one completed raw-`__gc` result to the exact candidate.
+///
+/// A non-nil field is the existing queue path: the candidate gets one pending
+/// record and a mark through the ordinary target follow. A missing or nil
+/// field settles the identity instead: no record and no mark. Both outcomes
+/// re-check the slot identity in their heap method; a candidate that changed
+/// during the walk is not selected or settled.
+fn apply_pending_gc(
+    heap: &mut LuaHeap,
+    state: &mut MarkState,
+    candidate: &super::PendingCandidate,
+    non_nil: bool,
+) {
+    if non_nil {
+        if heap.commit_pending_finalizer(candidate) {
             heap.scan.pending_finalizers_selected += 1;
             let _matched = follow_one(
                 heap,
@@ -1997,12 +2026,9 @@ fn step_pending(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
                 HandleKind::Userdata,
             );
         }
-        return true;
+    } else {
+        let _settled = heap.settle_pending_finalizer(candidate);
     }
-    let cursor = heap.slots[candidate.metatable_slot as usize].edge_head;
-    heap.scan.pending_finalizer_gc_lookups += 1;
-    state.pending_lookup = Some(PendingGcLookup { candidate, cursor });
-    true
 }
 
 /// One edge record of the open raw-`__gc` lookup.
@@ -2022,6 +2048,7 @@ fn step_pending_gc(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
             false,
         );
         state.pending_lookup = None;
+        apply_pending_gc(heap, state, &lookup.candidate, false);
         return true;
     };
     let (next, matched, non_nil) = heap.pending_gc_record(index);
@@ -2038,16 +2065,7 @@ fn step_pending_gc(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
             non_nil,
         );
         state.pending_lookup = None;
-        if non_nil && heap.commit_pending_finalizer(&lookup.candidate) {
-            heap.scan.pending_finalizers_selected += 1;
-            let _matched = follow_one(
-                heap,
-                state,
-                lookup.candidate.slot,
-                lookup.candidate.generation,
-                HandleKind::Userdata,
-            );
-        }
+        apply_pending_gc(heap, state, &lookup.candidate, non_nil);
         return true;
     }
     state.pending_lookup = Some(PendingGcLookup {

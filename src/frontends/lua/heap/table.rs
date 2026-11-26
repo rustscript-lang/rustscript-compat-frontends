@@ -270,10 +270,14 @@ struct Slot {
     /// unreachable from guest roots; weak keys keep the entry because the
     /// selected object is retained for the eventual finalizer consumer.
     pending_finalizer: bool,
-    /// The explicit test retirement control consumed this generation's
-    /// pending record. Selection must not pick the object again; the next
-    /// collection treats it as ordinary garbage even if the raw `__gc` field
-    /// is still non-nil. Release and slot reuse clear the flag.
+    /// This generation was finalized without a queue record: either the
+    /// explicit test retirement control consumed its pending record, or the
+    /// selecting white-userdata pass found no raw `__gc` on its metatable.
+    /// Selection must not pick the object again, and a later raw `__gc` on
+    /// the same generation does not queue it. The flag never marks the object
+    /// and never keeps it alive; it only makes a live marked generation
+    /// value-dead for weak-value publication. Release and slot reuse clear
+    /// the flag.
     finalizer_settled: bool,
     /// Cached raw `__gc` lookup result when this table slot is a candidate
     /// metatable. Valid only with `pending_gc_generation` and
@@ -914,6 +918,19 @@ pub(super) struct DoomedMark {
     pub(super) modes: MarkSnapshot,
 }
 
+/// One white userdata identity settled by the selecting pass.
+///
+/// Upstream `lj_gc_separateudata` sets the finalized flag for a white
+/// userdata whose metatable has no raw `__gc` and does not put it on the
+/// finalizer queue. The flag is per heap identity: the exact slot and
+/// generation. It is not a queue record, is not a mark, and does not keep the
+/// object alive. A later raw `__gc` on that generation does not queue it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct SettledFinalizer {
+    pub(super) slot: u32,
+    pub(super) generation: u32,
+}
+
 #[derive(Clone, Copy, Default)]
 struct WeakMode {
     keys: bool,
@@ -998,6 +1015,14 @@ pub struct LuaHeap {
     /// [`PendingQueue`]'s counted boundary, including the test-only release
     /// meter. No call site counts by hand.
     pending_finalizers: PendingQueue,
+    /// Identities settled by the current selecting mark pass, in scan order.
+    ///
+    /// This is the rollback record for [`Self::finalizer_settled`], not a
+    /// queue and not a root. The selecting mark clears it before its scan; a
+    /// verification or doomed-close failure clears exactly those flags before
+    /// returning, and a successful publication drops the list. A pulse-only
+    /// test mark leaves it here until the next selecting mark starts.
+    selecting_settlements: Vec<SettledFinalizer>,
     /// Owner chains opened by the legacy table rollback edge walk.
     /// Test-only observation: an empty userdata reservation rollback must
     /// leave this unchanged, so its work stays independent of the graph size.
@@ -1325,6 +1350,7 @@ impl LuaHeap {
             payload_bytes: 0,
             pending_userdata: None,
             pending_finalizers: PendingQueue::default(),
+            selecting_settlements: Vec::new(),
             #[cfg(test)]
             rollback_owner_visits: 0,
             #[cfg(test)]
@@ -3510,11 +3536,12 @@ impl LuaHeap {
     /// reading the metatable edge chain.
     ///
     /// A candidate is a live, unmarked userdata that already published a
-    /// typed Core token, is not pending yet, and stores a live table
-    /// metatable at its exact generation. The raw `__gc` lookup is a separate
-    /// metered walk; this function reads one slot record only. A missing
-    /// token, a table owner, an absent metatable, or a dead metatable is not
-    /// a candidate.
+    /// typed Core token, is not pending or settled yet, and stores a live
+    /// table metatable at its exact generation. The raw `__gc` lookup is a
+    /// separate metered walk; this function reads one slot record only. A
+    /// missing token, a table owner, an absent metatable, or a dead metatable
+    /// is not a candidate. A missing or nil raw `__gc` is still a candidate:
+    /// it is the settlement arm, not a non-candidate.
     pub(super) fn pending_finalizer_candidate(&self, index: usize) -> Option<PendingCandidate> {
         let slot = self.slots.get(index)?;
         if !matches!(slot.state, SlotState::Live { marked: false }) {
@@ -3619,6 +3646,67 @@ impl LuaHeap {
             raw,
         });
         true
+    }
+
+    /// Settles one metered raw-`__gc`-negative candidate.
+    ///
+    /// Upstream `lj_gc_separateudata` marks such a white userdata finalized
+    /// without queueing it. This writes the same per-identity state on the
+    /// exact slot generation: no queue record, no mark, and no retention.
+    /// The rollback list keeps the identity so a failure before weak
+    /// publication can clear only this pass's flags. The live-token,
+    /// unmarked, userdata, and generation checks mirror
+    /// [`Self::commit_pending_finalizer`]; a candidate that changed during
+    /// the walk is not settled.
+    pub(super) fn settle_pending_finalizer(&mut self, candidate: &PendingCandidate) -> bool {
+        let index = candidate.slot as usize;
+        let Some(slot) = self.slots.get(index) else {
+            return false;
+        };
+        if slot.generation != candidate.generation
+            || !matches!(slot.state, SlotState::Live { marked: false })
+            || slot.kind != HandleKind::Userdata
+            || slot.pending_finalizer
+            || slot.finalizer_settled
+            || slot.token.is_none()
+        {
+            return false;
+        }
+        self.slots[index].finalizer_settled = true;
+        self.selecting_settlements.push(SettledFinalizer {
+            slot: candidate.slot,
+            generation: candidate.generation,
+        });
+        true
+    }
+
+    /// Clears settlements from a previous pulse-only selecting mark, before
+    /// the next selecting scan starts. The published pass already dropped its
+    /// own list after a successful boundary.
+    pub(super) fn clear_selecting_settlements(&mut self) {
+        self.selecting_settlements.clear();
+    }
+
+    /// Clears exactly the settlement flags named by the current failed pass
+    /// and drops the rollback list.
+    ///
+    /// Each entry is re-checked against the live slot generation and the
+    /// userdata kind. A slot that changed, was already pending, or was
+    /// settled by an earlier pass is not touched, so valid previous-cycle
+    /// state and a pending record's flag survive the rollback.
+    pub(super) fn discard_settlements(&mut self) {
+        for entry in self.selecting_settlements.drain(..) {
+            let Some(slot) = self.slots.get_mut(entry.slot as usize) else {
+                continue;
+            };
+            if slot.generation == entry.generation
+                && slot.kind == HandleKind::Userdata
+                && slot.finalizer_settled
+                && !slot.pending_finalizer
+            {
+                slot.finalizer_settled = false;
+            }
+        }
     }
 
     /// Number of pending-finalizer records. Does not read the graph or a
@@ -3992,12 +4080,15 @@ impl LuaHeap {
     /// selection scan for finalizer-eligible userdata after the gray, rescan,
     /// and late work has emptied, then the usual pending-close enumeration.
     ///
-    /// Selection marks each chosen userdata through the ordinary target
-    /// follow, so `open_owner` follows its metatable edge and the metatable's
-    /// own strong entries are scanned by the ordinary gray loop. The selection
-    /// phase does not run in [`Self::mark_and_doomed_tokens`], so an ordinary
-    /// host collection neither selects new objects nor charges the selection
-    /// units. A second selecting pass skips a slot that is already pending.
+    /// Selection marks each raw-`__gc`-positive userdata through the ordinary
+    /// target follow, so `open_owner` follows its metatable edge and the
+    /// metatable's own strong entries are scanned by the ordinary gray loop.
+    /// A raw-`__gc`-negative candidate is settled instead: it is not marked,
+    /// not queued, and not retained, but a live marked generation is
+    /// value-dead for weak publication. The phase does not run in
+    /// [`Self::mark_and_doomed_tokens`], so an ordinary host collection
+    /// neither selects new objects nor charges the selection units. A second
+    /// selecting pass skips a slot that is already pending or settled.
     pub(super) fn mark_and_pending_tokens(&mut self) -> DoomedMark {
         let modes = self.mark_reachable_selecting_pending();
         self.drain_pending_close(modes)
