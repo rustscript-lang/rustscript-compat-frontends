@@ -21,8 +21,13 @@
 //! parameter may be invoked dynamically only when every argument that reaches
 //! that parameter from a statically visible call site (including `pcall`
 //! forwarding) is itself a Lua function literal or another admitted parameter.
-//! A callable binding must come from a function literal in this chunk and must
-//! never be reassigned. Anything else is refused at lowering time.
+//! A missing argument is padded with nil at the Lua call boundary and counts
+//! as a possible non-Lua value, so it taints the parameter for callable
+//! admission even when another call site supplies a function literal. A
+//! callable binding must come from a function literal in this chunk and must
+//! never be reassigned. Non-Lua data may flow through parameters and be
+//! returned; only the dynamic callee position is constrained. Anything else is
+//! refused at lowering time.
 //!
 //! The slice deliberately refuses unsupported statements, expressions,
 //! multi-value forms, and extra arguments instead of guessing. Missing
@@ -140,7 +145,7 @@ struct Lower<'a> {
     function_body_of_binding: Vec<Option<u32>>,
     param_bindings: HashMap<u32, Vec<usize>>,
     possible: Vec<HashSet<u32>>,
-    impure: Vec<bool>,
+    non_lua: Vec<bool>,
     assigned: Vec<bool>,
     sites: Vec<Site<'a>>,
 }
@@ -164,7 +169,7 @@ impl<'a> Lower<'a> {
             function_body_of_binding: vec![None; count],
             param_bindings: HashMap::new(),
             possible: vec![HashSet::new(); count],
-            impure: vec![false; count],
+            non_lua: vec![false; count],
             assigned: vec![false; count],
             sites: Vec::new(),
         }
@@ -175,7 +180,6 @@ impl<'a> Lower<'a> {
     fn analyze(&mut self, chunk: &'a Chunk) -> Result<(), ParseError> {
         self.walk_block(&chunk.body)?;
         self.propagate();
-        self.mark_impure_parameters();
         Ok(())
     }
 
@@ -441,6 +445,10 @@ impl<'a> Lower<'a> {
         Some(site)
     }
 
+    /// One fixpoint over both facts admission needs: which function bodies can
+    /// reach a parameter, and whether any reachable argument is a non-Lua
+    /// value. A missing argument is nil at the Lua call boundary, so it is a
+    /// non-Lua source even when another call site supplies a function literal.
     fn propagate(&mut self) {
         loop {
             let mut changed = false;
@@ -453,8 +461,13 @@ impl<'a> Lower<'a> {
                         .get(&target)
                         .cloned()
                         .unwrap_or_default();
-                    for (index, arg) in site.args.iter().skip(offset).enumerate() {
-                        let Some(&param) = params.get(index) else {
+                    for index in 0..params.len() {
+                        let param = params[index];
+                        let Some(arg) = site.args.get(offset + index) else {
+                            if !self.non_lua[param] {
+                                self.non_lua[param] = true;
+                                changed = true;
+                            }
                             continue;
                         };
                         let sources = self.expr_sources(arg);
@@ -462,6 +475,10 @@ impl<'a> Lower<'a> {
                             if self.possible[param].insert(source) {
                                 changed = true;
                             }
+                        }
+                        if !self.expr_lua_only(arg) && !self.non_lua[param] {
+                            self.non_lua[param] = true;
+                            changed = true;
                         }
                     }
                 }
@@ -501,29 +518,29 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// After the source sets reach a fixpoint, a parameter is impure when some
-    /// statically visible argument that reaches it is not a proven Lua
-    /// callable. Such a parameter may never be invoked through the completion.
-    fn mark_impure_parameters(&mut self) {
-        for site in &self.sites {
-            let targets = self.site_targets(site);
-            let offset = usize::from(site.pcall);
-            for target in targets {
-                let params = self
-                    .param_bindings
-                    .get(&target)
-                    .cloned()
-                    .unwrap_or_default();
-                for (index, arg) in site.args.iter().skip(offset).enumerate() {
-                    let Some(&param) = params.get(index) else {
-                        continue;
-                    };
-                    if self.expr_sources(arg).is_empty() {
-                        self.impure[param] = true;
-                    }
-                }
-            }
+    /// Whether every value this expression can evaluate to is a Lua callable
+    /// produced by this lowering: a function literal, or a name whose binding
+    /// is a non-reassigned function literal or an admitted parameter with no
+    /// known non-Lua source. Any other expression may be ordinary data.
+    fn expr_lua_only(&self, expr: &LuaExpr) -> bool {
+        match expr {
+            LuaExpr::Function { .. } => true,
+            LuaExpr::Paren { inner, .. } => self.expr_lua_only(inner),
+            LuaExpr::Name { name, .. } => self
+                .use_binding(name)
+                .is_some_and(|binding| self.binding_lua_only(binding)),
+            _ => false,
         }
+    }
+
+    fn binding_lua_only(&self, binding: usize) -> bool {
+        if self.assigned[binding] {
+            return false;
+        }
+        if self.function_body_of_binding[binding].is_some() {
+            return true;
+        }
+        self.resolution.bindings[binding].kind == BindingKind::Param && !self.non_lua[binding]
     }
 
     // ---- binding and slot plumbing ---------------------------------------
@@ -990,7 +1007,7 @@ impl<'a> Lower<'a> {
         }
         if self.resolution.bindings[binding].kind == BindingKind::Param {
             let mut arity: Option<usize> = None;
-            if self.possible[binding].is_empty() || self.impure[binding] {
+            if self.possible[binding].is_empty() || self.non_lua[binding] {
                 return Err(ParseError::at_line(
                     line_of(self.source, span),
                     "dynamic call target is not a proven Lua callable",
