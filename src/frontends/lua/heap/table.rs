@@ -262,6 +262,19 @@ struct Slot {
     carrier: Option<Arc<Vec<Value>>>,
     /// Optional metatable. Not a field key and not an edge record.
     metatable: Option<(u32, u32)>,
+    /// This live userdata was selected by the private pending-finalizer scan.
+    /// The Core token stays bound and the slot stays live until an explicit
+    /// retirement control removes the record. A later ordinary mark retains
+    /// the object and its metatable graph instead of releasing them. Weak
+    /// values that name this userdata are still cleared because the object is
+    /// unreachable from guest roots; weak keys keep the entry because the
+    /// selected object is retained for the eventual finalizer consumer.
+    pending_finalizer: bool,
+    /// The explicit test retirement control consumed this generation's
+    /// pending record. Selection must not pick the object again; the next
+    /// collection treats it as ordinary garbage even if the raw `__gc` field
+    /// is still non-nil. Release and slot reuse clear the flag.
+    finalizer_settled: bool,
     /// Head of this owner's edge chain. `None` means no edges. A reused owner
     /// starts with no chain.
     edge_head: Option<u32>,
@@ -671,9 +684,9 @@ struct Frame {
 /// Adding those fields is not a total GC cost.
 ///
 /// A metatable is not in an owner chain. `metatable_edge_checks` counts
-/// stored metatable refs followed from marked nodes. A collect with none
-/// stored does not read those slots, so the field-edge counters stay the
-/// same as a heap that never had a metatable.
+/// stored metatable refs followed from marked table or userdata nodes. A
+/// collect with none stored does not read those slots, so the field-edge
+/// counters stay the same as a heap that never had a metatable.
 ///
 /// `weak_mode_slot_checks` counts `mode_edge` pointer reads during the
 /// clear-mark slot walk. `weak_mode_edge_checks` counts the edge records
@@ -796,6 +809,18 @@ pub struct ScanMeter {
     pub mode_late_event_reuses: u64,
     /// Deferred owner checks and edge writes consumed after every parse.
     pub mode_late_deferred: u64,
+    /// Live slot records read by the private pending-finalizer selection scan.
+    /// One per slot in the separate selection phase; a slot that cannot be
+    /// selected still counts. Not charged by an ordinary collection.
+    pub pending_finalizer_scan_slots: u64,
+    /// Userdata slots newly retained by the private pending-finalizer
+    /// selection. One per record appended; an already pending userdata or a
+    /// non-qualifying slot does not increment this. Not a callback count.
+    pub pending_finalizers_selected: u64,
+    /// Pending-finalizer records offered as host-retained edges by a mark.
+    /// One per record read in the root phase, including a record whose exact
+    /// slot is no longer valid. Not a pulse unit and not a selection.
+    pub pending_finalizer_offers: u64,
     pub scratch: ScanScratch,
 }
 
@@ -937,6 +962,17 @@ pub struct LuaHeap {
     /// reservation as a host edge, and the next normal issuance closes and
     /// releases it before reserving again.
     pending_userdata: Option<PendingUserdata>,
+    /// Userdata slots retained by the private pending-finalizer selection.
+    ///
+    /// Each record names one exact live userdata generation and the Core raw
+    /// handle that its slot still binds. Selection appends at most one record
+    /// per userdata; an ordinary mark offers every record as a host-retained
+    /// edge so no live token is closed or orphaned while it waits for a
+    /// consumer. The explicit retirement test control removes the record and
+    /// clears the slot flag; a later collection may then close the token and
+    /// release the slot. Release also drops a record that names the released
+    /// generation.
+    pending_finalizers: Vec<PendingFinalizer>,
     /// Owner chains opened by the legacy table rollback edge walk.
     /// Test-only observation: an empty userdata reservation rollback must
     /// leave this unchanged, so its work stays independent of the graph size.
@@ -949,6 +985,26 @@ pub struct LuaHeap {
     /// Interior mutability keeps the identity guard's `&self` read-only.
     #[cfg(test)]
     selection_slot_trace: std::cell::RefCell<Vec<u32>>,
+    /// Test-only anti-control for the secondary propagation. When armed, a
+    /// selected pending userdata is still marked and protected, but its
+    /// metatable edge is not followed while its owner head is scanned. This
+    /// proves the graph-retention assertion depends on that real propagation.
+    /// It is not a callback path and never fabricates a close or a status.
+    #[cfg(test)]
+    skip_pending_finalizer_metatable: bool,
+}
+
+/// One typed userdata retained after the ordinary mark converged.
+///
+/// `raw` is the exact Core handle still bound in `slot`; the selection and
+/// the host pre-publication check both read that same binding, so a record
+/// cannot name a different object. The record is not a root vector entry and
+/// is not a guest value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingFinalizer {
+    slot: u32,
+    generation: u32,
+    raw: u64,
 }
 
 /// One typed-issuer userdata reservation, keyed by its exact slot and
@@ -980,8 +1036,9 @@ fn sequence_index(key: &EdgeKey, cap: u32) -> Option<u32> {
     Some(number as u32)
 }
 
-/// Where a publish-only sweep stopped. A completion means no dead slot was
-/// published. `Published` has rewritten weak edges and has not released.
+/// Where a publish-only sweep stopped. A completion means neither a dead slot
+/// nor a retained pending finalizer was published. `Published` has rewritten
+/// weak edges and has not released.
 pub(super) enum PublishHalt {
     Completed(CollectReport),
     Published { heads: u64, edges: u64 },
@@ -1033,10 +1090,13 @@ impl LuaHeap {
             sweep_tail: None,
             payload_bytes: 0,
             pending_userdata: None,
+            pending_finalizers: Vec::new(),
             #[cfg(test)]
             rollback_owner_visits: 0,
             #[cfg(test)]
             selection_slot_trace: std::cell::RefCell::new(Vec::new()),
+            #[cfg(test)]
+            skip_pending_finalizer_metatable: false,
         }
     }
 
@@ -1114,6 +1174,8 @@ impl LuaHeap {
         slot.token = None;
         slot.carrier = None;
         slot.metatable = None;
+        slot.pending_finalizer = false;
+        slot.finalizer_settled = false;
         slot.edge_head = None;
         slot.edge_tail = None;
         slot.mode_edge = None;
@@ -1155,6 +1217,8 @@ impl LuaHeap {
             token: None,
             carrier: None,
             metatable: None,
+            pending_finalizer: false,
+            finalizer_settled: false,
             edge_head: None,
             edge_tail: None,
             mode_edge: None,
@@ -2520,6 +2584,57 @@ impl LuaHeap {
             .map(|(slot, generation)| TableRef::table(self.domain, slot, generation)))
     }
 
+    /// Attaches or clears one metatable reference on a typed userdata.
+    ///
+    /// This is the minimal fixture wiring for the private pending-finalizer
+    /// slice, not a guest metamethod path. A userdata has no owner chain, so
+    /// the reference is stored only in the one `metatable` tuple. The target
+    /// must be a live table in this heap. A new attachment counts in
+    /// `metatable_edges`, the same flag that lets reset parse direct
+    /// `__mode` fields; a replacement that keeps the reference present does
+    /// not change the count. A parked mark or a saved published tail is
+    /// refused before the slot changes, matching the unbarriered
+    /// `alloc_userdata` contract. The edge is strong: `open_owner` follows it
+    /// when the userdata is marked, and the pending selection marks the
+    /// selected userdata after the ordinary mark converges.
+    pub(crate) fn set_userdata_metatable(
+        &mut self,
+        userdata: UserdataRef,
+        mt: Option<TableRef>,
+    ) -> Result<(), HeapError> {
+        self.require_userdata(userdata)?;
+        if let Some(target) = mt {
+            self.require_live(target)?;
+        }
+        self.deny_unbarriered()?;
+        let index = userdata.slot() as usize;
+        let old = self.slots[index].metatable;
+        let new = mt.map(|target| (target.slot(), target.generation()));
+        if old.is_some() != new.is_some() {
+            if new.is_some() {
+                self.metatable_edges = self.metatable_edges.saturating_add(1);
+            } else {
+                self.metatable_edges = self.metatable_edges.saturating_sub(1);
+            }
+        }
+        self.slots[index].metatable = new;
+        Ok(())
+    }
+
+    /// The metatable reference stored on one typed userdata.
+    ///
+    /// This is a raw slot read, not a guest `getmetatable`. A missing
+    /// reference is `Ok(None)`.
+    pub(crate) fn userdata_metatable(
+        &self,
+        userdata: UserdataRef,
+    ) -> Result<Option<TableRef>, HeapError> {
+        self.require_userdata(userdata)?;
+        Ok(self.slots[userdata.slot() as usize]
+            .metatable
+            .map(|(slot, generation)| TableRef::table(self.domain, slot, generation)))
+    }
+
     /// Clones the slot's issued carrier for a field read. This does not add a root.
     pub fn issued_value(&self, table: TableRef) -> Result<Value, HeapError> {
         self.require_live(table)?;
@@ -3073,6 +3188,151 @@ impl LuaHeap {
         }
     }
 
+    /// Whether a named raw field holds any value other than nil.
+    ///
+    /// A missing record and a weak-cleared cursor gap are nil. A scalar,
+    /// including `false`, is a value. Table, closure, upvalue, and userdata
+    /// carriers are values too. This reads only the raw stored record; it
+    /// does not consult `__index` or any other metamethod, and it does not
+    /// build a guest value. One owner-chain lookup, no scan counter.
+    fn raw_named_non_nil(&self, from: TableRef, name: &str) -> Result<bool, HeapError> {
+        self.require_live(from)?;
+        Ok(
+            match self.read_edge(from, |stored| stored.matches_name(name))? {
+                None => false,
+                Some(EdgeValue::Scalar(Value::Null)) => false,
+                Some(_) => true,
+            },
+        )
+    }
+
+    /// Examines one slot for the private pending-finalizer selection.
+    ///
+    /// A candidate is a live, unmarked userdata that already published a
+    /// typed Core token, is not pending yet, and has a metatable whose raw
+    /// `__gc` field is non-nil. The metatable must be a live table at the
+    /// stored generation. The slot generation and the exact bound raw handle
+    /// are copied into the record before the flag changes. This is one slot
+    /// read plus at most one metatable record read; the mark's selection
+    /// phase charges those units. A missing token, a table owner, an absent
+    /// metatable, or an absent raw field is not selected.
+    pub(super) fn select_pending_finalizer(&mut self, index: usize) -> Option<(u32, u32)> {
+        let slot = self.slots.get(index)?;
+        if !matches!(slot.state, SlotState::Live { marked: false }) {
+            return None;
+        }
+        if slot.kind != HandleKind::Userdata || slot.pending_finalizer || slot.finalizer_settled {
+            return None;
+        }
+        let raw = slot.token?;
+        let (metatable_slot, metatable_generation) = slot.metatable?;
+        let generation = slot.generation;
+        let metatable = TableRef::table(self.domain, metatable_slot, metatable_generation);
+        if !self.raw_named_non_nil(metatable, "__gc").ok()? {
+            return None;
+        }
+        self.slots[index].pending_finalizer = true;
+        self.pending_finalizers.push(PendingFinalizer {
+            slot: index as u32,
+            generation,
+            raw,
+        });
+        Some((index as u32, generation))
+    }
+
+    /// Number of pending-finalizer records. Does not read the graph.
+    pub(super) fn pending_finalizer_count(&self) -> usize {
+        self.pending_finalizers.len()
+    }
+
+    /// Exact live userdata named by one pending record, if that record still
+    /// matches the slot, generation, kind, pending flag, live state, and bound
+    /// raw handle. One record read plus one same-slot identity read. This is
+    /// the ordinary mark's host-retained edge offer; it does not close,
+    /// select, or advance the record.
+    pub(super) fn pending_finalizer_retention(&self, index: usize) -> Option<(u32, u32)> {
+        let pending = *self.pending_finalizers.get(index)?;
+        let slot = self.slots.get(pending.slot as usize)?;
+        let exact = slot.generation == pending.generation
+            && slot.kind == HandleKind::Userdata
+            && slot.pending_finalizer
+            && !slot.finalizer_settled
+            && slot.token == Some(pending.raw)
+            && matches!(slot.state, SlotState::Live { .. });
+        exact.then_some((pending.slot, pending.generation))
+    }
+
+    /// Copies the exact pending records as `(raw, slot, generation)`.
+    ///
+    /// The host entry borrows each token with that raw and its concrete
+    /// `lua.userdata` key before it closes any doomed token or publishes weak
+    /// edges. Order is the selection order, which is ascending slot order for
+    /// one cycle.
+    pub(crate) fn pending_finalizer_records(&self) -> Vec<(u64, u32, u32)> {
+        self.pending_finalizers
+            .iter()
+            .map(|pending| (pending.raw, pending.slot, pending.generation))
+            .collect()
+    }
+
+    /// Test-only explicit retirement control for the eventual finalizer
+    /// consumer.
+    ///
+    /// It removes one exact record, clears the slot flag, and leaves the Core
+    /// token bound and the object live. It does not call a callback, close a
+    /// token, run guest code, or mark anything. A later collection may then
+    /// judge the object dead and close its token. Missing record, mismatch, a
+    /// parked mark, or a saved tail is refused before any change.
+    #[cfg(test)]
+    pub(crate) fn retire_pending_finalizer(
+        &mut self,
+        userdata: UserdataRef,
+    ) -> Result<(), HeapError> {
+        self.require_userdata(userdata)?;
+        self.deny_unbarriered()?;
+        let index = userdata.slot();
+        let raw = self.slots[index as usize]
+            .token
+            .ok_or(HeapError::StaleHandle)?;
+        let Some(position) = self.pending_finalizers.iter().position(|pending| {
+            pending.slot == index
+                && pending.generation == userdata.generation()
+                && pending.raw == raw
+        }) else {
+            return Err(HeapError::StaleHandle);
+        };
+        self.pending_finalizers.remove(position);
+        self.slots[index as usize].pending_finalizer = false;
+        self.slots[index as usize].finalizer_settled = true;
+        Ok(())
+    }
+
+    /// Test-only read of the per-slot pending flag.
+    #[cfg(test)]
+    pub(crate) fn slot_pending_finalizer(&self, userdata: UserdataRef) -> Result<bool, HeapError> {
+        self.require_userdata(userdata)?;
+        Ok(self.slots[userdata.slot() as usize].pending_finalizer)
+    }
+
+    /// Test-only read of the per-slot settled flag.
+    #[cfg(test)]
+    pub(crate) fn slot_finalizer_settled(&self, userdata: UserdataRef) -> Result<bool, HeapError> {
+        self.require_userdata(userdata)?;
+        Ok(self.slots[userdata.slot() as usize].finalizer_settled)
+    }
+
+    /// Test-only anti-control arm for the secondary metatable propagation.
+    ///
+    /// With the flag armed, `open_owner` does not follow the metatable edge of
+    /// a selected pending userdata. The userdata itself is still marked and
+    /// retained; its graph then dies. This proves the graph-retention
+    /// assertion depends on the real propagation. It changes no record and
+    /// runs no callback.
+    #[cfg(test)]
+    pub(crate) fn arm_pending_finalizer_metatable_skip(&mut self, armed: bool) {
+        self.skip_pending_finalizer_metatable = armed;
+    }
+
     /// The staged Core raw handle for one exact reservation, before publish.
     ///
     /// Test-only: the private retry entry reads it to close the same token
@@ -3307,6 +3567,21 @@ impl LuaHeap {
         self.drain_pending_close(modes)
     }
 
+    /// The private single-shot entry's mark: the same ordinary mark, then one
+    /// selection scan for finalizer-eligible userdata after the gray, rescan,
+    /// and late work has emptied, then the usual pending-close enumeration.
+    ///
+    /// Selection marks each chosen userdata through the ordinary target
+    /// follow, so `open_owner` follows its metatable edge and the metatable's
+    /// own strong entries are scanned by the ordinary gray loop. The selection
+    /// phase does not run in [`Self::mark_and_doomed_tokens`], so an ordinary
+    /// host collection neither selects new objects nor charges the selection
+    /// units. A second selecting pass skips a slot that is already pending.
+    pub(super) fn mark_and_pending_tokens(&mut self) -> DoomedMark {
+        let modes = self.mark_reachable_selecting_pending();
+        self.drain_pending_close(modes)
+    }
+
     /// Advances a saved mark with the borrowed batch. `None` means the same
     /// state was written back and tokens were not enumerated. `Some` is the
     /// owned close list of a finished mark; the saved state is already gone.
@@ -3375,7 +3650,9 @@ impl LuaHeap {
     }
 
     /// Same sweep session from selection through release. The callback runs
-    /// once, after Owners and before Release, and only when a dead slot exists.
+    /// once, after Owners and before Release, and only when that sweep
+    /// publishes: a dead slot exists, or a retained pending finalizer needs
+    /// its weak values cleared.
     pub(super) fn sweep_observing<R>(
         &mut self,
         modes: MarkSnapshot,
@@ -3387,8 +3664,9 @@ impl LuaHeap {
         (session.report(), seen)
     }
 
-    /// Publishes weak edges and stores the release tail. No dead slot finishes
-    /// the sweep and records the one report.
+    /// Publishes weak edges and stores the release tail. No dead slot and no
+    /// retained pending finalizer finishes the sweep and records the one
+    /// report.
     pub(super) fn halt_at_publish(&mut self, modes: MarkSnapshot) -> PublishHalt {
         debug_assert!(self.sweep_tail.is_none(), "publish must not stack a tail");
         let mut session = SweepSession::start(self, modes);
@@ -3593,6 +3871,20 @@ impl LuaHeap {
         self.drain_mark()
     }
 
+    /// Drops any parked mark, then runs one mark whose selection phase scans
+    /// for finalizer-eligible userdata after the ordinary work empties.
+    /// Selection records and marks each chosen userdata; its metatable graph
+    /// is then scanned by the same gray loop. A close failure after this mark
+    /// does not put the mark back, but the records and marked bits remain
+    /// until the next reset, so a retry marks the same records again.
+    fn mark_reachable_selecting_pending(&mut self) -> MarkSnapshot {
+        let abandoned = self.mark.take();
+        drop(abandoned);
+        let mut session = MarkSession::start_selecting_pending(self);
+        session.drain();
+        session.into_snapshot()
+    }
+
     fn release_slot(&mut self, index: u32) {
         debug_assert!(
             self.slots[index as usize].edge_head.is_none()
@@ -3609,6 +3901,22 @@ impl LuaHeap {
             );
             self.pending_userdata = None;
         }
+        // A pending record is a host-retained edge; a selected slot must not
+        // reach release. Keep the invariant explicit and drop only a record
+        // that names this exact released generation, so a reused successor is
+        // never covered by the old record.
+        let released_generation = self.slots[index as usize].generation;
+        debug_assert!(
+            !self
+                .pending_finalizers
+                .iter()
+                .any(|pending| pending.slot == index && pending.generation == released_generation),
+            "a pending finalizer reached release without its retirement"
+        );
+        self.pending_finalizers
+            .retain(|pending| pending.slot != index || pending.generation != released_generation);
+        self.slots[index as usize].pending_finalizer = false;
+        self.slots[index as usize].finalizer_settled = false;
         let mark = self.mark.as_mut();
         mark::release_rescan_slot(mark, &mut self.slots, index);
         let mark = self.mark.as_mut();

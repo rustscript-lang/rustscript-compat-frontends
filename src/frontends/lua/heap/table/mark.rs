@@ -12,7 +12,9 @@
 //! one slot reset, one mode-edge open, one mode-string byte (including a NUL),
 //! one mode-cache initialization, one root slot, one reached owner's outgoing
 //! head, or one outgoing edge or gap. Target checks and the metatable check
-//! ride with the edge or the owner head. A zero budget does not read the graph.
+//! ride with the edge or the owner head. A zero budget does not read the
+//! graph. The private pending-finalizer selection adds one phase whose pulse
+//! unit is one slot read; only the private selecting entry enables it.
 //!
 //! Late work is bounded by live sites, not by mutation count: one parse per
 //! metatable slot (intrusive queue), one deferred transition check per owner,
@@ -82,6 +84,19 @@ pub(super) struct MarkState {
     /// value and does not enter `roots`; it is one host-retained edge checked
     /// once per mark after the explicit roots.
     pending_reservation_checked: bool,
+    /// Private single-shot entry only: after the ordinary gray, rescan, and
+    /// late work empties, scan every slot once for finalizer-eligible
+    /// userdata. Each selected userdata is marked through the ordinary target
+    /// follow, so the following gray pass traces its metatable graph. An
+    /// ordinary mark leaves this false and never charges the selection units.
+    select_pending: bool,
+    /// The one selection scan finished. A second gray pass may now finish the
+    /// mark.
+    pending_scan_done: bool,
+    /// Next slot the selection scan reads.
+    pending_index: usize,
+    /// Next pending record offered as a host-retained edge in Roots.
+    pending_offer: usize,
     mode_edge: Option<u32>,
     mode_owner: usize,
     byte_at: usize,
@@ -167,6 +182,7 @@ enum MarkPhase {
     ModeInit,
     Roots,
     Gray,
+    Pending,
     ModeLate,
     Done,
 }
@@ -220,6 +236,10 @@ impl MarkState {
             late_target_tail: None,
             index: 0,
             pending_reservation_checked: false,
+            select_pending: false,
+            pending_scan_done: false,
+            pending_index: 0,
+            pending_offer: 0,
             mode_edge: None,
             mode_owner: 0,
             byte_at: 0,
@@ -284,6 +304,7 @@ impl MarkState {
             MarkPhase::ModeInit => "mode-init",
             MarkPhase::Roots => "roots",
             MarkPhase::Gray => "gray",
+            MarkPhase::Pending => "pending-finalizer",
             MarkPhase::ModeLate => "mode-late",
             MarkPhase::Done => "done",
         }
@@ -300,6 +321,19 @@ impl<'a> MarkSession<'a> {
         let rescan_epoch = heap.advance_rescan_epoch();
         heap.mark = Some(MarkState::new(rescan_epoch));
         Self { heap }
+    }
+
+    /// One ordinary mark, plus one selection scan after the ordinary work
+    /// empties. Only the private pending-finalizer entry uses this starter.
+    pub(super) fn start_selecting_pending(heap: &'a mut LuaHeap) -> Self {
+        let session = Self::start(heap);
+        session
+            .heap
+            .mark
+            .as_mut()
+            .expect("start installed the mark state")
+            .select_pending = true;
+        session
     }
 
     pub(super) fn meter(&self) -> super::ScanMeter {
@@ -979,6 +1013,7 @@ fn step(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
         MarkPhase::ModeInit => step_mode_init(heap, state),
         MarkPhase::Roots => step_root(heap, state),
         MarkPhase::Gray => step_gray(heap, state),
+        MarkPhase::Pending => step_pending(heap, state),
         MarkPhase::ModeLate => step_mode_late(heap, state),
         MarkPhase::Done => false,
     }
@@ -1828,6 +1863,23 @@ fn step_root(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
                 return true;
             }
         }
+        // Pending finalizers are host-retained edges, not guest roots. Each
+        // record is offered once, after the explicit roots and the registered
+        // reservation. The record check is one same-slot identity read; a
+        // valid record is marked like a root. A record that no longer names
+        // its exact live generation is skipped without closing anything.
+        if state.pending_offer < heap.pending_finalizer_count() {
+            let index = state.pending_offer;
+            state.pending_offer += 1;
+            heap.scan.pending_finalizer_offers += 1;
+            if let Some((slot, _generation)) = heap.pending_finalizer_retention(index) {
+                heap.scan.node_slot_visits += 1;
+                if heap.mark_new(slot) {
+                    state.gray.push(slot);
+                }
+            }
+            return true;
+        }
         state.phase = MarkPhase::Gray;
         return false;
     }
@@ -1880,8 +1932,39 @@ fn step_gray(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
     if state.discover_on {
         return probe_deleted_mode_owner(heap, state);
     }
+    if state.select_pending && !state.pending_scan_done {
+        state.phase = MarkPhase::Pending;
+        return false;
+    }
     state.phase = MarkPhase::Done;
     false
+}
+
+/// One slot of the private pending-finalizer selection scan.
+///
+/// The scan runs only after the ordinary gray, rescan, and late work has
+/// emptied and only when the private entry asked for it. Each call reads one
+/// slot, charged as one node-slot visit and one pending selection slot. A
+/// candidate is recorded and then marked through the ordinary `follow_one`
+/// path; the next Gray pass opens it as an owner and follows its metatable.
+/// The scan itself never opens an owner, walks an edge, or clears a weak
+/// entry. When the index reaches the slot-vector length, the phase returns to
+/// Gray so selected graphs finish marking; that transition is uncharged.
+fn step_pending(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
+    if state.pending_index >= heap.slots.len() {
+        state.pending_scan_done = true;
+        state.phase = MarkPhase::Gray;
+        return false;
+    }
+    let index = state.pending_index;
+    state.pending_index += 1;
+    heap.scan.pending_finalizer_scan_slots += 1;
+    heap.scan.node_slot_visits += 1;
+    if let Some((slot, generation)) = heap.select_pending_finalizer(index) {
+        heap.scan.pending_finalizers_selected += 1;
+        let _matched = follow_one(heap, state, slot, generation, HandleKind::Userdata);
+    }
+    true
 }
 
 fn begin_owner(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
@@ -1902,11 +1985,39 @@ fn open_owner(heap: &mut LuaHeap, state: &mut MarkState, slot: u32) -> bool {
         return false;
     }
     let kind = stored.kind;
+    let userdata_metatable = if kind == HandleKind::Userdata {
+        stored.metatable
+    } else {
+        None
+    };
     let mode = if kind == HandleKind::Table && heap.metatable_edges > 0 {
         owner_mode(heap, state, slot)
     } else {
         WeakMode::default()
     };
+    // A userdata metatable is a strong edge of the marked userdata. Following
+    // it rides on this same owner-head unit, exactly as a table's metatable
+    // check rides on the table head. The test-only anti-control can suppress
+    // this follow for a selected pending userdata; the userdata itself stays
+    // marked and retained in that arm.
+    #[cfg(test)]
+    let skip_metatable =
+        heap.skip_pending_finalizer_metatable && heap.slots[slot as usize].pending_finalizer;
+    #[cfg(not(test))]
+    let skip_metatable = false;
+    if let Some((metatable_slot, metatable_generation)) = userdata_metatable
+        && heap.metatable_edges > 0
+        && !skip_metatable
+    {
+        heap.scan.metatable_edge_checks += 1;
+        let _matched = follow_one(
+            heap,
+            state,
+            metatable_slot,
+            metatable_generation,
+            HandleKind::Table,
+        );
+    }
     heap.scan.owner_head_checks += 1;
     state.cursor = heap.slots[slot as usize].edge_head;
     state.owner = Some(slot);

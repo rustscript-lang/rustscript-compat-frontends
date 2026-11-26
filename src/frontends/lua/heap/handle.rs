@@ -13,8 +13,10 @@ pub enum HandleKind {
     /// scalar (boolean, binary64, string, or bytes), or is absent (nil). It has
     /// no open or closed flag.
     Upvalue,
-    /// A bare userdata node. It has no finalizer, metatable, environment, or
-    /// guest carrier. It is not a table and not a Core number.
+    /// A bare userdata node. It has no guest carrier and no Core resource
+    /// token. The private pending-finalizer slice can attach one metatable
+    /// reference with `set_userdata_metatable`; that reference is a strong
+    /// edge only in the private slice and is not a guest metamethod surface.
     Userdata,
 }
 
@@ -154,7 +156,10 @@ impl UpvalueRef {
 /// Domain-checked reference to one bare userdata node.
 ///
 /// Construction stays inside the heap. A guest `Value` is not a
-/// `UserdataRef`. The node has no finalizer, environment, or payload.
+/// `UserdataRef`. A bare node has no environment or payload. The private
+/// pending-finalizer slice stores one optional metatable reference on the
+/// slot and can retain the node for a future finalizer consumer; it still has
+/// no guest carrier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UserdataRef {
     domain: u64,

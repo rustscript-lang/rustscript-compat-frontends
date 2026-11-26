@@ -9,6 +9,8 @@ mod heap;
 
 #[path = "luajit_heap_runtime/owner_adjacency.rs"]
 mod owner_adjacency;
+#[path = "luajit_heap_runtime/pending_finalizer.rs"]
+mod pending_finalizer;
 #[path = "luajit_heap_runtime/mod.rs"]
 mod support;
 #[path = "luajit_heap_runtime/userdata_resource.rs"]
