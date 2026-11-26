@@ -1,0 +1,24 @@
+// Core pre-close witness: a normal callback, a real script fault callback, and
+// a final callback that must stay queued when the host error aborts the drain.
+// This is exact RSS input for the real Core compiler; no Lua frontend is
+// involved.
+
+fn mark(phase: int) -> int;
+fn explode(phase: int) -> int;
+
+pub fn a(x: [int]) -> int {
+    mark(1);
+    x[0]
+}
+
+pub fn fault(x: [int]) -> int {
+    mark(2);
+    explode(0)
+}
+
+pub fn c(x: [int]) -> int {
+    mark(3);
+    x[0]
+}
+
+0;

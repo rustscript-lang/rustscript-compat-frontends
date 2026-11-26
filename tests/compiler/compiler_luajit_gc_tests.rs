@@ -29,6 +29,9 @@ mod parser;
 #[path = "../../src/frontends/lua/resolve.rs"]
 mod resolve;
 
+#[path = "compiler_luajit_gc_tests/core_pre_close.rs"]
+mod core_pre_close;
+
 use super::heap;
 
 use std::path::{Path, PathBuf};
