@@ -1527,8 +1527,9 @@ fn pulse_steps(heap: &mut heap::LuaHeap, limit: usize) -> (Vec<PulseStep>, ScanM
 }
 
 /// Checks the one-record-per-call boundary on a real pulse trace. A lookup
-/// start and a cursor exhaustion are uncharged transitions; neither may hide
-/// a fabricated edge read.
+/// start and a cursor exhaustion each spend their pulse unit without reading
+/// an edge record; the edge meter, not the budget, counts real reads, so
+/// neither may hide a fabricated one.
 fn assert_single_edge_per_pulse(steps: &[PulseStep], expected_edges: u64) {
     let mut starts = 0;
     let mut total = 0;

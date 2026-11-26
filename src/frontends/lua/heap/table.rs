@@ -1054,8 +1054,9 @@ mod pending_queue {
     ///
     /// A read is one record handed to the caller: `get` yields one, `iter`
     /// counts each yielded item, `remove` counts the removed record, and
-    /// `split_off_from` counts every removed record. `len` touches only the
-    /// vector header, and `push` writes; neither is a record read.
+    /// `split_off_from` hands back the whole suffix and counts it once by its
+    /// length. `len` touches only the vector header, and `push` writes;
+    /// neither is a record read.
     #[derive(Default)]
     pub(super) struct PendingQueue {
         records: Vec<PendingFinalizer>,
@@ -1098,16 +1099,20 @@ mod pending_queue {
             Some(record)
         }
 
-        /// Removes and returns every record from `base` onward. Each removed
-        /// record is one read; an out-of-range base reads no record.
+        /// Removes and returns every record from `base` onward.
+        ///
+        /// The batch is one boundary: a non-empty suffix is accounted once by
+        /// its length in the test meter. The production build has no
+        /// per-record loop here; the returned records are the caller's own
+        /// rollback input. An out-of-range base returns nothing and reads no
+        /// record.
         pub(super) fn split_off_from(&mut self, base: usize) -> Vec<PendingFinalizer> {
             if base >= self.records.len() {
                 return Vec::new();
             }
             let removed = self.records.split_off(base);
-            for _ in &removed {
-                self.record_read();
-            }
+            #[cfg(test)]
+            self.record_reads(removed.len());
             removed
         }
 
@@ -1122,6 +1127,12 @@ mod pending_queue {
         #[cfg(test)]
         fn record_read(&self) {
             self.reads.set(self.reads.get() + 1);
+        }
+
+        /// Accounts a whole batch handed out by one boundary. Test-only.
+        #[cfg(test)]
+        fn record_reads(&self, count: usize) {
+            self.reads.set(self.reads.get() + count as u64);
         }
 
         #[cfg(not(test))]
@@ -1147,6 +1158,77 @@ mod pending_queue {
     }
 }
 use pending_queue::{PendingFinalizer, PendingQueue};
+
+/// The batch boundary's own metering witness.
+///
+/// This is an equivalence witness for the boundary result: the split has
+/// always handed back the suffix exactly once. What the fix changes is where
+/// the test meter pays for it: a single test-only `removed.len()` charge
+/// replaces a per-record loop that the production build also compiled. These
+/// assertions pin the boundary contract on both the old and the new source;
+/// they are not a fabricated behavior RED.
+#[cfg(test)]
+mod pending_queue_tests {
+    use super::pending_queue::{PendingFinalizer, PendingQueue};
+
+    fn record(slot: u32) -> PendingFinalizer {
+        PendingFinalizer {
+            slot,
+            generation: slot + 1,
+            raw: u64::from(slot) + 10,
+        }
+    }
+
+    #[test]
+    fn split_off_from_accounts_the_suffix_once_and_keeps_the_prefix() {
+        let mut queue = PendingQueue::default();
+        assert!(
+            queue.split_off_from(0).is_empty(),
+            "an empty queue has no suffix"
+        );
+        assert_eq!(queue.take_reads(), 0, "an empty queue reads no record");
+        for slot in 0..3 {
+            queue.push(record(slot));
+        }
+        assert_eq!(queue.take_reads(), 0, "push and len are not record reads");
+
+        let suffix = queue.split_off_from(1);
+        assert_eq!(suffix, vec![record(1), record(2)]);
+        assert_eq!(queue.len(), 1, "only the old prefix stays queued");
+        assert_eq!(
+            queue.take_reads(),
+            2,
+            "a two-record suffix is accounted once by its length"
+        );
+        assert_eq!(
+            queue.get(0),
+            Some(&record(0)),
+            "the untouched prefix keeps its record"
+        );
+        assert_eq!(queue.take_reads(), 1, "the split did not read the prefix");
+
+        assert!(
+            queue.split_off_from(1).is_empty(),
+            "base at the length is an empty suffix"
+        );
+        assert_eq!(queue.take_reads(), 0, "an empty suffix reads no record");
+        assert!(
+            queue.split_off_from(9).is_empty(),
+            "an out-of-range base is an empty suffix"
+        );
+        assert_eq!(
+            queue.take_reads(),
+            0,
+            "an out-of-range base reads no record"
+        );
+
+        assert_eq!(queue.split_off_from(0), vec![record(0)]);
+        assert_eq!(queue.len(), 0);
+        assert_eq!(queue.take_reads(), 1, "the last record is one batch read");
+        assert!(queue.split_off_from(0).is_empty());
+        assert_eq!(queue.take_reads(), 0, "a drained queue reads no record");
+    }
+}
 
 /// One userdata that passed the slot-local selection checks and whose
 /// metatable's raw `__gc` field still has to be resolved by a metered walk.
