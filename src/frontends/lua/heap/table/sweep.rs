@@ -27,14 +27,25 @@
 //! its weak value is cleared while a weak key keeps the entry. Independently
 //! of the value bit, a `k`-only table clears a pending or settled userdata
 //! value from its string-keyed and object-keyed hash entries, matching the
-//! upstream hash loop. Numeric keys keep the previous rule because this
-//! representation has no array/hash split to decide which part owns them.
+//! upstream hash loop. A negative or non-integer numeric key and an integer
+//! above the upstream last possible array index are hash keys; other numeric
+//! keys keep the previous rule because this representation does not carry
+//! the actual array/hash split.
 
 use super::{
     CollectReport, EdgeKey, EdgeValue, GuestClass, HandleKind, HeapError, LuaHeap, MarkSnapshot,
     ScanMeter, SlotState, TableRef, WeakMode,
 };
 use vm::Value;
+
+/// The largest numeric key that the upstream dense array can still hold.
+///
+/// LuaJIT caps the array part at `LJ_MAX_ASIZE = (1 << 27) + 1` slots,
+/// including the zero slot (`lj_def.h:60-61`), and `inarray` accepts an
+/// index only when `index < asize` (`lj_tab.h:79-84`). The largest index
+/// that can ever be an array slot is therefore `2^27`, and every larger
+/// integer key is necessarily a hash key.
+const LAST_POSSIBLE_ARRAY_INDEX: f64 = 134_217_728.0; // (1 << 27)
 
 pub(super) struct SweepSession<'a> {
     heap: &'a mut LuaHeap,
@@ -722,18 +733,20 @@ impl<'a> SweepSession<'a> {
         // `__mode` field, which `EdgeKey::named` stores as field id 0) and an
         // object key are always hash keys, so those branches are claimed. A
         // numeric key may name a dense array slot in LuaJIT: a negative
-        // number or a non-integer is never an integer array index, so those
-        // are hash keys; zero, negative zero, and positive integers can be
-        // array slots or hash nodes depending on the real array part, which
-        // this slice does not carry, so they keep the previous strong-value
-        // rule. Boolean keys have no representation here. The LuaJIT
-        // positive-integer evidence is therefore not claimed.
+        // number or a non-integer is never an integer array index, and an
+        // integer above `LAST_POSSIBLE_ARRAY_INDEX` cannot be one either, so
+        // those are hash keys. Zero, negative zero, and integers up to that
+        // bound can be array slots or hash nodes depending on the real array
+        // part, which this slice does not carry, so they keep the previous
+        // strong-value rule. Boolean keys have no representation here. The
+        // LuaJIT layout of an integer within the possible array range is
+        // therefore not claimed.
         let hash_key = match &edge.key {
             EdgeKey::Utf8(_) | EdgeKey::Object { .. } => true,
             EdgeKey::Field(field) => *field == LuaHeap::MODE_FIELD,
             EdgeKey::Number(bits) => {
                 let number = f64::from_bits(*bits);
-                number < 0.0 || number.fract() != 0.0
+                number < 0.0 || number.fract() != 0.0 || number > LAST_POSSIBLE_ARRAY_INDEX
             }
         };
         let finalized_value = match &edge.value {

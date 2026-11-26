@@ -3976,6 +3976,114 @@ fn k_hash_published_gaps_keep_real_cursors_to_scalar_successors() {
     });
 }
 
+/// The first integer above LuaJIT's last possible array index is a
+/// deterministic hash key: `LJ_MAX_ASIZE = (1 << 27) + 1` includes the zero
+/// slot (`lj_def.h:60-61`) and `inarray` tests `index < asize`
+/// (`lj_tab.h:79-84`), so `2^27 + 1` cannot be an array index. Under `k`, a
+/// finalized value there is cleared, and the real numeric cursor obtained
+/// before the write still continues to the same scalar successor. The last
+/// possible index `2^27` stays on the existing unclaimed array/hash branch:
+/// this slice does not model the actual layout, so the test does not claim
+/// that a sparse LuaJIT table must retain it.
+///
+/// The settlement cycle runs first because a rooted `k` table's strong value
+/// would keep a fresh userdata marked. The checked publication is the first
+/// one that carries these edges after that cycle.
+#[test]
+fn k_hash_clears_the_first_integer_above_the_last_array_index() {
+    crate::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        let seed = seed_settlement(&mut host, SettlementArm::Linked, false);
+        let boundary = publish_boundary(&mut host);
+        assert!(
+            matches!(boundary, PublishedBoundary::Published { .. }),
+            "the linked settlement cycle really queues A and settles B"
+        );
+        assert!(pending_flag(&mut host, seed.a));
+        assert!(finalizer_settled(&mut host, seed.b));
+        let _ = finish_release(&mut host);
+
+        const LAST_ARRAY_INDEX: f64 = 134_217_728.0; // (1 << 27)
+        const FIRST_HASH_INTEGER: f64 = 134_217_729.0; // (1 << 27) + 1
+        let (boundary_pair, layout_table) = heap::with_heap(&mut host, |heap| {
+            let boundary_pair = build_cursor_pair(
+                heap,
+                CursorKey::Number(FIRST_HASH_INTEGER),
+                "seed-boundary",
+                "after-boundary",
+                "boundary-tail",
+            )?;
+            let layout_table = weak_table(heap, "k")?;
+            heap.set_number_userdata(layout_table, LAST_ARRAY_INDEX, seed.b)?;
+            Ok((boundary_pair, layout_table))
+        })
+        .expect("boundary lattice");
+        assert_eq!(boundary_pair.cursor, Value::Float(FIRST_HASH_INTEGER));
+
+        let frame = heap::with_heap(&mut host, |heap| {
+            let frame = heap.enter_roots(2)?;
+            heap.write_root(frame, 0, boundary_pair.table)?;
+            heap.write_root(frame, 1, layout_table)?;
+            Ok(frame)
+        })
+        .expect("boundary roots");
+
+        heap::with_heap(&mut host, |heap| {
+            heap.set_number_userdata(boundary_pair.table, FIRST_HASH_INTEGER, seed.a)?;
+            assert_eq!(
+                heap.number_userdata(boundary_pair.table, FIRST_HASH_INTEGER),
+                Ok(Some(seed.a))
+            );
+            assert_eq!(
+                heap.number_userdata(layout_table, LAST_ARRAY_INDEX),
+                Ok(Some(seed.b))
+            );
+            Ok(())
+        })
+        .expect("boundary userdata targets");
+
+        let boundary = publish_boundary(&mut host);
+        assert!(
+            matches!(boundary, PublishedBoundary::Published { .. }),
+            "the first real publication that carries the boundary tables"
+        );
+        assert!(pending_flag(&mut host, seed.a));
+        assert!(finalizer_settled(&mut host, seed.b));
+
+        heap::with_heap(&mut host, |heap| {
+            assert_eq!(
+                heap.number_value(boundary_pair.table, FIRST_HASH_INTEGER),
+                Ok(Value::Null),
+                "the pending A above the last possible array index is cleared"
+            );
+            assert_eq!(
+                heap.number_userdata(layout_table, LAST_ARRAY_INDEX),
+                Ok(Some(seed.b)),
+                "the last possible array index stays on the unclaimed layout branch"
+            );
+            assert_eq!(
+                heap.next_guest(boundary_pair.table, &boundary_pair.cursor),
+                Ok(Some((
+                    boundary_pair.successor.clone(),
+                    boundary_pair.successor_value.clone()
+                ))),
+                "the original numeric cursor continues at the same scalar successor"
+            );
+            Ok(())
+        })
+        .expect("boundary publication");
+
+        assert!(userdata_token_open(&host, seed.a_raw));
+        assert!(userdata_token_open(&host, seed.b_raw));
+        let _ = finish_release(&mut host);
+        assert!(alive(&mut host, boundary_pair.table));
+        assert!(alive(&mut host, layout_table));
+        heap::with_heap(&mut host, |heap| heap.leave_roots(frame)).expect("leave boundary roots");
+        heap::with_heap(&mut host, |heap| heap.leave_roots(seed.weak_frame))
+            .expect("leave weak roots");
+    });
+}
+
 /// Per-unit journal witness across the growth points of the removed vector.
 /// Nine white userdata with live empty metatables are settled by the real
 /// selecting mark. The old design's `Vec::push` grew at four and eight
