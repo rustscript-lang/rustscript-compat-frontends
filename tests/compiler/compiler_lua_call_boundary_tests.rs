@@ -46,11 +46,25 @@
 //!
 //! Each replacement below asserts that its exact before-pattern occurs once,
 //! so the witness cannot silently drift from the original fixtures.
+//!
+//! At `mark(1)` the host also binds the observed call to the actual `held`
+//! argument, not merely to some callable in the parent frame:
+//!
+//! - the caller is the frame immediately below the active callee;
+//! - the caller prototype's `parameter_slots[0]` selects one exact local slot;
+//! - that slot is read with checked arithmetic inside the caller's own
+//!   `local_base..local_base + local_count` frame range;
+//! - the value must be a `Value::Callable` whose prototype is the prototype of
+//!   the frame that is actually executing, and whose prototype target is a
+//!   script function.
+//!
+//! No other slot is searched, so an unrelated callable cannot satisfy the
+//! witness.
 
 use std::sync::{Arc, Mutex};
 
-use vm::vm::VmFrameContinuation;
-use vm::{CallOutcome, CallReturn, HostFunction, Value, Vm, VmError, VmStatus};
+use vm::vm::{VmExecutionFrameSnapshot, VmFrameContinuation};
+use vm::{CallOutcome, CallReturn, CallableTarget, HostFunction, Value, Vm, VmError, VmStatus};
 
 const GUEST_SUCCESS: &str = include_str!("fixtures/core_active_protected_call/guest-success.rss");
 const GUEST_ERROR: &str = include_str!("fixtures/core_active_protected_call/guest-error.rss");
@@ -66,7 +80,27 @@ struct Mark {
     last_prototype: Option<u32>,
     last_return_ip: Option<usize>,
     parent_prototype: Option<u32>,
-    parent_holds_callable: bool,
+    held_parameter: HeldParameterWitness,
+}
+
+/// Exact observation of the active parent frame's first declared parameter.
+///
+/// Only `parameter_slots[0]` of the caller prototype is read. The absolute
+/// index is formed with checked arithmetic and then read with `get`, so both
+/// the relative slot check and the concrete local-range bounds check are
+/// recorded instead of assumed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct HeldParameterWitness {
+    caller_prototype: Option<u32>,
+    declared_slot: Option<u16>,
+    caller_local_base: Option<usize>,
+    caller_local_count: Option<usize>,
+    slot_inside_caller_frame: bool,
+    read_within_bounds: bool,
+    value_is_callable: bool,
+    callable_prototype: Option<u32>,
+    callable_is_script_function: bool,
+    callee_prototype: Option<u32>,
 }
 
 struct MarkHost {
@@ -80,18 +114,13 @@ impl HostFunction for MarkHost {
         };
         let frames = vm.execution_frames();
         let parent = frames.iter().rev().nth(1);
-        let parent_holds_callable = parent
-            .map(|frame| {
-                let end = frame.local_base.saturating_add(frame.local_count);
-                vm.locals()
-                    .get(frame.local_base..end)
-                    .is_some_and(|locals| {
-                        locals
-                            .iter()
-                            .any(|value| matches!(value, Value::Callable(_)))
-                    })
-            })
-            .unwrap_or(false);
+        // The strict parent-parameter binding belongs to the callee marker: at
+        // `mark(1)` the parent is one frame below the active callee.
+        let held_parameter = if *phase == 1 {
+            observe_held_parameter(vm, &frames)
+        } else {
+            HeldParameterWitness::default()
+        };
         let mark = Mark {
             phase: *phase,
             frame_len: frames.len(),
@@ -102,11 +131,70 @@ impl HostFunction for MarkHost {
                 _ => None,
             }),
             parent_prototype: parent.and_then(|frame| frame.prototype_id),
-            parent_holds_callable,
+            held_parameter,
         };
         self.log.lock().expect("mark log").push(mark);
         Ok(CallOutcome::Return(CallReturn::one(Value::Int(*phase))))
     }
+}
+
+/// Reads the caller's declared first parameter and records the exact callee
+/// binding for the caller's strict assertions.
+///
+/// The caller is the frame immediately below the active frame. The slot comes
+/// from the caller prototype itself (`parameter_slots[0]`), is required to be
+/// inside the caller's declared local count, and is then read with
+/// `checked_add` plus a bounds-checked slice lookup. The value must be a
+/// `Value::Callable` whose prototype is the executing callee frame's
+/// prototype, and whose prototype target must be a script function. No other
+/// slot is scanned.
+fn observe_held_parameter(vm: &Vm, frames: &[VmExecutionFrameSnapshot]) -> HeldParameterWitness {
+    let (Some(callee), Some(caller)) = (frames.last(), frames.iter().rev().nth(1)) else {
+        return HeldParameterWitness::default();
+    };
+    let mut witness = HeldParameterWitness {
+        caller_prototype: caller.prototype_id,
+        caller_local_base: Some(caller.local_base),
+        caller_local_count: Some(caller.local_count),
+        callee_prototype: callee.prototype_id,
+        ..HeldParameterWitness::default()
+    };
+    let program = vm.program();
+    let Some(prototype) = caller
+        .prototype_id
+        .and_then(|id| program.callable_prototypes.get(id as usize))
+    else {
+        return witness;
+    };
+    let Some(&declared_slot) = prototype.parameter_slots.first() else {
+        return witness;
+    };
+    witness.declared_slot = Some(declared_slot);
+    let relative = usize::from(declared_slot);
+    if relative >= caller.local_count {
+        return witness;
+    }
+    witness.slot_inside_caller_frame = true;
+    let Some(absolute) = caller.local_base.checked_add(relative) else {
+        return witness;
+    };
+    let Some(value) = vm.locals().get(absolute) else {
+        return witness;
+    };
+    witness.read_within_bounds = true;
+    let Value::Callable(callable) = value else {
+        return witness;
+    };
+    witness.value_is_callable = true;
+    witness.callable_prototype = Some(callable.prototype_id);
+    witness.callable_is_script_function = matches!(
+        program
+            .callable_prototypes
+            .get(callable.prototype_id as usize)
+            .map(|prototype| prototype.target),
+        Some(CallableTarget::ScriptFunction(_))
+    );
+    witness
 }
 
 /// Rewrites the exact fixture into the minimal syntax accepted by this Core pin.
@@ -219,9 +307,40 @@ fn assert_executed_site(vm: &Vm, log: &Mutex<Vec<Mark>>, invoked: bool) {
             Some(caller),
             "the active parent frame must be one below the callee"
         );
+        let held = &callee.held_parameter;
+        assert_eq!(
+            held.caller_prototype,
+            Some(caller),
+            "the held argument must be read from the parent frame: {held:?}"
+        );
+        assert_eq!(
+            held.callee_prototype, callee.last_prototype,
+            "the witness must compare against the executing callee frame: {held:?}"
+        );
+        assert_eq!(
+            held.declared_slot,
+            Some(0),
+            "the Core pin must declare the first parameter in slot 0: {held:?}"
+        );
         assert!(
-            callee.parent_holds_callable,
-            "the active parent frame must still hold the real guest callable"
+            held.slot_inside_caller_frame,
+            "the declared parameter slot must be inside the parent frame: {held:?}"
+        );
+        assert!(
+            held.read_within_bounds,
+            "the bounds-checked parent local read must succeed: {held:?}"
+        );
+        assert!(
+            held.value_is_callable,
+            "the first declared parameter must hold a real callable: {held:?}"
+        );
+        assert_eq!(
+            held.callable_prototype, callee.last_prototype,
+            "the held callable must be the executing callee, not any other callable: {held:?}"
+        );
+        assert!(
+            held.callable_is_script_function,
+            "the held callable prototype target must be a script function: {held:?}"
         );
         assert_eq!(callee.frame_len, 3, "root + parent + callee");
     } else {
@@ -278,6 +397,12 @@ fn unpack(vm: &Vm) -> (bool, i64, i64, Value, Value) {
     };
     let Value::Int(marker) = &result[3] else {
         panic!("element 3 must be int");
+    };
+    // `same_array` answers false for a non-array, so the comparator `t` must
+    // first be proven to be an array; otherwise the omitted arm's payload
+    // inequality would pass without comparing two arrays.
+    let Value::Array(_) = &result[4] else {
+        panic!("element 4 must be the comparator array t");
     };
     (*tag, *arity, *marker, result[1].clone(), result[4].clone())
 }
