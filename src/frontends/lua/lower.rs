@@ -461,8 +461,7 @@ impl<'a> Lower<'a> {
                         .get(&target)
                         .cloned()
                         .unwrap_or_default();
-                    for index in 0..params.len() {
-                        let param = params[index];
+                    for (index, &param) in params.iter().enumerate() {
                         let Some(arg) = site.args.get(offset + index) else {
                             if !self.non_lua[param] {
                                 self.non_lua[param] = true;

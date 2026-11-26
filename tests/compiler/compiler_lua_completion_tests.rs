@@ -435,6 +435,9 @@ fn drive_fixture(name: &str) -> Run {
     let stack = vm.stack().to_vec();
     let status_log = format!("{status:?}");
     let exit = consume_completion_exit(status, stack.clone());
+    if let CompletionExit::MalformedTransport { detail } = &exit {
+        eprintln!("LUA_COMPLETION malformed-transport fixture={name} detail={detail}");
+    }
     eprintln!(
         "LUA_COMPLETION fixture={name} fuel_budget={FUEL_BUDGET} check_interval={FUEL_CHECK_INTERVAL} consumed={fuel_consumed} remaining={remaining} jit=disabled status={status_log} exit={exit:?} stack={stack:?} marks={:?}",
         marks
