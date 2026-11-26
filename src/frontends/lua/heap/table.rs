@@ -284,12 +284,12 @@ struct Slot {
     /// vector; this slot field replaces the old record-keyed map, so a late
     /// parse neither inserts into a tree nor queries one.
     mode_weak: WeakMode,
-    /// Current direct `__mode` record version inspected by this round's reset
-    /// walk, including a read whose bytes name no weak side. This is not a
-    /// weak-mode cache: `mode_generation` and `mode_round` above stay unset
-    /// for a strong read. The triple only lets a first attachment skip a
-    /// second read of the same field version. A later write bumps `mode_epoch`
-    /// and is still registered and read late.
+    /// Current direct `__mode` record version inspected by this round, either
+    /// by the reset walk or by a finished late read, including a read whose
+    /// bytes name no weak side. This is not a weak-mode cache: `mode_generation`
+    /// and `mode_round` above stay unset for a strong read. The triple only
+    /// lets a first attachment skip a second read of the same field version. A
+    /// later write bumps `mode_epoch` and is still registered and read late.
     mode_checked_generation: u32,
     mode_checked_round: u64,
     mode_checked_epoch: u32,

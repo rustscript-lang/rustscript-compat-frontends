@@ -15472,6 +15472,269 @@ fn late_first_attachment_reset_control_reads_an_in_place_rewrite() {
 }
 
 // ---------------------------------------------------------------------------
+// Whole-slice review deleg_f0957a44: a late strong result at a zero-attachment
+// Reset is a field observation, not an authoritative weak cache. The next
+// in-place rewrite must be read before the unscanned owner opens.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug)]
+enum LateStrongArm {
+    /// Business: attach after a zero-attachment Reset, finish the late `x`
+    /// read, then rewrite the same record to `v` before the owner opens.
+    StrongThenWeak,
+    /// Control: the same stop point keeps `x` for this round; a later round
+    /// that reads `v` clears the same original graph.
+    StrongKeep,
+}
+
+struct LateStrongGraph {
+    mt: TableRef,
+    owner: TableRef,
+    gate: TableRef,
+    gate_record: u32,
+    value: TableRef,
+    child: TableRef,
+    orphan: TableRef,
+}
+
+fn plant_late_strong(heap: &mut LuaHeap) -> LateStrongGraph {
+    let mt = heap.alloc().expect("late-strong metatable");
+    heap.set_mode_scalar(mt, Value::string("x"))
+        .expect("prewrite the direct x");
+    let owner = heap.alloc().expect("late-strong owner");
+    let value = heap.alloc().expect("late-strong value");
+    let child = heap.alloc().expect("late-strong child");
+    heap.set_named_edge(owner, "subj", value)
+        .expect("owner subj");
+    heap.set_named_edge(value, "next", child)
+        .expect("value next");
+    let orphan = heap.alloc().expect("late-strong orphan");
+    let gate = heap.alloc().expect("late-strong gate");
+    heap.set_named_scalar(gate, "g0", Value::Bool(true))
+        .expect("gate g0");
+    heap.set_named_scalar(gate, "g1", Value::Bool(true))
+        .expect("gate g1");
+    let (_, gate_record) = heap
+        .locate_named(gate.slot(), "g1")
+        .expect("gate g1 record");
+    let frame = heap.enter_roots(2).expect("late-strong roots");
+    heap.write_root(frame, 0, owner).expect("root owner");
+    heap.write_root(frame, 1, gate).expect("root gate");
+    LateStrongGraph {
+        mt,
+        owner,
+        gate,
+        gate_record,
+        value,
+        child,
+        orphan,
+    }
+}
+
+fn run_late_strong(arm: LateStrongArm) {
+    let mut heap = LuaHeap::new(limits(24, 8, 32));
+    let graph = plant_late_strong(&mut heap);
+    assert_eq!(
+        heap.metatable_edges, 0,
+        "no metatable is attached when Reset runs"
+    );
+    assert!(
+        heap.slots[graph.mt.slot() as usize].mode_edge.is_some(),
+        "the metatable carries a direct __mode record"
+    );
+    assert_eq!(
+        heap.slots[graph.mt.slot() as usize].mode_checked_generation,
+        0,
+        "the prewritten field has no observation yet"
+    );
+    heap.take_scan_meter();
+    let mut write_registrations = 0;
+    let mut rewrite_parses = 0;
+    {
+        let mut parked = ParkedMark::start(&mut heap).expect("start late-strong mark");
+        pause_at(&mut parked, graph.gate.slot(), graph.gate_record);
+        assert!(parked.marked(graph.owner), "the owner is queued");
+        assert!(
+            parked.pending().map(|scan| scan.owner) != Some(graph.owner.slot()),
+            "the owner has not opened yet"
+        );
+        assert!(
+            !parked.marked(graph.value) && !parked.marked(graph.child),
+            "the weak value and its successor start white"
+        );
+        assert!(
+            !parked.marked(graph.orphan),
+            "the independent orphan starts white"
+        );
+        assert_eq!(
+            parked.meter().weak_mode_bytes,
+            0,
+            "a zero-attachment Reset reads no __mode bytes"
+        );
+        assert_eq!(
+            parked.with_saved_heap(|heap| heap.named_value(graph.mt, "__mode")),
+            Ok(Value::string("x")),
+            "the raw field really holds the unread x"
+        );
+        let before_attach = parked.meter();
+        parked
+            .with_saved_heap(|heap| heap.set_metatable(graph.owner, Some(graph.mt)))
+            .expect("first attachment during Gray");
+        let after_attach = parked.meter();
+        assert_eq!(
+            after_attach.mode_late_registrations - before_attach.mode_late_registrations,
+            1,
+            "the unread field registers one late read"
+        );
+        assert_eq!(
+            after_attach.mode_late_events - before_attach.mode_late_events,
+            1,
+            "the attach records one deferred transition while the mode is unknown"
+        );
+        pulse_until_late_parsed(&mut parked);
+        assert_eq!(
+            parked.with_saved_heap(|heap| heap.named_value(graph.mt, "__mode")),
+            Ok(Value::string("x")),
+            "the late read sees the raw x"
+        );
+        assert!(
+            parked.pending().map(|scan| scan.owner) != Some(graph.owner.slot()),
+            "finishing the late read did not open the owner"
+        );
+        assert!(
+            !parked.marked(graph.value) && !parked.marked(graph.child),
+            "a finished strong read does not mark the value or its successor"
+        );
+        let before_reattach = parked.meter();
+        parked
+            .with_saved_heap(|heap| -> Result<(), HeapError> {
+                heap.set_metatable(graph.owner, None)?;
+                heap.set_metatable(graph.owner, Some(graph.mt))
+            })
+            .expect("detach and reattach the same mode version");
+        assert_eq!(
+            parked.meter().mode_late_registrations,
+            before_reattach.mode_late_registrations,
+            "a same-version reattachment must not requeue the inspected field"
+        );
+        let before_write = parked.meter();
+        match arm {
+            LateStrongArm::StrongThenWeak => {
+                parked
+                    .with_saved_heap(|heap| heap.set_mode_scalar(graph.mt, Value::string("v")))
+                    .expect("rewrite x -> v in place");
+                assert_eq!(
+                    parked.with_saved_heap(|heap| heap.named_value(graph.mt, "__mode")),
+                    Ok(Value::string("v")),
+                    "the raw field really holds the rewritten v"
+                );
+                let after_write = parked.meter();
+                write_registrations =
+                    after_write.mode_late_registrations - before_write.mode_late_registrations;
+                let parsed_before = after_write.mode_late_parsed;
+                if write_registrations > 0 {
+                    pulse_until_late_parsed(&mut parked);
+                }
+                rewrite_parses = parked.meter().mode_late_parsed - parsed_before;
+                assert_eq!(
+                    parked.with_saved_heap(|heap| heap.named_value(graph.mt, "__mode")),
+                    Ok(Value::string("v")),
+                    "the late rewrite bytes stay exact"
+                );
+                assert!(
+                    parked.pending().map(|scan| scan.owner) != Some(graph.owner.slot()),
+                    "the rewritten read did not open the owner"
+                );
+                assert!(
+                    !parked.marked(graph.value) && !parked.marked(graph.child),
+                    "the rewrite did not mark the value before the owner scan"
+                );
+            }
+            LateStrongArm::StrongKeep => {}
+        }
+        let _ = finish(&mut parked);
+        parked.complete().expect("sweep late-strong mark");
+    }
+    assert!(heap.alive(graph.owner), "the rooted owner survives");
+    assert!(heap.alive(graph.mt), "the attached metatable survives");
+    assert!(
+        !heap.alive(graph.orphan),
+        "the independent orphan clears in both arms"
+    );
+    match arm {
+        LateStrongArm::StrongThenWeak => {
+            assert!(
+                !heap.alive(graph.value),
+                "the unscanned owner must read the late v and clear its value \
+                 (write registrations {write_registrations}, rewrite parses {rewrite_parses})"
+            );
+            assert!(
+                !heap.alive(graph.child),
+                "the strong successor clears with the weak value"
+            );
+            assert_eq!(
+                heap.named_edge(graph.owner, "subj"),
+                Ok(None),
+                "the weak entry clears at entry level"
+            );
+            assert_eq!(
+                write_registrations, 1,
+                "a rewrite after a finished strong read must register its own late read"
+            );
+            assert_eq!(
+                rewrite_parses, 1,
+                "the rewritten field is read exactly once"
+            );
+        }
+        LateStrongArm::StrongKeep => {
+            assert!(
+                heap.alive(graph.value),
+                "keeping x leaves the original value strongly reachable"
+            );
+            assert!(
+                heap.alive(graph.child),
+                "and the successor behind that value"
+            );
+            assert_eq!(
+                heap.named_edge(graph.owner, "subj"),
+                Ok(Some(graph.value)),
+                "the strong entry stays live"
+            );
+            heap.set_mode_scalar(graph.mt, Value::string("v"))
+                .expect("re-weaken the kept field after the round");
+            heap.take_scan_meter();
+            let mut second = ParkedMark::start(&mut heap).expect("start the re-weaken round");
+            let _ = finish(&mut second);
+            second.complete().expect("sweep the re-weaken round");
+            drop(second);
+            assert!(
+                !heap.alive(graph.value),
+                "the next round reads v and clears the kept original value"
+            );
+            assert!(
+                !heap.alive(graph.child),
+                "the successor clears with the kept value"
+            );
+            assert_eq!(
+                heap.named_edge(graph.owner, "subj"),
+                Ok(None),
+                "the kept entry clears in the re-weaken round"
+            );
+        }
+    }
+}
+
+#[test]
+fn late_strong_result_does_not_block_a_same_round_weak_rewrite() {
+    run_late_strong(LateStrongArm::StrongThenWeak);
+}
+
+#[test]
+fn late_strong_keep_control_survives_and_the_next_round_reweak_clears() {
+    run_late_strong(LateStrongArm::StrongKeep);
+}
+
+// ---------------------------------------------------------------------------
 // Review ba3c944, item 2: a same-tuple rescan must re-read the mode before the
 // next record is charged.
 // ---------------------------------------------------------------------------
