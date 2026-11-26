@@ -28,3 +28,6 @@ mod compiler_luajit_gc_tests;
 
 #[path = "compiler/compiler_lua_call_boundary_tests.rs"]
 mod compiler_lua_call_boundary_tests;
+
+#[path = "compiler/compiler_lua_completion_tests.rs"]
+mod compiler_lua_completion_tests;
