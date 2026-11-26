@@ -897,6 +897,10 @@ fn assert_lowering_refusal(name: &str, needle: &str) {
             ..
         })
         | Err(SourcePathError::Source(SourceError::Parse(parse))) => {
+            eprintln!(
+                "LUA_COMPLETION refusal fixture={name} message={}",
+                parse.message
+            );
             assert!(
                 parse.message.contains(needle),
                 "{name}: unexpected refusal: {}",
