@@ -22,4 +22,4 @@ mark("outer")
 local ok, err = pcall(relay, middle, leaf)
 note(err)
 mark("outer-tail")
-return ok, err
+return ok

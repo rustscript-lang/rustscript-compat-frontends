@@ -23,6 +23,7 @@ end
 mark("outer")
 local ok, err = pcall(table_arm)
 mark("after-table")
+note(err)
 local ok2, err2 = pcall(relay, scalar_fail)
 mark("after-scalar")
-return ok, err, ok2, err2
+return ok, ok2, err2

@@ -17,14 +17,30 @@
 //! precise host error. The error object and its strong child are canonical
 //! issued table carriers, never Core arrays standing in for a table.
 //!
+//! A normal chunk completion must never carry a table. The chunk exit has no
+//! root slot, so a carrier there would be a value the frame retirement is
+//! about to reclaim. The chunk finish refuses every table in a normal
+//! completion before it retires anything: the formal root still holds the
+//! table, the chunk frame stays on top, and the caller is the one that
+//! releases that frame and collects the reclaimed carrier.
+//!
+//! The protected receiver adopts a table only from the exact reserved temp
+//! root: the temp slot must already hold that same issued table when the
+//! formal root is written. The temp slot is cleared after the formal write. A
+//! missing third publish is refused at the receiver, never repaired by
+//! fabricating a formal root. That refusal also keeps the chunk frame open
+//! for the caller to release and collect.
+//!
 //! An uncaught issued table at the chunk boundary keeps the chunk frame open:
 //! the caller receives the table together with an explicit live root, then
 //! releases the frame and collects. The boundary records both states, and a
 //! reclaimed carrier is never classified as a usable table.
 //!
 //! The observer holds only `TableRef` values and carrier pointers; a guest
-//! carrier does not keep the heap node alive. Collection is the real
-//! synchronous full sweep.
+//! carrier does not keep the heap node alive. A refusal record additionally
+//! keeps the offending carrier value so the test can classify it after the
+//! run; that clone is not a root. Collection is the real synchronous full
+//! sweep.
 
 use std::sync::{Arc, Mutex};
 
@@ -45,14 +61,15 @@ use crate::heap;
 const POSITIVE_FIXTURE: &str = "root-handoff.lua";
 const MAX_FIXTURE_TABLES: usize = 8;
 
-/// One test arm. The positive arm publishes at every table handoff. Each
-/// negative arm omits exactly one publish while keeping that handoff's frame
-/// retirement and the real full collection in the same window.
+/// One test arm. The positive arm publishes at every handoff. Each negative
+/// arm omits exactly one publish while keeping that handoff's frame retirement
+/// (and, for the first two, the real full collection in the same window).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Arm {
     Positive,
     OmitFirstPublish,
     OmitSecondPublish,
+    OmitThirdPublish,
 }
 
 /// A run budget. `Normal` is the fixed production-shaped fuel budget used by
@@ -247,6 +264,46 @@ struct FinishRecord {
     top_after: Option<(u32, u32)>,
     collection: Option<FinishCollection>,
     uncaught: Option<UncaughtRecord>,
+    refused: Option<FinishRefusal>,
+}
+
+/// One refusal at a host protocol seam. The reason string is the exact host
+/// error; the frame and slot fields are what the host observed before it
+/// refused. The frame is never retired here, so the caller still owns it.
+#[derive(Clone, Debug)]
+struct FinishRefusal {
+    site: &'static str,
+    frame: (u32, u32),
+    temp_slot: u32,
+    formal_slot: u32,
+    temp_before: Option<heap::TableRef>,
+    formal_before: Option<heap::TableRef>,
+    value: TypedValue,
+    table: Option<heap::TableRef>,
+    carrier: Option<usize>,
+    carrier_value: Option<Value>,
+    frame_retained: bool,
+    reason: String,
+}
+
+/// One refusal of a protected table receive. It is recorded before any formal
+/// root is written: `formal_after` and `temp_after` are still empty.
+#[derive(Clone, Debug)]
+struct FormalRefusal {
+    site: &'static str,
+    frame: (u32, u32),
+    temp_slot: u32,
+    formal_slot: u32,
+    temp_before: Option<heap::TableRef>,
+    formal_before: Option<heap::TableRef>,
+    value: TypedValue,
+    table: Option<heap::TableRef>,
+    carrier: Option<usize>,
+    carrier_value: Option<Value>,
+    temp_after: Option<heap::TableRef>,
+    formal_after: Option<heap::TableRef>,
+    frame_retained: bool,
+    reason: String,
 }
 
 #[derive(Clone, Debug)]
@@ -257,6 +314,10 @@ struct NoteRecord {
     carrier: Option<usize>,
     temp_empty: bool,
     formal_table: Option<heap::TableRef>,
+    table_alive: bool,
+    child: Option<heap::TableRef>,
+    child_alive: bool,
+    rooted: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -266,6 +327,7 @@ struct RootWitness {
     enters: Vec<EnterRecord>,
     handoffs: Vec<HandoffRecord>,
     formals: Vec<FormalRecord>,
+    formal_refusals: Vec<FormalRefusal>,
     discards: Vec<DiscardRecord>,
     finish: Option<FinishRecord>,
     note: Option<NoteRecord>,
@@ -285,9 +347,46 @@ struct UncaughtBoundary {
     alive_at_boundary: bool,
     carrier_is_table_at_boundary: bool,
     frame: Option<(u32, u32)>,
+    temp_after_run: Option<heap::TableRef>,
+    formal_after_run: Option<heap::TableRef>,
     released: bool,
     alive_after_release: bool,
     carrier_is_table_after_release: bool,
+    report: Option<heap::CollectReport>,
+}
+
+/// One exit carrier classified on the scope heap after `Vm::run`.
+///
+/// A refused or reclaimed carrier is not an issued table: the classification
+/// is the evidence, not the pointer identity.
+#[derive(Clone, Copy, Debug)]
+struct ExitCarrier {
+    carrier: usize,
+    class: heap::GuestClass,
+}
+
+/// The post-run state of one refused protocol seam.
+///
+/// Both refusals happen before any frame retirement, so the chunk frame, its
+/// slots and the carrier are still real after `Vm::run` returns. This records
+/// that state and then performs the caller-side release and collection: the
+/// refusing host does not retire or collect the chunk frame.
+#[derive(Clone, Debug)]
+struct RefusalBoundary {
+    site: &'static str,
+    frame: (u32, u32),
+    top_after_run: Option<(u32, u32)>,
+    frame_retained: bool,
+    temp_after_run: Option<heap::TableRef>,
+    formal_after_run: Option<heap::TableRef>,
+    carrier_is_table_before_release: bool,
+    table_alive_before_release: bool,
+    child: Option<heap::TableRef>,
+    child_alive_before_release: bool,
+    released_by_caller: bool,
+    carrier_is_table_after_release: bool,
+    table_alive_after_release: bool,
+    child_alive_after_release: bool,
     report: Option<heap::CollectReport>,
 }
 
@@ -303,6 +402,9 @@ struct RootRun {
     call_sites: Vec<super::DecodedCallSite>,
     witness: RootWitness,
     boundary: Option<UncaughtBoundary>,
+    exit_carriers: Vec<ExitCarrier>,
+    heap_after_run: Option<heap::HeapStats>,
+    refusal: Option<RefusalBoundary>,
 }
 
 impl RootRun {
@@ -559,6 +661,25 @@ impl RootHost {
                 .iter()
                 .position(|witness| witness.table == table)
         });
+        let table_alive = match table {
+            Some(table) => alive_table(&mut host, table)?,
+            None => false,
+        };
+        let child = match table {
+            Some(table) => heap::with_heap(&mut host, |heap| heap.named_edge(table, "child"))
+                .map_err(heap_fault)?,
+            None => None,
+        };
+        let child_alive = match child {
+            Some(child) => alive_table(&mut host, child)?,
+            None => false,
+        };
+        if table.is_some() && (!table_alive || (child.is_some() && !child_alive)) {
+            return Err(self.fail(
+                "note cannot use the issued payload: the table or its strong child is not live",
+            ));
+        }
+        let rooted = table.is_some_and(|table| temp == Some(table) || formal == Some(table));
         self.witness.lock().expect("root witness").note = Some(NoteRecord {
             frame: frame.parts(),
             table,
@@ -566,6 +687,10 @@ impl RootHost {
             carrier,
             temp_empty: temp.is_none(),
             formal_table: formal,
+            table_alive,
+            child,
+            child_alive,
+            rooted,
         });
         Ok(CallOutcome::Return(CallReturn::one(Value::Bool(true))))
     }
@@ -726,7 +851,9 @@ impl RootHost {
         let skipped_publish = payload_table.is_some()
             && matches!(
                 (arm, index),
-                (Arm::OmitFirstPublish, 0) | (Arm::OmitSecondPublish, 1)
+                (Arm::OmitFirstPublish, 0)
+                    | (Arm::OmitSecondPublish, 1)
+                    | (Arm::OmitThirdPublish, 2)
             );
         let mut published = false;
         if let Some(table) = payload_table
@@ -806,9 +933,38 @@ impl RootHost {
             Value::Array(_) => match classify(&mut host, value)? {
                 heap::GuestClass::Table(table) => {
                     value_table = Some(table);
-                    if let Some(temp_table) = temp_before
-                        && temp_table != table
-                    {
+                    // The table may only be adopted from the exact reserved
+                    // temp root. A missing publish (for example an omitted
+                    // third handoff) is a refusal here; writing the formal
+                    // root anyway would fabricate the root the handoff never
+                    // published.
+                    let Some(temp_table) = temp_before else {
+                        let temp_after = rooted_table(&mut host, own, temp)?;
+                        let formal_after = rooted_table(&mut host, own, formal)?;
+                        let reason = "the formal receive requires the exact reserved temp root before it may write the formal root";
+                        self.witness
+                            .lock()
+                            .expect("root witness")
+                            .formal_refusals
+                            .push(FormalRefusal {
+                                site: "formal_receive",
+                                frame: own.parts(),
+                                temp_slot: temp,
+                                formal_slot: formal,
+                                temp_before,
+                                formal_before,
+                                value: value_kind,
+                                table: Some(table),
+                                carrier: carrier_ptr(value),
+                                carrier_value: Some(value.clone()),
+                                temp_after,
+                                formal_after,
+                                frame_retained: current == Some(own),
+                                reason: reason.to_string(),
+                            });
+                        return Err(self.fail(reason));
+                    };
+                    if temp_table != table {
                         return Err(
                             self.fail("the formal receive does not match the reserved temp root")
                         );
@@ -818,10 +974,8 @@ impl RootHost {
                     }
                     heap::with_heap(&mut host, |heap| heap.write_root(own, formal, table))
                         .map_err(heap_fault)?;
-                    if temp_before.is_some() {
-                        heap::with_heap(&mut host, |heap| heap.clear_root(own, temp))
-                            .map_err(heap_fault)?;
-                    }
+                    heap::with_heap(&mut host, |heap| heap.clear_root(own, temp))
+                        .map_err(heap_fault)?;
                     rooted = true;
                 }
                 other => {
@@ -969,23 +1123,45 @@ impl RootHost {
                 let Value::Array(items) = completion else {
                     unreachable!("decode_completion accepted a non-array");
                 };
-                for item in &items[1..] {
-                    if matches!(item, Value::Array(_)) {
-                        match classify(&mut host, item)? {
-                            heap::GuestClass::Table(table) => {
-                                if formal_before != Some(table) {
-                                    return Err(self.fail(
-                                        "a normal chunk completion carries an issued table that is not the last formal root",
-                                    ));
-                                }
-                            }
-                            other => {
-                                return Err(self.fail(format!(
-                                    "a normal chunk completion carries an array that is not a live issued table: {other:?}"
-                                )));
-                            }
-                        }
-                    }
+                // A chunk exit has no root slot. Returning a table carrier
+                // here would hand back a value that the retirement is about to
+                // reclaim, so every table is refused before anything retires.
+                if let Some(item) = items[1..]
+                    .iter()
+                    .find(|item| matches!(item, Value::Array(_)))
+                {
+                    let table = match classify(&mut host, item)? {
+                        heap::GuestClass::Table(table) => Some(table),
+                        _ => None,
+                    };
+                    let temp_before = rooted_table(&mut host, own, 0)?;
+                    let top = current_frame(&mut host)?;
+                    let reason = "the chunk finish refuses a table in a normal completion: a normal chunk exit has no root slot and must not return a carrier";
+                    self.witness.lock().expect("root witness").finish = Some(FinishRecord {
+                        frame: own.parts(),
+                        formal_slot: formal,
+                        formal_before,
+                        completion: completion_class.clone(),
+                        retired: false,
+                        top_after: top.map(heap::RootFrameId::parts),
+                        collection: None,
+                        uncaught: None,
+                        refused: Some(FinishRefusal {
+                            site: "chunk_finish",
+                            frame: own.parts(),
+                            temp_slot: 0,
+                            formal_slot: formal,
+                            temp_before,
+                            formal_before,
+                            value: typed_value(item),
+                            table,
+                            carrier: carrier_ptr(item),
+                            carrier_value: Some(item.clone()),
+                            frame_retained: top == Some(own),
+                            reason: reason.to_string(),
+                        }),
+                    });
+                    return Err(self.fail(reason));
                 }
             }
             CompletionClass::Error { .. } => {
@@ -1071,6 +1247,7 @@ impl RootHost {
                 top_after: top_after.map(heap::RootFrameId::parts),
                 collection: None,
                 uncaught,
+                refused: None,
             });
             return Ok(CallOutcome::Return(CallReturn::one(completion.clone())));
         }
@@ -1114,6 +1291,7 @@ impl RootHost {
                 report,
             }),
             uncaught,
+            refused: None,
         });
         Ok(CallOutcome::Return(CallReturn::one(completion.clone())))
     }
@@ -1191,6 +1369,7 @@ fn drive_mode(fixture: &str, arm: Arm, mode: RunMode) -> RootRun {
         enters: Vec::new(),
         handoffs: Vec::new(),
         formals: Vec::new(),
+        formal_refusals: Vec::new(),
         discards: Vec::new(),
         finish: None,
         note: None,
@@ -1227,16 +1406,21 @@ fn drive_mode(fixture: &str, arm: Arm, mode: RunMode) -> RootRun {
     let epoch_deadline = vm.epoch_deadline();
     let stack = vm.stack().to_vec();
     let exit = consume_completion_exit(status, stack.clone());
+    let exit_carriers = inspect_exit_carriers(&mut vm, &exit);
+    let heap_after_run = heap::with_heap(&mut vm.host_context(), |heap| Ok(heap.stats())).ok();
     let witness = witness.lock().expect("root witness lock").clone();
     let boundary = resolve_uncaught_boundary(&mut vm, &witness, &exit);
+    let refusal = resolve_refusal_boundary(&mut vm, &witness);
     eprintln!(
-        "LUA_ROOT_HANDOFF fixture={fixture} arm={arm:?} fuel_budget={fuel_budget:?} fuel_remaining={fuel_remaining:?} epoch_deadline={epoch_deadline:?} yield_reason={last_yield_reason:?} exit={exit:?} table_count={} enters={:?} handoffs={:?} formals={:?} discards={:?} finish={:?} boundary={boundary:?} failures={:?}",
+        "LUA_ROOT_HANDOFF fixture={fixture} arm={arm:?} fuel_budget={fuel_budget:?} fuel_remaining={fuel_remaining:?} epoch_deadline={epoch_deadline:?} yield_reason={last_yield_reason:?} exit={exit:?} exit_carriers={exit_carriers:?} heap_after_run={heap_after_run:?} table_count={} enters={:?} handoffs={:?} formals={:?} formal_refusals={:?} discards={:?} finish={:?} note={:?} boundary={boundary:?} refusal={refusal:?} failures={:?}",
         witness.tables.len(),
         witness.enters,
         witness.handoffs,
         witness.formals,
+        witness.formal_refusals,
         witness.discards,
         witness.finish,
+        witness.note,
         witness.failures
     );
     RootRun {
@@ -1250,7 +1434,38 @@ fn drive_mode(fixture: &str, arm: Arm, mode: RunMode) -> RootRun {
         call_sites,
         witness,
         boundary,
+        exit_carriers,
+        heap_after_run,
+        refusal,
     }
+}
+
+/// Classifies every table carrier on the completion exit after `Vm::run`.
+///
+/// A carrier whose heap slot was swept classifies as `Unissued`; pointer
+/// identity alone would not show that. This is a read-only observation on the
+/// still-live scope heap.
+fn inspect_exit_carriers(vm: &mut Vm, exit: &CompletionExit) -> Vec<ExitCarrier> {
+    let values: &[Value] = match exit {
+        CompletionExit::Values(values) => values,
+        CompletionExit::Uncaught { payload } => std::slice::from_ref(payload),
+        _ => return Vec::new(),
+    };
+    let mut host = vm.host_context();
+    let mut carriers = Vec::new();
+    for value in values {
+        let Value::Array(_) = value else {
+            continue;
+        };
+        let Some(carrier) = carrier_ptr(value) else {
+            continue;
+        };
+        let Ok(class) = classify(&mut host, value) else {
+            continue;
+        };
+        carriers.push(ExitCarrier { carrier, class });
+    }
+    carriers
 }
 
 /// Resolves the uncaught boundary against the still-live scope heap.
@@ -1277,6 +1492,8 @@ fn resolve_uncaught_boundary(
         alive_at_boundary: false,
         carrier_is_table_at_boundary: false,
         frame: uncaught.frame,
+        temp_after_run: None,
+        formal_after_run: None,
         released: false,
         alive_after_release: false,
         carrier_is_table_after_release: false,
@@ -1285,13 +1502,18 @@ fn resolve_uncaught_boundary(
     let Some(table) = uncaught.table else {
         return Some(boundary);
     };
+    let Some(frame_parts) = uncaught.frame else {
+        return Some(boundary);
+    };
+    let frame = heap::RootFrameId::from_parts(frame_parts.0, frame_parts.1);
+    // Read the real frame slots after `Vm::run` instead of trusting the
+    // finish record: the retained chunk frame must be the one that still
+    // roots the payload.
+    boundary.temp_after_run = rooted_table(&mut host, frame, 0).ok()?;
+    boundary.formal_after_run = rooted_table(&mut host, frame, 1).ok()?;
     let before = classify(&mut host, payload).ok()?;
     boundary.alive_at_boundary = matches!(before, heap::GuestClass::Table(found) if found == table);
     boundary.carrier_is_table_at_boundary = matches!(before, heap::GuestClass::Table(_));
-    let Some(frame) = uncaught.frame else {
-        return Some(boundary);
-    };
-    let frame = heap::RootFrameId::from_parts(frame.0, frame.1);
     heap::with_heap(&mut host, |heap| heap.leave_roots(frame)).ok()?;
     boundary.released = true;
     let report = heap::collect(&mut host).ok()?;
@@ -1300,6 +1522,101 @@ fn resolve_uncaught_boundary(
     boundary.alive_after_release =
         matches!(after, heap::GuestClass::Table(found) if found == table);
     boundary.carrier_is_table_after_release = matches!(after, heap::GuestClass::Table(_));
+    Some(boundary)
+}
+
+/// Resolves one refused protocol seam against the still-live scope heap.
+///
+/// Both refusals happen before any frame retirement, so after `Vm::run`
+/// returns the chunk frame, its temp/formal slots and the offending carrier
+/// are still real. This reads that state, records that the refusing seam kept
+/// the chunk frame open, then performs the caller-side release and collection.
+/// The refusing host neither retires nor collects: the caller is responsible
+/// for that cleanup, and the same carrier must stop classifying as a table.
+fn resolve_refusal_boundary(vm: &mut Vm, witness: &RootWitness) -> Option<RefusalBoundary> {
+    struct Refused {
+        site: &'static str,
+        frame: (u32, u32),
+        temp_slot: u32,
+        formal_slot: u32,
+        table: Option<heap::TableRef>,
+        carrier_value: Option<Value>,
+    }
+    let refused = if let Some(refusal) = witness
+        .finish
+        .as_ref()
+        .and_then(|finish| finish.refused.as_ref())
+    {
+        Refused {
+            site: refusal.site,
+            frame: refusal.frame,
+            temp_slot: refusal.temp_slot,
+            formal_slot: refusal.formal_slot,
+            table: refusal.table,
+            carrier_value: refusal.carrier_value.clone(),
+        }
+    } else {
+        let refusal = witness.formal_refusals.last()?;
+        Refused {
+            site: refusal.site,
+            frame: refusal.frame,
+            temp_slot: refusal.temp_slot,
+            formal_slot: refusal.formal_slot,
+            table: refusal.table,
+            carrier_value: refusal.carrier_value.clone(),
+        }
+    };
+    let frame = heap::RootFrameId::from_parts(refused.frame.0, refused.frame.1);
+    let child = witness.tables.iter().map(|table| table.table).nth(1);
+    let mut host = vm.host_context();
+    let top = current_frame(&mut host).ok()?;
+    let mut boundary = RefusalBoundary {
+        site: refused.site,
+        frame: refused.frame,
+        top_after_run: top.map(heap::RootFrameId::parts),
+        frame_retained: top == Some(frame),
+        temp_after_run: rooted_table(&mut host, frame, refused.temp_slot).ok()?,
+        formal_after_run: rooted_table(&mut host, frame, refused.formal_slot).ok()?,
+        carrier_is_table_before_release: false,
+        table_alive_before_release: false,
+        child,
+        child_alive_before_release: false,
+        released_by_caller: false,
+        carrier_is_table_after_release: false,
+        table_alive_after_release: false,
+        child_alive_after_release: false,
+        report: None,
+    };
+    if let Some(table) = refused.table {
+        if let Some(carrier) = refused.carrier_value.as_ref() {
+            boundary.carrier_is_table_before_release = matches!(
+                classify(&mut host, carrier).ok()?,
+                heap::GuestClass::Table(found) if found == table
+            );
+        }
+        boundary.table_alive_before_release = alive_table(&mut host, table).ok()?;
+    }
+    if let Some(child) = child {
+        boundary.child_alive_before_release = alive_table(&mut host, child).ok()?;
+    }
+    if !boundary.frame_retained {
+        return Some(boundary);
+    }
+    heap::with_heap(&mut host, |heap| heap.leave_roots(frame)).ok()?;
+    boundary.released_by_caller = true;
+    boundary.report = Some(heap::collect(&mut host).ok()?);
+    if let Some(table) = refused.table {
+        if let Some(carrier) = refused.carrier_value.as_ref() {
+            boundary.carrier_is_table_after_release = matches!(
+                classify(&mut host, carrier).ok()?,
+                heap::GuestClass::Table(found) if found == table
+            );
+        }
+        boundary.table_alive_after_release = alive_table(&mut host, table).ok()?;
+    }
+    if let Some(child) = child {
+        boundary.child_alive_after_release = alive_table(&mut host, child).ok()?;
+    }
     Some(boundary)
 }
 
@@ -1534,7 +1851,24 @@ fn positive_handoff_keeps_one_issued_table_through_all_three_paths() {
     assert_eq!(note.table, Some(original.table));
     assert_eq!(note.table_index, Some(0));
     assert_eq!(note.carrier, Some(original.carrier));
-    assert!(note.temp_empty && note.formal_table == Some(original.table));
+    assert!(
+        note.table_alive,
+        "the original table must still be a usable issued table in note"
+    );
+    assert_eq!(
+        note.child,
+        Some(child.table),
+        "note must read the strong child edge"
+    );
+    assert!(
+        note.child_alive,
+        "the strong child must still be a usable table in note"
+    );
+    assert!(
+        note.temp_empty && note.formal_table == Some(original.table),
+        "the formal root still holds the payload in note"
+    );
+    assert!(note.rooted, "the payload is in a reserved root in note");
 
     let finish = witness.finish.as_ref().expect("finish record");
     assert_eq!(
@@ -1545,16 +1879,20 @@ fn positive_handoff_keeps_one_issued_table_through_all_three_paths() {
     assert_eq!(
         finish.completion,
         CompletionClass::Normal {
-            arity: 2,
-            values: vec![TypedValue::Bool(false), TypedValue::Array]
+            arity: 1,
+            values: vec![TypedValue::Bool(false)]
         },
-        "chunk completion decodes to true, false, payload"
+        "the positive chunk returns the scalar pcall status only"
     );
     assert!(
         finish.retired,
         "the receiving chunk frame is really retired"
     );
     assert_eq!(finish.top_after, None, "no Lua root frame remains");
+    assert!(
+        finish.refused.is_none(),
+        "a scalar chunk completion is not refused"
+    );
     let collection = finish.collection.as_ref().expect("final collection");
     assert_eq!(collection.tables.len(), 2);
     assert!(
@@ -1571,19 +1909,33 @@ fn positive_handoff_keeps_one_issued_table_through_all_three_paths() {
         collection.collections_after,
         collection.collections_before + 1
     );
+    assert!(
+        run.heap_after_run
+            .is_some_and(|stats| stats.live_nodes == 0),
+        "the scope heap is empty after the chunk retirement: {:?}",
+        run.heap_after_run
+    );
 
     let values = completed(POSITIVE_FIXTURE, &run);
     assert_eq!(
         values.len(),
-        2,
-        "pcall returns exactly false and the payload"
+        1,
+        "the chunk returns only the scalar pcall status"
     );
     assert_eq!(values[0], Value::Bool(false));
-    assert_eq!(
-        carrier_ptr(&values[1]),
-        Some(original.carrier),
-        "the returned payload is the same issued carrier"
+    assert!(
+        run.exit_carriers.is_empty(),
+        "a normal chunk exit carries no table: {:?}",
+        run.exit_carriers
     );
+    assert!(
+        run.exit_carriers.iter().all(|carrier| {
+            carrier.carrier != original.carrier
+                && !matches!(carrier.class, heap::GuestClass::Table(_))
+        }),
+        "the scalar exit must not return the issued carrier or any live table"
+    );
+    assert!(run.boundary.is_none() && run.refusal.is_none());
 }
 
 #[test]
@@ -1760,6 +2112,343 @@ fn omitting_the_second_publish_collects_after_middle_and_before_relay_returns() 
     let _ = child;
 }
 
+/// The frozen original `root-handoff.lua` bytes are kept as a separate
+/// fixture. It really reaches the chunk finish through the first two
+/// collection windows, the third (protected) handoff and the formal root
+/// adoption, so this refusal is the chunk exit and not a sub-call refusal.
+#[test]
+fn root_normal_chunk_table_exit_is_refused_at_the_finish() {
+    let run = drive("root-chunk-table-exit.lua", Arm::Positive);
+    let witness = &run.witness;
+    assert_eq!(
+        labels(&run),
+        ["outer", "relay", "middle", "leaf", "outer-tail"]
+    );
+    assert_eq!(witness.tables.len(), 2);
+    let original = table_witness(&run, 0);
+    let child = table_witness(&run, 1);
+    assert_eq!(
+        witness.handoffs.len(),
+        3,
+        "two ordinary windows, the protected handoff: {:?}",
+        witness.failures
+    );
+    for (handoff, what) in [
+        (&witness.handoffs[0], "leaf -> middle"),
+        (&witness.handoffs[1], "middle -> relay"),
+    ] {
+        assert!(handoff.published && !handoff.skipped_publish, "{what}");
+        assert!(
+            handoff.child_top_at_publish && handoff.retired && handoff.top_after_parent,
+            "{what}: the publish precedes the real retire"
+        );
+        assert_eq!(handoff.parent_slot_after, Some(original.table), "{what}");
+        let window = handoff.window.as_ref().expect("collection window");
+        assert!(
+            window.orphan_alive_before && !window.orphan_alive_after,
+            "{what}: the fresh orphan is really swept"
+        );
+        assert_eq!(window.tables.len(), 2, "{what}");
+        assert!(
+            window
+                .tables
+                .iter()
+                .all(|table| table.before && table.after),
+            "{what}: the payload graph survives the window"
+        );
+        assert_eq!(window.report.live_nodes, 2, "{what}");
+        assert_eq!(
+            window.collections_after,
+            window.collections_before + 1,
+            "{what}: one real collection"
+        );
+    }
+    let third = &witness.handoffs[2];
+    assert_eq!(
+        third.completion,
+        CompletionClass::Error {
+            payload: TypedValue::Array
+        }
+    );
+    assert_eq!(third.payload_table, Some(original.table));
+    assert_eq!(third.payload_carrier, Some(original.carrier));
+    assert!(
+        third.published && third.retired && third.top_after_parent,
+        "the protected handoff really publishes and retires"
+    );
+    assert!(third.window.is_none(), "the third handoff adds no window");
+
+    let formal = witness.formals.first().expect("formal record");
+    assert_eq!(formal.temp_before, Some(original.table));
+    assert_eq!(formal.formal_after, Some(original.table));
+    assert!(formal.rooted && formal.temp_after.is_none());
+
+    let note = witness.note.as_ref().expect("note record");
+    assert_eq!(note.table, Some(original.table));
+    assert_eq!(note.table_index, Some(0));
+    assert_eq!(note.carrier, Some(original.carrier));
+    assert!(
+        note.table_alive && note.child == Some(child.table) && note.child_alive,
+        "note verifies the payload graph before the chunk exit"
+    );
+    assert!(note.temp_empty && note.formal_table == Some(original.table));
+    assert!(note.rooted);
+
+    let finish = witness
+        .finish
+        .as_ref()
+        .expect("the chunk finish must be reached");
+    assert_eq!(
+        finish.completion,
+        CompletionClass::Normal {
+            arity: 2,
+            values: vec![TypedValue::Bool(false), TypedValue::Array]
+        }
+    );
+    assert_eq!(finish.formal_before, Some(original.table));
+    assert!(
+        !finish.retired,
+        "a refused chunk exit must not retire the chunk frame"
+    );
+    assert_eq!(
+        finish.top_after,
+        Some(finish.frame),
+        "the refused chunk frame stays on top"
+    );
+    assert!(finish.collection.is_none() && finish.uncaught.is_none());
+    let refusal = finish.refused.as_ref().expect("the table exit is refused");
+    assert_eq!(refusal.site, "chunk_finish");
+    assert_eq!(refusal.value, TypedValue::Array);
+    assert_eq!(refusal.table, Some(original.table));
+    assert_eq!(refusal.carrier, Some(original.carrier));
+    assert_eq!(refusal.temp_before, None);
+    assert_eq!(refusal.formal_before, Some(original.table));
+    assert!(refusal.frame_retained);
+    assert_eq!(
+        refusal.reason,
+        "the chunk finish refuses a table in a normal completion: a normal chunk exit has no root slot and must not return a carrier"
+    );
+
+    let CompletionExit::VmFailure(VmError::HostError(message)) = &run.exit else {
+        panic!(
+            "a table in a normal chunk completion must be refused, got {:?}",
+            run.exit
+        );
+    };
+    assert_eq!(
+        message,
+        "the chunk finish refuses a table in a normal completion: a normal chunk exit has no root slot and must not return a carrier"
+    );
+    assert!(
+        witness.failures.iter().any(|failure| failure == message),
+        "the refusal is recorded: {:?}",
+        witness.failures
+    );
+    assert!(
+        run.exit_carriers.is_empty(),
+        "a refused exit returns no carrier at all: {:?}",
+        run.exit_carriers
+    );
+    assert!(run.boundary.is_none());
+
+    let boundary = run.refusal.as_ref().expect("refusal boundary");
+    assert_eq!(boundary.site, "chunk_finish");
+    assert_eq!(boundary.frame, finish.frame);
+    assert!(
+        boundary.frame_retained && boundary.top_after_run == Some(finish.frame),
+        "the refusing host leaves the chunk frame to its caller"
+    );
+    assert_eq!(boundary.formal_after_run, Some(original.table));
+    assert_eq!(boundary.temp_after_run, None);
+    assert!(
+        boundary.carrier_is_table_before_release
+            && boundary.table_alive_before_release
+            && boundary.child_alive_before_release,
+        "the refused payload is still a usable table before the caller cleans up"
+    );
+    assert_eq!(boundary.child, Some(child.table));
+    assert!(
+        boundary.released_by_caller,
+        "the caller releases the retained chunk frame"
+    );
+    let report = boundary.report.expect("caller-side collection");
+    assert_eq!(
+        report.live_nodes, 0,
+        "the caller's collection reclaims the graph"
+    );
+    assert!(
+        !boundary.carrier_is_table_after_release
+            && !boundary.table_alive_after_release
+            && !boundary.child_alive_after_release,
+        "the reclaimed carrier is not a table"
+    );
+}
+
+/// The third publish is the only thing this control changes: the protected
+/// handoff retires the relay frame without writing the chunk temp root. Both
+/// earlier windows complete and keep the table graph alive, so the receiver
+/// must refuse instead of fabricating a formal root.
+#[test]
+fn third_publish_omission_is_refused_at_the_formal_receiver() {
+    let run = drive(POSITIVE_FIXTURE, Arm::OmitThirdPublish);
+    let witness = &run.witness;
+    assert_eq!(labels(&run), ["outer", "relay", "middle", "leaf"]);
+    assert_eq!(witness.tables.len(), 2);
+    let original = table_witness(&run, 0);
+    let child = table_witness(&run, 1);
+    assert_eq!(
+        witness.handoffs.len(),
+        3,
+        "the two ordinary handoffs still run: {:?}",
+        witness.failures
+    );
+    assert!(
+        witness.formals.is_empty(),
+        "the receiver must refuse before recording an adoption"
+    );
+    assert!(
+        witness.note.is_none(),
+        "note must not run after the refusal"
+    );
+    assert!(
+        witness.finish.is_none(),
+        "the chunk finish must not run after the refusal"
+    );
+    for (handoff, what) in [
+        (&witness.handoffs[0], "leaf -> middle"),
+        (&witness.handoffs[1], "middle -> relay"),
+    ] {
+        assert!(handoff.published && !handoff.skipped_publish, "{what}");
+        assert!(
+            handoff.child_top_at_publish && handoff.retired && handoff.top_after_parent,
+            "{what}"
+        );
+        assert_eq!(handoff.parent_slot_after, Some(original.table), "{what}");
+        assert_eq!(handoff.payload_table, Some(original.table), "{what}");
+        let window = handoff.window.as_ref().expect("collection window");
+        assert!(
+            window.orphan_alive_before && !window.orphan_alive_after,
+            "{what}: the independent orphan is cleared"
+        );
+        assert_eq!(window.tables.len(), 2, "{what}");
+        assert!(
+            window
+                .tables
+                .iter()
+                .all(|table| table.before && table.after),
+            "{what}: the original and its child stay alive"
+        );
+        assert_eq!(window.report.live_nodes, 2, "{what}");
+        assert_eq!(
+            window.collections_after,
+            window.collections_before + 1,
+            "{what}"
+        );
+    }
+    let third = &witness.handoffs[2];
+    assert!(
+        third.skipped_publish && !third.published,
+        "this control changes only the third publish"
+    );
+    assert!(third.parent_slot_before_empty);
+    assert!(
+        third.child_top_at_publish,
+        "the decision happens while the relay frame is still top"
+    );
+    assert_eq!(
+        third.parent_slot_after, None,
+        "the third temp root is not written"
+    );
+    assert!(
+        third.retired && third.top_after_parent,
+        "the third handoff really retires the relay frame"
+    );
+    assert_eq!(
+        third.parent, witness.enters[0].child,
+        "the chunk frame is the parent of the third handoff"
+    );
+    assert_eq!(
+        third.child, witness.enters[1].child,
+        "the relay frame is the retired child"
+    );
+    assert!(
+        third.window.is_none(),
+        "the third handoff adds no collection"
+    );
+    assert_eq!(third.payload_table, Some(original.table));
+    assert_eq!(third.payload_carrier, Some(original.carrier));
+
+    let refusal = witness
+        .formal_refusals
+        .first()
+        .expect("the formal receiver refuses");
+    assert_eq!(refusal.site, "formal_receive");
+    assert_eq!(refusal.frame, witness.enters[0].child);
+    assert_eq!(refusal.temp_before, None);
+    assert_eq!(refusal.formal_before, None);
+    assert_eq!(refusal.value, TypedValue::Array);
+    assert_eq!(refusal.table, Some(original.table));
+    assert_eq!(refusal.carrier, Some(original.carrier));
+    assert_eq!(refusal.temp_after, None);
+    assert_eq!(
+        refusal.formal_after, None,
+        "no formal root is fabricated after the refusal"
+    );
+    assert!(refusal.frame_retained);
+    assert_eq!(
+        refusal.reason,
+        "the formal receive requires the exact reserved temp root before it may write the formal root"
+    );
+
+    let CompletionExit::VmFailure(VmError::HostError(message)) = &run.exit else {
+        panic!(
+            "a missing third publish must be refused by the formal receive, got {:?}",
+            run.exit
+        );
+    };
+    assert_eq!(
+        message,
+        "the formal receive requires the exact reserved temp root before it may write the formal root"
+    );
+    assert!(
+        witness.failures.iter().any(|failure| failure == message),
+        "the refusal is recorded: {:?}",
+        witness.failures
+    );
+    assert!(run.exit_carriers.is_empty());
+
+    let boundary = run.refusal.as_ref().expect("refusal boundary");
+    assert_eq!(boundary.site, "formal_receive");
+    assert_eq!(boundary.frame, witness.enters[0].child);
+    assert!(
+        boundary.frame_retained && boundary.top_after_run == Some(witness.enters[0].child),
+        "the original chunk frame is the top frame after the refusal"
+    );
+    assert_eq!(boundary.temp_after_run, None);
+    assert_eq!(boundary.formal_after_run, None, "both slots stay empty");
+    assert!(
+        boundary.carrier_is_table_before_release,
+        "the unswept original carrier is still classifiable"
+    );
+    assert_eq!(boundary.child, Some(child.table));
+    assert!(
+        boundary.table_alive_before_release && boundary.child_alive_before_release,
+        "the original table and its strong child are still live"
+    );
+    assert!(boundary.released_by_caller);
+    let report = boundary.report.expect("caller-side collection");
+    assert_eq!(
+        report.live_nodes, 0,
+        "the caller's collection reclaims the unrooted graph"
+    );
+    assert!(
+        !boundary.carrier_is_table_after_release
+            && !boundary.table_alive_after_release
+            && !boundary.child_alive_after_release,
+        "the reclaimed carrier and child are not tables"
+    );
+}
+
 #[test]
 fn root_entry_matches_the_p0_identity_and_exit_contract() {
     let run = drive(POSITIVE_FIXTURE, Arm::Positive);
@@ -1786,7 +2475,11 @@ fn root_entry_matches_the_p0_identity_and_exit_contract() {
     );
     let values = completed(POSITIVE_FIXTURE, &run);
     assert_eq!(values.first(), Some(&Value::Bool(false)));
-    assert!(matches!(values.get(1), Some(Value::Array(_))));
+    assert_eq!(values.len(), 1, "the chunk exit is the scalar status only");
+    assert!(
+        run.exit_carriers.is_empty(),
+        "the entry contract never returns a table carrier"
+    );
 }
 
 struct ScalarTailCase {
@@ -1971,25 +2664,35 @@ fn root_scalar_error_retires_non_table_error_frames() {
     );
 
     let values = completed("root-scalar-error.lua", &run);
-    assert_eq!(values.len(), 4);
+    assert_eq!(values.len(), 3);
     assert_eq!(values[0], Value::Bool(false));
+    assert_eq!(values[1], Value::Bool(false));
+    assert_eq!(values[2], Value::string("boom"));
     assert!(
-        matches!(values[1], Value::Array(_)),
-        "the caught table arm keeps its carrier: {:?}",
-        values[1]
+        run.exit_carriers.is_empty(),
+        "the scalar-error chunk exit carries no table: {:?}",
+        run.exit_carriers
     );
-    assert_eq!(carrier_ptr(&values[1]), Some(original.carrier));
-    assert_eq!(values[2], Value::Bool(false));
-    assert_eq!(values[3], Value::string("boom"));
+
+    let note = run.witness.note.as_ref().expect("caught-table note");
+    assert_eq!(note.frame, run.witness.enters[0].child);
+    assert_eq!(note.table, Some(original.table));
+    assert_eq!(note.table_index, Some(0));
+    assert_eq!(note.carrier, Some(original.carrier));
+    assert!(
+        note.table_alive && note.child_alive,
+        "the table graph is usable in note"
+    );
+    assert!(note.temp_empty && note.formal_table == Some(original.table));
+    assert!(note.rooted, "the table formal is still rooted in note");
 
     let finish = run.witness.finish.as_ref().expect("finish record");
     assert_eq!(
         finish.completion,
         CompletionClass::Normal {
-            arity: 4,
+            arity: 3,
             values: vec![
                 TypedValue::Bool(false),
-                TypedValue::Array,
                 TypedValue::Bool(false),
                 TypedValue::String
             ]
@@ -1997,6 +2700,7 @@ fn root_scalar_error_retires_non_table_error_frames() {
     );
     assert_eq!(finish.formal_before, Some(original.table));
     assert!(finish.retired && finish.top_after.is_none());
+    assert!(finish.refused.is_none());
     let collection = finish.collection.as_ref().expect("final collection");
     assert_eq!(collection.report.live_nodes, 0);
     assert!(
@@ -2028,7 +2732,15 @@ fn root_uncaught_issued_table_reaches_the_typed_boundary_with_a_live_root() {
     assert_eq!(note.table, Some(original.table));
     assert_eq!(note.table_index, Some(0));
     assert_eq!(note.carrier, Some(original.carrier));
+    assert!(
+        note.table_alive && note.child == Some(child.table) && note.child_alive,
+        "the leaf-local payload and its strong child are usable in note"
+    );
     assert!(note.temp_empty && note.formal_table.is_none());
+    assert!(
+        !note.rooted,
+        "the leaf has not published the payload into a reserved root yet"
+    );
 
     let finish = run.witness.finish.as_ref().expect("finish record");
     assert!(
@@ -2058,6 +2770,10 @@ fn root_uncaught_issued_table_reaches_the_typed_boundary_with_a_live_root() {
     assert_eq!(boundary.carrier, Some(original.carrier));
     assert_eq!(boundary.frame, Some(finish.frame));
     assert!(boundary.live_root, "the caller receives a real live root");
+    assert!(
+        boundary.temp_after_run == Some(original.table) && boundary.formal_after_run.is_none(),
+        "the real chunk slot still roots the payload after the run: {boundary:?}"
+    );
     assert!(boundary.alive_at_boundary);
     assert!(boundary.carrier_is_table_at_boundary);
     assert!(boundary.released, "the caller releases the retained frame");
@@ -2165,20 +2881,18 @@ fn root_status_only_pcall_clears_the_exact_temp_root_and_next_handoff_runs() {
     assert_eq!(note.table, Some(payload.table));
     assert_eq!(note.table_index, Some(1));
     assert!(note.temp_empty && note.formal_table == Some(payload.table));
+    assert!(note.table_alive && note.rooted);
 
     let finish = run.witness.finish.as_ref().expect("finish record");
     assert_eq!(
         finish.completion,
         CompletionClass::Normal {
-            arity: 3,
-            values: vec![
-                TypedValue::Bool(false),
-                TypedValue::Bool(false),
-                TypedValue::Array
-            ]
+            arity: 2,
+            values: vec![TypedValue::Bool(false), TypedValue::Bool(false)]
         }
     );
     assert_eq!(finish.formal_before, Some(payload.table));
+    assert!(finish.refused.is_none());
     let collection = finish.collection.as_ref().expect("final collection");
     assert!(
         collection.tables.iter().all(|table| !table.after),
@@ -2187,10 +2901,14 @@ fn root_status_only_pcall_clears_the_exact_temp_root_and_next_handoff_runs() {
     assert_eq!(collection.report.live_nodes, 0);
 
     let values = completed("root-pcall-status-discard.lua", &run);
-    assert_eq!(values.len(), 3);
+    assert_eq!(values.len(), 2);
     assert_eq!(values[0], Value::Bool(false));
     assert_eq!(values[1], Value::Bool(false));
-    assert_eq!(carrier_ptr(&values[2]), Some(payload.carrier));
+    assert!(
+        run.exit_carriers.is_empty(),
+        "the discard chunk exit carries no table: {:?}",
+        run.exit_carriers
+    );
 }
 
 #[test]
@@ -2236,11 +2954,16 @@ fn root_statement_pcall_discard_clears_the_exact_temp_root() {
     let note = run.witness.note.as_ref().expect("note record");
     assert_eq!(note.table, Some(payload.table));
     assert_eq!(note.table_index, Some(1));
+    assert!(note.table_alive && note.rooted);
 
     let values = completed("root-pcall-statement-discard.lua", &run);
-    assert_eq!(values.len(), 2);
+    assert_eq!(values.len(), 1);
     assert_eq!(values[0], Value::Bool(false));
-    assert_eq!(carrier_ptr(&values[1]), Some(payload.carrier));
+    assert!(
+        run.exit_carriers.is_empty(),
+        "the statement-discard chunk exit carries no table: {:?}",
+        run.exit_carriers
+    );
 }
 
 #[test]
@@ -2301,12 +3024,25 @@ fn root_shared_table_status_discard_reaches_the_second_handoff() {
     );
     assert_eq!(second_window.report.live_nodes, 2);
 
+    let note = run.witness.note.as_ref().expect("note record");
+    assert_eq!(note.table, Some(original.table));
+    assert_eq!(note.table_index, Some(0));
+    assert!(
+        note.table_alive && note.child == Some(child.table) && note.child_alive,
+        "the republished original and its child are usable in note"
+    );
+    assert!(note.temp_empty && note.formal_table == Some(original.table));
+    assert!(note.rooted);
+
     let values = completed("root-pcall-shared-table.lua", &run);
-    assert_eq!(values.len(), 3);
+    assert_eq!(values.len(), 2);
     assert_eq!(values[0], Value::Bool(false));
     assert_eq!(values[1], Value::Bool(false));
-    assert_eq!(carrier_ptr(&values[2]), Some(original.carrier));
-    let _ = child;
+    assert!(
+        run.exit_carriers.is_empty(),
+        "the shared-table chunk exit carries no table: {:?}",
+        run.exit_carriers
+    );
 }
 
 #[test]

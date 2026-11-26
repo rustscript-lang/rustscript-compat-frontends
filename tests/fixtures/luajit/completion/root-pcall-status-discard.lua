@@ -22,4 +22,4 @@ mark("after-first")
 local ok2, err2 = pcall(second_fail)
 mark("after-second")
 note(err2)
-return ok, ok2, err2
+return ok, ok2
