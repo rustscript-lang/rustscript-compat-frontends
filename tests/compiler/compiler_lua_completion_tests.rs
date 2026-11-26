@@ -1143,6 +1143,170 @@ fn protected_after_calls_original_binding_after_capture() {
     assert_eq!(payload_of("protected-after.lua", &run), Value::Int(7));
 }
 
+/// Lua 5.2 keeps the outer local `f` usable after the nested closure is
+/// created. Both the direct `f(f)` and the nested `inner()`'s `f(f)` return 1,
+/// whether the direct call is written before or after the capture site.
+#[test]
+fn nested_direct_capture_keeps_the_original_binding() {
+    for name in ["nested-direct-before.lua", "nested-direct-after.lua"] {
+        let run = run_halted(name);
+        assert_eq!(
+            completed_values(name, &run),
+            &[Value::Int(1), Value::Int(1)][..],
+            "{name}: both the direct and nested calls must return 1"
+        );
+    }
+}
+
+/// Compares the actual `Value::Callable` payload by `Arc::ptr_eq`. Core's
+/// ordinary `Value` equality would also accept two distinct carriers of the
+/// same prototype, so only pointer identity proves one shared callable.
+fn same_callable(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Callable(left), Value::Callable(right)) => Arc::ptr_eq(left, right),
+        _ => false,
+    }
+}
+
+/// The ordinary path returns `direct, nested, f, other` as real file results.
+/// Both the direct `f(f)` and the nested `inner()`'s `f(f)` must yield the
+/// exact same `SharedCallable` as the original `f`; the separately declared
+/// `other` must stay a different one.
+#[test]
+fn nested_callable_identity_survives_ordinary_call() {
+    let name = "nested-callable-identity-ordinary.lua";
+    let run = run_halted(name);
+    let values = completed_values(name, &run);
+    assert_eq!(
+        values.len(),
+        4,
+        "exactly direct, nested, f, other: {values:?}"
+    );
+    let (direct, nested, original, other) = (&values[0], &values[1], &values[2], &values[3]);
+    assert!(
+        matches!(original, Value::Callable(_)) && matches!(other, Value::Callable(_)),
+        "both declared function bindings are returned as callables: {values:?}"
+    );
+    assert!(
+        same_callable(direct, original),
+        "the direct call result must be the original callable Arc: direct={direct:?} original={original:?}"
+    );
+    assert!(
+        same_callable(nested, original),
+        "the nested call result must be the original callable Arc: nested={nested:?} original={original:?}"
+    );
+    assert!(
+        !same_callable(other, original),
+        "a different declared function must not share the original Arc: other={other:?} original={original:?}"
+    );
+    assert_eq!(
+        run.capture_plans.len(),
+        2,
+        "the outer and inner capture edges are both visible: {:?}",
+        run.capture_plans
+    );
+    for plan in &run.capture_plans {
+        assert_eq!(
+            plan.modes,
+            [vm::CaptureBindingMode::Copy],
+            "every nested callable capture edge must copy, not move: {plan:?}"
+        );
+    }
+}
+
+/// The protected path returns `direct_ok, direct, nested_ok, nested, f,
+/// other`. Both `pcall(f, f)` results must share the original Arc, both
+/// status flags must be the exact Boolean `true`, and `other` must differ.
+#[test]
+fn nested_callable_identity_survives_protected_call() {
+    let name = "nested-callable-identity-protected.lua";
+    let run = run_halted(name);
+    let values = completed_values(name, &run);
+    assert_eq!(
+        values.len(),
+        6,
+        "exactly direct_ok, direct, nested_ok, nested, f, other: {values:?}"
+    );
+    assert_eq!(values[0], Value::Bool(true), "direct pcall flag");
+    assert_eq!(values[2], Value::Bool(true), "nested pcall flag");
+    let (direct, nested, original, other) = (&values[1], &values[3], &values[4], &values[5]);
+    assert!(
+        matches!(original, Value::Callable(_)) && matches!(other, Value::Callable(_)),
+        "both declared function bindings are returned as callables: {values:?}"
+    );
+    assert!(
+        same_callable(direct, original),
+        "the direct pcall result must be the original callable Arc: direct={direct:?} original={original:?}"
+    );
+    assert!(
+        same_callable(nested, original),
+        "the nested pcall result must be the original callable Arc: nested={nested:?} original={original:?}"
+    );
+    assert!(
+        !same_callable(other, original),
+        "a different declared function must not share the original Arc: other={other:?} original={original:?}"
+    );
+    assert_eq!(
+        run.capture_plans.len(),
+        2,
+        "the outer and inner capture edges are both visible: {:?}",
+        run.capture_plans
+    );
+    for plan in &run.capture_plans {
+        assert_eq!(
+            plan.modes,
+            [vm::CaptureBindingMode::Copy],
+            "every nested callable capture edge must copy, not move: {plan:?}"
+        );
+    }
+}
+
+/// A callable parameter is admitted by binding identity, not by its name. The
+/// same two-level shape through `pcall(callee, callee)` must keep the original
+/// `leaf` callable in the parameter slot, so the post-capture `return callee`
+/// still yields the original Arc.
+#[test]
+fn nested_callable_identity_survives_callable_parameter() {
+    let name = "nested-callable-identity-parameter.lua";
+    let run = run_halted(name);
+    let values = completed_values(name, &run);
+    assert_eq!(
+        values.len(),
+        4,
+        "exactly original, ok, passed, leaf: {values:?}"
+    );
+    assert_eq!(values[1], Value::Bool(true), "pcall flag");
+    assert!(
+        matches!(values[3], Value::Callable(_)),
+        "the declared leaf must be returned as a callable: {values:?}"
+    );
+    assert!(
+        same_callable(&values[0], &values[3]),
+        "the parameter slot must still hold the original Arc after the capture: original={:?} leaf={:?}",
+        values[0],
+        values[3]
+    );
+    assert!(
+        same_callable(&values[2], &values[3]),
+        "the pcall result must be the original Arc: passed={:?} leaf={:?}",
+        values[2],
+        values[3]
+    );
+    assert_eq!(
+        run.capture_plans.len(),
+        2,
+        "the parameter capture and the inner capture are both visible: {:?}",
+        run.capture_plans
+    );
+    for plan in &run.capture_plans {
+        assert_eq!(
+            plan.modes,
+            [vm::CaptureBindingMode::Copy],
+            "every nested callable capture edge must copy, not move: {plan:?}"
+        );
+    }
+}
+
 #[test]
 fn missing_data_arguments_pad_nil_without_rejecting() {
     let run = run_halted("missing-data-argument.lua");

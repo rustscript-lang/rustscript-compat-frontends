@@ -542,6 +542,23 @@ impl<'a> Lower<'a> {
         self.resolution.bindings[binding].kind == BindingKind::Param && !self.non_lua[binding]
     }
 
+    /// Whether `binding` is an immutable binding whose every admitted source
+    /// is a Lua callable produced by this lowering. This is the value-position
+    /// counterpart of `proof_for`: a read never selects an arity, so a
+    /// parameter whose callable sources disagree on arity is still admitted
+    /// here, while one with no known source or any non-Lua source is not.
+    fn binding_is_admitted_callable(&self, binding: usize) -> bool {
+        if self.assigned[binding] {
+            return false;
+        }
+        if self.function_body_of_binding[binding].is_some() {
+            return true;
+        }
+        self.resolution.bindings[binding].kind == BindingKind::Param
+            && !self.possible[binding].is_empty()
+            && !self.non_lua[binding]
+    }
+
     // ---- binding and slot plumbing ---------------------------------------
 
     fn use_binding(&self, name: &Name) -> Option<usize> {
@@ -639,7 +656,10 @@ impl<'a> Lower<'a> {
     /// that binding usable after the closure is created. Return an explicit
     /// by-value copy the call performs (`.copy()`, a `ToOwned` read) as the
     /// callee slot, so the capture is classified `Copy` and the original
-    /// binding survives.
+    /// binding survives. This is the callee half of one read policy: every
+    /// read of an admitted immutable Lua callable binding, in any value
+    /// position, uses the same explicit non-consuming read (see
+    /// `binding_is_admitted_callable`).
     fn captured_callee_slot(
         &mut self,
         binding: usize,
@@ -662,7 +682,7 @@ impl<'a> Lower<'a> {
             Some(Stmt::Let {
                 index: copy,
                 declared_schema: None,
-                expr: Expr::ToOwned(Box::new(Expr::Var(captured))),
+                expr: explicit_value_read(captured),
                 line: self.line(span),
             }),
         ))
@@ -1217,7 +1237,20 @@ impl<'a> Lower<'a> {
                         "global name used as a value is outside the completion slice",
                     )
                 })?;
-                Ok(Expr::Var(self.slot_for(binding)?))
+                let slot = self.slot_for(binding)?;
+                if self.binding_is_admitted_callable(binding) {
+                    // A Lua callable is an immutable shared reference. Reading
+                    // it never consumes the binding, whether the value feeds a
+                    // forwarded pcall argument, a host argument, a return, or
+                    // any other value position. Emit the same explicit
+                    // by-value read the callee position uses so the fixed
+                    // Core's capture scan sees a copy, not a move, on every
+                    // capture edge; `ToOwned` compiles to the same plain local
+                    // read as `Var`.
+                    Ok(explicit_value_read(slot))
+                } else {
+                    Ok(Expr::Var(slot))
+                }
             }
             LuaExpr::Paren { inner, .. } => self.lower_scalar(inner),
             LuaExpr::Function { body, .. } => {
@@ -1284,6 +1317,14 @@ fn block(stmts: Vec<Stmt>, expr: Expr) -> Expr {
 
 fn lua_ir_call(index: u16, args: Vec<Expr>) -> Expr {
     Expr::Call(index, Vec::new(), args, None, None)
+}
+
+/// One non-consuming by-value read of an immutable Lua callable slot. The
+/// fixed Core's availability and capture classification treat `ToOwned` as an
+/// explicit copy and a bare `Var` as an implicit read that can move a movable
+/// captured binding; codegen compiles both to the same plain local read.
+fn explicit_value_read(slot: LocalSlot) -> Expr {
+    Expr::ToOwned(Box::new(Expr::Var(slot)))
 }
 
 fn packed_array(values: Vec<Expr>) -> Expr {
