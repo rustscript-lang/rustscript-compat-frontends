@@ -47,10 +47,21 @@
 //! slot still runs the Owners walk when a pending finalizer or a marked
 //! settled generation needs that publication. Ordinary collections never
 //! select; they offer every existing record as a host-retained edge, so no
-//! live token is closed or orphaned while it waits for a consumer. No
-//! callback, resurrection, guest step, or production entry is added here. The
-//! test-only retirement control consumes one record so a later collection can
-//! close the token and advance the slot generation; it is not a finalizer.
+//! live token is closed or orphaned while it waits for a consumer.
+//!
+//! A successful private collection records the queue length it published as a
+//! consumable prefix only after the real weak publication finished. The
+//! private real handoff [`take_published_pending_finalizer`] then pops exactly
+//! that front record with one `VecDeque` front removal, verifies the exact
+//! live userdata and typed Core token, writes the userdata into one specified
+//! empty root slot, and settles that generation in the same commit. It never
+//! calls guest code. A saved mark or Release tail refuses before any write, and
+//! records retained by a failed or ordinary collection stay outside the ready
+//! prefix. The first-round order is only the selecting scan's offered order
+//! (ascending slots in this representation), not LuaJIT's reverse allocation
+//! order and not a guest callback order. The test-only retirement control
+//! remains a historical fixture with the same prefix invariant. No callback,
+//! resurrection, guest step, or production entry is added here.
 //!
 //! Borrowed from the ES5 heap at `3e348a010bc8d84baa5b7d1169a5f50aeb4e46ec`
 //! `src/javascript/heap.rs`: slot plus generation handles, explicit root
@@ -705,6 +716,10 @@ pub(crate) fn collect_pending_finalizers(
     }
     let boundary = close_then_halt_at_publish(host, marked, true)?;
     with_heap(host, |heap| {
+        // The real weak publication finished in this call. Only now do the
+        // retained records become a consumable prefix. A saved Release tail
+        // still refuses a dequeue until the caller resumes it to completion.
+        heap.publish_pending_finalizer_prefix();
         heap.clear_selecting_settlements();
         Ok(())
     })?;
@@ -748,13 +763,94 @@ fn verify_pending_finalizers(host: &HostContext) -> Result<(), HeapError> {
 /// settled without closing the token or running guest code. Selection will
 /// not pick the settled object again; a later collection may then close that
 /// token and advance the slot generation. It is not a callback and does not
-/// fabricate a close status.
+/// fabricate a close status. It also keeps the queue's published-prefix
+/// invariant: removing a published position drops the ready prefix by one,
+/// while removing an unpublished position leaves it unchanged.
 #[cfg(test)]
 pub fn retire_pending_finalizer_test_control(
     host: &mut HostContext,
     userdata: UserdataRef,
 ) -> Result<(), HeapError> {
     with_heap(host, |heap| heap.retire_pending_finalizer(userdata))
+}
+
+/// Private real handoff for one published pending-finalizer head.
+///
+/// This is not a guest `__gc` callback and does not run guest code. It refuses
+/// a saved mark ([`HeapError::MarkActive`]) or release tail
+/// ([`HeapError::SweepPending`]) before reading the queue. The head must be in
+/// the prefix that one successful private publication made consumable; an
+/// unpublished or absent head returns a scope error. The specified frame and
+/// slot must name an open, previously empty root slot
+/// ([`HeapError::StaleFrame`] or a scope error for an occupied slot). The
+/// record's live slot must still bind its exact generation, kind, pending
+/// flag, and raw handle, and the typed `lua.userdata` payload must name that
+/// same userdata ([`HeapError::TokenMismatch`] otherwise). All of those checks
+/// happen before the first queue, root, or slot write.
+///
+/// On success the head is popped with one `VecDeque` front removal, the exact
+/// `UserdataRef` is written into the specified root slot, and that generation
+/// is marked settled and no longer pending. The returned handle is the same
+/// typed object the queue verified; the raw Core token is not returned or
+/// copied into a guest value. The order is only the selecting scan's offered
+/// order, not LuaJIT's reverse allocation or callback order.
+pub(crate) fn take_published_pending_finalizer(
+    host: &mut HostContext,
+    frame: RootFrameId,
+    slot: u32,
+) -> Result<UserdataRef, HeapError> {
+    let Some(heap) = host.scope_state::<LuaHeap>() else {
+        return Err(HeapError::SweepDenied);
+    };
+    if heap.has_sweep_tail() {
+        return Err(HeapError::SweepPending);
+    }
+    if heap.has_saved_mark() {
+        return Err(HeapError::MarkActive);
+    }
+    let head = heap.pending_finalizer_published_front()?;
+    heap.pending_finalizer_root_slot(frame, slot)?;
+    let userdata = UserdataRef::userdata(heap.domain(), head.slot, head.generation);
+    if heap.published_userdata_token(userdata)? != head.raw {
+        return Err(HeapError::TokenMismatch);
+    }
+    let handle =
+        vm::ResourceHandle::from_raw(head.raw).map_err(|_| HeapError::CarrierOutOfRange)?;
+    let borrowed = host
+        .borrow_resource_with_key::<LuaUserdataResource>(handle, &LuaUserdataResource::key())
+        .map_err(HeapError::from_scope)?;
+    if borrowed.get().userdata() != userdata {
+        return Err(HeapError::TokenMismatch);
+    }
+    drop(borrowed);
+    with_heap(host, |heap| {
+        heap.take_published_finalizer_into_root(frame, slot, head)
+    })
+}
+
+/// Number of pending records in the published prefix. Test-only header read;
+/// it does not read a stored record.
+#[cfg(test)]
+pub fn pending_finalizer_published_count(host: &mut HostContext) -> Result<usize, HeapError> {
+    with_heap(host, |heap| Ok(heap.pending_finalizer_published_count()))
+}
+
+/// One userdata root slot. Test-only; does not scan or read the queue.
+#[cfg(test)]
+pub fn rooted_userdata(
+    host: &mut HostContext,
+    frame: RootFrameId,
+    slot: u32,
+) -> Result<Option<UserdataRef>, HeapError> {
+    with_heap(host, |heap| heap.rooted_userdata(frame, slot))
+}
+
+/// Saves one empty private mark for a handoff refusal test. Test-only: the
+/// real handoff must refuse a saved mark before it reads the queue. It does
+/// not scan, close, publish, or run guest code.
+#[cfg(test)]
+pub fn open_saved_mark_for_test(host: &mut HostContext) -> Result<(), HeapError> {
+    with_heap(host, |heap| heap.open_private_step())
 }
 
 /// Continues a published sweep this scope already saved. Does not install a

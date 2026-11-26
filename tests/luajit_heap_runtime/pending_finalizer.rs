@@ -861,6 +861,7 @@ fn secondary_propagation_omission_makes_the_graph_assertion_fail() {
 struct Eligible {
     userdata: UserdataRef,
     raw: u64,
+    metatable: TableRef,
     weak_values: TableRef,
 }
 
@@ -869,24 +870,61 @@ struct Eligible {
 fn publish_eligible(host: &mut vm::HostContext<'_>) -> Eligible {
     let userdata = heap::publish_userdata(host).expect("eligible userdata");
     let raw = bound_raw(host, userdata);
-    let weak_values = heap::with_heap(host, |heap| {
+    let (metatable, weak_values) = heap::with_heap(host, |heap| {
         let metatable = heap.alloc()?;
         heap.set_named_scalar(metatable, "__gc", Value::Bool(false))?;
         heap.set_userdata_metatable(userdata, Some(metatable))?;
         let weak_values = weak_table(heap, "v")?;
         heap.set_number_userdata(weak_values, 1.0, userdata)?;
-        Ok(weak_values)
+        Ok((metatable, weak_values))
     })
     .expect("eligible lattice");
     Eligible {
         userdata,
         raw,
+        metatable,
         weak_values,
     }
 }
 
 fn pending_flag(host: &mut vm::HostContext<'_>, userdata: UserdataRef) -> bool {
     heap::with_heap(host, |heap| heap.slot_pending_finalizer(userdata)).expect("pending flag")
+}
+
+fn published_count(host: &mut vm::HostContext<'_>) -> usize {
+    heap::pending_finalizer_published_count(host).expect("published pending prefix")
+}
+
+fn rooted_userdata(
+    host: &mut vm::HostContext<'_>,
+    frame: RootFrameId,
+    slot: u32,
+) -> Option<UserdataRef> {
+    heap::rooted_userdata(host, frame, slot).expect("userdata root slot")
+}
+
+/// The private handoff's refusal for a queue head that no successful private
+/// publication has made consumable.
+fn assert_not_published(error: HeapError) {
+    match error {
+        HeapError::Scope(message) => assert!(
+            message.contains("pending finalizer head is not published"),
+            "unexpected scope message: {message}"
+        ),
+        other => panic!("expected an unpublished-head scope error, got {other:?}"),
+    }
+}
+
+/// The private handoff's refusal for a specified root slot that is already
+/// occupied. The slot and the queue must both stay unchanged.
+fn assert_root_slot_occupied(error: HeapError) {
+    match error {
+        HeapError::Scope(message) => assert!(
+            message.contains("pending finalizer root slot is occupied"),
+            "unexpected scope message: {message}"
+        ),
+        other => panic!("expected an occupied-root scope error, got {other:?}"),
+    }
 }
 
 /// A previous-cycle record, a new candidate verified before the failing item,
@@ -4169,5 +4207,710 @@ fn settlement_journal_appends_one_node_per_pulse_across_old_capacity() {
             members, expected,
             "the journal holds exactly the nine new identities"
         );
+    });
+}
+
+fn userdata_alive(host: &mut vm::HostContext<'_>, userdata: UserdataRef) -> bool {
+    heap::with_heap(host, |heap| Ok(heap.userdata_alive(userdata))).expect("userdata liveness")
+}
+
+fn finish_if_published(host: &mut vm::HostContext<'_>, boundary: PublishedBoundary) {
+    if matches!(boundary, PublishedBoundary::Published { .. }) {
+        finish_release(host);
+    }
+}
+
+/// A successful private publication makes its queue prefix consumable. The
+/// real handoff removes exactly that published head, roots its still-bound
+/// typed token in a specified empty root slot, and settles that generation
+/// once. A later ordinary collection must keep the token alive through that
+/// root alone, keep the sibling pending record, and still collect an
+/// independent weak orphan. Removing the root is the only step that lets a
+/// later collection close the token and advance the slot generation; a
+/// successor generation is never mistaken for the old one.
+#[test]
+fn published_head_hands_one_typed_token_to_a_root_and_settles_its_generation() {
+    crate::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        let first = publish_eligible(&mut host);
+        let second = publish_eligible(&mut host);
+        assert!(
+            first.userdata.slot() < second.userdata.slot(),
+            "the provided candidate order is the ascending slot order here"
+        );
+        let frame = heap::with_heap(&mut host, |heap| {
+            let frame = heap.enter_roots(4)?;
+            heap.write_root(frame, 0, first.weak_values)?;
+            heap.write_root(frame, 1, second.weak_values)?;
+            heap.write_root(frame, 2, first.metatable)?;
+            Ok(frame)
+        })
+        .expect("initial roots");
+
+        let resources_before = host.resource_count();
+        let boundary = publish_boundary(&mut host);
+        assert!(
+            matches!(boundary, PublishedBoundary::Published { .. }),
+            "the real weak publication must stop at the published boundary"
+        );
+        assert_eq!(
+            published_count(&mut host),
+            2,
+            "both selected records are published by the successful collection"
+        );
+        assert_eq!(
+            pending_records(&mut host),
+            vec![
+                (
+                    first.raw,
+                    first.userdata.slot(),
+                    first.userdata.generation()
+                ),
+                (
+                    second.raw,
+                    second.userdata.slot(),
+                    second.userdata.generation()
+                )
+            ],
+            "the queue keeps the real selection order"
+        );
+        assert_eq!(
+            weak_value(&mut host, first.weak_values, 1.0),
+            None,
+            "the first pending weak value is published as a gap"
+        );
+        assert_eq!(
+            weak_value(&mut host, second.weak_values, 1.0),
+            None,
+            "the second pending weak value is published as a gap"
+        );
+        finish_release(&mut host);
+
+        let taken = heap::take_published_pending_finalizer(&mut host, frame, 3)
+            .expect("the published head is consumable");
+        assert_eq!(taken, first.userdata);
+        assert_eq!(
+            pending_records(&mut host),
+            vec![(
+                second.raw,
+                second.userdata.slot(),
+                second.userdata.generation()
+            )],
+            "only the consumed head record disappeared"
+        );
+        assert!(
+            !pending_flag(&mut host, first.userdata),
+            "the consumed generation is no longer pending"
+        );
+        assert!(
+            finalizer_settled(&mut host, first.userdata),
+            "the consumed generation is settled exactly once"
+        );
+        assert!(
+            pending_flag(&mut host, second.userdata),
+            "the sibling record stays pending"
+        );
+        assert_eq!(
+            published_count(&mut host),
+            1,
+            "the sibling head remains in the published prefix"
+        );
+        assert_eq!(
+            rooted_userdata(&mut host, frame, 3),
+            Some(first.userdata),
+            "the handoff wrote the exact typed userdata into the empty root slot"
+        );
+        assert_eq!(
+            host.resource_count(),
+            resources_before,
+            "the handoff moves no Core resource"
+        );
+        assert_eq!(
+            heap::borrow_published_userdata(&host, first.userdata),
+            Ok(first.userdata),
+            "the root carries the exact typed token"
+        );
+        assert!(userdata_token_open(&host, first.raw));
+
+        // This independent orphan is allocated after the handoff. Only the
+        // later ordinary collection may reclaim it.
+        let (orphan, orphan_weak, orphan_frame) = heap::with_heap(&mut host, |heap| {
+            let orphan = heap.alloc()?;
+            heap.set_edge(orphan, 1, orphan)?;
+            let orphan_weak = weak_table(heap, "v")?;
+            heap.set_number_edge(orphan_weak, 1.0, orphan)?;
+            let frame = heap.enter_roots(1)?;
+            heap.write_root(frame, 0, orphan_weak)?;
+            Ok((orphan, orphan_weak, frame))
+        })
+        .expect("independent orphan");
+        let _ = orphan_weak;
+
+        let _ = heap::collect(&mut host).expect("ordinary collection after the handoff");
+        assert!(
+            userdata_alive(&mut host, first.userdata),
+            "the newly published root keeps the consumed userdata alive"
+        );
+        assert_eq!(
+            slot_generation(&mut host, first.userdata.slot()),
+            first.userdata.generation(),
+            "the rooted generation did not change"
+        );
+        assert!(userdata_token_open(&host, first.raw));
+        assert_eq!(
+            pending_records(&mut host),
+            vec![(
+                second.raw,
+                second.userdata.slot(),
+                second.userdata.generation()
+            )],
+            "the sibling pending record survives the ordinary collection"
+        );
+        assert!(pending_flag(&mut host, second.userdata));
+        assert!(userdata_token_open(&host, second.raw));
+        assert!(
+            !alive(&mut host, orphan),
+            "the independent weak orphan is actually collected"
+        );
+        assert_eq!(
+            slot_generation(&mut host, orphan.slot()),
+            orphan.generation() + 1,
+            "the independent orphan's slot generation advanced"
+        );
+
+        // Only clearing that root lets the next real collection close the
+        // consumed token and advance its slot generation.
+        heap::with_heap(&mut host, |heap| heap.clear_root(frame, 3))
+            .expect("clear handed-off root");
+        let _ = heap::collect(&mut host).expect("ordinary collection after clearing the root");
+        assert!(
+            !userdata_alive(&mut host, first.userdata),
+            "without the published root the consumed userdata is dead"
+        );
+        assert_eq!(
+            heap::borrow_published_userdata(&host, first.userdata),
+            Err(HeapError::StaleHandle),
+            "the consumed typed binding is cleared only by that later collection"
+        );
+        assert!(
+            !userdata_token_open(&host, first.raw),
+            "the consumed token closes only after the root is gone"
+        );
+        assert_eq!(
+            slot_generation(&mut host, first.userdata.slot()),
+            first.userdata.generation() + 1,
+            "the real release advances the consumed slot generation"
+        );
+        assert!(
+            userdata_alive(&mut host, second.userdata),
+            "the sibling record still retains its own userdata"
+        );
+        assert!(userdata_token_open(&host, second.raw));
+
+        // A successor may reuse the freed slot. It must not inherit the old
+        // generation's pending or settled state, and a later selection may
+        // queue only the new generation.
+        let fresh = heap::publish_userdata(&mut host).expect("successor userdata");
+        assert_eq!(
+            fresh.slot(),
+            first.userdata.slot(),
+            "the freed slot is reusable"
+        );
+        assert_eq!(
+            fresh.generation(),
+            first.userdata.generation() + 1,
+            "the successor takes the next generation"
+        );
+        assert!(!pending_flag(&mut host, fresh));
+        assert!(!finalizer_settled(&mut host, fresh));
+        let fresh_metatable = heap::with_heap(&mut host, |heap| {
+            let metatable = heap.alloc()?;
+            heap.set_named_scalar(metatable, "__gc", Value::Bool(false))?;
+            heap.set_userdata_metatable(fresh, Some(metatable))?;
+            Ok(metatable)
+        })
+        .expect("successor metatable");
+        let _ = fresh_metatable;
+
+        let boundary = publish_boundary(&mut host);
+        let records = pending_records(&mut host);
+        assert_eq!(published_count(&mut host), records.len());
+        assert!(
+            records
+                .iter()
+                .any(|record| record.1 == fresh.slot() && record.2 == fresh.generation()),
+            "the new generation is selected as its own record"
+        );
+        assert!(
+            !records
+                .iter()
+                .any(|record| record.1 == first.userdata.slot()
+                    && record.2 == first.userdata.generation()),
+            "the old generation is never selected again"
+        );
+        finish_if_published(&mut host, boundary);
+        heap::with_heap(&mut host, |heap| heap.leave_roots(orphan_frame))
+            .expect("leave orphan roots");
+        heap::with_heap(&mut host, |heap| heap.leave_roots(frame)).expect("leave initial roots");
+    });
+}
+
+/// A failed doomed close keeps an already verified but unpublished candidate.
+/// That candidate is not consumable until a later successful publication, and
+/// the earlier published prefix stays usable. Resource, root-slot, stale-frame,
+/// out-of-range, and saved-tail refusals must all happen before any dequeue
+/// write. Repairing the real binding and retrying in the same context publishes
+/// the candidate, after which the ordinary handoff consumes it.
+#[test]
+fn unpublished_candidate_survives_close_failure_and_retries_in_the_same_context() {
+    crate::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits()).expect("install");
+        let prior = publish_eligible(&mut host);
+        let frame = heap::with_heap(&mut host, |heap| {
+            let frame = heap.enter_roots(4)?;
+            heap.write_root(frame, 0, prior.weak_values)?;
+            Ok(frame)
+        })
+        .expect("prior roots");
+        let boundary = publish_boundary(&mut host);
+        assert!(matches!(boundary, PublishedBoundary::Published { .. }));
+        finish_release(&mut host);
+        assert_eq!(published_count(&mut host), 1);
+
+        let fresh = publish_eligible(&mut host);
+        heap::with_heap(&mut host, |heap| {
+            heap.write_root(frame, 1, fresh.weak_values)
+        })
+        .expect("fresh weak root");
+
+        // A real typed userdata is doomed in this batch. Its slot is bound to
+        // the fresh token, so the real close verifier refuses after selection
+        // but before weak publication.
+        let bad = heap::publish_userdata(&mut host).expect("doomed userdata");
+        let bad_raw = bound_raw(&mut host, bad);
+        heap::with_heap(&mut host, |heap| {
+            heap.unbind_userdata_token(bad)?;
+            heap.bind_userdata_token(bad, fresh.raw)
+        })
+        .expect("same-type misbind");
+
+        let error = heap::collect_pending_finalizers(&mut host).expect_err("close mismatch");
+        assert_eq!(error, HeapError::TokenMismatch);
+        assert_eq!(
+            pending_records(&mut host),
+            vec![
+                (
+                    prior.raw,
+                    prior.userdata.slot(),
+                    prior.userdata.generation()
+                ),
+                (
+                    fresh.raw,
+                    fresh.userdata.slot(),
+                    fresh.userdata.generation()
+                )
+            ],
+            "the verified new record is kept after the real close failure"
+        );
+        assert_eq!(
+            published_count(&mut host),
+            1,
+            "only the earlier record is in the published prefix"
+        );
+        assert!(userdata_token_open(&host, bad_raw));
+        assert!(userdata_token_open(&host, fresh.raw));
+        assert!(
+            !heap::saved_sweep_tail(&mut host).expect("no tail"),
+            "a close failure publishes nothing"
+        );
+
+        // The prior record remains the only consumable head. The new candidate
+        // stays behind it and is not touched by this handoff.
+        let taken = heap::take_published_pending_finalizer(&mut host, frame, 2)
+            .expect("the earlier published head stays consumable");
+        assert_eq!(taken, prior.userdata);
+        assert_eq!(
+            pending_records(&mut host),
+            vec![(
+                fresh.raw,
+                fresh.userdata.slot(),
+                fresh.userdata.generation()
+            )],
+            "only the earlier head disappeared"
+        );
+        assert_eq!(published_count(&mut host), 0);
+        assert_eq!(rooted_userdata(&mut host, frame, 2), Some(prior.userdata));
+
+        let refused =
+            heap::take_published_pending_finalizer(&mut host, frame, 3).expect_err("unpublished");
+        assert_not_published(refused);
+        assert_eq!(
+            pending_records(&mut host),
+            vec![(
+                fresh.raw,
+                fresh.userdata.slot(),
+                fresh.userdata.generation()
+            )],
+            "an unpublished head refusal changes no record"
+        );
+        assert!(pending_flag(&mut host, fresh.userdata));
+        assert!(!finalizer_settled(&mut host, fresh.userdata));
+        assert!(userdata_token_open(&host, fresh.raw));
+        assert_eq!(
+            published_count(&mut host),
+            0,
+            "the unpublished candidate does not advance the ready prefix"
+        );
+        assert_eq!(rooted_userdata(&mut host, frame, 3), None);
+
+        // Repair the real doomed binding and retry in this same context. The
+        // earlier prefix was consumed; the fresh record is selected by the
+        // earlier failed pass and becomes published now.
+        heap::with_heap(&mut host, |heap| {
+            heap.unbind_userdata_token(bad)?;
+            heap.bind_userdata_token(bad, bad_raw)
+        })
+        .expect("restore the doomed binding");
+        let boundary = publish_boundary(&mut host);
+        assert!(matches!(boundary, PublishedBoundary::Published { .. }));
+        assert_eq!(published_count(&mut host), 1);
+        assert_eq!(
+            pending_records(&mut host),
+            vec![(
+                fresh.raw,
+                fresh.userdata.slot(),
+                fresh.userdata.generation()
+            )]
+        );
+        assert_eq!(
+            weak_value(&mut host, fresh.weak_values, 1.0),
+            None,
+            "the retry clears the newly published pending weak value"
+        );
+
+        // A saved Release tail owns the graph and refuses before any write.
+        let refused =
+            heap::take_published_pending_finalizer(&mut host, frame, 3).expect_err("saved tail");
+        assert_eq!(refused, HeapError::SweepPending);
+        assert_eq!(
+            pending_records(&mut host),
+            vec![(
+                fresh.raw,
+                fresh.userdata.slot(),
+                fresh.userdata.generation()
+            )]
+        );
+        assert!(userdata_token_open(&host, fresh.raw));
+        finish_release(&mut host);
+
+        // Occupied root slot: the anchor table and the queue are unchanged.
+        assert_eq!(
+            rooted_userdata(&mut host, frame, 3),
+            None,
+            "the target slot starts empty"
+        );
+        let occupied =
+            heap::take_published_pending_finalizer(&mut host, frame, 0).expect_err("occupied root");
+        assert_root_slot_occupied(occupied);
+        assert!(alive(&mut host, prior.weak_values));
+        assert_eq!(
+            pending_records(&mut host),
+            vec![(
+                fresh.raw,
+                fresh.userdata.slot(),
+                fresh.userdata.generation()
+            )]
+        );
+        assert_eq!(rooted_userdata(&mut host, frame, 3), None);
+
+        // Out-of-range slot and stale frame are refused before any write.
+        let refused =
+            heap::take_published_pending_finalizer(&mut host, frame, 4).expect_err("slot range");
+        assert_eq!(refused, HeapError::StaleFrame);
+        let stale =
+            heap::with_heap(&mut host, |heap| heap.enter_roots(1)).expect("temporary frame");
+        heap::with_heap(&mut host, |heap| heap.leave_roots(stale)).expect("leave temporary frame");
+        let refused =
+            heap::take_published_pending_finalizer(&mut host, stale, 0).expect_err("stale frame");
+        assert_eq!(refused, HeapError::StaleFrame);
+        assert_eq!(
+            pending_records(&mut host),
+            vec![(
+                fresh.raw,
+                fresh.userdata.slot(),
+                fresh.userdata.generation()
+            )]
+        );
+        assert_eq!(rooted_userdata(&mut host, frame, 3), None);
+
+        // A same-type token for another live userdata is refused by the exact
+        // payload check. The queue, the published binding, and the root stay
+        // unchanged until the real binding is restored.
+        let decoy = heap::publish_userdata(&mut host).expect("decoy userdata");
+        let decoy_raw = bound_raw(&mut host, decoy);
+        heap::with_heap(&mut host, |heap| {
+            heap.unbind_userdata_token(fresh.userdata)?;
+            heap.bind_userdata_token(fresh.userdata, decoy_raw)
+        })
+        .expect("same-type misbind on the head");
+        let refused = heap::take_published_pending_finalizer(&mut host, frame, 3)
+            .expect_err("typed token mismatch");
+        assert_eq!(refused, HeapError::TokenMismatch);
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| heap
+                .published_userdata_token(fresh.userdata))
+            .expect("the failing binding is unchanged"),
+            decoy_raw
+        );
+        assert_eq!(
+            pending_records(&mut host),
+            vec![(
+                fresh.raw,
+                fresh.userdata.slot(),
+                fresh.userdata.generation()
+            )]
+        );
+        assert_eq!(rooted_userdata(&mut host, frame, 3), None);
+
+        heap::with_heap(&mut host, |heap| {
+            heap.unbind_userdata_token(fresh.userdata)?;
+            heap.bind_userdata_token(fresh.userdata, fresh.raw)
+        })
+        .expect("restore the head binding");
+        let _ = heap::take_scan_meter(&mut host);
+        let taken = heap::take_published_pending_finalizer(&mut host, frame, 3)
+            .expect("repaired head is consumable");
+        assert_eq!(taken, fresh.userdata);
+        let meter = heap::take_scan_meter(&mut host).expect("handoff meter");
+        assert_eq!(
+            meter.pending_queue_storage_moves, 1,
+            "one front pop moves one stored record"
+        );
+        assert_eq!(
+            meter.pending_release_queue_reads, 2,
+            "the handoff reads the published head twice, independent of queue length"
+        );
+        assert!(pending_records(&mut host).is_empty());
+        assert_eq!(published_count(&mut host), 0);
+        assert!(
+            finalizer_settled(&mut host, fresh.userdata),
+            "the repaired candidate is settled by the handoff"
+        );
+        assert_eq!(rooted_userdata(&mut host, frame, 3), Some(fresh.userdata));
+        assert!(userdata_token_open(&host, fresh.raw));
+        heap::with_heap(&mut host, |heap| heap.leave_roots(frame)).expect("leave roots");
+    });
+}
+
+/// The saved Release tail, an unpublished head, an occupied slot, a stale
+/// frame, an out-of-range slot, and a wrong typed token are all refused before
+/// the queue or the root slot is written. The successful repair then performs
+/// exactly one front pop.
+#[test]
+fn handoff_refuses_before_any_write_and_then_dequeues_the_published_head() {
+    crate::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        let eligible = publish_eligible(&mut host);
+        let (frame, anchor) = heap::with_heap(&mut host, |heap| {
+            let frame = heap.enter_roots(2)?;
+            let anchor = heap.alloc()?;
+            heap.write_root(frame, 0, anchor)?;
+            Ok((frame, anchor))
+        })
+        .expect("frame with an occupied slot");
+
+        let boundary = publish_boundary(&mut host);
+        assert!(matches!(boundary, PublishedBoundary::Published { .. }));
+        let records_before = pending_records(&mut host);
+        assert_eq!(published_count(&mut host), 1);
+
+        let refused = heap::take_published_pending_finalizer(&mut host, frame, 1)
+            .expect_err("saved release tail");
+        assert_eq!(refused, HeapError::SweepPending);
+        assert_eq!(pending_records(&mut host), records_before);
+        assert_eq!(rooted_userdata(&mut host, frame, 1), None);
+        assert!(userdata_token_open(&host, eligible.raw));
+        finish_release(&mut host);
+
+        let occupied =
+            heap::take_published_pending_finalizer(&mut host, frame, 0).expect_err("occupied slot");
+        assert_root_slot_occupied(occupied);
+        assert_eq!(pending_records(&mut host), records_before);
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| heap.rooted_table(frame, 0)).expect("anchor root"),
+            Some(anchor),
+            "the occupied root is unchanged"
+        );
+        assert_eq!(rooted_userdata(&mut host, frame, 1), None);
+        assert!(userdata_token_open(&host, eligible.raw));
+
+        let stale =
+            heap::with_heap(&mut host, |heap| heap.enter_roots(1)).expect("temporary frame");
+        heap::with_heap(&mut host, |heap| heap.leave_roots(stale)).expect("leave temporary frame");
+        let refused =
+            heap::take_published_pending_finalizer(&mut host, stale, 0).expect_err("stale frame");
+        assert_eq!(refused, HeapError::StaleFrame);
+        let refused =
+            heap::take_published_pending_finalizer(&mut host, frame, 2).expect_err("slot range");
+        assert_eq!(refused, HeapError::StaleFrame);
+        assert_eq!(pending_records(&mut host), records_before);
+        assert_eq!(rooted_userdata(&mut host, frame, 1), None);
+
+        let decoy = heap::publish_userdata(&mut host).expect("decoy");
+        let decoy_raw = bound_raw(&mut host, decoy);
+        heap::with_heap(&mut host, |heap| {
+            heap.unbind_userdata_token(eligible.userdata)?;
+            heap.bind_userdata_token(eligible.userdata, decoy_raw)
+        })
+        .expect("same-type misbind");
+        let refused = heap::take_published_pending_finalizer(&mut host, frame, 1)
+            .expect_err("typed mismatch");
+        assert_eq!(refused, HeapError::TokenMismatch);
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| heap
+                .published_userdata_token(eligible.userdata))
+            .expect("failing binding unchanged"),
+            decoy_raw
+        );
+        assert_eq!(pending_records(&mut host), records_before);
+        assert_eq!(rooted_userdata(&mut host, frame, 1), None);
+
+        heap::with_heap(&mut host, |heap| {
+            heap.unbind_userdata_token(eligible.userdata)?;
+            heap.bind_userdata_token(eligible.userdata, eligible.raw)
+        })
+        .expect("restore binding");
+        let _ = heap::take_scan_meter(&mut host);
+        let taken = heap::take_published_pending_finalizer(&mut host, frame, 1)
+            .expect("published head after repair");
+        assert_eq!(taken, eligible.userdata);
+        let meter = heap::take_scan_meter(&mut host).expect("handoff meter");
+        assert_eq!(meter.pending_queue_storage_moves, 1);
+        assert_eq!(meter.pending_release_queue_reads, 2);
+        assert!(pending_records(&mut host).is_empty());
+        assert_eq!(published_count(&mut host), 0);
+        assert_eq!(
+            rooted_userdata(&mut host, frame, 1),
+            Some(eligible.userdata)
+        );
+        assert_eq!(
+            heap::borrow_published_userdata(&host, eligible.userdata),
+            Ok(eligible.userdata)
+        );
+
+        // No record remains, so the same entry now refuses without touching
+        // the root or the queue.
+        let refused = heap::take_published_pending_finalizer(&mut host, frame, 1)
+            .expect_err("drained published prefix");
+        assert_not_published(refused);
+        assert_eq!(
+            rooted_userdata(&mut host, frame, 1),
+            Some(eligible.userdata)
+        );
+        assert!(userdata_token_open(&host, eligible.raw));
+        heap::with_heap(&mut host, |heap| heap.leave_roots(frame)).expect("leave roots");
+    });
+}
+
+/// The storage meter distinguishes a record read from a stored-record move.
+/// Every front pop, at the first and the last queue length, reads exactly two
+/// records and moves exactly one stored record. The queue length and the
+/// number of remaining successors do not add a read or a move.
+#[test]
+fn published_front_pop_reads_and_moves_a_constant_amount_per_item() {
+    crate::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(
+            &mut host,
+            HeapLimits {
+                nodes: 256,
+                roots: 2,
+                edges: 512,
+                max_generation: 8,
+            },
+        )
+        .expect("install");
+        let count = 24usize;
+        let mut expected = Vec::with_capacity(count);
+        for _ in 0..count {
+            let eligible = publish_eligible(&mut host);
+            expected.push((
+                eligible.userdata,
+                eligible.raw,
+                eligible.userdata.slot(),
+                eligible.userdata.generation(),
+            ));
+        }
+        let boundary = publish_boundary(&mut host);
+        assert!(matches!(boundary, PublishedBoundary::Published { .. }));
+        assert_eq!(pending_records(&mut host).len(), count);
+        assert_eq!(published_count(&mut host), count);
+        finish_release(&mut host);
+
+        let frame = heap::with_heap(&mut host, |heap| heap.enter_roots(1)).expect("one root slot");
+        let resources = host.resource_count();
+        for (index, (userdata, raw, slot, generation)) in expected.iter().copied().enumerate() {
+            let _ = heap::take_scan_meter(&mut host);
+            let taken = heap::take_published_pending_finalizer(&mut host, frame, 0)
+                .expect("published front");
+            let meter = heap::take_scan_meter(&mut host).expect("front-pop meter");
+            assert_eq!(
+                (taken.slot(), taken.generation()),
+                (slot, generation),
+                "front pop {index} returns the provided queue order"
+            );
+            assert_eq!(
+                meter.pending_release_queue_reads, 2,
+                "front pop {index} reads exactly the head, not a successor"
+            );
+            assert_eq!(
+                meter.pending_queue_storage_moves, 1,
+                "front pop {index} moves exactly one stored record"
+            );
+            assert_eq!(
+                pending_records(&mut host).len(),
+                count - index - 1,
+                "front pop {index} shortens the queue by one"
+            );
+            assert_eq!(rooted_userdata(&mut host, frame, 0), Some(userdata));
+            assert!(userdata_token_open(&host, raw));
+            heap::with_heap(&mut host, |heap| heap.clear_root(frame, 0)).expect("clear root");
+        }
+        assert!(pending_records(&mut host).is_empty());
+        assert_eq!(published_count(&mut host), 0);
+        assert_eq!(host.resource_count(), resources);
+        for (_, raw, _, _) in expected {
+            assert!(
+                userdata_token_open(&host, raw),
+                "the handoff itself closes no typed token"
+            );
+        }
+        heap::with_heap(&mut host, |heap| heap.leave_roots(frame)).expect("leave root");
+    });
+}
+
+/// A saved mark owns the graph even when no Release tail exists. The handoff
+/// must refuse it before reading the published queue or writing the root.
+#[test]
+fn handoff_refuses_a_saved_mark_before_reading_the_queue() {
+    crate::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        let eligible = publish_eligible(&mut host);
+        let frame = heap::with_heap(&mut host, |heap| heap.enter_roots(1)).expect("root frame");
+        let boundary = publish_boundary(&mut host);
+        assert!(matches!(boundary, PublishedBoundary::Published { .. }));
+        finish_release(&mut host);
+        let records = pending_records(&mut host);
+        assert_eq!(published_count(&mut host), 1);
+
+        heap::open_saved_mark_for_test(&mut host).expect("saved mark");
+        let refused =
+            heap::take_published_pending_finalizer(&mut host, frame, 0).expect_err("saved mark");
+        assert_eq!(refused, HeapError::MarkActive);
+        assert_eq!(pending_records(&mut host), records);
+        assert_eq!(published_count(&mut host), 1);
+        assert_eq!(rooted_userdata(&mut host, frame, 0), None);
+        assert!(userdata_token_open(&host, eligible.raw));
     });
 }
