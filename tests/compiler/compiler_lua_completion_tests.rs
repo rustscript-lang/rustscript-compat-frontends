@@ -128,6 +128,7 @@ fn catalog() -> &'static Arc<HostApiCatalog> {
             ("lua_root_enter", 1usize),
             ("lua_root_handoff", 2),
             ("lua_root_formal", 4),
+            ("lua_root_discard", 3),
             ("lua_root_finish", 3),
         ] {
             builder.function(HostFunctionSchema::with_return(

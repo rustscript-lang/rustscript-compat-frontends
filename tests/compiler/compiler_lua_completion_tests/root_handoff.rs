@@ -4,15 +4,27 @@
 //! This is the second private entry of the same completion lowerer. It feeds
 //! the same real lexer/parser/resolver, compiles through the fixed Core and
 //! runs one interpreter VM. The difference is that every Lua function enters a
-//! real `LuaHeap` root frame, every admitted Lua call publishes the error
-//! payload into the caller's reserved root slot before the callee frame is
-//! retired, and `pcall` moves that payload from the temp slot into its formal
-//! slot.
+//! real `LuaHeap` root frame, every admitted Lua call publishes an issued error
+//! table into the caller's reserved root slot before the callee frame is
+//! retired, and `pcall` either adopts that table into its formal slot or
+//! clears the exact temp root when the object is discarded.
 //!
-//! The error object and its strong child are canonical issued table carriers,
-//! never Core arrays standing in for a table. The observer holds only
-//! `TableRef` values and carrier pointers; a guest carrier does not keep the
-//! heap node alive. Collection is the real synchronous full sweep.
+//! The completion protocol is decoded by its own shape, never by a fixture
+//! singleton: `[true, ...values]` retires the callee frame with its original
+//! arity and typed values, `[false, scalar]` retires it with no root, and
+//! `[false, issued_table]` publishes that same-heap table. A table in a normal
+//! completion, or an array that is not a live issued table, is refused with a
+//! precise host error. The error object and its strong child are canonical
+//! issued table carriers, never Core arrays standing in for a table.
+//!
+//! An uncaught issued table at the chunk boundary keeps the chunk frame open:
+//! the caller receives the table together with an explicit live root, then
+//! releases the frame and collects. The boundary records both states, and a
+//! reclaimed carrier is never classified as a usable table.
+//!
+//! The observer holds only `TableRef` values and carrier pointers; a guest
+//! carrier does not keep the heap node alive. Collection is the real
+//! synchronous full sweep.
 
 use std::sync::{Arc, Mutex};
 
@@ -20,7 +32,8 @@ use vm::compiler::HostCallResolver;
 use vm::vm::VmFrameContinuation;
 use vm::{
     CallOutcome, CallReturn, CompileSourceFileOptions, FrontendImportSyntax, FrontendIr,
-    HostFunction, ParseError, SourceFlavor, SourcePlugin, Value, Vm, VmError,
+    HostFunction, ParseError, SourceError, SourceFlavor, SourcePathError, SourcePlugin, Value, Vm,
+    VmError, VmStatus, VmYieldReason,
 };
 
 use super::{
@@ -29,14 +42,27 @@ use super::{
 };
 use crate::heap;
 
-/// One test arm. The positive arm publishes at every handoff. Each negative
-/// arm omits exactly one publish while keeping that handoff's retirements and
-/// the real full collection in the same window.
+const POSITIVE_FIXTURE: &str = "root-handoff.lua";
+const MAX_FIXTURE_TABLES: usize = 8;
+
+/// One test arm. The positive arm publishes at every table handoff. Each
+/// negative arm omits exactly one publish while keeping that handoff's frame
+/// retirement and the real full collection in the same window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Arm {
     Positive,
     OmitFirstPublish,
     OmitSecondPublish,
+}
+
+/// A run budget. `Normal` is the fixed production-shaped fuel budget used by
+/// every behavioral arm; the other two are real VM interrupt arms so the
+/// bottom-level status is observed instead of synthesized.
+#[derive(Clone, Copy, Debug)]
+enum RunMode {
+    Normal,
+    Fuel(u64),
+    Epoch(u64),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -52,14 +78,85 @@ struct EnterRecord {
     core_depth: usize,
 }
 
+/// The typed decode of one completion value. Carrier arrays are recorded as a
+/// kind only: the observer must not clone a carrier and keep its heap node
+/// reachable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TypedValue {
+    Nil,
+    Bool(bool),
+    Int(i64),
+    Float(u64),
+    String,
+    Bytes(usize),
+    Array,
+    Map,
+    Callable,
+}
+
+fn typed_value(value: &Value) -> TypedValue {
+    match value {
+        Value::Null => TypedValue::Nil,
+        Value::Bool(inner) => TypedValue::Bool(*inner),
+        Value::Int(inner) => TypedValue::Int(*inner),
+        Value::Float(inner) => TypedValue::Float(inner.to_bits()),
+        Value::String(_) => TypedValue::String,
+        Value::Bytes(inner) => TypedValue::Bytes(inner.len()),
+        Value::Array(_) => TypedValue::Array,
+        Value::Map(_) => TypedValue::Map,
+        Value::Callable(_) => TypedValue::Callable,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CompletionClass {
+    Normal {
+        arity: usize,
+        values: Vec<TypedValue>,
+    },
+    Error {
+        payload: TypedValue,
+    },
+}
+
+fn decode_completion(value: &Value) -> Result<CompletionClass, String> {
+    let Value::Array(items) = value else {
+        return Err("root completion is not a private array".to_string());
+    };
+    let Some(Value::Bool(status)) = items.first() else {
+        return Err("root completion has no Boolean status".to_string());
+    };
+    if *status {
+        let values: Vec<_> = items[1..].iter().map(typed_value).collect();
+        return Ok(CompletionClass::Normal {
+            arity: values.len(),
+            values,
+        });
+    }
+    if items.len() != 2 {
+        return Err(format!(
+            "error completion must carry exactly one payload, got {} items",
+            items.len()
+        ));
+    }
+    Ok(CompletionClass::Error {
+        payload: typed_value(&items[1]),
+    })
+}
+
+#[derive(Clone, Debug)]
+struct TableAlive {
+    table: heap::TableRef,
+    before: bool,
+    after: bool,
+}
+
 #[derive(Clone, Debug)]
 struct WindowRecord {
     collections_before: u32,
     orphan: TableWitness,
     orphan_alive_before: bool,
-    original_alive: bool,
-    child_alive: bool,
-    child_edge_same: bool,
+    tables: Vec<TableAlive>,
     orphan_alive_after: bool,
     collections_after: u32,
     report: heap::CollectReport,
@@ -74,14 +171,14 @@ struct HandoffRecord {
     parent_slot: u32,
     parent_slot_before_empty: bool,
     child_top_at_publish: bool,
+    completion: CompletionClass,
+    skipped_publish: bool,
     published: bool,
+    payload_table: Option<heap::TableRef>,
+    payload_carrier: Option<usize>,
     parent_slot_after: Option<heap::TableRef>,
     retired: bool,
     top_after_parent: bool,
-    completion_is_error: bool,
-    completion_is_unissued: bool,
-    payload_is_original: bool,
-    payload_carrier_is_original: bool,
     caller_core_prototype: Option<u32>,
     core_depth: usize,
     window: Option<WindowRecord>,
@@ -89,23 +186,49 @@ struct HandoffRecord {
 
 #[derive(Clone, Debug)]
 struct FormalRecord {
+    frame: (u32, u32),
     temp_slot: u32,
     formal_slot: u32,
     temp_before: Option<heap::TableRef>,
     formal_before: Option<heap::TableRef>,
-    value_is_original: bool,
+    value: TypedValue,
+    value_table: Option<heap::TableRef>,
+    rooted: bool,
     temp_after: Option<heap::TableRef>,
     formal_after: Option<heap::TableRef>,
 }
 
 #[derive(Clone, Debug)]
-struct FinishRecord {
-    formal_before: Option<heap::TableRef>,
+struct DiscardRecord {
+    frame: (u32, u32),
+    temp_slot: u32,
     formal_slot: u32,
-    retired: bool,
-    top_after: Option<(u32, u32)>,
-    original_alive_after: bool,
-    child_alive_after: bool,
+    completion: CompletionClass,
+    payload_table: Option<heap::TableRef>,
+    payload_carrier: Option<usize>,
+    temp_before: Option<heap::TableRef>,
+    temp_after: Option<heap::TableRef>,
+    formal_before: Option<heap::TableRef>,
+    formal_after: Option<heap::TableRef>,
+    cleared_exact_root: bool,
+}
+
+#[derive(Clone, Debug)]
+struct UncaughtRecord {
+    payload: TypedValue,
+    table: Option<heap::TableRef>,
+    carrier: Option<usize>,
+    frame: Option<(u32, u32)>,
+    root_slot: Option<u32>,
+    rooted_in_temp: bool,
+    rooted_in_formal: bool,
+    frame_retained: bool,
+    alive_before_finish: bool,
+}
+
+#[derive(Clone, Debug)]
+struct FinishCollection {
+    tables: Vec<TableAlive>,
     orphan: TableWitness,
     orphan_alive_before: bool,
     orphan_alive_after: bool,
@@ -115,35 +238,71 @@ struct FinishRecord {
 }
 
 #[derive(Clone, Debug)]
+struct FinishRecord {
+    frame: (u32, u32),
+    formal_slot: u32,
+    formal_before: Option<heap::TableRef>,
+    completion: CompletionClass,
+    retired: bool,
+    top_after: Option<(u32, u32)>,
+    collection: Option<FinishCollection>,
+    uncaught: Option<UncaughtRecord>,
+}
+
+#[derive(Clone, Debug)]
 struct NoteRecord {
-    value_is_original: bool,
-    carrier_is_original: bool,
+    frame: (u32, u32),
+    table: Option<heap::TableRef>,
+    table_index: Option<usize>,
+    carrier: Option<usize>,
     temp_empty: bool,
-    formal_holds_original: bool,
+    formal_table: Option<heap::TableRef>,
 }
 
 #[derive(Clone, Debug)]
 struct RootWitness {
     arm: Arm,
-    original: Option<TableWitness>,
-    child: Option<TableWitness>,
+    tables: Vec<TableWitness>,
     enters: Vec<EnterRecord>,
     handoffs: Vec<HandoffRecord>,
-    formal: Option<FormalRecord>,
+    formals: Vec<FormalRecord>,
+    discards: Vec<DiscardRecord>,
     finish: Option<FinishRecord>,
     note: Option<NoteRecord>,
     marks: Vec<super::MarkRecord>,
     failures: Vec<String>,
 }
 
+/// The explicit uncaught boundary. `live_root` is true when the chunk frame
+/// was retained with the payload in a real root slot; `carrier_is_table_*`
+/// proves whether the carrier is still a usable table before and after the
+/// caller releases that frame and collects.
+#[derive(Clone, Debug)]
+struct UncaughtBoundary {
+    table: Option<heap::TableRef>,
+    carrier: Option<usize>,
+    live_root: bool,
+    alive_at_boundary: bool,
+    carrier_is_table_at_boundary: bool,
+    frame: Option<(u32, u32)>,
+    released: bool,
+    alive_after_release: bool,
+    carrier_is_table_after_release: bool,
+    report: Option<heap::CollectReport>,
+}
+
 #[derive(Debug)]
 struct RootRun {
     stack: Vec<Value>,
     exit: CompletionExit,
-    fuel_consumed: u64,
+    fuel_budget: Option<u64>,
+    fuel_remaining: Option<u64>,
+    last_yield_reason: Option<VmYieldReason>,
+    epoch_deadline: Option<u64>,
     marks: Vec<super::MarkRecord>,
     call_sites: Vec<super::DecodedCallSite>,
     witness: RootWitness,
+    boundary: Option<UncaughtBoundary>,
 }
 
 impl RootRun {
@@ -152,7 +311,11 @@ impl RootRun {
     fn as_p0_run(&self) -> super::Run {
         super::Run {
             stack: self.stack.clone(),
-            fuel_consumed: self.fuel_consumed,
+            fuel_consumed: self
+                .fuel_budget
+                .zip(self.fuel_remaining)
+                .map(|(budget, remaining)| budget.saturating_sub(remaining))
+                .unwrap_or(0),
             marks: self.marks.clone(),
             seen: None,
             ticks: Vec::new(),
@@ -205,6 +368,7 @@ enum RootOp {
     Enter,
     Handoff,
     Formal,
+    Discard,
     Finish,
 }
 
@@ -272,6 +436,65 @@ fn classify_table(
     }
 }
 
+fn alive_table(host: &mut vm::HostContext<'_>, table: heap::TableRef) -> Result<bool, VmError> {
+    heap::with_heap(host, |heap| Ok(heap.alive(table))).map_err(heap_fault)
+}
+
+fn current_frame(host: &mut vm::HostContext<'_>) -> Result<Option<heap::RootFrameId>, VmError> {
+    heap::with_heap(host, |heap| Ok(heap.current_frame())).map_err(heap_fault)
+}
+
+fn rooted_table(
+    host: &mut vm::HostContext<'_>,
+    frame: heap::RootFrameId,
+    slot: u32,
+) -> Result<Option<heap::TableRef>, VmError> {
+    heap::with_heap(host, |heap| heap.rooted_table(frame, slot)).map_err(heap_fault)
+}
+
+/// One real full collection. The observed tables are read around the sweep so
+/// each window carries independent reclamation evidence, and a fresh unrooted
+/// orphan proves the sweep actually ran.
+fn collect_window(
+    host: &mut vm::HostContext<'_>,
+    observed: &[heap::TableRef],
+) -> Result<WindowRecord, VmError> {
+    let stats_before = heap::with_heap(host, |heap| Ok(heap.stats())).map_err(heap_fault)?;
+    let orphan_value = heap::publish_guest(host).map_err(heap_fault)?;
+    let orphan_table = classify_table(host, &orphan_value)?;
+    let orphan = TableWitness {
+        table: orphan_table,
+        carrier: carrier_ptr(&orphan_value)
+            .ok_or_else(|| host_fault("fresh window orphan has no carrier"))?,
+    };
+    let orphan_alive_before = alive_table(host, orphan_table)?;
+    let mut before = Vec::with_capacity(observed.len());
+    for table in observed {
+        before.push(alive_table(host, *table)?);
+    }
+    let report = heap::collect(host).map_err(heap_fault)?;
+    let stats_after = heap::with_heap(host, |heap| Ok(heap.stats())).map_err(heap_fault)?;
+    let mut tables = Vec::with_capacity(observed.len());
+    for (table, before) in observed.iter().zip(before) {
+        let after = alive_table(host, *table)?;
+        tables.push(TableAlive {
+            table: *table,
+            before,
+            after,
+        });
+    }
+    let orphan_alive_after = alive_table(host, orphan_table)?;
+    Ok(WindowRecord {
+        collections_before: stats_before.collections,
+        orphan,
+        orphan_alive_before,
+        tables,
+        orphan_alive_after,
+        collections_after: stats_after.collections,
+        report,
+    })
+}
+
 impl RootHost {
     fn fail(&self, message: impl Into<String>) -> VmError {
         let message = message.into();
@@ -312,27 +535,37 @@ impl RootHost {
         let [value] = args else {
             return Err(host_fault("note expects one value"));
         };
-        let original = self
-            .witness
-            .lock()
-            .expect("root witness")
-            .original
-            .ok_or_else(|| host_fault("note ran before the original table was created"))?;
         let mut host = vm.host_context();
-        let table = classify_table(&mut host, value)?;
-        let frame = heap::with_heap(&mut host, |heap| {
-            heap.current_frame().ok_or(heap::HeapError::NoRootFrame)
-        })
-        .map_err(heap_fault)?;
-        let (temp, formal) = heap::with_heap(&mut host, |heap| {
-            Ok((heap.rooted_table(frame, 0)?, heap.rooted_table(frame, 1)?))
-        })
-        .map_err(heap_fault)?;
+        let frame =
+            current_frame(&mut host)?.ok_or_else(|| host_fault("note has no root frame"))?;
+        let temp = rooted_table(&mut host, frame, 0)?;
+        let formal = rooted_table(&mut host, frame, 1)?;
+        let (table, carrier) = match value {
+            Value::Array(_) => match classify(&mut host, value)? {
+                heap::GuestClass::Table(table) => (Some(table), carrier_ptr(value)),
+                other => {
+                    return Err(self.fail(format!(
+                        "note value is an array but not a live issued table: {other:?}"
+                    )));
+                }
+            },
+            _ => (None, None),
+        };
+        let table_index = table.and_then(|table| {
+            self.witness
+                .lock()
+                .expect("root witness")
+                .tables
+                .iter()
+                .position(|witness| witness.table == table)
+        });
         self.witness.lock().expect("root witness").note = Some(NoteRecord {
-            value_is_original: table == original.table,
-            carrier_is_original: carrier_ptr(value) == Some(original.carrier),
+            frame: frame.parts(),
+            table,
+            table_index,
+            carrier,
             temp_empty: temp.is_none(),
-            formal_holds_original: formal == Some(original.table),
+            formal_table: formal,
         });
         Ok(CallOutcome::Return(CallReturn::one(Value::Bool(true))))
     }
@@ -348,14 +581,9 @@ impl RootHost {
         };
         {
             let mut state = self.witness.lock().expect("root witness");
-            if state.original.is_none() {
-                state.original = Some(witness);
-            } else if state.child.is_none() {
-                state.child = Some(witness);
-            } else {
-                return Err(host_fault(
-                    "the fixture must create exactly one original and one child",
-                ));
+            state.tables.push(witness);
+            if state.tables.len() > MAX_FIXTURE_TABLES {
+                return Err(host_fault("the fixture created too many issued tables"));
             }
         }
         Ok(CallOutcome::Return(CallReturn::one(issued)))
@@ -365,25 +593,11 @@ impl RootHost {
         let [original_value, child_value] = args else {
             return Err(host_fault("setchild expects the original and the child"));
         };
-        let (original, child) = {
-            let state = self.witness.lock().expect("root witness");
-            (
-                state
-                    .original
-                    .ok_or_else(|| host_fault("setchild ran before the original table"))?,
-                state
-                    .child
-                    .ok_or_else(|| host_fault("setchild ran before the child table"))?,
-            )
-        };
         let mut host = vm.host_context();
-        let original_found = classify_table(&mut host, original_value)?;
-        let child_found = classify_table(&mut host, child_value)?;
-        if original_found != original.table || child_found != child.table {
-            return Err(host_fault("setchild received a different issued table"));
-        }
+        let original = classify_table(&mut host, original_value)?;
+        let child = classify_table(&mut host, child_value)?;
         heap::with_heap(&mut host, |heap| {
-            heap.set_named_edge(original.table, "child", child.table)
+            heap.set_named_edge(original, "child", child)
         })
         .map_err(heap_fault)?;
         Ok(CallOutcome::Return(CallReturn::one(Value::Int(0))))
@@ -395,8 +609,7 @@ impl RootHost {
         };
         let width = u32_arg(width, "root frame width")?;
         let mut host = vm.host_context();
-        let parent =
-            heap::with_heap(&mut host, |heap| Ok(heap.current_frame())).map_err(heap_fault)?;
+        let parent = current_frame(&mut host)?;
         let frame =
             heap::with_heap(&mut host, |heap| heap.enter_roots(width)).map_err(heap_fault)?;
         let depth = vm.call_depth();
@@ -424,25 +637,22 @@ impl RootHost {
             .last()
             .and_then(|frame| frame.prototype_id);
         let core_depth = vm.call_depth();
-        let (arm, index, original, child) = {
+        let (arm, index, observed) = {
             let state = self.witness.lock().expect("root witness");
             (
                 state.arm,
                 state.handoffs.len(),
                 state
-                    .original
-                    .ok_or_else(|| host_fault("handoff ran before the original table"))?,
-                state
-                    .child
-                    .ok_or_else(|| host_fault("handoff ran before the child table"))?,
+                    .tables
+                    .iter()
+                    .map(|witness| witness.table)
+                    .collect::<Vec<_>>(),
             )
         };
 
         let mut host = vm.host_context();
-        let child_frame = heap::with_heap(&mut host, |heap| {
-            heap.current_frame().ok_or(heap::HeapError::NoRootFrame)
-        })
-        .map_err(heap_fault)?;
+        let child_frame = current_frame(&mut host)?
+            .ok_or_else(|| host_fault("handoff has no child root frame"))?;
         let enter = {
             let state = self.witness.lock().expect("root witness");
             state
@@ -465,115 +675,83 @@ impl RootHost {
                 "callee frame {child_parts:?} is not adjacent to caller {own_parts:?}"
             )));
         }
-        let parent_slot_before =
-            heap::with_heap(&mut host, |heap| heap.rooted_table(own, 0)).map_err(heap_fault)?;
+        let parent_slot_before = rooted_table(&mut host, own, 0)?;
         if parent_slot_before.is_some() {
             return Err(self.fail("the reserved parent handoff root slot is not empty"));
         }
-        let completion_is_unissued =
-            !matches!(classify(&mut host, completion)?, heap::GuestClass::Table(_));
-        let Value::Array(items) = completion else {
-            return Err(self.fail("root handoff completion is not a private array"));
-        };
-        let completion_is_error =
-            items.len() == 2 && matches!(items.first(), Some(Value::Bool(false)));
-        if !completion_is_error {
-            return Err(self.fail("root handoff completion is not exactly [false, payload]"));
-        }
-        let payload = &items[1];
-        let payload_table = match classify(&mut host, payload) {
-            Ok(heap::GuestClass::Table(table)) => table,
-            Ok(other) => {
-                return Err(self.fail(format!(
-                    "root handoff payload is not an issued table: {other:?}"
-                )));
+
+        let completion_class =
+            decode_completion(completion).map_err(|message| self.fail(message))?;
+        let mut payload_table = None;
+        let mut payload_carrier = None;
+        match &completion_class {
+            CompletionClass::Normal { .. } => {
+                let Value::Array(items) = completion else {
+                    unreachable!("decode_completion accepted a non-array");
+                };
+                if items[1..]
+                    .iter()
+                    .any(|value| matches!(value, Value::Array(_)))
+                {
+                    return Err(
+                        self.fail("a table value in a normal completion has no root in this slice")
+                    );
+                }
             }
-            Err(error) => return Err(error),
-        };
-        let payload_carrier_is_original = carrier_ptr(payload) == Some(original.carrier);
-        let payload_is_original = payload_table == original.table;
-        if !payload_is_original || !payload_carrier_is_original {
-            return Err(self.fail("root handoff payload is not the same issued original table"));
+            CompletionClass::Error { .. } => {
+                let Value::Array(items) = completion else {
+                    unreachable!("decode_completion accepted a non-array");
+                };
+                let payload = &items[1];
+                if matches!(payload, Value::Array(_)) {
+                    match classify(&mut host, payload)? {
+                        heap::GuestClass::Table(table) => {
+                            payload_table = Some(table);
+                            payload_carrier = carrier_ptr(payload);
+                        }
+                        other => {
+                            return Err(self.fail(format!(
+                                "root handoff payload is not an issued table: {other:?}"
+                            )));
+                        }
+                    }
+                }
+            }
         }
 
-        let skip_publish = matches!(
-            (arm, index),
-            (Arm::OmitFirstPublish, 0) | (Arm::OmitSecondPublish, 1)
-        );
-        let child_top_at_publish = heap::with_heap(&mut host, |heap| {
-            Ok(heap.current_frame() == Some(child_frame))
-        })
-        .map_err(heap_fault)?;
+        let child_top_at_publish = current_frame(&mut host)? == Some(child_frame);
         if !child_top_at_publish {
             return Err(self.fail("the callee frame is not the top frame at the publish point"));
         }
-        if !skip_publish {
-            heap::with_heap(&mut host, |heap| heap.write_root(own, 0, payload_table))
+        let skipped_publish = payload_table.is_some()
+            && matches!(
+                (arm, index),
+                (Arm::OmitFirstPublish, 0) | (Arm::OmitSecondPublish, 1)
+            );
+        let mut published = false;
+        if let Some(table) = payload_table
+            && !skipped_publish
+        {
+            heap::with_heap(&mut host, |heap| heap.write_root(own, 0, table))
                 .map_err(heap_fault)?;
+            published = true;
         }
-        let parent_slot_after =
-            heap::with_heap(&mut host, |heap| heap.rooted_table(own, 0)).map_err(heap_fault)?;
-        if !skip_publish && parent_slot_after != Some(payload_table) {
+        let parent_slot_after = rooted_table(&mut host, own, 0)?;
+        if published && parent_slot_after != payload_table {
             return Err(self.fail("the parent temp root did not receive the payload"));
         }
-        if skip_publish && parent_slot_after.is_some() {
+        if skipped_publish && parent_slot_after.is_some() {
             return Err(self.fail("the omitted handoff still wrote a parent root"));
         }
 
-        // Publish (or the deliberate omission) is complete while the callee
+        // Publishing (or the deliberate omission) is complete while the callee
         // frame is still the top frame. Only now retire it.
         heap::with_heap(&mut host, |heap| heap.leave_roots(child_frame)).map_err(heap_fault)?;
-        let top_after =
-            heap::with_heap(&mut host, |heap| Ok(heap.current_frame())).map_err(heap_fault)?;
+        let top_after = current_frame(&mut host)?;
         let top_after_parent = top_after == Some(own);
 
         let window = if index < 2 {
-            // Each window publishes exactly one fresh table with no root
-            // immediately before the mark. It is not part of the payload
-            // graph, so it can only disappear when this real collection sweeps.
-            let stats_before =
-                heap::with_heap(&mut host, |heap| Ok(heap.stats())).map_err(heap_fault)?;
-            let orphan_value = heap::publish_guest(&mut host).map_err(heap_fault)?;
-            let orphan_table = classify_table(&mut host, &orphan_value)?;
-            let orphan = TableWitness {
-                table: orphan_table,
-                carrier: carrier_ptr(&orphan_value)
-                    .ok_or_else(|| host_fault("fresh window orphan has no carrier"))?,
-            };
-            let orphan_alive_before =
-                heap::with_heap(&mut host, |heap| Ok(heap.alive(orphan_table)))
-                    .map_err(heap_fault)?;
-            let report = heap::collect(&mut host).map_err(heap_fault)?;
-            let stats_after =
-                heap::with_heap(&mut host, |heap| Ok(heap.stats())).map_err(heap_fault)?;
-            let original_alive = heap::with_heap(&mut host, |heap| Ok(heap.alive(original.table)))
-                .map_err(heap_fault)?;
-            let child_alive = heap::with_heap(&mut host, |heap| Ok(heap.alive(child.table)))
-                .map_err(heap_fault)?;
-            let child_edge_same = heap::with_heap(&mut host, |heap| {
-                if !heap.alive(original.table) {
-                    return Ok(false);
-                }
-                match heap.named_edge(original.table, "child") {
-                    Ok(Some(found)) => Ok(found == child.table),
-                    _ => Ok(false),
-                }
-            })
-            .map_err(heap_fault)?;
-            let orphan_alive_after =
-                heap::with_heap(&mut host, |heap| Ok(heap.alive(orphan_table)))
-                    .map_err(heap_fault)?;
-            Some(WindowRecord {
-                collections_before: stats_before.collections,
-                orphan,
-                orphan_alive_before,
-                original_alive,
-                child_alive,
-                child_edge_same,
-                orphan_alive_after,
-                collections_after: stats_after.collections,
-                report,
-            })
+            Some(collect_window(&mut host, &observed)?)
         } else {
             None
         };
@@ -590,14 +768,14 @@ impl RootHost {
                 parent_slot: 0,
                 parent_slot_before_empty: parent_slot_before.is_none(),
                 child_top_at_publish,
-                published: !skip_publish,
+                completion: completion_class,
+                skipped_publish,
+                published,
+                payload_table,
+                payload_carrier,
                 parent_slot_after,
                 retired: top_after_parent,
                 top_after_parent,
-                completion_is_error,
-                completion_is_unissued,
-                payload_is_original,
-                payload_carrier_is_original,
                 caller_core_prototype,
                 core_depth,
                 window,
@@ -614,53 +792,149 @@ impl RootHost {
         let own = decode_frame_token(frame_value)?;
         let temp = u32_arg(temp, "temp root slot")?;
         let formal = u32_arg(formal, "formal root slot")?;
-        let original = self
-            .witness
-            .lock()
-            .expect("root witness")
-            .original
-            .ok_or_else(|| host_fault("formal ran before the original table"))?;
         let mut host = vm.host_context();
-        let current =
-            heap::with_heap(&mut host, |heap| Ok(heap.current_frame())).map_err(heap_fault)?;
+        let current = current_frame(&mut host)?;
         if current != Some(own) {
             return Err(self.fail("the formal receiver is not the current parent frame"));
         }
-        let (temp_before, formal_before) = heap::with_heap(&mut host, |heap| {
-            Ok((
-                heap.rooted_table(own, temp)?,
-                heap.rooted_table(own, formal)?,
-            ))
-        })
-        .map_err(heap_fault)?;
-        let value_table = classify_table(&mut host, value)?;
-        if value_table != original.table
-            || temp_before != Some(original.table)
-            || formal_before.is_some()
-        {
-            return Err(self.fail("the formal receive does not match the reserved temp root"));
+        let temp_before = rooted_table(&mut host, own, temp)?;
+        let formal_before = rooted_table(&mut host, own, formal)?;
+        let value_kind = typed_value(value);
+        let mut value_table = None;
+        let mut rooted = false;
+        match value {
+            Value::Array(_) => match classify(&mut host, value)? {
+                heap::GuestClass::Table(table) => {
+                    value_table = Some(table);
+                    if let Some(temp_table) = temp_before
+                        && temp_table != table
+                    {
+                        return Err(
+                            self.fail("the formal receive does not match the reserved temp root")
+                        );
+                    }
+                    if formal_before.is_some() {
+                        return Err(self.fail("the reserved formal root slot is not empty"));
+                    }
+                    heap::with_heap(&mut host, |heap| heap.write_root(own, formal, table))
+                        .map_err(heap_fault)?;
+                    if temp_before.is_some() {
+                        heap::with_heap(&mut host, |heap| heap.clear_root(own, temp))
+                            .map_err(heap_fault)?;
+                    }
+                    rooted = true;
+                }
+                other => {
+                    return Err(self.fail(format!(
+                        "the protected receive is not an issued table: {other:?}"
+                    )));
+                }
+            },
+            _ => {
+                if temp_before.is_some() {
+                    return Err(
+                        self.fail("the formal receive did not consume the reserved temp root")
+                    );
+                }
+            }
         }
-        heap::with_heap(&mut host, |heap| {
-            heap.write_root(own, formal, original.table)
-        })
-        .map_err(heap_fault)?;
-        heap::with_heap(&mut host, |heap| heap.clear_root(own, temp)).map_err(heap_fault)?;
-        let (temp_after, formal_after) = heap::with_heap(&mut host, |heap| {
-            Ok((
-                heap.rooted_table(own, temp)?,
-                heap.rooted_table(own, formal)?,
-            ))
-        })
-        .map_err(heap_fault)?;
-        self.witness.lock().expect("root witness").formal = Some(FormalRecord {
-            temp_slot: temp,
-            formal_slot: formal,
-            temp_before,
-            formal_before,
-            value_is_original: value_table == original.table,
-            temp_after,
-            formal_after,
-        });
+        let temp_after = rooted_table(&mut host, own, temp)?;
+        let formal_after = rooted_table(&mut host, own, formal)?;
+        self.witness
+            .lock()
+            .expect("root witness")
+            .formals
+            .push(FormalRecord {
+                frame: own.parts(),
+                temp_slot: temp,
+                formal_slot: formal,
+                temp_before,
+                formal_before,
+                value: value_kind,
+                value_table,
+                rooted,
+                temp_after,
+                formal_after,
+            });
+        Ok(CallOutcome::Return(CallReturn::one(Value::Int(0))))
+    }
+
+    fn discard(&self, vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
+        let [sequence, frame_value, temp] = args else {
+            return Err(host_fault(
+                "root discard expects sequence, frame and temp slot",
+            ));
+        };
+        let own = decode_frame_token(frame_value)?;
+        let temp = u32_arg(temp, "temp root slot")?;
+        let formal_slot = 1u32;
+        let mut host = vm.host_context();
+        let current = current_frame(&mut host)?;
+        if current != Some(own) {
+            return Err(self.fail("the discard receiver is not the current parent frame"));
+        }
+        let temp_before = rooted_table(&mut host, own, temp)?;
+        let formal_before = rooted_table(&mut host, own, formal_slot)?;
+        let completion = decode_completion(sequence).map_err(|message| self.fail(message))?;
+        let mut payload_table = None;
+        let mut payload_carrier = None;
+        let mut cleared = false;
+        match &completion {
+            CompletionClass::Normal { .. } => {
+                if temp_before.is_some() {
+                    return Err(self.fail("the discarded protected result still holds a temp root"));
+                }
+            }
+            CompletionClass::Error { .. } => {
+                let Value::Array(items) = sequence else {
+                    unreachable!("decode_completion accepted a non-array");
+                };
+                let payload = &items[1];
+                if matches!(payload, Value::Array(_)) {
+                    match classify(&mut host, payload)? {
+                        heap::GuestClass::Table(table) => {
+                            payload_table = Some(table);
+                            payload_carrier = carrier_ptr(payload);
+                            if temp_before != Some(table) {
+                                return Err(self
+                                    .fail("the discarded payload is not the reserved temp root"));
+                            }
+                            heap::with_heap(&mut host, |heap| heap.clear_root(own, temp))
+                                .map_err(heap_fault)?;
+                            cleared = true;
+                        }
+                        other => {
+                            return Err(self.fail(format!(
+                                "the discarded payload is not an issued table: {other:?}"
+                            )));
+                        }
+                    }
+                } else if temp_before.is_some() {
+                    return Err(
+                        self.fail("the discarded scalar did not consume the reserved temp root")
+                    );
+                }
+            }
+        }
+        let temp_after = rooted_table(&mut host, own, temp)?;
+        let formal_after = rooted_table(&mut host, own, formal_slot)?;
+        self.witness
+            .lock()
+            .expect("root witness")
+            .discards
+            .push(DiscardRecord {
+                frame: own.parts(),
+                temp_slot: temp,
+                formal_slot,
+                completion,
+                payload_table,
+                payload_carrier,
+                temp_before,
+                temp_after,
+                formal_before,
+                formal_after,
+                cleared_exact_root: cleared,
+            });
         Ok(CallOutcome::Return(CallReturn::one(Value::Int(0))))
     }
 
@@ -672,46 +946,137 @@ impl RootHost {
         };
         let own = decode_frame_token(frame_value)?;
         let formal = u32_arg(formal, "formal root slot")?;
-        let (original, child) = {
+        let observed = {
             let state = self.witness.lock().expect("root witness");
-            (
-                state
-                    .original
-                    .ok_or_else(|| host_fault("finish ran before the original table"))?,
-                state
-                    .child
-                    .ok_or_else(|| host_fault("finish ran before the child table"))?,
-            )
+            state
+                .tables
+                .iter()
+                .map(|witness| witness.table)
+                .collect::<Vec<_>>()
         };
         let mut host = vm.host_context();
-        let current =
-            heap::with_heap(&mut host, |heap| Ok(heap.current_frame())).map_err(heap_fault)?;
+        let current = current_frame(&mut host)?;
         if current != Some(own) {
             return Err(self.fail("the finishing chunk is not the current frame"));
         }
-        let Value::Array(items) = completion else {
-            return Err(self.fail("chunk completion is not a private array"));
-        };
-        if items.len() != 3
-            || !matches!(items.first(), Some(Value::Bool(true)))
-            || !matches!(items.get(1), Some(Value::Bool(false)))
-        {
-            return Err(self.fail("chunk completion is not [true, false, payload]"));
+        let formal_before = rooted_table(&mut host, own, formal)?;
+        let completion_class =
+            decode_completion(completion).map_err(|message| self.fail(message))?;
+        let mut uncaught = None;
+        let mut retained = false;
+        match &completion_class {
+            CompletionClass::Normal { .. } => {
+                let Value::Array(items) = completion else {
+                    unreachable!("decode_completion accepted a non-array");
+                };
+                for item in &items[1..] {
+                    if matches!(item, Value::Array(_)) {
+                        match classify(&mut host, item)? {
+                            heap::GuestClass::Table(table) => {
+                                if formal_before != Some(table) {
+                                    return Err(self.fail(
+                                        "a normal chunk completion carries an issued table that is not the last formal root",
+                                    ));
+                                }
+                            }
+                            other => {
+                                return Err(self.fail(format!(
+                                    "a normal chunk completion carries an array that is not a live issued table: {other:?}"
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+            CompletionClass::Error { .. } => {
+                let Value::Array(items) = completion else {
+                    unreachable!("decode_completion accepted a non-array");
+                };
+                let payload = &items[1];
+                match payload {
+                    Value::Array(_) => match classify(&mut host, payload)? {
+                        heap::GuestClass::Table(table) => {
+                            let temp = rooted_table(&mut host, own, 0)?;
+                            let (root_slot, rooted_in_temp, rooted_in_formal) = if temp
+                                == Some(table)
+                            {
+                                if let Some(other) = formal_before
+                                    && other != table
+                                {
+                                    return Err(self.fail(
+                                            "the uncaught payload is not the only table in the chunk roots",
+                                        ));
+                                }
+                                (Some(0), true, formal_before == Some(table))
+                            } else if formal_before == Some(table) {
+                                (Some(formal), false, true)
+                            } else if formal_before.is_none() {
+                                heap::with_heap(&mut host, |heap| {
+                                    heap.write_root(own, formal, table)
+                                })
+                                .map_err(heap_fault)?;
+                                (Some(formal), false, true)
+                            } else {
+                                return Err(self.fail(
+                                    "the uncaught payload table does not match the reserved roots",
+                                ));
+                            };
+                            let alive_before_finish = alive_table(&mut host, table)?;
+                            uncaught = Some(UncaughtRecord {
+                                payload: typed_value(payload),
+                                table: Some(table),
+                                carrier: carrier_ptr(payload),
+                                frame: Some(own.parts()),
+                                root_slot,
+                                rooted_in_temp,
+                                rooted_in_formal,
+                                frame_retained: true,
+                                alive_before_finish,
+                            });
+                            retained = true;
+                        }
+                        other => {
+                            return Err(self.fail(format!(
+                                "the uncaught payload is not an issued table: {other:?}"
+                            )));
+                        }
+                    },
+                    _ => {
+                        uncaught = Some(UncaughtRecord {
+                            payload: typed_value(payload),
+                            table: None,
+                            carrier: None,
+                            frame: None,
+                            root_slot: None,
+                            rooted_in_temp: false,
+                            rooted_in_formal: false,
+                            frame_retained: false,
+                            alive_before_finish: false,
+                        });
+                    }
+                }
+            }
         }
-        let payload_table = classify_table(&mut host, &items[2])?;
-        if payload_table != original.table || carrier_ptr(&items[2]) != Some(original.carrier) {
-            return Err(self.fail("chunk payload is not the same issued original table"));
-        }
-        let formal_before = heap::with_heap(&mut host, |heap| heap.rooted_table(own, formal))
-            .map_err(heap_fault)?;
-        if formal_before != Some(original.table) {
-            return Err(self.fail("the last formal root does not hold the original table"));
-        }
-        heap::with_heap(&mut host, |heap| heap.leave_roots(own)).map_err(heap_fault)?;
-        let top_after =
-            heap::with_heap(&mut host, |heap| Ok(heap.current_frame())).map_err(heap_fault)?;
+
         let stats_before =
             heap::with_heap(&mut host, |heap| Ok(heap.stats())).map_err(heap_fault)?;
+        if retained {
+            let top_after = current_frame(&mut host)?;
+            self.witness.lock().expect("root witness").finish = Some(FinishRecord {
+                frame: own.parts(),
+                formal_slot: formal,
+                formal_before,
+                completion: completion_class,
+                retired: false,
+                top_after: top_after.map(heap::RootFrameId::parts),
+                collection: None,
+                uncaught,
+            });
+            return Ok(CallOutcome::Return(CallReturn::one(completion.clone())));
+        }
+
+        heap::with_heap(&mut host, |heap| heap.leave_roots(own)).map_err(heap_fault)?;
+        let top_after = current_frame(&mut host)?;
         let orphan_value = heap::publish_guest(&mut host).map_err(heap_fault)?;
         let orphan_table = classify_table(&mut host, &orphan_value)?;
         let orphan = TableWitness {
@@ -719,31 +1084,36 @@ impl RootHost {
             carrier: carrier_ptr(&orphan_value)
                 .ok_or_else(|| host_fault("final orphan has no carrier"))?,
         };
-        let orphan_alive_before =
-            heap::with_heap(&mut host, |heap| Ok(heap.alive(orphan_table))).map_err(heap_fault)?;
+        let orphan_alive_before = alive_table(&mut host, orphan_table)?;
         let report = heap::collect(&mut host).map_err(heap_fault)?;
         let stats_after =
             heap::with_heap(&mut host, |heap| Ok(heap.stats())).map_err(heap_fault)?;
-        let original_alive_after =
-            heap::with_heap(&mut host, |heap| Ok(heap.alive(original.table)))
-                .map_err(heap_fault)?;
-        let child_alive_after =
-            heap::with_heap(&mut host, |heap| Ok(heap.alive(child.table))).map_err(heap_fault)?;
-        let orphan_alive_after =
-            heap::with_heap(&mut host, |heap| Ok(heap.alive(orphan_table))).map_err(heap_fault)?;
+        let mut tables = Vec::with_capacity(observed.len());
+        for table in &observed {
+            tables.push(TableAlive {
+                table: *table,
+                before: true,
+                after: alive_table(&mut host, *table)?,
+            });
+        }
+        let orphan_alive_after = alive_table(&mut host, orphan_table)?;
         self.witness.lock().expect("root witness").finish = Some(FinishRecord {
-            formal_before,
+            frame: own.parts(),
             formal_slot: formal,
+            formal_before,
+            completion: completion_class,
             retired: top_after.is_none(),
             top_after: top_after.map(heap::RootFrameId::parts),
-            original_alive_after,
-            child_alive_after,
-            orphan,
-            orphan_alive_before,
-            orphan_alive_after,
-            collections_before: stats_before.collections,
-            collections_after: stats_after.collections,
-            report,
+            collection: Some(FinishCollection {
+                tables,
+                orphan,
+                orphan_alive_before,
+                orphan_alive_after,
+                collections_before: stats_before.collections,
+                collections_after: stats_after.collections,
+                report,
+            }),
+            uncaught,
         });
         Ok(CallOutcome::Return(CallReturn::one(completion.clone())))
     }
@@ -759,6 +1129,7 @@ impl HostFunction for RootHost {
             RootOp::Enter => self.enter(vm, args),
             RootOp::Handoff => self.handoff(vm, args),
             RootOp::Formal => self.formal(vm, args),
+            RootOp::Discard => self.discard(vm, args),
             RootOp::Finish => self.finish(vm, args),
         }
     }
@@ -773,6 +1144,7 @@ fn bind_hosts(vm: &mut Vm, witness: &Arc<Mutex<RootWitness>>) {
         ("lua_root_enter", RootOp::Enter),
         ("lua_root_handoff", RootOp::Handoff),
         ("lua_root_formal", RootOp::Formal),
+        ("lua_root_discard", RootOp::Discard),
         ("lua_root_finish", RootOp::Finish),
     ] {
         vm.bind_function(
@@ -783,12 +1155,27 @@ fn bind_hosts(vm: &mut Vm, witness: &Arc<Mutex<RootWitness>>) {
             }),
         );
     }
+    vm.bind_function("fault", Box::new(RootFaultHost));
 }
 
-fn drive(arm: Arm) -> RootRun {
-    let path = fixture_path("root-handoff.lua");
+/// The real host fault arm. It is a normal host import in the same catalog,
+/// and its `VmError` must abort the VM instead of becoming a guest completion.
+struct RootFaultHost;
+
+impl HostFunction for RootFaultHost {
+    fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> vm::VmResult<CallOutcome> {
+        Err(host_fault("completion host fault"))
+    }
+}
+
+fn drive(fixture: &str, arm: Arm) -> RootRun {
+    drive_mode(fixture, arm, RunMode::Normal)
+}
+
+fn drive_mode(fixture: &str, arm: Arm, mode: RunMode) -> RootRun {
+    let path = fixture_path(fixture);
     let compiled = vm::compile_source_file_with_options(&path, root_options())
-        .unwrap_or_else(|error| panic!("root handoff compile failed: {error:?}"));
+        .unwrap_or_else(|error| panic!("{fixture}: root handoff compile failed: {error:?}"));
     let call_sites = decoded_call_sites(&compiled.program);
     let mut vm = Vm::new_with_jit_config(
         compiled.program,
@@ -800,42 +1187,120 @@ fn drive(arm: Arm) -> RootRun {
     );
     let witness = Arc::new(Mutex::new(RootWitness {
         arm,
-        original: None,
-        child: None,
+        tables: Vec::new(),
         enters: Vec::new(),
         handoffs: Vec::new(),
-        formal: None,
+        formals: Vec::new(),
+        discards: Vec::new(),
         finish: None,
         note: None,
         marks: Vec::new(),
         failures: Vec::new(),
     }));
     bind_hosts(&mut vm, &witness);
-    vm.set_fuel_check_interval(FUEL_CHECK_INTERVAL)
-        .unwrap_or_else(|error| panic!("root handoff fuel interval: {error}"));
-    vm.set_fuel(FUEL_BUDGET);
+    match mode {
+        RunMode::Normal => {
+            vm.set_fuel_check_interval(FUEL_CHECK_INTERVAL)
+                .unwrap_or_else(|error| panic!("{fixture}: fuel interval: {error}"));
+            vm.set_fuel(FUEL_BUDGET);
+        }
+        RunMode::Fuel(budget) => {
+            vm.set_fuel_check_interval(FUEL_CHECK_INTERVAL)
+                .unwrap_or_else(|error| panic!("{fixture}: fuel interval: {error}"));
+            vm.set_fuel(budget);
+        }
+        RunMode::Epoch(delta) => {
+            vm.set_epoch_check_interval(FUEL_CHECK_INTERVAL)
+                .unwrap_or_else(|error| panic!("{fixture}: epoch interval: {error}"));
+            vm.set_epoch_deadline(delta)
+                .unwrap_or_else(|error| panic!("{fixture}: epoch deadline: {error}"));
+        }
+    }
+    let fuel_budget = match mode {
+        RunMode::Normal => Some(FUEL_BUDGET),
+        RunMode::Fuel(budget) => Some(budget),
+        RunMode::Epoch(_) => None,
+    };
     let status = vm.run();
-    let remaining = vm
-        .get_fuel()
-        .unwrap_or_else(|| panic!("root handoff fuel metering missing"));
-    let fuel_consumed = FUEL_BUDGET
-        .checked_sub(remaining)
-        .unwrap_or_else(|| panic!("root handoff fuel increased"));
+    let fuel_remaining = vm.get_fuel();
+    let last_yield_reason = vm.last_yield_reason();
+    let epoch_deadline = vm.epoch_deadline();
     let stack = vm.stack().to_vec();
     let exit = consume_completion_exit(status, stack.clone());
     let witness = witness.lock().expect("root witness lock").clone();
+    let boundary = resolve_uncaught_boundary(&mut vm, &witness, &exit);
     eprintln!(
-        "LUA_ROOT_HANDOFF arm={arm:?} fuel={fuel_consumed} exit={exit:?} enters={:?} handoffs={:?} formal={:?} finish={:?} failures={:?}",
-        witness.enters, witness.handoffs, witness.formal, witness.finish, witness.failures
+        "LUA_ROOT_HANDOFF fixture={fixture} arm={arm:?} fuel_budget={fuel_budget:?} fuel_remaining={fuel_remaining:?} epoch_deadline={epoch_deadline:?} yield_reason={last_yield_reason:?} exit={exit:?} table_count={} enters={:?} handoffs={:?} formals={:?} discards={:?} finish={:?} boundary={boundary:?} failures={:?}",
+        witness.tables.len(),
+        witness.enters,
+        witness.handoffs,
+        witness.formals,
+        witness.discards,
+        witness.finish,
+        witness.failures
     );
     RootRun {
         stack,
         exit,
-        fuel_consumed,
+        fuel_budget,
+        fuel_remaining,
+        last_yield_reason,
+        epoch_deadline,
         marks: witness.marks.clone(),
         call_sites,
         witness,
+        boundary,
     }
+}
+
+/// Resolves the uncaught boundary against the still-live scope heap.
+///
+/// The finish host retained the chunk frame when the completion was an
+/// uncaught issued table. This reads the payload with a root, records that
+/// state, then performs the caller-side release and collection. The same
+/// carrier must stop classifying as a table afterwards.
+fn resolve_uncaught_boundary(
+    vm: &mut Vm,
+    witness: &RootWitness,
+    exit: &CompletionExit,
+) -> Option<UncaughtBoundary> {
+    let finish = witness.finish.as_ref()?;
+    let uncaught = finish.uncaught.as_ref()?;
+    let CompletionExit::Uncaught { payload } = exit else {
+        return None;
+    };
+    let mut host = vm.host_context();
+    let mut boundary = UncaughtBoundary {
+        table: uncaught.table,
+        carrier: uncaught.carrier,
+        live_root: uncaught.root_slot.is_some(),
+        alive_at_boundary: false,
+        carrier_is_table_at_boundary: false,
+        frame: uncaught.frame,
+        released: false,
+        alive_after_release: false,
+        carrier_is_table_after_release: false,
+        report: None,
+    };
+    let Some(table) = uncaught.table else {
+        return Some(boundary);
+    };
+    let before = classify(&mut host, payload).ok()?;
+    boundary.alive_at_boundary = matches!(before, heap::GuestClass::Table(found) if found == table);
+    boundary.carrier_is_table_at_boundary = matches!(before, heap::GuestClass::Table(_));
+    let Some(frame) = uncaught.frame else {
+        return Some(boundary);
+    };
+    let frame = heap::RootFrameId::from_parts(frame.0, frame.1);
+    heap::with_heap(&mut host, |heap| heap.leave_roots(frame)).ok()?;
+    boundary.released = true;
+    let report = heap::collect(&mut host).ok()?;
+    boundary.report = Some(report);
+    let after = classify(&mut host, payload).ok()?;
+    boundary.alive_after_release =
+        matches!(after, heap::GuestClass::Table(found) if found == table);
+    boundary.carrier_is_table_after_release = matches!(after, heap::GuestClass::Table(_));
+    Some(boundary)
 }
 
 fn labels(run: &RootRun) -> Vec<&str> {
@@ -845,16 +1310,35 @@ fn labels(run: &RootRun) -> Vec<&str> {
 fn mark_prototype(run: &RootRun, label: &str) -> Option<u32> {
     run.marks
         .iter()
-        .find(|mark| mark.label == label)?
-        .last_prototype
+        .find(|mark| mark.label == label)
+        .and_then(|mark| mark.last_prototype)
+}
+
+fn table_witness(run: &RootRun, index: usize) -> TableWitness {
+    *run.witness
+        .tables
+        .get(index)
+        .unwrap_or_else(|| panic!("{index}: missing table witness"))
+}
+
+fn completed<'a>(name: &str, run: &'a RootRun) -> &'a [Value] {
+    match &run.exit {
+        CompletionExit::Values(values) => values,
+        other => panic!("{name}: expected a value exit, got {other:?}"),
+    }
 }
 
 #[test]
 fn positive_handoff_keeps_one_issued_table_through_all_three_paths() {
-    let run = drive(Arm::Positive);
+    let run = drive(POSITIVE_FIXTURE, Arm::Positive);
     let witness = &run.witness;
-    let original = witness.original.expect("original table witness");
-    let child = witness.child.expect("child table witness");
+    assert_eq!(
+        witness.tables.len(),
+        2,
+        "the fixture issues exactly two tables"
+    );
+    let original = table_witness(&run, 0);
+    let child = table_witness(&run, 1);
     assert_ne!(child.table, original.table, "the child is a distinct node");
     assert_eq!(
         labels(&run),
@@ -862,7 +1346,7 @@ fn positive_handoff_keeps_one_issued_table_through_all_three_paths() {
         "the ordinary tail is skipped and the outer tail runs"
     );
     assert_eq!(witness.handoffs.len(), 3, "ordinary, tail, protected");
-    assert!(witness.formal.is_some(), "pcall must adopt its formal");
+    assert_eq!(witness.formals.len(), 1, "pcall must adopt its formal");
     assert!(
         witness.finish.is_some(),
         "the chunk must retire and collect"
@@ -933,7 +1417,24 @@ fn positive_handoff_keeps_one_issued_table_through_all_three_paths() {
             "{what}: publish precedes the callee retire"
         );
         assert_eq!(handoff.parent_slot, 0, "{what}: temp slot");
+        assert_eq!(
+            handoff.completion,
+            CompletionClass::Error {
+                payload: TypedValue::Array
+            },
+            "{what}: exact [false, payload]"
+        );
         assert!(handoff.published, "{what}: publish");
+        assert_eq!(
+            handoff.payload_table,
+            Some(original.table),
+            "{what}: issued TableRef"
+        );
+        assert_eq!(
+            handoff.payload_carrier,
+            Some(original.carrier),
+            "{what}: issued carrier identity"
+        );
         assert_eq!(
             handoff.parent_slot_after,
             Some(original.table),
@@ -942,19 +1443,6 @@ fn positive_handoff_keeps_one_issued_table_through_all_three_paths() {
         assert!(
             handoff.retired && handoff.top_after_parent,
             "{what}: retire"
-        );
-        assert!(
-            handoff.completion_is_error,
-            "{what}: exact [false, payload]"
-        );
-        assert!(
-            handoff.completion_is_unissued,
-            "{what}: completion array is not a table"
-        );
-        assert!(handoff.payload_is_original, "{what}: original TableRef");
-        assert!(
-            handoff.payload_carrier_is_original,
-            "{what}: issued carrier identity"
         );
     }
     assert_eq!(
@@ -996,11 +1484,14 @@ fn positive_handoff_keeps_one_issued_table_through_all_three_paths() {
         assert!(window.orphan_alive_before, "fresh orphan must start live");
         assert_ne!(window.orphan.table, original.table);
         assert_ne!(window.orphan.table, child.table);
-        assert!(window.original_alive, "the published payload stays alive");
-        assert!(window.child_alive, "the strong child stays reachable");
+        assert_eq!(window.tables.len(), 2);
         assert!(
-            window.child_edge_same,
-            "the strong edge keeps the child identity"
+            window
+                .tables
+                .iter()
+                .all(|table| table.before && table.after),
+            "the published payload and its strong child stay alive: {:?}",
+            window.tables
         );
         assert!(
             !window.orphan_alive_after,
@@ -1022,12 +1513,15 @@ fn positive_handoff_keeps_one_issued_table_through_all_three_paths() {
         "no extra window after the protected receive"
     );
 
-    let formal = witness.formal.as_ref().expect("formal record");
+    let formal = witness.formals.first().expect("formal record");
+    assert_eq!(formal.frame, witness.enters[0].child);
     assert_eq!(formal.temp_slot, 0);
     assert_eq!(formal.formal_slot, 1);
     assert_eq!(formal.temp_before, Some(original.table));
     assert_eq!(formal.formal_before, None);
-    assert!(formal.value_is_original);
+    assert_eq!(formal.value, TypedValue::Array);
+    assert_eq!(formal.value_table, Some(original.table));
+    assert!(formal.rooted);
     assert_eq!(formal.temp_after, None, "the temp root is cleared");
     assert_eq!(
         formal.formal_after,
@@ -1036,8 +1530,11 @@ fn positive_handoff_keeps_one_issued_table_through_all_three_paths() {
     );
 
     let note = witness.note.as_ref().expect("note record");
-    assert!(note.value_is_original && note.carrier_is_original);
-    assert!(note.temp_empty && note.formal_holds_original);
+    assert_eq!(note.frame, witness.enters[0].child);
+    assert_eq!(note.table, Some(original.table));
+    assert_eq!(note.table_index, Some(0));
+    assert_eq!(note.carrier, Some(original.carrier));
+    assert!(note.temp_empty && note.formal_table == Some(original.table));
 
     let finish = witness.finish.as_ref().expect("finish record");
     assert_eq!(
@@ -1045,30 +1542,37 @@ fn positive_handoff_keeps_one_issued_table_through_all_three_paths() {
         "the formal slot is the second reserved slot"
     );
     assert_eq!(finish.formal_before, Some(original.table));
+    assert_eq!(
+        finish.completion,
+        CompletionClass::Normal {
+            arity: 2,
+            values: vec![TypedValue::Bool(false), TypedValue::Array]
+        },
+        "chunk completion decodes to true, false, payload"
+    );
     assert!(
         finish.retired,
         "the receiving chunk frame is really retired"
     );
     assert_eq!(finish.top_after, None, "no Lua root frame remains");
+    let collection = finish.collection.as_ref().expect("final collection");
+    assert_eq!(collection.tables.len(), 2);
     assert!(
-        !finish.original_alive_after,
-        "the last formal root release collects the original"
+        collection.tables.iter().all(|table| !table.after),
+        "the last formal root release collects the original and child"
     );
-    assert!(
-        !finish.child_alive_after,
-        "the strong child dies with the original"
-    );
-    assert!(finish.orphan_alive_before && !finish.orphan_alive_after);
-    assert_ne!(finish.orphan.table, original.table);
+    assert!(collection.orphan_alive_before && !collection.orphan_alive_after);
+    assert_ne!(collection.orphan.table, original.table);
     assert_eq!(
-        finish.report.live_nodes, 0,
+        collection.report.live_nodes, 0,
         "no heap node survives the last root"
     );
-    assert_eq!(finish.collections_after, finish.collections_before + 1);
+    assert_eq!(
+        collection.collections_after,
+        collection.collections_before + 1
+    );
 
-    let CompletionExit::Values(values) = &run.exit else {
-        panic!("positive run must halt with values: {:?}", run.exit);
-    };
+    let values = completed(POSITIVE_FIXTURE, &run);
     assert_eq!(
         values.len(),
         2,
@@ -1084,9 +1588,11 @@ fn positive_handoff_keeps_one_issued_table_through_all_three_paths() {
 
 #[test]
 fn omitting_the_first_publish_collects_the_payload_before_middle_returns() {
-    let run = drive(Arm::OmitFirstPublish);
+    let run = drive(POSITIVE_FIXTURE, Arm::OmitFirstPublish);
     let witness = &run.witness;
-    let original = witness.original.expect("original table witness");
+    assert_eq!(witness.tables.len(), 2);
+    let original = table_witness(&run, 0);
+    let child = table_witness(&run, 1);
     assert_eq!(labels(&run), ["outer", "relay", "middle", "leaf"]);
     assert_eq!(
         witness.handoffs.len(),
@@ -1095,7 +1601,11 @@ fn omitting_the_first_publish_collects_the_payload_before_middle_returns() {
         witness.failures
     );
     let handoff = &witness.handoffs[0];
-    assert!(!handoff.published, "this arm omits exactly this publish");
+    assert!(
+        handoff.skipped_publish,
+        "this arm omits exactly this publish"
+    );
+    assert!(!handoff.published);
     assert!(handoff.parent_slot_before_empty);
     assert!(
         handoff.child_top_at_publish,
@@ -1106,8 +1616,14 @@ fn omitting_the_first_publish_collects_the_payload_before_middle_returns() {
         handoff.retired && handoff.top_after_parent,
         "the retire is kept"
     );
-    assert!(handoff.completion_is_error && handoff.payload_is_original);
-    assert!(handoff.payload_carrier_is_original);
+    assert_eq!(
+        handoff.completion,
+        CompletionClass::Error {
+            payload: TypedValue::Array
+        }
+    );
+    assert_eq!(handoff.payload_table, Some(original.table));
+    assert_eq!(handoff.payload_carrier, Some(original.carrier));
     super::assert_dynamic_call_witness(&run.as_p0_run(), "leaf", 0);
     assert_eq!(
         handoff.caller_core_prototype,
@@ -1118,11 +1634,11 @@ fn omitting_the_first_publish_collects_the_payload_before_middle_returns() {
     let window = handoff.window.as_ref().expect("first window");
     assert!(window.orphan_alive_before);
     assert_ne!(window.orphan.table, original.table);
+    assert_eq!(window.tables.len(), 2);
     assert!(
-        !window.original_alive,
-        "the unpubished payload is collected"
+        window.tables.iter().all(|table| !table.after),
+        "the unpublished payload and the child are collected"
     );
-    assert!(!window.child_alive, "the strong child dies with it");
     assert!(
         !window.orphan_alive_after,
         "the fresh orphan is collected in this sweep"
@@ -1132,7 +1648,7 @@ fn omitting_the_first_publish_collects_the_payload_before_middle_returns() {
         window.report.live_nodes, 0,
         "the original graph and the fresh orphan are both swept"
     );
-    let _ = original;
+    let _ = child;
 
     let CompletionExit::VmFailure(VmError::HostError(message)) = &run.exit else {
         panic!(
@@ -1153,10 +1669,11 @@ fn omitting_the_first_publish_collects_the_payload_before_middle_returns() {
 
 #[test]
 fn omitting_the_second_publish_collects_after_middle_and_before_relay_returns() {
-    let run = drive(Arm::OmitSecondPublish);
+    let run = drive(POSITIVE_FIXTURE, Arm::OmitSecondPublish);
     let witness = &run.witness;
-    let original = witness.original.expect("original table witness");
-    let child = witness.child.expect("child table witness");
+    assert_eq!(witness.tables.len(), 2);
+    let original = table_witness(&run, 0);
+    let child = table_witness(&run, 1);
     assert_eq!(labels(&run), ["outer", "relay", "middle", "leaf"]);
     assert_eq!(
         witness.handoffs.len(),
@@ -1174,11 +1691,11 @@ fn omitting_the_second_publish_collects_after_middle_and_before_relay_returns() 
         "the first window runs in middle"
     );
     let first_window = first.window.as_ref().expect("first window control");
+    assert_eq!(first_window.tables.len(), 2);
     assert!(
-        first_window.original_alive && first_window.child_alive,
+        first_window.tables.iter().all(|table| table.after),
         "the second control's first window already succeeded"
     );
-    assert!(first_window.child_edge_same);
     assert!(first_window.orphan_alive_before && !first_window.orphan_alive_after);
     assert_ne!(first_window.orphan.table, original.table);
     assert_eq!(
@@ -1201,23 +1718,23 @@ fn omitting_the_second_publish_collects_after_middle_and_before_relay_returns() 
         "the second window runs in the actual Core caller of the middle call"
     );
     assert!(
-        !second.published,
+        second.skipped_publish && !second.published,
         "this arm omits exactly the second publish"
     );
     assert!(second.parent_slot_before_empty);
     assert!(second.child_top_at_publish);
     assert_eq!(second.parent_slot_after, None);
     assert!(second.retired && second.top_after_parent);
-    assert!(second.payload_is_original && second.payload_carrier_is_original);
+    assert_eq!(second.payload_table, Some(original.table));
+    assert_eq!(second.payload_carrier, Some(original.carrier));
     let second_window = second.window.as_ref().expect("second window");
     assert!(second_window.orphan_alive_before);
     assert_ne!(second_window.orphan.table, original.table);
     assert_ne!(second_window.orphan.table, child.table);
     assert!(
-        !second_window.original_alive,
-        "the unpubished payload is collected in the second window"
+        second_window.tables.iter().all(|table| !table.after),
+        "the unpublished payload and the child are collected in the second window"
     );
-    assert!(!second_window.child_alive);
     assert!(!second_window.orphan_alive_after);
     assert_eq!(
         second_window.collections_after,
@@ -1245,8 +1762,12 @@ fn omitting_the_second_publish_collects_after_middle_and_before_relay_returns() 
 
 #[test]
 fn root_entry_matches_the_p0_identity_and_exit_contract() {
-    let run = drive(Arm::Positive);
-    assert!(run.fuel_consumed > 0 && run.fuel_consumed < FUEL_BUDGET);
+    let run = drive(POSITIVE_FIXTURE, Arm::Positive);
+    assert!(
+        run.fuel_budget
+            .zip(run.fuel_remaining)
+            .is_some_and(|(budget, remaining)| remaining > 0 && remaining < budget)
+    );
     assert_eq!(
         run.witness
             .marks
@@ -1263,9 +1784,682 @@ fn root_entry_matches_the_p0_identity_and_exit_contract() {
             .count(),
         1
     );
-    let CompletionExit::Values(values) = &run.exit else {
-        panic!("expected a value exit: {:?}", run.exit);
-    };
+    let values = completed(POSITIVE_FIXTURE, &run);
     assert_eq!(values.first(), Some(&Value::Bool(false)));
     assert!(matches!(values.get(1), Some(Value::Array(_))));
+}
+
+struct ScalarTailCase {
+    fixture: &'static str,
+    subject_label: &'static str,
+    values: Vec<Value>,
+    arity: usize,
+    finish_values: Vec<TypedValue>,
+}
+
+#[test]
+fn root_tail_scalars_retire_frames_with_the_original_arity() {
+    let cases = [
+        ScalarTailCase {
+            fixture: "root-tail-zero.lua",
+            subject_label: "zero",
+            values: Vec::new(),
+            arity: 0,
+            finish_values: Vec::new(),
+        },
+        ScalarTailCase {
+            fixture: "root-tail-one-nil.lua",
+            subject_label: "one-nil",
+            values: vec![Value::Null],
+            arity: 1,
+            finish_values: vec![TypedValue::Nil],
+        },
+        ScalarTailCase {
+            fixture: "root-tail-trailing-nil.lua",
+            subject_label: "pair",
+            values: vec![Value::Int(1), Value::Null],
+            arity: 2,
+            finish_values: vec![TypedValue::Int(1), TypedValue::Nil],
+        },
+        ScalarTailCase {
+            fixture: "root-tail-false.lua",
+            subject_label: "data-false",
+            values: vec![Value::Bool(false)],
+            arity: 1,
+            finish_values: vec![TypedValue::Bool(false)],
+        },
+    ];
+    for case in &cases {
+        let fixture = case.fixture;
+        let expected_arity = case.arity;
+        let expected_finish_values = case.finish_values.clone();
+        let expected_values = &case.values;
+        let subject_label = case.subject_label;
+        let run = drive(fixture, Arm::Positive);
+        assert_eq!(
+            labels(&run),
+            ["outer", "table-arm", "after-table", subject_label],
+            "{fixture}"
+        );
+        assert_eq!(run.witness.tables.len(), 2, "{fixture}");
+        let original = table_witness(&run, 0);
+        let child = table_witness(&run, 1);
+        assert_eq!(run.witness.handoffs.len(), 2, "{fixture}");
+        let table_handoff = &run.witness.handoffs[0];
+        assert_eq!(
+            table_handoff.completion,
+            CompletionClass::Error {
+                payload: TypedValue::Array
+            },
+            "{fixture}: the table arm still hands off"
+        );
+        assert_eq!(
+            table_handoff.payload_table,
+            Some(original.table),
+            "{fixture}"
+        );
+        assert!(table_handoff.published, "{fixture}");
+        let tail = &run.witness.handoffs[1];
+        assert_eq!(
+            tail.completion,
+            CompletionClass::Normal {
+                arity: expected_arity,
+                values: expected_finish_values.clone()
+            },
+            "{fixture}: the tail completion keeps its arity and typed values"
+        );
+        assert!(
+            !tail.published,
+            "{fixture}: a scalar tail publishes no root"
+        );
+        assert!(
+            tail.payload_table.is_none(),
+            "{fixture}: no table payload in a normal completion"
+        );
+        assert!(tail.retired && tail.top_after_parent, "{fixture}");
+        assert_eq!(run.witness.formals.len(), 1, "{fixture}");
+        assert_eq!(
+            run.witness.formals[0].formal_after,
+            Some(original.table),
+            "{fixture}"
+        );
+
+        let finish = run.witness.finish.as_ref().expect("finish record");
+        assert_eq!(
+            finish.completion,
+            CompletionClass::Normal {
+                arity: expected_arity,
+                values: expected_finish_values
+            },
+            "{fixture}: the chunk keeps the tail arity"
+        );
+        assert!(finish.retired && finish.top_after.is_none(), "{fixture}");
+        let collection = finish.collection.as_ref().expect("final collection");
+        assert_eq!(collection.tables.len(), 2, "{fixture}");
+        assert!(
+            collection
+                .tables
+                .iter()
+                .all(|table| table.table != original.table || !table.after),
+            "{fixture}"
+        );
+        assert!(
+            collection
+                .tables
+                .iter()
+                .all(|table| table.table != child.table || !table.after),
+            "{fixture}"
+        );
+        assert_eq!(collection.report.live_nodes, 0, "{fixture}");
+        assert_eq!(
+            completed(fixture, &run),
+            expected_values.as_slice(),
+            "{fixture}: exit values"
+        );
+    }
+}
+
+#[test]
+fn root_scalar_error_retires_non_table_error_frames() {
+    let run = drive("root-scalar-error.lua", Arm::Positive);
+    assert_eq!(
+        labels(&run),
+        [
+            "outer",
+            "table-arm",
+            "after-table",
+            "relay",
+            "scalar-fail",
+            "after-scalar"
+        ]
+    );
+    assert_eq!(run.witness.tables.len(), 2);
+    let original = table_witness(&run, 0);
+    let handoffs = &run.witness.handoffs;
+    assert_eq!(handoffs.len(), 3);
+    assert_eq!(
+        handoffs[0].completion,
+        CompletionClass::Error {
+            payload: TypedValue::Array
+        }
+    );
+    assert!(handoffs[0].published);
+    for handoff in &handoffs[1..] {
+        assert_eq!(
+            handoff.completion,
+            CompletionClass::Error {
+                payload: TypedValue::String
+            },
+            "a non-table error keeps its scalar payload"
+        );
+        assert!(!handoff.published, "a scalar error publishes no root");
+        assert!(handoff.payload_table.is_none());
+        assert!(handoff.retired && handoff.top_after_parent);
+        assert!(handoff.parent_slot_before_empty);
+    }
+    assert_eq!(run.witness.formals.len(), 2);
+    let scalar_formal = &run.witness.formals[1];
+    assert_eq!(scalar_formal.value, TypedValue::String);
+    assert_eq!(scalar_formal.temp_before, None);
+    assert_eq!(scalar_formal.temp_after, None);
+    assert!(scalar_formal.value_table.is_none());
+    assert!(!scalar_formal.rooted);
+    assert_eq!(
+        scalar_formal.formal_before,
+        Some(original.table),
+        "the earlier table formal stays rooted"
+    );
+
+    let values = completed("root-scalar-error.lua", &run);
+    assert_eq!(values.len(), 4);
+    assert_eq!(values[0], Value::Bool(false));
+    assert!(
+        matches!(values[1], Value::Array(_)),
+        "the caught table arm keeps its carrier: {:?}",
+        values[1]
+    );
+    assert_eq!(carrier_ptr(&values[1]), Some(original.carrier));
+    assert_eq!(values[2], Value::Bool(false));
+    assert_eq!(values[3], Value::string("boom"));
+
+    let finish = run.witness.finish.as_ref().expect("finish record");
+    assert_eq!(
+        finish.completion,
+        CompletionClass::Normal {
+            arity: 4,
+            values: vec![
+                TypedValue::Bool(false),
+                TypedValue::Array,
+                TypedValue::Bool(false),
+                TypedValue::String
+            ]
+        }
+    );
+    assert_eq!(finish.formal_before, Some(original.table));
+    assert!(finish.retired && finish.top_after.is_none());
+    let collection = finish.collection.as_ref().expect("final collection");
+    assert_eq!(collection.report.live_nodes, 0);
+    assert!(
+        collection.tables.iter().all(|table| !table.after),
+        "the final collection reclaims the table arm graph"
+    );
+}
+
+#[test]
+fn root_uncaught_issued_table_reaches_the_typed_boundary_with_a_live_root() {
+    let run = drive("root-uncaught-table.lua", Arm::Positive);
+    assert_eq!(labels(&run), ["outer", "leaf"]);
+    assert_eq!(run.witness.tables.len(), 2);
+    let original = table_witness(&run, 0);
+    let child = table_witness(&run, 1);
+    assert_eq!(run.witness.handoffs.len(), 1);
+    let handoff = &run.witness.handoffs[0];
+    assert_eq!(
+        handoff.completion,
+        CompletionClass::Error {
+            payload: TypedValue::Array
+        }
+    );
+    assert_eq!(handoff.payload_table, Some(original.table));
+    assert!(handoff.published && handoff.retired);
+    assert_eq!(run.witness.formals.len(), 0);
+
+    let note = run.witness.note.as_ref().expect("leaf note record");
+    assert_eq!(note.table, Some(original.table));
+    assert_eq!(note.table_index, Some(0));
+    assert_eq!(note.carrier, Some(original.carrier));
+    assert!(note.temp_empty && note.formal_table.is_none());
+
+    let finish = run.witness.finish.as_ref().expect("finish record");
+    assert!(
+        !finish.retired,
+        "the uncaught boundary keeps the chunk frame"
+    );
+    assert_eq!(finish.top_after, Some(finish.frame));
+    assert!(
+        finish.collection.is_none(),
+        "the boundary does not sweep yet"
+    );
+    let uncaught = finish.uncaught.as_ref().expect("uncaught record");
+    assert_eq!(uncaught.payload, TypedValue::Array);
+    assert_eq!(uncaught.table, Some(original.table));
+    assert_eq!(uncaught.carrier, Some(original.carrier));
+    assert_eq!(uncaught.root_slot, Some(0));
+    assert!(uncaught.rooted_in_temp && !uncaught.rooted_in_formal);
+    assert!(uncaught.frame_retained && uncaught.alive_before_finish);
+
+    let payload = match &run.exit {
+        CompletionExit::Uncaught { payload } => payload,
+        other => panic!("expected the typed uncaught boundary, got {other:?}"),
+    };
+    assert_eq!(carrier_ptr(payload), Some(original.carrier));
+    let boundary = run.boundary.as_ref().expect("uncaught boundary");
+    assert_eq!(boundary.table, Some(original.table));
+    assert_eq!(boundary.carrier, Some(original.carrier));
+    assert_eq!(boundary.frame, Some(finish.frame));
+    assert!(boundary.live_root, "the caller receives a real live root");
+    assert!(boundary.alive_at_boundary);
+    assert!(boundary.carrier_is_table_at_boundary);
+    assert!(boundary.released, "the caller releases the retained frame");
+    assert!(
+        !boundary.alive_after_release,
+        "the released payload is really collected"
+    );
+    assert!(
+        !boundary.carrier_is_table_after_release,
+        "the reclaimed carrier is not a usable table"
+    );
+    let report = boundary.report.expect("caller-side collection report");
+    assert_eq!(report.live_nodes, 0);
+    let _ = child;
+}
+
+#[test]
+fn root_status_only_pcall_clears_the_exact_temp_root_and_next_handoff_runs() {
+    let run = drive("root-pcall-status-discard.lua", Arm::Positive);
+    assert_eq!(
+        labels(&run),
+        ["outer", "first", "after-first", "second", "after-second"]
+    );
+    assert_eq!(run.witness.tables.len(), 2);
+    let discarded = table_witness(&run, 0);
+    let payload = table_witness(&run, 1);
+    assert_ne!(discarded.table, payload.table);
+    assert!(run.witness.failures.is_empty());
+    assert_eq!(run.witness.handoffs.len(), 2);
+    assert_eq!(
+        run.witness.handoffs[0].completion,
+        CompletionClass::Error {
+            payload: TypedValue::Array
+        }
+    );
+    assert_eq!(run.witness.handoffs[0].payload_table, Some(discarded.table));
+    assert_eq!(
+        run.witness.handoffs[1].completion,
+        CompletionClass::Error {
+            payload: TypedValue::Array
+        }
+    );
+    assert_eq!(run.witness.handoffs[1].payload_table, Some(payload.table));
+
+    let discard = run.witness.discards.first().expect("discard record");
+    assert_eq!(discard.frame, run.witness.enters[0].child);
+    assert_eq!(discard.temp_slot, 0);
+    assert_eq!(discard.formal_slot, 1);
+    assert_eq!(
+        discard.completion,
+        CompletionClass::Error {
+            payload: TypedValue::Array
+        }
+    );
+    assert_eq!(discard.payload_table, Some(discarded.table));
+    assert_eq!(discard.payload_carrier, Some(discarded.carrier));
+    assert_eq!(discard.temp_before, Some(discarded.table));
+    assert_eq!(discard.temp_after, None, "the exact temp root is cleared");
+    assert!(discard.formal_before.is_none() && discard.formal_after.is_none());
+    assert!(discard.cleared_exact_root);
+
+    let formal = run.witness.formals.first().expect("formal record");
+    assert_eq!(formal.temp_before, Some(payload.table));
+    assert_eq!(formal.value_table, Some(payload.table));
+    assert_eq!(formal.formal_before, None);
+    assert_eq!(formal.formal_after, Some(payload.table));
+    assert_eq!(formal.temp_after, None);
+    assert!(formal.rooted);
+
+    let first_window = run.witness.handoffs[0]
+        .window
+        .as_ref()
+        .expect("first window");
+    assert_eq!(first_window.tables.len(), 1);
+    assert_eq!(first_window.tables[0].table, discarded.table);
+    assert!(first_window.tables[0].before && first_window.tables[0].after);
+    assert_eq!(first_window.report.live_nodes, 1);
+
+    let second_window = run.witness.handoffs[1]
+        .window
+        .as_ref()
+        .expect("second window");
+    assert_eq!(second_window.tables.len(), 2);
+    let discarded_after = second_window
+        .tables
+        .iter()
+        .find(|table| table.table == discarded.table)
+        .expect("discarded table observed in the second window");
+    assert!(
+        discarded_after.before && !discarded_after.after,
+        "the discarded table is really collected by the next window"
+    );
+    let payload_after = second_window
+        .tables
+        .iter()
+        .find(|table| table.table == payload.table)
+        .expect("payload table observed in the second window");
+    assert!(
+        payload_after.before && payload_after.after,
+        "the newly published payload stays rooted"
+    );
+    assert_eq!(second_window.report.live_nodes, 1);
+
+    let note = run.witness.note.as_ref().expect("note record");
+    assert_eq!(note.table, Some(payload.table));
+    assert_eq!(note.table_index, Some(1));
+    assert!(note.temp_empty && note.formal_table == Some(payload.table));
+
+    let finish = run.witness.finish.as_ref().expect("finish record");
+    assert_eq!(
+        finish.completion,
+        CompletionClass::Normal {
+            arity: 3,
+            values: vec![
+                TypedValue::Bool(false),
+                TypedValue::Bool(false),
+                TypedValue::Array
+            ]
+        }
+    );
+    assert_eq!(finish.formal_before, Some(payload.table));
+    let collection = finish.collection.as_ref().expect("final collection");
+    assert!(
+        collection.tables.iter().all(|table| !table.after),
+        "both issued tables are reclaimed after the chunk retirement"
+    );
+    assert_eq!(collection.report.live_nodes, 0);
+
+    let values = completed("root-pcall-status-discard.lua", &run);
+    assert_eq!(values.len(), 3);
+    assert_eq!(values[0], Value::Bool(false));
+    assert_eq!(values[1], Value::Bool(false));
+    assert_eq!(carrier_ptr(&values[2]), Some(payload.carrier));
+}
+
+#[test]
+fn root_statement_pcall_discard_clears_the_exact_temp_root() {
+    let run = drive("root-pcall-statement-discard.lua", Arm::Positive);
+    assert_eq!(
+        labels(&run),
+        ["outer", "first", "after-first", "second", "after-second"]
+    );
+    assert_eq!(run.witness.tables.len(), 2);
+    let discarded = table_witness(&run, 0);
+    let payload = table_witness(&run, 1);
+    assert!(run.witness.failures.is_empty());
+    assert_eq!(run.witness.handoffs.len(), 2);
+    let discard = run.witness.discards.first().expect("discard record");
+    assert_eq!(discard.frame, run.witness.enters[0].child);
+    assert_eq!(discard.temp_slot, 0);
+    assert_eq!(discard.formal_slot, 1);
+    assert_eq!(discard.temp_before, Some(discarded.table));
+    assert_eq!(discard.temp_after, None);
+    assert!(discard.cleared_exact_root);
+    let formal = run.witness.formals.first().expect("formal record");
+    assert_eq!(formal.value_table, Some(payload.table));
+    assert_eq!(formal.formal_after, Some(payload.table));
+
+    let second_window = run.witness.handoffs[1]
+        .window
+        .as_ref()
+        .expect("second window");
+    let discarded_after = second_window
+        .tables
+        .iter()
+        .find(|table| table.table == discarded.table)
+        .expect("discarded table observed in the second window");
+    assert!(discarded_after.before && !discarded_after.after);
+    let payload_after = second_window
+        .tables
+        .iter()
+        .find(|table| table.table == payload.table)
+        .expect("payload table observed in the second window");
+    assert!(payload_after.before && payload_after.after);
+
+    let note = run.witness.note.as_ref().expect("note record");
+    assert_eq!(note.table, Some(payload.table));
+    assert_eq!(note.table_index, Some(1));
+
+    let values = completed("root-pcall-statement-discard.lua", &run);
+    assert_eq!(values.len(), 2);
+    assert_eq!(values[0], Value::Bool(false));
+    assert_eq!(carrier_ptr(&values[1]), Some(payload.carrier));
+}
+
+#[test]
+fn root_shared_table_status_discard_reaches_the_second_handoff() {
+    let run = drive("root-pcall-shared-table.lua", Arm::Positive);
+    assert_eq!(
+        labels(&run),
+        ["outer", "first", "after-first", "second", "after-second"]
+    );
+    assert_eq!(run.witness.tables.len(), 2);
+    let original = table_witness(&run, 0);
+    let child = table_witness(&run, 1);
+    assert!(run.witness.failures.is_empty());
+    assert_eq!(run.witness.handoffs.len(), 2);
+    for handoff in &run.witness.handoffs {
+        assert_eq!(
+            handoff.completion,
+            CompletionClass::Error {
+                payload: TypedValue::Array
+            }
+        );
+        assert_eq!(handoff.payload_table, Some(original.table));
+        assert!(handoff.published);
+    }
+    let discard = run.witness.discards.first().expect("discard record");
+    assert_eq!(discard.frame, run.witness.enters[0].child);
+    assert_eq!(discard.temp_slot, 0);
+    assert_eq!(discard.formal_slot, 1);
+    assert_eq!(discard.payload_table, Some(original.table));
+    assert_eq!(discard.temp_before, Some(original.table));
+    assert_eq!(discard.temp_after, None);
+    assert!(discard.cleared_exact_root);
+    let formal = run.witness.formals.first().expect("formal record");
+    assert_eq!(formal.temp_before, Some(original.table));
+    assert_eq!(formal.formal_after, Some(original.table));
+
+    let first_window = run.witness.handoffs[0]
+        .window
+        .as_ref()
+        .expect("first window");
+    assert!(
+        first_window
+            .tables
+            .iter()
+            .all(|table| table.before && table.after),
+        "the shared original and its child survive the first window"
+    );
+    let second_window = run.witness.handoffs[1]
+        .window
+        .as_ref()
+        .expect("second window");
+    assert!(
+        second_window
+            .tables
+            .iter()
+            .all(|table| table.before && table.after),
+        "the republished original is rooted again in the second window"
+    );
+    assert_eq!(second_window.report.live_nodes, 2);
+
+    let values = completed("root-pcall-shared-table.lua", &run);
+    assert_eq!(values.len(), 3);
+    assert_eq!(values[0], Value::Bool(false));
+    assert_eq!(values[1], Value::Bool(false));
+    assert_eq!(carrier_ptr(&values[2]), Some(original.carrier));
+    let _ = child;
+}
+
+#[test]
+fn root_normal_completion_with_a_table_is_refused_at_the_handoff() {
+    let run = drive("root-normal-table.lua", Arm::Positive);
+    assert_eq!(labels(&run), ["outer", "make"]);
+    assert_eq!(run.witness.tables.len(), 2);
+    assert!(
+        run.witness.handoffs.is_empty(),
+        "the refusal happens before the callee frame is retired"
+    );
+    let CompletionExit::VmFailure(VmError::HostError(message)) = &run.exit else {
+        panic!(
+            "a table in a normal completion must be refused, got {:?}",
+            run.exit
+        );
+    };
+    assert!(
+        message.contains("normal completion"),
+        "unexpected refusal: {message}"
+    );
+    assert!(
+        run.witness
+            .failures
+            .iter()
+            .any(|failure| failure == message),
+        "the refusal is recorded: {:?}",
+        run.witness.failures
+    );
+}
+
+#[test]
+fn root_tail_protected_call_is_refused_at_lowering() {
+    let path = fixture_path("protected-zero.lua");
+    let roots = vm::compile_source_file_with_options(&path, root_options());
+    match roots {
+        Err(SourcePathError::SourceWithMap {
+            error: SourceError::Parse(parse),
+            ..
+        })
+        | Err(SourcePathError::Source(SourceError::Parse(parse))) => {
+            eprintln!("LUA_ROOT_REFUSAL tail-pcall message={}", parse.message);
+            assert!(
+                parse
+                    .message
+                    .contains("protected call in tail-return position"),
+                "unexpected refusal: {}",
+                parse.message
+            );
+        }
+        Err(other) => panic!("expected a roots-mode lowering refusal, got {other:?}"),
+        Ok(_) => panic!("protected-zero.lua must be refused by the roots-mode lowering"),
+    }
+    assert!(
+        vm::compile_source_file_with_options(&path, super::candidate_options(),).is_ok(),
+        "the same fixture must stay supported on the P0 non-roots path"
+    );
+}
+
+#[test]
+fn root_table_literal_is_refused_at_lowering() {
+    let path = fixture_path("root-table-literal.lua");
+    let roots = vm::compile_source_file_with_options(&path, root_options());
+    match roots {
+        Err(SourcePathError::SourceWithMap {
+            error: SourceError::Parse(parse),
+            ..
+        })
+        | Err(SourcePathError::Source(SourceError::Parse(parse))) => {
+            eprintln!("LUA_ROOT_REFUSAL table-literal message={}", parse.message);
+            assert!(
+                parse.message.contains("table literal"),
+                "unexpected refusal: {}",
+                parse.message
+            );
+        }
+        Err(other) => panic!("expected a roots-mode lowering refusal, got {other:?}"),
+        Ok(_) => panic!("root-table-literal.lua must be refused by the roots-mode lowering"),
+    }
+    assert!(
+        vm::compile_source_file_with_options(&path, super::candidate_options(),).is_ok(),
+        "a table literal must stay supported on the P0 non-roots path"
+    );
+}
+
+#[test]
+fn root_host_fault_aborts_without_guest_recovery() {
+    let run = drive("root-host-fault.lua", Arm::Positive);
+    let CompletionExit::VmFailure(VmError::HostError(message)) = &run.exit else {
+        panic!("a real host error must abort the VM, got {:?}", run.exit);
+    };
+    assert_eq!(message, "completion host fault");
+    assert_eq!(labels(&run), ["outer", "leaf", "after-catch"]);
+    assert_eq!(run.witness.handoffs.len(), 1);
+    assert_eq!(run.witness.formals.len(), 1);
+    assert!(
+        run.witness.finish.is_none(),
+        "the chunk boundary is never reached after the host fault"
+    );
+    assert!(
+        !run.stack.iter().any(|value| matches!(
+            value,
+            Value::Array(items) if matches!(items.first(), Some(Value::Bool(_)))
+        )),
+        "the host error must not turn into a guest completion tag: {:?}",
+        run.stack
+    );
+}
+
+#[test]
+fn root_real_fuel_exhaustion_is_not_a_guest_error() {
+    let run = drive_mode(POSITIVE_FIXTURE, Arm::Positive, RunMode::Fuel(1));
+    eprintln!(
+        "LUA_ROOT_FUEL budget={:?} remaining={:?} yield_reason={:?} exit={:?}",
+        run.fuel_budget, run.fuel_remaining, run.last_yield_reason, run.exit
+    );
+    assert!(
+        matches!(run.exit, CompletionExit::VmStatus(VmStatus::Yielded)),
+        "the real fuel stop is the Core yielded status: {:?}",
+        run.exit
+    );
+    assert_eq!(
+        run.last_yield_reason,
+        Some(VmYieldReason::Fuel),
+        "the Core reports the actual fuel reason"
+    );
+    assert_eq!(run.fuel_remaining, Some(0), "the tiny budget is consumed");
+    assert!(
+        !matches!(run.exit, CompletionExit::Uncaught { .. }),
+        "fuel must not be mapped to a guest error"
+    );
+}
+
+#[test]
+fn root_real_epoch_deadline_is_not_a_guest_error() {
+    let run = drive_mode(POSITIVE_FIXTURE, Arm::Positive, RunMode::Epoch(0));
+    eprintln!(
+        "LUA_ROOT_EPOCH deadline={:?} yield_reason={:?} exit={:?}",
+        run.epoch_deadline, run.last_yield_reason, run.exit
+    );
+    assert_eq!(run.epoch_deadline, Some(0));
+    assert!(
+        matches!(run.exit, CompletionExit::VmStatus(VmStatus::Yielded)),
+        "the real epoch deadline is the Core yielded status: {:?}",
+        run.exit
+    );
+    assert_eq!(
+        run.last_yield_reason,
+        Some(VmYieldReason::Epoch),
+        "the Core reports the actual epoch reason"
+    );
+    assert!(
+        !matches!(run.exit, CompletionExit::Uncaught { .. }),
+        "the epoch stop must not be mapped to a guest error"
+    );
 }

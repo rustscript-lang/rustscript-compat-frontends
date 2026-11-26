@@ -44,8 +44,11 @@
 //! and admission contract but wraps every lowered function in one real LuaHeap
 //! root frame. Each admitted Lua call then hands its error payload to the
 //! caller's reserved temp slot while the callee frame is still the top frame;
-//! only after that write is the callee frame retired. The chunk's protected
-//! receive moves the payload from the temp slot into its formal slot. That
+//! only after that write is the callee frame retired. A `pcall` that binds the
+//! payload moves it from the temp slot into its formal slot; a status-only or
+//! statement `pcall` discards the object and clears the exact temp root in the
+//! same statement. A protected call in tail-return position and a table literal
+//! have no root handoff in this slice, so both are refused at lowering. That
 //! entry is compiled only by the root-handoff test. Production `LuaPlugin`
 //! never reaches it.
 use std::collections::{HashMap, HashSet};
@@ -77,6 +80,7 @@ const ROOT_GUEST_IMPORTS: &[&str] = &["newtable", "setchild"];
 const ROOT_ENTER: &str = "lua_root_enter";
 const ROOT_HANDOFF: &str = "lua_root_handoff";
 const ROOT_FORMAL: &str = "lua_root_formal";
+const ROOT_DISCARD: &str = "lua_root_discard";
 const ROOT_FINISH: &str = "lua_root_finish";
 
 /// Slots reserved in every root frame: slot 0 receives the handoff payload
@@ -1046,29 +1050,55 @@ impl<'a> Lower<'a> {
                         }
                     }
                     if self.roots
-                        && let (Some(err), Some(frame)) =
-                            (formal_slot, self.frames.last().and_then(|frame| frame.root))
+                        && let Some(frame) = self.frames.last().and_then(|frame| frame.root)
                     {
-                        // The protected result is now in its formal local. Move
-                        // the temp handoff root into the formal frame slot and
-                        // clear the temp slot, both in one host call.
-                        let formal = self.root_host_call(
-                            ROOT_FORMAL,
-                            vec![
-                                Expr::Var(err),
-                                Expr::Var(frame),
-                                Expr::Int(ROOT_HANDOFF_SLOT),
-                                Expr::Int(ROOT_FORMAL_SLOT),
-                            ],
-                            span,
-                        )?;
-                        let discarded = self.alloc_temp("root_formal")?;
-                        pre.push(Stmt::Let {
-                            index: discarded,
-                            declared_schema: None,
-                            expr: formal,
-                            line,
-                        });
+                        match formal_slot {
+                            Some(err) => {
+                                // The protected payload is bound. Adopt the
+                                // temp handoff root into the formal slot and
+                                // clear the temp slot in one host call. A
+                                // non-table payload needs no root, but the
+                                // host still verifies the reserved slots.
+                                let formal = self.root_host_call(
+                                    ROOT_FORMAL,
+                                    vec![
+                                        Expr::Var(err),
+                                        Expr::Var(frame),
+                                        Expr::Int(ROOT_HANDOFF_SLOT),
+                                        Expr::Int(ROOT_FORMAL_SLOT),
+                                    ],
+                                    span,
+                                )?;
+                                let discarded = self.alloc_temp("root_formal")?;
+                                pre.push(Stmt::Let {
+                                    index: discarded,
+                                    declared_schema: None,
+                                    expr: formal,
+                                    line,
+                                });
+                            }
+                            None => {
+                                // No second local binds the payload: the whole
+                                // protected sequence is discarded. Clear the
+                                // exact temp root now, not at the next call.
+                                let discard = self.root_host_call(
+                                    ROOT_DISCARD,
+                                    vec![
+                                        Expr::Var(sequence),
+                                        Expr::Var(frame),
+                                        Expr::Int(ROOT_HANDOFF_SLOT),
+                                    ],
+                                    span,
+                                )?;
+                                let discarded = self.alloc_temp("root_discard")?;
+                                pre.push(Stmt::Let {
+                                    index: discarded,
+                                    declared_schema: None,
+                                    expr: discard,
+                                    line,
+                                });
+                            }
+                        }
                     }
                     return Ok(None);
                 }
@@ -1147,7 +1177,40 @@ impl<'a> Lower<'a> {
                     else_expr: Box::new(Expr::Var(completion)),
                 }))
             }
-            CallClass::Pcall | CallClass::Host => {
+            CallClass::Pcall => {
+                let discarded = self.alloc_temp("discarded")?;
+                pre.push(Stmt::Let {
+                    index: discarded,
+                    declared_schema: None,
+                    expr: value,
+                    line,
+                });
+                if self.roots
+                    && let Some(frame) = self.frames.last().and_then(|frame| frame.root)
+                {
+                    // Statement position discards every protected result.
+                    // Clear the exact temp root in this same statement so the
+                    // next handoff does not find it occupied.
+                    let discard = self.root_host_call(
+                        ROOT_DISCARD,
+                        vec![
+                            Expr::Var(discarded),
+                            Expr::Var(frame),
+                            Expr::Int(ROOT_HANDOFF_SLOT),
+                        ],
+                        span,
+                    )?;
+                    let sink = self.alloc_temp("root_discard")?;
+                    pre.push(Stmt::Let {
+                        index: sink,
+                        declared_schema: None,
+                        expr: discard,
+                        line,
+                    });
+                }
+                Ok(None)
+            }
+            CallClass::Host => {
                 let discarded = self.alloc_temp("discarded")?;
                 pre.push(Stmt::Let {
                     index: discarded,
@@ -1169,6 +1232,12 @@ impl<'a> Lower<'a> {
             let expr = &values.exprs[0];
             if is_call_shape(expr) {
                 let (class, value) = self.lower_call(expr)?;
+                if self.roots && class == CallClass::Pcall {
+                    return Err(self.fail(
+                        span,
+                        "a protected call in tail-return position has no table root handoff in this slice",
+                    ));
+                }
                 return Ok(match class {
                     CallClass::Lua => value,
                     CallClass::Pcall => pcall_tail_completion(value),
@@ -1464,6 +1533,12 @@ impl<'a> Lower<'a> {
                 Ok(Expr::Closure(closure))
             }
             LuaExpr::Table { fields, .. } => {
+                if self.roots {
+                    return Err(self.fail(
+                        expr_span(expr),
+                        "table literals are not issued heap tables in the root handoff slice",
+                    ));
+                }
                 let mut array = lua_ir_call(BuiltinFunction::ArrayNew.call_index(), Vec::new());
                 for field in fields {
                     let Field::Item { value, .. } = field else {
