@@ -317,13 +317,74 @@ impl HostFunction for TickHost {
     }
 }
 
+/// Typed result of the candidate file-execution exit.
+///
+/// `drive_fixture` runs this consumer on the real path, after `Vm::run` and
+/// before any caller observes the run. A normal completion is an ordered value
+/// list; an uncaught explicit Lua error is a typed failure carrying exactly its
+/// original payload. A real `VmError` is surfaced unchanged, and any other
+/// `VmStatus` is reported as itself, never as a guest error.
+#[derive(Debug)]
+enum CompletionExit {
+    /// Normal completion: values in order, preserving zero returns, one nil,
+    /// and trailing nils.
+    Values(Vec<Value>),
+    /// An uncaught explicit guest error: exactly the original payload.
+    Uncaught { payload: Value },
+    /// The underlying VM stopped on a real core or host error.
+    VmFailure(VmError),
+    /// The underlying VM reported a status other than `Halted`.
+    VmStatus(VmStatus),
+    /// The pre-consumer candidate exit: `Halted` plus the raw private array.
+    /// This records the old behavior during the RED run.
+    LegacyHalted { stack: Vec<Value> },
+    /// The stack did not match the private transport; fail closed.
+    MalformedTransport { detail: String },
+}
+
+/// Consume the candidate completion at the file-execution exit.
+///
+/// This is the one place that reads the private `[Bool, ...values]` transport.
+/// It is not a per-test assertion and it never guesses provenance from a guest
+/// value's shape: only the single chunk result slot of a candidate-compiled
+/// file is inspected. `[false, payload]` is the explicit error completion.
+fn consume_completion_exit(status: Result<VmStatus, VmError>, stack: Vec<Value>) -> CompletionExit {
+    let status = match status {
+        Err(error) => return CompletionExit::VmFailure(error),
+        Ok(status) => status,
+    };
+    if status != VmStatus::Halted {
+        return CompletionExit::VmStatus(status);
+    }
+    let [Value::Array(items)] = stack.as_slice() else {
+        return CompletionExit::MalformedTransport {
+            detail: format!("expected exactly one completion array, stack={stack:?}"),
+        };
+    };
+    match items.first() {
+        Some(Value::Bool(true)) => CompletionExit::Values(items[1..].to_vec()),
+        Some(Value::Bool(false)) if items.len() == 2 => CompletionExit::LegacyHalted {
+            stack: stack.clone(),
+        },
+        Some(Value::Bool(false)) => CompletionExit::MalformedTransport {
+            detail: format!("error completion must carry exactly one payload: {items:?}"),
+        },
+        Some(other) => CompletionExit::MalformedTransport {
+            detail: format!("completion status is not a Bool: {other:?}"),
+        },
+        None => CompletionExit::MalformedTransport {
+            detail: "completion is empty".to_string(),
+        },
+    }
+}
+
 struct Run {
     stack: Vec<Value>,
     fuel_consumed: u64,
     marks: Vec<MarkRecord>,
     seen: Option<Value>,
     ticks: Vec<String>,
-    status: Result<VmStatus, VmError>,
+    exit: CompletionExit,
     call_sites: Vec<DecodedCallSite>,
 }
 
@@ -374,36 +435,43 @@ fn drive_fixture(name: &str) -> Run {
     let marks = observation.marks.lock().expect("mark log").clone();
     let seen = observation.seen.lock().expect("seen payload").clone();
     let ticks = observation.ticks.lock().expect("tick log").clone();
+    let stack = vm.stack().to_vec();
+    let status_log = format!("{status:?}");
+    let exit = consume_completion_exit(status, stack.clone());
     eprintln!(
-        "LUA_COMPLETION fixture={name} fuel_budget={FUEL_BUDGET} check_interval={FUEL_CHECK_INTERVAL} consumed={fuel_consumed} remaining={remaining} jit=disabled status={status:?} marks={:?}",
+        "LUA_COMPLETION fixture={name} fuel_budget={FUEL_BUDGET} check_interval={FUEL_CHECK_INTERVAL} consumed={fuel_consumed} remaining={remaining} jit=disabled status={status_log} exit={exit:?} stack={stack:?} marks={:?}",
         marks
             .iter()
             .map(|mark| mark.label.as_str())
             .collect::<Vec<_>>()
     );
     Run {
-        stack: vm.stack().to_vec(),
+        stack,
         fuel_consumed,
         marks,
         seen,
         ticks,
-        status,
+        exit,
         call_sites,
     }
 }
 
-fn run_halted(name: &str) -> Run {
+fn run_stopped(name: &str) -> Run {
     let run = drive_fixture(name);
-    match &run.status {
-        Ok(VmStatus::Halted) => {}
-        Ok(other) => panic!("{name}: expected Halted, got {other:?}"),
-        Err(error) => panic!("{name}: expected Halted, got error {error:?}"),
-    }
     assert!(run.fuel_consumed > 0, "{name}: recorded no fuel");
     assert!(
         run.fuel_consumed < FUEL_BUDGET,
         "{name}: exhausted the fuel budget"
     );
+    run
+}
+
+fn run_halted(name: &str) -> Run {
+    let run = run_stopped(name);
+    match &run.exit {
+        CompletionExit::Values(_) => {}
+        other => panic!("{name}: expected a normal completion exit, got {other:?}"),
+    }
     run
 }
 
@@ -517,20 +585,18 @@ fn labels(run: &Run) -> Vec<&str> {
     run.marks.iter().map(|mark| mark.label.as_str()).collect()
 }
 
-fn unpack_completion(name: &str, run: &Run) -> (bool, Vec<Value>) {
-    assert_eq!(
-        run.stack.len(),
-        1,
-        "{name}: the chunk must leave exactly one completion array, stack={:?}",
-        run.stack
-    );
-    let Value::Array(items) = &run.stack[0] else {
-        panic!("{name}: chunk result is not an array: {:?}", run.stack[0]);
-    };
-    let Some(Value::Bool(status)) = items.first() else {
-        panic!("{name}: completion has no Bool status: {items:?}");
-    };
-    (*status, items[1..].to_vec())
+fn completed_values<'a>(name: &str, run: &'a Run) -> &'a [Value] {
+    match &run.exit {
+        CompletionExit::Values(values) => values,
+        other => panic!("{name}: expected a normal completion exit, got {other:?}"),
+    }
+}
+
+fn uncaught_payload<'a>(name: &str, run: &'a Run) -> &'a Value {
+    match &run.exit {
+        CompletionExit::Uncaught { payload } => payload,
+        other => panic!("{name}: expected a typed uncaught guest error, got {other:?}"),
+    }
 }
 
 fn same_array(left: &Value, right: &Value) -> bool {
@@ -576,8 +642,7 @@ fn dynamic_error_propagates_through_ordinary_call_and_pcall_recovers() {
         ],
         "the ordinary caller tail must be skipped and the outer tail kept"
     );
-    let (status, values) = unpack_completion("dynamic-error.lua", &run);
-    assert!(status, "the chunk itself must finish normally");
+    let values = completed_values("dynamic-error.lua", &run);
     assert_eq!(
         values.len(),
         2,
@@ -639,11 +704,9 @@ fn call_arguments_evaluate_left_to_right_before_one_callee_run() {
         1,
         "the dynamic callee must run exactly once"
     );
-    let (status, values) = unpack_completion("argument-order.lua", &run);
-    assert!(status);
     assert_eq!(
-        values,
-        vec![Value::Int(2)],
+        completed_values("argument-order.lua", &run),
+        &[Value::Int(2)][..],
         "the second argument is the returned value, unpadded"
     );
     let Value::Int(first) = run.seen.clone().expect("note observed the first argument") else {
@@ -668,8 +731,7 @@ fn dynamic_success_keeps_the_ordinary_tail_and_true() {
             "done"
         ]
     );
-    let (status, values) = unpack_completion("dynamic-success.lua", &run);
-    assert!(status);
+    let values = completed_values("dynamic-success.lua", &run);
     assert_eq!(values.len(), 2);
     assert_eq!(values[0], Value::Bool(true));
     assert!(same_array(
@@ -695,8 +757,7 @@ fn false_first_table_item_is_data_not_an_error() {
         ],
         "a false table item must not turn the success path into an error"
     );
-    let (status, values) = unpack_completion("dynamic-false-table.lua", &run);
-    assert!(status);
+    let values = completed_values("dynamic-false-table.lua", &run);
     assert_eq!(values[0], Value::Bool(true));
     let Value::Array(payload) = &values[1] else {
         panic!("payload must be the original table");
@@ -716,8 +777,7 @@ fn host_false_return_is_not_a_completion_status() {
         ["middle", "leaf", "leaf-tail", "middle-tail", "done"],
         "a false host return value must not stop either tail"
     );
-    let (status, values) = unpack_completion("host-return-false.lua", &run);
-    assert!(status);
+    let values = completed_values("host-return-false.lua", &run);
     assert_eq!(values.len(), 1);
     assert!(same_array(
         &values[0],
@@ -729,8 +789,7 @@ fn host_false_return_is_not_a_completion_status() {
 fn ordinary_tail_zero_and_one_nil_stay_distinct() {
     let zero = run_halted("ordinary-zero.lua");
     assert_eq!(labels(&zero), ["zero"]);
-    let (status, values) = unpack_completion("ordinary-zero.lua", &zero);
-    assert!(status);
+    let values = completed_values("ordinary-zero.lua", &zero);
     assert!(
         values.is_empty(),
         "ordinary tail zero returns is zero values"
@@ -738,8 +797,7 @@ fn ordinary_tail_zero_and_one_nil_stay_distinct() {
 
     let one_nil = run_halted("ordinary-one-nil.lua");
     assert_eq!(labels(&one_nil), ["nil"]);
-    let (status, values) = unpack_completion("ordinary-one-nil.lua", &one_nil);
-    assert!(status);
+    let values = completed_values("ordinary-one-nil.lua", &one_nil);
     assert_eq!(values.len(), 1, "one explicit nil is one value");
     assert_eq!(values[0], Value::Null);
 }
@@ -748,52 +806,51 @@ fn ordinary_tail_zero_and_one_nil_stay_distinct() {
 fn protected_tail_zero_and_one_nil_stay_distinct() {
     let zero = run_halted("protected-zero.lua");
     assert_eq!(labels(&zero), ["zero"]);
-    let (status, values) = unpack_completion("protected-zero.lua", &zero);
-    assert!(status);
     assert_eq!(
-        values,
-        vec![Value::Bool(true)],
+        completed_values("protected-zero.lua", &zero),
+        &[Value::Bool(true)][..],
         "pcall adds exactly its success value"
     );
     assert_dynamic_call_witness(&zero, "zero", 0);
 
     let one_nil = run_halted("protected-one-nil.lua");
     assert_eq!(labels(&one_nil), ["nil"]);
-    let (status, values) = unpack_completion("protected-one-nil.lua", &one_nil);
-    assert!(status);
-    assert_eq!(values, vec![Value::Bool(true), Value::Null]);
+    assert_eq!(
+        completed_values("protected-one-nil.lua", &one_nil),
+        &[Value::Bool(true), Value::Null][..]
+    );
 }
 
 #[test]
 fn single_slot_zero_return_binds_nil_with_lazy_guard() {
     let run = run_halted("scalar-zero.lua");
     assert_eq!(labels(&run), ["zero", "scalar-tail", "done"]);
-    let (status, values) = unpack_completion("scalar-zero.lua", &run);
-    assert!(status);
-    assert_eq!(values, vec![Value::Null]);
+    assert_eq!(
+        completed_values("scalar-zero.lua", &run),
+        &[Value::Null][..]
+    );
     assert_dynamic_call_witness(&run, "zero", 0);
 }
 
 #[test]
 fn uncaught_explicit_error_is_not_a_normal_chunk_result() {
-    let run = run_halted("uncaught-error.lua");
+    let run = run_stopped("uncaught-error.lua");
     assert_eq!(labels(&run), ["leaf"]);
-    let (status, values) = unpack_completion("uncaught-error.lua", &run);
-    assert!(!status, "the chunk boundary must keep the explicit error");
-    assert_eq!(values.len(), 1);
-    assert!(same_array(
-        &values[0],
-        &payload_of("uncaught-error.lua", &run)
-    ));
+    let payload = uncaught_payload("uncaught-error.lua", &run);
+    let observed = payload_of("uncaught-error.lua", &run);
+    assert!(
+        same_array(payload, &observed),
+        "the typed uncaught failure must keep the original table object"
+    );
 }
 
 #[test]
 fn host_error_aborts_without_guest_catch() {
     let run = drive_fixture("host-fault.lua");
-    let error = run
-        .status
-        .as_ref()
-        .expect_err("a real host error must abort the VM");
+    let error = match &run.exit {
+        CompletionExit::VmFailure(error) => error,
+        other => panic!("a real host error must abort the VM, got {other:?}"),
+    };
     assert!(
         matches!(error, VmError::HostError(message) if message == "completion host fault"),
         "unexpected host error: {error:?}"
@@ -829,4 +886,111 @@ fn unknown_global_call_is_refused_at_lowering() {
         message.contains("unsupported global call"),
         "unexpected refusal: {message}"
     );
+}
+
+/// Admission RED/GREEN boundary: the candidate lowering must refuse the input
+/// before any VM runs. If the current lowering still admits it, the same real
+/// fixture is executed and the panic reports the actual runtime gate, so a
+/// diagnostic is never assumed from a helper-only assertion.
+fn assert_lowering_refusal(name: &str, needle: &str) {
+    let path = fixture_path(name);
+    match vm::compile_source_file_with_options(&path, candidate_options()) {
+        Err(SourcePathError::SourceWithMap {
+            error: SourceError::Parse(parse),
+            ..
+        })
+        | Err(SourcePathError::Source(SourceError::Parse(parse))) => {
+            assert!(
+                parse.message.contains(needle),
+                "{name}: unexpected refusal: {}",
+                parse.message
+            );
+        }
+        Err(other) => panic!("{name}: expected a lowering/parse refusal, got {other:?}"),
+        Ok(_) => {
+            let run = drive_fixture(name);
+            panic!(
+                "{name}: the fixture must be refused at lowering, but the candidate ran: exit={:?} stack={:?} marks={:?}",
+                run.exit,
+                run.stack,
+                labels(&run)
+            );
+        }
+    }
+}
+
+#[test]
+fn missing_callable_argument_is_refused_at_lowering() {
+    assert_lowering_refusal("missing-callee-argument.lua", "not a proven Lua callable");
+}
+
+#[test]
+fn pcall_missing_callable_argument_is_refused_at_lowering() {
+    assert_lowering_refusal(
+        "pcall-missing-callee-argument.lua",
+        "not a proven Lua callable",
+    );
+}
+
+#[test]
+fn pcall_forwarded_non_lua_argument_is_refused_at_lowering() {
+    assert_lowering_refusal("pcall-forwarded-non-lua.lua", "not a proven Lua callable");
+}
+
+#[test]
+fn all_lua_multilevel_forwarding_runs() {
+    let run = run_halted("forward-all-lua.lua");
+    assert_eq!(labels(&run), ["forward", "invoke", "leaf", "done"]);
+    assert_eq!(
+        completed_values("forward-all-lua.lua", &run),
+        &[Value::Bool(true), Value::Int(7)][..]
+    );
+    assert_dynamic_call_witness(&run, "leaf", 1);
+}
+
+#[test]
+fn missing_data_arguments_pad_nil_without_rejecting() {
+    let run = run_halted("missing-data-argument.lua");
+    assert_eq!(labels(&run), ["take", "take", "forward", "take", "done"]);
+    assert_eq!(
+        completed_values("missing-data-argument.lua", &run),
+        &[Value::Null, Value::Bool(true), Value::Null, Value::Int(42)][..]
+    );
+}
+
+#[test]
+fn ordinary_trailing_nil_is_preserved() {
+    let run = run_halted("ordinary-trailing-nil.lua");
+    assert_eq!(labels(&run), ["pair"]);
+    assert_eq!(
+        completed_values("ordinary-trailing-nil.lua", &run),
+        &[Value::Int(1), Value::Null][..]
+    );
+}
+
+#[test]
+fn completion_exit_separates_vm_status_and_malformed_transport() {
+    match consume_completion_exit(Ok(VmStatus::Yielded), Vec::new()) {
+        CompletionExit::VmStatus(VmStatus::Yielded) => {}
+        other => panic!("a non-Halted status must be reported as itself: {other:?}"),
+    }
+    let malformed = [
+        Vec::new(),
+        vec![Value::Int(1)],
+        vec![Value::array(Vec::new())],
+        vec![Value::array(vec![Value::Int(0)])],
+        vec![Value::array(vec![Value::Bool(false)])],
+        vec![Value::array(vec![
+            Value::Bool(false),
+            Value::Null,
+            Value::Null,
+        ])],
+        vec![Value::array(vec![Value::Bool(true)]), Value::Null],
+    ];
+    for stack in malformed {
+        match consume_completion_exit(Ok(VmStatus::Halted), stack) {
+            CompletionExit::MalformedTransport { .. } => {}
+            other => panic!("malformed transport must fail closed: {other:?}"),
+        }
+    }
 }
