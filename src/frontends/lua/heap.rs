@@ -63,6 +63,20 @@
 //! remains a historical fixture with the same prefix invariant. No callback,
 //! resurrection, guest step, or production entry is added here.
 //!
+//! The private action handoff [`take_published_pending_finalizer_action`]
+//! resolves the current raw `__gc` of that same published head in the exclusive
+//! borrow that pops it, so a change made between two dequeues is observed. It
+//! never reuses the selection cache and never pre-parses a batch. A missing
+//! metatable, a missing field, or a true stored-nil gap is `Skip`; a present
+//! non-callable value is a typed reject; a live closure is the direct action;
+//! a live table adds only its own current metatable's raw `__call` closure,
+//! with the original table kept as the receiver. The table form does not
+//! inherit `__call` and does not dispatch a table-valued `__call` again. The
+//! commit roots the userdata, the actual closure, and when needed the original
+//! receiver in caller-supplied empty, distinct slots, then settles once.
+//! `Skip` and a typed reject retire exactly once with only the userdata root.
+//! No guest callback, diagnostic text, or Core handle copy is produced here.
+//!
 //! Borrowed from the ES5 heap at `3e348a010bc8d84baa5b7d1169a5f50aeb4e46ec`
 //! `src/javascript/heap.rs`: slot plus generation handles, explicit root
 //! frames, and non-moving mark/sweep. The guest table check uses the issued
@@ -828,6 +842,124 @@ pub(crate) fn take_published_pending_finalizer(
     })
 }
 
+/// The current raw finalizer decision for one published pending head.
+///
+/// This is a private dispatch plan, not a guest callable. It is recomputed at
+/// dequeue time from the userdata's current metatable, so a modifier that ran
+/// earlier in the same batch is observed. A `Closure` or the `call` inside
+/// `TableCall` is an actual closure identity; the table form also keeps the
+/// original receiver instead of replacing it with the callable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PendingFinalizerAction {
+    /// No live metatable, no raw `__gc` record, or a true stored-nil gap.
+    Skip,
+    /// A present raw `__gc` value that is not callable in this slice's
+    /// one-layer raw form.
+    NonCallable(PendingFinalizerNotCallable),
+    /// The raw `__gc` is a live closure.
+    Closure(ClosureRef),
+    /// The raw `__gc` is a live table whose own current metatable stores a raw
+    /// `__call` closure. The receiver is that original table.
+    TableCall {
+        receiver: TableRef,
+        call: ClosureRef,
+    },
+}
+
+/// Why a present raw `__gc` value is not callable here.
+///
+/// The table reasons keep the exact original receiver identity, so a later
+/// diagnostic can name the original called type (a table) instead of the
+/// invalid `__call` value. This slice emits no diagnostic text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PendingFinalizerNotCallable {
+    /// `false`, `true`, a number, a string, or bytes.
+    Scalar,
+    /// A bare userdata value.
+    Userdata,
+    /// A shared upvalue value.
+    Upvalue,
+    /// A table receiver with no live metatable or no raw `__call` field.
+    TableWithoutCall(TableRef),
+    /// A table receiver whose raw `__call` exists but is not a live closure.
+    /// Another table is refused here: this slice does not dispatch twice.
+    TableCallNotClosure(TableRef),
+    /// A stored object target no longer names a live node of its kind.
+    Detached,
+}
+
+/// One committed private action handoff.
+///
+/// The identities are already rooted in the caller's frame. No raw Core token
+/// or guest callable is copied out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TakenPendingFinalizer {
+    /// The exact typed userdata that left the published prefix.
+    pub userdata: UserdataRef,
+    /// The current raw decision that this same commit rooted.
+    pub action: PendingFinalizerAction,
+    /// Root slots written from the caller's plan: one for the userdata, two
+    /// for a direct closure, three for the table form.
+    pub roots_written: u32,
+}
+
+/// Private real dequeue that re-reads the current raw finalizer of the head.
+///
+/// This is not a guest `__gc` callback and does not run guest code. It refuses
+/// a saved mark ([`HeapError::MarkActive`]) or release tail
+/// ([`HeapError::SweepPending`]) before reading the queue. The head must be in
+/// the prefix that one successful private publication made consumable; an
+/// unpublished or absent head returns a scope error. The record's live slot
+/// must still bind its exact generation, kind, pending flag, and raw handle,
+/// and the typed `lua.userdata` payload must name that same userdata
+/// ([`HeapError::TokenMismatch`] otherwise). Every one of those checks happens
+/// before the first queue, root, or slot write.
+///
+/// The current raw `__gc` is then read again in the same exclusive borrow that
+/// pops the head. `slots[0]` must be an open, empty root slot for the
+/// userdata. A direct closure adds an empty distinct `slots[1]`; the table
+/// form adds the closure at `slots[1]` and the original receiver at an empty
+/// distinct `slots[2]`. A short plan, an overlapping plan, a stale frame, an
+/// occupied slot, or an out-of-range position is refused before any write, so
+/// the head and every existing root stay. A `Skip` or typed reject needs only
+/// `slots[0]`, is returned as its typed result, and is settled exactly once;
+/// it is never re-queued. The commit pops one `VecDeque` front record, writes
+/// the required roots together, and settles that generation. The returned
+/// action and rooted identities are private; the raw Core token is not copied
+/// into a guest value.
+pub(crate) fn take_published_pending_finalizer_action(
+    host: &mut HostContext,
+    frame: RootFrameId,
+    slots: &[u32],
+) -> Result<TakenPendingFinalizer, HeapError> {
+    let Some(heap) = host.scope_state::<LuaHeap>() else {
+        return Err(HeapError::SweepDenied);
+    };
+    if heap.has_sweep_tail() {
+        return Err(HeapError::SweepPending);
+    }
+    if heap.has_saved_mark() {
+        return Err(HeapError::MarkActive);
+    }
+    let head = heap.pending_finalizer_published_front()?;
+    let userdata = UserdataRef::userdata(heap.domain(), head.slot, head.generation);
+    if heap.published_userdata_token(userdata)? != head.raw {
+        return Err(HeapError::TokenMismatch);
+    }
+    let handle =
+        vm::ResourceHandle::from_raw(head.raw).map_err(|_| HeapError::CarrierOutOfRange)?;
+    let borrowed = host
+        .borrow_resource_with_key::<LuaUserdataResource>(handle, &LuaUserdataResource::key())
+        .map_err(HeapError::from_scope)?;
+    if borrowed.get().userdata() != userdata {
+        return Err(HeapError::TokenMismatch);
+    }
+    drop(borrowed);
+    with_heap(host, |heap| {
+        heap.take_published_finalizer_action_into_roots(frame, slots, head)
+    })
+}
+
 /// Number of pending records in the published prefix. Test-only header read;
 /// it does not read a stored record.
 #[cfg(test)]
@@ -843,6 +975,16 @@ pub fn rooted_userdata(
     slot: u32,
 ) -> Result<Option<UserdataRef>, HeapError> {
     with_heap(host, |heap| heap.rooted_userdata(frame, slot))
+}
+
+/// One closure root slot. Test-only; does not scan or read the queue.
+#[cfg(test)]
+pub fn rooted_closure(
+    host: &mut HostContext,
+    frame: RootFrameId,
+    slot: u32,
+) -> Result<Option<ClosureRef>, HeapError> {
+    with_heap(host, |heap| heap.rooted_closure(frame, slot))
 }
 
 /// Saves one empty private mark for a handoff refusal test. Test-only: the

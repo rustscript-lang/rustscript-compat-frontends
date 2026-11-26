@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use vm::{HostContextError, Value};
 
 use super::handle::{ClosureRef, HandleKind, TableRef, UpvalueRef, UserdataRef};
+use super::{PendingFinalizerAction, PendingFinalizerNotCallable, TakenPendingFinalizer};
 
 #[path = "table/mark.rs"]
 mod mark;
@@ -2149,6 +2150,32 @@ impl LuaHeap {
         )
     }
 
+    /// Writes one closure under a Lua string key.
+    ///
+    /// This is the private strong-edge form used by the pending-finalizer raw
+    /// `__gc` and `__call` fixtures: a metatable field can name the exact live
+    /// closure generation. The write uses the same record, quota, and mutation
+    /// gates as a table field. It does not issue a guest value and does not
+    /// make that closure a callable.
+    pub fn set_named_closure(
+        &mut self,
+        from: TableRef,
+        name: &str,
+        value: ClosureRef,
+    ) -> Result<(), HeapError> {
+        self.require_live(from)?;
+        self.require_closure(value)?;
+        self.deny_unbarriered()?;
+        self.write_edge(
+            from,
+            EdgeKey::named(name),
+            EdgeValue::Closure {
+                slot: value.slot(),
+                generation: value.generation(),
+            },
+        )
+    }
+
     /// Writes a scalar under a Lua string key, or deletes that record on nil.
     ///
     /// A boolean may occupy any raw named field. A number remains only the
@@ -2984,6 +3011,21 @@ impl LuaHeap {
     fn stored_from(&self, from_slot: u32, key: &EdgeKey) -> Option<&EdgeValue> {
         let index = self.find_key(from_slot, key)?;
         self.edge_slots[index as usize]
+            .edge
+            .as_ref()
+            .map(|edge| &edge.value)
+    }
+
+    /// One raw stored value under a Lua string key through the owner's chain.
+    ///
+    /// A missing key returns `None`; a stored `Value::Null` gap still returns a
+    /// value record, so the caller can tell an absent field from a true
+    /// stored-nil gap. This does not consult `__index`, a metatable, or the
+    /// selection cache, and it does not construct a key.
+    fn raw_named_value(&self, owner: u32, name: &str) -> Option<&EdgeValue> {
+        let index = self.find_matching(owner, |key| key.matches_name(name))?;
+        self.edge_slots
+            .get(index as usize)?
             .edge
             .as_ref()
             .map(|edge| &edge.value)
@@ -3930,24 +3972,46 @@ impl LuaHeap {
         Ok(index)
     }
 
-    /// Pops the exact published head, roots its typed userdata in the
-    /// specified empty slot, and settles that generation in one commit.
+    /// Resolves the concrete root positions for one dequeue plan.
     ///
-    /// Every refusal is checked before the first queue, root, or slot write:
-    /// a saved mark or tail, an unpublished head, a bad frame or slot, an
-    /// occupied root, and a record whose live slot no longer binds the exact
-    /// generation, kind, pending flag, and raw handle. The front record is
-    /// then popped with one `VecDeque` front removal, the exact userdata is
-    /// written into the root slot, and the slot's pending flag is replaced by
-    /// its settled flag. It does not call a guest callback.
-    pub(super) fn take_published_finalizer_into_root(
-        &mut self,
+    /// `slots[0]` receives the userdata. A direct closure adds `slots[1]`; the
+    /// table form adds the closure at `slots[1]` and the original receiver at
+    /// `slots[2]`. Only the first `needed` positions are read. They must be
+    /// distinct, inside one open frame, present, and empty. A short plan or a
+    /// duplicate is refused before any queue, root, or slot write.
+    fn pending_finalizer_root_indices(
+        &self,
         frame: RootFrameId,
-        slot: u32,
+        slots: &[u32],
+        needed: usize,
+    ) -> Result<[usize; 3], HeapError> {
+        if needed > 3 || slots.len() < needed {
+            return Err(HeapError::Scope(
+                "lua pending finalizer needs more root slots".to_string(),
+            ));
+        }
+        let mut indices = [0usize; 3];
+        for (offset, slot) in slots[..needed].iter().copied().enumerate() {
+            if slots[..offset].contains(&slot) {
+                return Err(HeapError::Scope(
+                    "lua pending finalizer root slots overlap".to_string(),
+                ));
+            }
+            indices[offset] = self.pending_finalizer_root_index(frame, slot)?;
+        }
+        Ok(indices)
+    }
+
+    /// The exact live userdata a published head record still names.
+    ///
+    /// The record's slot must still bind the same generation, kind, pending
+    /// flag, raw handle, and live state. A successor generation in the same
+    /// slot is refused. This is the shared identity preflight of both dequeue
+    /// entries; it reads one record and writes nothing.
+    fn pending_finalizer_head_identity(
+        &self,
         head: PendingFinalizer,
     ) -> Result<UserdataRef, HeapError> {
-        self.deny_unbarriered()?;
-        let root_index = self.pending_finalizer_root_index(frame, slot)?;
         let Some(slot_record) = self.slots.get(head.slot as usize) else {
             return Err(HeapError::StaleHandle);
         };
@@ -3960,18 +4024,220 @@ impl LuaHeap {
         {
             return Err(HeapError::StaleHandle);
         }
-        let userdata = UserdataRef::userdata(self.domain, head.slot, head.generation);
+        Ok(UserdataRef::userdata(
+            self.domain,
+            head.slot,
+            head.generation,
+        ))
+    }
+
+    /// The current raw finalizer action for one live pending userdata.
+    ///
+    /// This is the dequeue-time re-read: the userdata's current metatable is
+    /// read again, then its raw `__gc` field, and for a table value only that
+    /// receiver's own current metatable and its raw `__call` field. It does
+    /// not reuse the selection cache, does not follow `__index`, does not walk
+    /// an inherited metatable, and does not dispatch a table-valued `__call` a
+    /// second time. Nothing is written.
+    fn pending_finalizer_action(&self, userdata: UserdataRef) -> PendingFinalizerAction {
+        let Some(slot) = self.slots.get(userdata.slot() as usize) else {
+            return PendingFinalizerAction::Skip;
+        };
+        let Some((metatable_slot, metatable_generation)) = slot.metatable else {
+            return PendingFinalizerAction::Skip;
+        };
+        if !self.slot_matches(metatable_slot, metatable_generation, HandleKind::Table) {
+            return PendingFinalizerAction::Skip;
+        }
+        let Some(value) = self.raw_named_value(metatable_slot, "__gc") else {
+            return PendingFinalizerAction::Skip;
+        };
+        match value {
+            EdgeValue::Scalar(Value::Null) => PendingFinalizerAction::Skip,
+            EdgeValue::Scalar(_) => {
+                PendingFinalizerAction::NonCallable(PendingFinalizerNotCallable::Scalar)
+            }
+            EdgeValue::Userdata { .. } => {
+                PendingFinalizerAction::NonCallable(PendingFinalizerNotCallable::Userdata)
+            }
+            EdgeValue::Upvalue { .. } => {
+                PendingFinalizerAction::NonCallable(PendingFinalizerNotCallable::Upvalue)
+            }
+            EdgeValue::Closure { slot, generation } => {
+                if self.slot_matches(*slot, *generation, HandleKind::Closure) {
+                    PendingFinalizerAction::Closure(ClosureRef::closure(
+                        self.domain,
+                        *slot,
+                        *generation,
+                    ))
+                } else {
+                    PendingFinalizerAction::NonCallable(PendingFinalizerNotCallable::Detached)
+                }
+            }
+            EdgeValue::Table { slot, generation } => {
+                if !self.slot_matches(*slot, *generation, HandleKind::Table) {
+                    return PendingFinalizerAction::NonCallable(
+                        PendingFinalizerNotCallable::Detached,
+                    );
+                }
+                let receiver = TableRef::table(self.domain, *slot, *generation);
+                let Some((call_metatable, call_metatable_generation)) =
+                    self.slots[*slot as usize].metatable
+                else {
+                    return PendingFinalizerAction::NonCallable(
+                        PendingFinalizerNotCallable::TableWithoutCall(receiver),
+                    );
+                };
+                if !self.slot_matches(call_metatable, call_metatable_generation, HandleKind::Table)
+                {
+                    return PendingFinalizerAction::NonCallable(
+                        PendingFinalizerNotCallable::TableWithoutCall(receiver),
+                    );
+                }
+                let Some(call) = self.raw_named_value(call_metatable, "__call") else {
+                    return PendingFinalizerAction::NonCallable(
+                        PendingFinalizerNotCallable::TableWithoutCall(receiver),
+                    );
+                };
+                match call {
+                    EdgeValue::Scalar(Value::Null) => PendingFinalizerAction::NonCallable(
+                        PendingFinalizerNotCallable::TableWithoutCall(receiver),
+                    ),
+                    EdgeValue::Closure {
+                        slot: call_slot,
+                        generation: call_generation,
+                    } if self.slot_matches(*call_slot, *call_generation, HandleKind::Closure) => {
+                        PendingFinalizerAction::TableCall {
+                            receiver,
+                            call: ClosureRef::closure(self.domain, *call_slot, *call_generation),
+                        }
+                    }
+                    _ => PendingFinalizerAction::NonCallable(
+                        PendingFinalizerNotCallable::TableCallNotClosure(receiver),
+                    ),
+                }
+            }
+        }
+    }
+
+    /// Pops exactly `head`, writes the already validated roots, and settles
+    /// that generation once.
+    ///
+    /// This is the shared commit behind both dequeue entries. Every fallible
+    /// check, including the current raw-field resolution and the whole root
+    /// plan, has already finished in this same exclusive borrow. The remaining
+    /// published-front pop reads one record and moves one stored record; it
+    /// happens before the first root or slot write, and a refusal leaves the
+    /// queue and every root unchanged. No guest code is called.
+    fn commit_published_finalizer(
+        &mut self,
+        head: PendingFinalizer,
+        userdata: UserdataRef,
+        roots: &[(usize, Rooted)],
+    ) -> Result<UserdataRef, HeapError> {
         let Some(popped) = self.pending_finalizers.pop_published_front(head) else {
             return Err(HeapError::Scope(
                 "lua pending finalizer head is not published".to_string(),
             ));
         };
         debug_assert_eq!(popped, head);
-        self.roots[root_index] = Some(Rooted::Userdata(userdata));
+        for (index, rooted) in roots {
+            self.roots[*index] = Some(*rooted);
+        }
         let slot_record = &mut self.slots[head.slot as usize];
         slot_record.pending_finalizer = false;
         slot_record.finalizer_settled = true;
         Ok(userdata)
+    }
+
+    /// Pops the exact published head, roots its typed userdata in the
+    /// specified empty slot, and settles that generation in one commit.
+    ///
+    /// Every refusal is checked before the first queue, root, or slot write:
+    /// a saved mark or tail, an unpublished head, a bad frame or slot, an
+    /// occupied root, and a record whose live slot no longer binds the exact
+    /// generation, kind, pending flag, and raw handle. The front record is
+    /// then popped with one `VecDeque` front removal, the exact userdata is
+    /// written into the root slot, and the slot's pending flag is replaced by
+    /// its settled flag. It does not call a guest callback and does not read a
+    /// raw `__gc` field: this is the retained single-root test path.
+    pub(super) fn take_published_finalizer_into_root(
+        &mut self,
+        frame: RootFrameId,
+        slot: u32,
+        head: PendingFinalizer,
+    ) -> Result<UserdataRef, HeapError> {
+        self.deny_unbarriered()?;
+        let indices = self.pending_finalizer_root_indices(frame, &[slot], 1)?;
+        let userdata = self.pending_finalizer_head_identity(head)?;
+        self.commit_published_finalizer(head, userdata, &[(indices[0], Rooted::Userdata(userdata))])
+    }
+
+    /// Pops one published head with a fresh raw-finalizer decision and roots
+    /// every identity that decision needs.
+    ///
+    /// The queue record is not trusted for callability: after the shared
+    /// identity preflight, the userdata's current metatable and its raw
+    /// `__gc` are read again in this same exclusive borrow, before any write.
+    /// A table value adds one raw `__call` read on that receiver's own current
+    /// metatable. An inherited or table-valued `__call` is a typed reject, not
+    /// a second dispatch, and the reject keeps the exact original receiver.
+    /// `slots[0]` always receives the userdata; a direct closure adds
+    /// `slots[1]`; the table form adds the closure at `slots[1]` and the
+    /// original receiver at `slots[2]`. Only that required prefix is validated
+    /// and written, and its positions must be distinct. A skip or a reject
+    /// retires exactly once with only the userdata root. No guest code is
+    /// called and no Core handle is copied.
+    pub(super) fn take_published_finalizer_action_into_roots(
+        &mut self,
+        frame: RootFrameId,
+        slots: &[u32],
+        head: PendingFinalizer,
+    ) -> Result<TakenPendingFinalizer, HeapError> {
+        self.deny_unbarriered()?;
+        let userdata = self.pending_finalizer_head_identity(head)?;
+        let action = self.pending_finalizer_action(userdata);
+        let needed = match &action {
+            PendingFinalizerAction::Skip | PendingFinalizerAction::NonCallable(_) => 1,
+            PendingFinalizerAction::Closure(_) => 2,
+            PendingFinalizerAction::TableCall { .. } => 3,
+        };
+        let indices = self.pending_finalizer_root_indices(frame, slots, needed)?;
+        match action {
+            PendingFinalizerAction::Skip | PendingFinalizerAction::NonCallable(_) => {
+                self.commit_published_finalizer(
+                    head,
+                    userdata,
+                    &[(indices[0], Rooted::Userdata(userdata))],
+                )?;
+            }
+            PendingFinalizerAction::Closure(closure) => {
+                self.commit_published_finalizer(
+                    head,
+                    userdata,
+                    &[
+                        (indices[0], Rooted::Userdata(userdata)),
+                        (indices[1], Rooted::Closure(closure)),
+                    ],
+                )?;
+            }
+            PendingFinalizerAction::TableCall { receiver, call } => {
+                self.commit_published_finalizer(
+                    head,
+                    userdata,
+                    &[
+                        (indices[0], Rooted::Userdata(userdata)),
+                        (indices[1], Rooted::Closure(call)),
+                        (indices[2], Rooted::Table(receiver)),
+                    ],
+                )?;
+            }
+        }
+        Ok(TakenPendingFinalizer {
+            userdata,
+            action,
+            roots_written: needed as u32,
+        })
     }
 
     /// Makes every currently stored pending record consumable after a
@@ -4272,6 +4538,29 @@ impl LuaHeap {
         match self.roots.get(index).copied().flatten() {
             None => Ok(None),
             Some(Rooted::Userdata(userdata)) => Ok(Some(userdata)),
+            Some(_) => Err(HeapError::StaleHandle),
+        }
+    }
+
+    /// The closure in one frame slot, if that slot holds a closure. This is a
+    /// test observation for the private action handoff and does not scan.
+    #[cfg(test)]
+    pub(crate) fn rooted_closure(
+        &self,
+        frame: RootFrameId,
+        slot: u32,
+    ) -> Result<Option<ClosureRef>, HeapError> {
+        let (start, width) = {
+            let found = self.frame(frame)?;
+            (found.start, found.width)
+        };
+        if slot >= width {
+            return Err(HeapError::StaleFrame);
+        }
+        let index = start as usize + slot as usize;
+        match self.roots.get(index).copied().flatten() {
+            None => Ok(None),
+            Some(Rooted::Closure(closure)) => Ok(Some(closure)),
             Some(_) => Err(HeapError::StaleHandle),
         }
     }
