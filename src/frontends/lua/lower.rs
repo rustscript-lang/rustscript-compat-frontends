@@ -39,6 +39,15 @@
 //! sequence. `error(value, 0)` is a lowering form that completes the current
 //! Lua function with `[false, value]` immediately. Both are limited to the
 //! exact shapes documented here.
+//!
+//! A second private entry, [`lower_source_with_roots`], keeps this completion
+//! and admission contract but wraps every lowered function in one real LuaHeap
+//! root frame. Each admitted Lua call then hands its error payload to the
+//! caller's reserved temp slot while the callee frame is still the top frame;
+//! only after that write is the callee frame retired. The chunk's protected
+//! receive moves the payload from the temp slot into its formal slot. That
+//! entry is compiled only by the root-handoff test. Production `LuaPlugin`
+//! never reaches it.
 use std::collections::{HashMap, HashSet};
 
 use super::ast::{
@@ -58,9 +67,47 @@ use vm::{
 /// host functions injected by the test, not guest callables.
 const HOST_IMPORTS: &[&str] = &["mark", "note", "fault", "tick"];
 
+/// Guest-visible host calls admitted only by the private root-handoff mode.
+/// They allocate real LuaHeap tables; no Core array stands in for a table.
+const ROOT_GUEST_IMPORTS: &[&str] = &["newtable", "setchild"];
+
+/// Private root transport calls. Their host bodies live in the test; the
+/// lowerer only emits the frame protocol around the existing completion
+/// transport.
+const ROOT_ENTER: &str = "lua_root_enter";
+const ROOT_HANDOFF: &str = "lua_root_handoff";
+const ROOT_FORMAL: &str = "lua_root_formal";
+const ROOT_FINISH: &str = "lua_root_finish";
+
+/// Slots reserved in every root frame: slot 0 receives the handoff payload
+/// while the callee frame is still live; slot 1 receives the formal result of
+/// a `pcall` in that function. Both start empty.
+const ROOT_FRAME_WIDTH: i64 = 2;
+const ROOT_HANDOFF_SLOT: i64 = 0;
+const ROOT_FORMAL_SLOT: i64 = 1;
+
 pub(super) fn lower_source_with(
     source: &str,
     hosts: Option<&HostCallResolver<'_>>,
+) -> Result<FrontendIr, ParseError> {
+    lower_source(source, hosts, false)
+}
+
+/// Private root-handoff entry. Same lexer, parser, resolver, admission
+/// analysis and completion transport as [`lower_source_with`]; the only
+/// addition is the real Lua heap frame protocol around each admitted Lua call.
+/// Production `LuaPlugin` does not call this entry.
+pub(super) fn lower_source_with_roots(
+    source: &str,
+    hosts: Option<&HostCallResolver<'_>>,
+) -> Result<FrontendIr, ParseError> {
+    lower_source(source, hosts, true)
+}
+
+fn lower_source(
+    source: &str,
+    hosts: Option<&HostCallResolver<'_>>,
+    roots: bool,
 ) -> Result<FrontendIr, ParseError> {
     let chunk = parser::parse_chunk(source.as_bytes()).map_err(syntax_error)?;
     let resolution = resolve::resolve(&chunk);
@@ -83,16 +130,33 @@ pub(super) fn lower_source_with(
             ),
         ));
     }
-    let mut lower = Lower::new(source, &resolution, hosts);
+    let mut lower = Lower::new(source, &resolution, hosts, roots);
     lower.analyze(&chunk)?;
-    lower.push_frame(chunk.span, None);
+    let mut pre = Vec::new();
+    let chunk_frame = if roots {
+        let frame = lower.alloc_temp("root_chunk")?;
+        pre.push(Stmt::Let {
+            index: frame,
+            declared_schema: None,
+            expr: lower.root_enter_call()?,
+            line: 1,
+        });
+        Some(frame)
+    } else {
+        None
+    };
+    lower.push_frame(chunk.span, None, chunk_frame);
     let body = lower.lower_block(&chunk.body.stmts)?;
+    let body = match chunk_frame {
+        Some(frame) => lower.root_finish_call(body, frame, 1)?,
+        None => body,
+    };
     lower.pop_frame();
-    let stmts = vec![Stmt::Expr {
+    pre.push(Stmt::Expr {
         expr: body,
         line: 1,
-    }];
-    let mut ir = lower.builder.finish(stmts);
+    });
+    let mut ir = lower.builder.finish(pre);
     ir.implicit_extern_names = Vec::new();
     Ok(ir)
 }
@@ -131,12 +195,16 @@ struct Frame {
     /// Binding of the local function currently being created, if any. A use of
     /// that binding inside its own body would capture a not-yet-assigned slot.
     creating: Option<usize>,
+    /// Core local holding this function's Lua heap root-frame token in the
+    /// private root-handoff mode. `None` in the completion-only mode.
+    root: Option<LocalSlot>,
 }
 
 struct Lower<'a> {
     source: &'a str,
     resolution: &'a Resolution,
     hosts: Option<&'a HostCallResolver<'a>>,
+    roots: bool,
     builder: LocalIrBuilder,
     binding_slots: Vec<Option<LocalSlot>>,
     frames: Vec<Frame>,
@@ -155,12 +223,14 @@ impl<'a> Lower<'a> {
         source: &'a str,
         resolution: &'a Resolution,
         hosts: Option<&'a HostCallResolver<'a>>,
+        roots: bool,
     ) -> Self {
         let count = resolution.bindings.len();
         Self {
             source,
             resolution,
             hosts,
+            roots,
             builder: LocalIrBuilder::new(),
             binding_slots: vec![None; count],
             frames: Vec::new(),
@@ -576,13 +646,14 @@ impl<'a> Lower<'a> {
             .position(|binding| binding.span == name.span && binding.kind == kind)
     }
 
-    fn push_frame(&mut self, span: Span, creating: Option<usize>) {
+    fn push_frame(&mut self, span: Span, creating: Option<usize>, root: Option<LocalSlot>) {
         self.frames.push(Frame {
             span,
             declared: HashSet::new(),
             captures: HashMap::new(),
             capture_copies: Vec::new(),
             creating,
+            root,
         });
     }
 
@@ -694,6 +765,91 @@ impl<'a> Lower<'a> {
         self.builder.alloc_local_named(&name)
     }
 
+    /// Opens one private Lua heap root frame of the fixed width. Emitted only
+    /// by the root-handoff entry; the completion-only entry never calls it.
+    fn root_enter_call(&mut self) -> Result<Expr, ParseError> {
+        self.root_host_call(
+            ROOT_ENTER,
+            vec![Expr::Int(ROOT_FRAME_WIDTH)],
+            Span { start: 0, end: 0 },
+        )
+    }
+
+    /// Resolves one private root transport host call through the same test host
+    /// catalog the guest-visible host imports use. These names never appear in
+    /// a Lua source; they are compiler-emitted frame protocol.
+    fn root_host_call(
+        &mut self,
+        name: &str,
+        args: Vec<Expr>,
+        span: Span,
+    ) -> Result<Expr, ParseError> {
+        let arity = u8::try_from(args.len())
+            .map_err(|_| self.fail(span, "root transport call has too many arguments"))?;
+        self.builder
+            .declare_function(name, Some(arity))
+            .map_err(|error| self.fail(span, error.message))?;
+        let signature = vec![TypeSchema::Unknown; args.len()];
+        let resolver = self.hosts.ok_or_else(|| {
+            self.fail(
+                span,
+                "root transport requires the completion test host catalog",
+            )
+        })?;
+        let resolved = resolver
+            .resolve(name, &signature)
+            .map_err(|error| self.fail(span, format!("root transport resolution: {error}")))?;
+        let index = self
+            .builder
+            .function_index(name)
+            .ok_or_else(|| self.fail(span, "root transport function was not declared"))?;
+        Ok(Expr::Call(
+            index,
+            Vec::new(),
+            args,
+            Some(Box::new(resolved)),
+            None,
+        ))
+    }
+
+    /// Wraps one completed admitted Lua call with the caller-side handoff.
+    /// The callee's Lua root frame is still the top frame here: publishing to
+    /// the parent happens before that frame is retired, inside the host.
+    fn wrap_handoff(&mut self, completion: Expr, span: Span) -> Result<Expr, ParseError> {
+        if !self.roots {
+            return Ok(completion);
+        }
+        let frame = self
+            .frames
+            .last()
+            .and_then(|frame| frame.root)
+            .ok_or_else(|| {
+                self.fail(
+                    span,
+                    "a Lua call cannot hand off without a current root frame",
+                )
+            })?;
+        self.root_host_call(ROOT_HANDOFF, vec![completion, Expr::Var(frame)], span)
+    }
+
+    /// Closes the chunk root frame. Only the chunk uses this: a callee frame
+    /// is retired by its caller's handoff after the parent root is written.
+    fn root_finish_call(
+        &mut self,
+        completion: Expr,
+        frame: LocalSlot,
+        span_start: u32,
+    ) -> Result<Expr, ParseError> {
+        self.root_host_call(
+            ROOT_FINISH,
+            vec![completion, Expr::Var(frame), Expr::Int(ROOT_FORMAL_SLOT)],
+            Span {
+                start: span_start,
+                end: span_start,
+            },
+        )
+    }
+
     // ---- function and statement lowering --------------------------------
 
     fn lower_function(
@@ -701,7 +857,12 @@ impl<'a> Lower<'a> {
         func: &'a FuncBody,
         creating: Option<usize>,
     ) -> Result<ClosureExpr, ParseError> {
-        self.push_frame(func.span, creating);
+        let root = if self.roots {
+            Some(self.alloc_temp("root_frame")?)
+        } else {
+            None
+        };
+        self.push_frame(func.span, creating, root);
         let mut param_slots = Vec::with_capacity(func.params.len());
         for param in &func.params {
             let binding = self
@@ -715,6 +876,18 @@ impl<'a> Lower<'a> {
             param_slots.push(self.declare(binding)?);
         }
         let body = self.lower_block(&func.body.stmts)?;
+        let body = match root {
+            Some(slot) => Expr::Block {
+                stmts: vec![Stmt::Let {
+                    index: slot,
+                    declared_schema: None,
+                    expr: self.root_enter_call()?,
+                    line: self.line(func.span),
+                }],
+                expr: Box::new(body),
+            },
+            None => body,
+        };
         let frame = self.pop_frame();
         Ok(ClosureExpr {
             param_slots,
@@ -854,6 +1027,7 @@ impl<'a> Lower<'a> {
                         expr: value,
                         line,
                     });
+                    let mut formal_slot = None;
                     for (index, name) in names.iter().enumerate() {
                         let binding = self
                             .declaration_binding(&name.name, BindingKind::Local)
@@ -865,6 +1039,34 @@ impl<'a> Lower<'a> {
                             index: slot,
                             declared_schema: None,
                             expr: guarded_get(sequence, index as i64),
+                            line,
+                        });
+                        if index == 1 {
+                            formal_slot = Some(slot);
+                        }
+                    }
+                    if self.roots
+                        && let (Some(err), Some(frame)) =
+                            (formal_slot, self.frames.last().and_then(|frame| frame.root))
+                    {
+                        // The protected result is now in its formal local. Move
+                        // the temp handoff root into the formal frame slot and
+                        // clear the temp slot, both in one host call.
+                        let formal = self.root_host_call(
+                            ROOT_FORMAL,
+                            vec![
+                                Expr::Var(err),
+                                Expr::Var(frame),
+                                Expr::Int(ROOT_HANDOFF_SLOT),
+                                Expr::Int(ROOT_FORMAL_SLOT),
+                            ],
+                            span,
+                        )?;
+                        let discarded = self.alloc_temp("root_formal")?;
+                        pre.push(Stmt::Let {
+                            index: discarded,
+                            declared_schema: None,
+                            expr: formal,
                             line,
                         });
                     }
@@ -1009,7 +1211,8 @@ impl<'a> Lower<'a> {
             LuaExpr::Function { body, .. } => {
                 let closure = self.lower_function(body, None)?;
                 let adapted = self.adapt_arguments(&list.exprs, body.params.len(), *span)?;
-                Ok((CallClass::Lua, Expr::ClosureCall(closure, adapted)))
+                let call = Expr::ClosureCall(closure, adapted);
+                Ok((CallClass::Lua, self.wrap_handoff(call, *span)?))
             }
             other => Err(self.fail(
                 expr_span(other),
@@ -1036,7 +1239,7 @@ impl<'a> Lower<'a> {
                 },
                 None => call,
             };
-            return Ok((CallClass::Lua, value));
+            return Ok((CallClass::Lua, self.wrap_handoff(value, span)?));
         }
         if name.is("pcall") {
             return self.lower_pcall(args, span);
@@ -1044,7 +1247,9 @@ impl<'a> Lower<'a> {
         if name.is("error") {
             return self.lower_error(args, span);
         }
-        if HOST_IMPORTS.iter().any(|host| name.is(host)) {
+        if HOST_IMPORTS.iter().any(|host| name.is(host))
+            || (self.roots && ROOT_GUEST_IMPORTS.iter().any(|host| name.is(host)))
+        {
             return self.lower_host_call(name, args, span);
         }
         Err(self.fail(name.span, "unsupported global call in the completion slice"))
@@ -1127,12 +1332,13 @@ impl<'a> Lower<'a> {
                         },
                         None => call,
                     };
-                    Ok((CallClass::Pcall, value))
+                    Ok((CallClass::Pcall, self.wrap_handoff(value, span)?))
                 }
                 LuaExpr::Function { body, .. } => {
                     let closure = self.lower_function(body, None)?;
                     let adapted = self.adapt_arguments(forwarded, body.params.len(), span)?;
-                    Ok((CallClass::Pcall, Expr::ClosureCall(closure, adapted)))
+                    let call = Expr::ClosureCall(closure, adapted);
+                    Ok((CallClass::Pcall, self.wrap_handoff(call, span)?))
                 }
                 other => Err(self.fail(
                     expr_span(other),

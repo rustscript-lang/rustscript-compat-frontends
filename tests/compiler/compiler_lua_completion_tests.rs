@@ -26,6 +26,9 @@ mod parser;
 #[path = "../../src/frontends/lua/resolve.rs"]
 mod resolve;
 
+#[path = "compiler_lua_completion_tests/root_handoff.rs"]
+mod root_handoff;
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -106,6 +109,37 @@ fn catalog() -> &'static Arc<HostApiCatalog> {
             vec![HostParamSchema::value("label", HostTypeSchema::String)],
             HostTypeSchema::Int,
         ));
+        // Private root-handoff surface. `newtable`/`setchild` are the only
+        // guest-visible names; the `lua_root_*` calls are compiler-emitted.
+        builder.function(HostFunctionSchema::with_return(
+            "newtable",
+            Vec::new(),
+            HostTypeSchema::Unknown,
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            "setchild",
+            vec![
+                HostParamSchema::value("original", HostTypeSchema::Unknown),
+                HostParamSchema::value("child", HostTypeSchema::Unknown),
+            ],
+            HostTypeSchema::Unknown,
+        ));
+        for (name, arity) in [
+            ("lua_root_enter", 1usize),
+            ("lua_root_handoff", 2),
+            ("lua_root_formal", 4),
+            ("lua_root_finish", 3),
+        ] {
+            builder.function(HostFunctionSchema::with_return(
+                name,
+                (0..arity)
+                    .map(|index| {
+                        HostParamSchema::value(format!("arg{index}"), HostTypeSchema::Unknown)
+                    })
+                    .collect(),
+                HostTypeSchema::Unknown,
+            ));
+        }
         Arc::new(builder.build().expect("completion host catalog"))
     })
 }
