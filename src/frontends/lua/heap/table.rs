@@ -266,6 +266,31 @@ struct Slot {
     /// Direct `__mode` edge of a table, if that field is stored. Not a parsed
     /// mode, and not set for field 0 on a closure or cell.
     mode_edge: Option<u32>,
+    /// Write version of the direct `__mode` record. Every store, in-place
+    /// replacement, and unlink bumps it, so a late byte read cannot combine
+    /// bytes from two writes.
+    mode_epoch: u32,
+    /// Generation whose parsed mode is stored for this slot. Zero means no
+    /// parse for the current generation. A reused slot cannot inherit the
+    /// mode of an older generation.
+    mode_generation: u32,
+    /// This table is linked in the saved mark's late-mode parse queue. The
+    /// links live on the slot, so a setter append and a release unlink are
+    /// constant work and allocate nothing.
+    late_mode_epoch: u64,
+    late_mode_prev: Option<u32>,
+    late_mode_next: Option<u32>,
+    /// One coalesced deferred metatable-transition check for this owner.
+    /// `old` is the first tuple and `new` is the latest tuple.
+    late_owner_epoch: u64,
+    late_owner_old: Option<(u32, u32)>,
+    late_owner_new: Option<(u32, u32)>,
+    late_owner_prev: Option<u32>,
+    late_owner_next: Option<u32>,
+    /// Deleted-mode discovery stamp for a slot past the reset-sized sidecar.
+    /// `discover_batch == 0` is unarmed.
+    discover_generation: u32,
+    discover_batch: u32,
     /// Mark epoch in which this owner's ordinary scan opened a weak side.
     /// Zero means no current-cycle weak start; an older epoch is inert. Set on
     /// the target slot only, so a grown slot needs no vector entry.
@@ -377,6 +402,17 @@ struct Edge {
 struct EdgeSlot {
     next: Option<u32>,
     edge: Option<Edge>,
+    /// The saved mark has one deferred late-mode check for this record.
+    /// A new write updates this record in place; an unlink removes it.
+    late_epoch: u64,
+    late_owner: u32,
+    /// Latest table value written through this edge while the mode is
+    /// pending. Only this target is offered after the parse.
+    late_value: Option<(u32, u32)>,
+    /// Table-object key of a new key insertion while the mode is pending.
+    late_key: Option<(u32, u32)>,
+    late_prev: Option<u32>,
+    late_next: Option<u32>,
 }
 
 enum EdgeValue {
@@ -699,11 +735,30 @@ pub struct ScanMeter {
     /// a slot walk and not a pulse unit.
     pub mode_cache_updates: u64,
     /// Direct `__mode` strings written on tables allocated after the indexed
-    /// cache was sized. One per metatable per mark; a repeat value on the same
-    /// generation reuses the pending marker. This is the setter-side append
-    /// only: the cache grow and the bytes read are `weak_modes_inited` and
-    /// `weak_mode_bytes`.
+    /// cache was sized. One per metatable slot linked into the late parse
+    /// queue; a repeat write on the same slot reuses the queued marker and is
+    /// `mode_late_cancels`. This is the setter-side append only: bytes and
+    /// parsed stores are `weak_mode_bytes` and `mode_late_parsed`.
     pub mode_late_registrations: u64,
+    /// O(1) slot/edge identity reads that route a setter or barrier through
+    /// the late window. Not a pulse unit.
+    pub mode_late_lookups: u64,
+    /// A write replaced or unlinked a direct `__mode` record whose slot was
+    /// already queued; the queued parse restarts from the new bytes. Not a
+    /// pulse unit and not a second registration.
+    pub mode_late_cancels: u64,
+    /// Parsed late modes stored for one metatable slot generation. One per
+    /// completed read, not one per indexed vector slot. No suffix is grown and
+    /// no indexed prefix is copied; the record-keyed store moves no vector.
+    pub mode_late_parsed: u64,
+    /// New deferred owner checks or edge writes. Bounded by owner slots and
+    /// edge records, never by mutation count.
+    pub mode_late_events: u64,
+    /// A repeat write updated an existing deferred owner check or edge write
+    /// in place. This is the coalescing path that keeps the backlog bounded.
+    pub mode_late_event_reuses: u64,
+    /// Deferred owner checks and edge writes consumed after every parse.
+    pub mode_late_deferred: u64,
     pub scratch: ScanScratch,
 }
 
@@ -761,6 +816,9 @@ pub(super) struct DoomedToken {
 /// parses again. It is not stored on the heap.
 pub(super) struct MarkSnapshot {
     modes: Option<Vec<WeakMode>>,
+    /// Late parsed modes outside the reset-sized `modes` vector, keyed by
+    /// metatable slot with the generation that owned the parse.
+    late_modes: std::collections::BTreeMap<u32, (u32, WeakMode)>,
 }
 
 /// Doomed host tokens, plus the modes sweep needs after those tokens close.
@@ -983,6 +1041,18 @@ impl LuaHeap {
         slot.edge_head = None;
         slot.edge_tail = None;
         slot.mode_edge = None;
+        slot.mode_epoch = 0;
+        slot.mode_generation = 0;
+        slot.late_mode_epoch = 0;
+        slot.late_mode_prev = None;
+        slot.late_mode_next = None;
+        slot.late_owner_epoch = 0;
+        slot.late_owner_old = None;
+        slot.late_owner_new = None;
+        slot.late_owner_prev = None;
+        slot.late_owner_next = None;
+        slot.discover_generation = 0;
+        slot.discover_batch = 0;
         slot.rescan_epoch = 0;
         slot.rescan_queued = false;
         slot.rescan_prev = None;
@@ -1002,6 +1072,18 @@ impl LuaHeap {
             edge_head: None,
             edge_tail: None,
             mode_edge: None,
+            mode_epoch: 0,
+            mode_generation: 0,
+            late_mode_epoch: 0,
+            late_mode_prev: None,
+            late_mode_next: None,
+            late_owner_epoch: 0,
+            late_owner_old: None,
+            late_owner_new: None,
+            late_owner_prev: None,
+            late_owner_next: None,
+            discover_generation: 0,
+            discover_batch: 0,
             rescan_epoch: 0,
             rescan_queued: false,
             rescan_prev: None,
@@ -2038,11 +2120,12 @@ impl LuaHeap {
         self.note_mode_pointer(from_slot, index);
         self.note_edge_peak();
         if let Some((slot, generation)) = barrier {
-            self.barrier_strong_field(from_slot, slot, generation);
+            self.barrier_strong_field(from_slot, index, Some((slot, generation)));
         }
         if let Some(insert) = table_key {
             self.barrier_new_table_key(
                 from_slot,
+                index,
                 insert.key_slot,
                 insert.key_generation,
                 insert.value,
@@ -3118,6 +3201,8 @@ impl LuaHeap {
         );
         let mark = self.mark.as_mut();
         mark::release_rescan_slot(mark, &mut self.slots, index);
+        let mark = self.mark.as_mut();
+        mark::release_late_slot(mark, &mut self.slots, index);
         if self.slots[index as usize].metatable.take().is_some() {
             self.metatable_edges = self.metatable_edges.saturating_sub(1);
         }
@@ -3127,6 +3212,10 @@ impl LuaHeap {
         slot.edge_head = None;
         slot.edge_tail = None;
         slot.mode_edge = None;
+        slot.mode_epoch = 0;
+        slot.mode_generation = 0;
+        slot.discover_generation = 0;
+        slot.discover_batch = 0;
         if slot.generation >= self.limits.max_generation {
             slot.state = SlotState::Retired;
             return;
@@ -3242,6 +3331,12 @@ impl LuaHeap {
         self.edge_slots.push(EdgeSlot {
             next: None,
             edge: None,
+            late_epoch: 0,
+            late_owner: 0,
+            late_value: None,
+            late_key: None,
+            late_prev: None,
+            late_next: None,
         });
         index
     }
@@ -3292,6 +3387,8 @@ impl LuaHeap {
         }
         if cleared_mode {
             self.slots[owner as usize].mode_edge = None;
+            self.slots[owner as usize].mode_epoch =
+                self.slots[owner as usize].mode_epoch.wrapping_add(1);
         }
         self.free_edge_record(index);
         if cleared_mode {
@@ -3300,6 +3397,7 @@ impl LuaHeap {
     }
 
     fn free_edge_record(&mut self, index: u32) {
+        mark::release_late_edge(self.mark.as_mut(), &mut self.edge_slots, index);
         let edge = self.edge_slots[index as usize]
             .edge
             .take()
@@ -3342,8 +3440,8 @@ impl LuaHeap {
             _ => {}
         }
         self.note_mode_pointer(owner, index);
-        if let Some((slot, generation)) = barrier {
-            self.barrier_strong_field(owner, slot, generation);
+        if self.mark.is_some() {
+            self.barrier_strong_field(owner, index, barrier);
         }
     }
 
@@ -3371,7 +3469,9 @@ impl LuaHeap {
         );
         if is_table && is_mode {
             self.slots[owner as usize].mode_edge = Some(index);
-            self.note_late_mode_write(owner, index);
+            self.slots[owner as usize].mode_epoch =
+                self.slots[owner as usize].mode_epoch.wrapping_add(1);
+            self.note_late_mode_write(owner);
         }
     }
 }

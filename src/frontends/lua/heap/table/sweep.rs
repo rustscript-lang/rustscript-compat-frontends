@@ -49,6 +49,9 @@ struct SweepSlot {
     marked: bool,
     kind: HandleKind,
     generation: u32,
+    /// Generation whose parsed mode this slot held when the mark finished.
+    /// A metatable reused after that parse does not inherit the old mode.
+    mode_generation: u32,
 }
 
 enum SweepPhase {
@@ -501,6 +504,7 @@ impl<'a> SweepSession<'a> {
             marked: matches!(slot.state, SlotState::Live { marked: true }),
             kind: slot.kind,
             generation: slot.generation,
+            mode_generation: slot.mode_generation,
         });
         self.heap.scan.node_slot_visits += 1;
         self.heap.scan.scratch.sweep_bitmap_inited += 1;
@@ -537,9 +541,6 @@ impl<'a> SweepSession<'a> {
     }
 
     fn weak_values(&self, owner: usize) -> bool {
-        let Some(modes) = self.modes.modes.as_ref() else {
-            return false;
-        };
         let found = &self.snapshot[owner];
         if !found.marked || found.kind != HandleKind::Table {
             return false;
@@ -553,7 +554,17 @@ impl<'a> SweepSession<'a> {
         if !mt.marked || mt.kind != HandleKind::Table || mt.generation != mt_generation {
             return false;
         }
-        modes.get(mt_slot as usize).is_some_and(|mode| mode.values)
+        if let Some((generation, mode)) = self.modes.late_modes.get(&mt_slot) {
+            return *generation == mt_generation && mode.values;
+        }
+        if mt.mode_generation != mt_generation {
+            return false;
+        }
+        self.modes
+            .modes
+            .as_ref()
+            .and_then(|modes| modes.get(mt_slot as usize))
+            .is_some_and(|mode| mode.values)
     }
 
     fn step_edge(&mut self) -> bool {

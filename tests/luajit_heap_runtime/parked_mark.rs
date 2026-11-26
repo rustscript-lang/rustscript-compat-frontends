@@ -12158,6 +12158,7 @@ fn shared_mode_delete_parsed_grown_metatable_rescans_owners() {
         let mut mt_copy = None;
         let mut cache_updates_before = 0u64;
         let mut discover_writes_before = 0u64;
+        let mut schedules_before_delete = 0u64;
         resume_weak(&mut host, |parked| {
             pause_after_both_weak_edges(parked, &graph);
             let mt = grow_one_table(parked);
@@ -12198,6 +12199,22 @@ fn shared_mode_delete_parsed_grown_metatable_rescans_owners() {
                 parked.with_saved_heap(|heap| heap.named_value(mt, "__mode")),
                 Ok(Value::string("v"))
             );
+            let schedules_before = parked.meter().owner_rescan_schedules;
+            let deferred_before = parked.meter().mode_late_deferred;
+            pulse_until_late_quiet(parked);
+            assert_eq!(
+                parked.meter().owner_rescan_schedules,
+                schedules_before,
+                "the deferred v -> v owner checks must not schedule a strong rescan"
+            );
+            assert_eq!(
+                parked.meter().mode_late_deferred - deferred_before,
+                2,
+                "both deferred owner checks finished while the metatable was still v"
+            );
+            assert!(!parked.marked(graph.left_value));
+            assert!(!parked.marked(graph.right_value));
+            schedules_before_delete = schedules_before;
             cache_updates_before = parked.meter().mode_cache_updates;
             discover_writes_before = parked.meter().mode_discover_writes;
             parked
@@ -12244,7 +12261,11 @@ fn shared_mode_delete_parsed_grown_metatable_rescans_owners() {
                 meter.owner_rescan_heads >= 2,
                 "both owners were rescanned; the probe may revisit a slot already rescheduled by the late check"
             );
-            assert!(meter.owner_rescan_schedules >= 2);
+            assert_eq!(
+                meter.owner_rescan_schedules,
+                schedules_before_delete + 2,
+                "the discovery probe schedules each intended owner exactly once"
+            );
             assert_eq!(meter.mode_cache_updates, cache_updates_before + 1);
             assert_eq!(meter.mode_discover_writes, discover_writes_before + 1);
             Ok(())
@@ -12321,6 +12342,11 @@ fn run_grown_long_mode(mode: &str, expect_weak: bool) {
                 "the setter registers exactly one late metatable"
             );
             assert_eq!(
+                setter.mode_late_events,
+                before.mode_late_events + 2,
+                "each already-scanned owner gets one deferred transition check"
+            );
+            assert_eq!(
                 setter.outgoing_edge_checks, before.outgoing_edge_checks,
                 "the setter must not scan an edge"
             );
@@ -12341,6 +12367,8 @@ fn run_grown_long_mode(mode: &str, expect_weak: bool) {
                     after.scratch.mode_discover_inited - before_pulse.scratch.mode_discover_inited;
                 let registered =
                     after.mode_late_registrations - before_pulse.mode_late_registrations;
+                let parsed = after.mode_late_parsed - before_pulse.mode_late_parsed;
+                let deferred = after.mode_late_deferred - before_pulse.mode_late_deferred;
                 let edges = after.outgoing_edge_checks - before_pulse.outgoing_edge_checks;
                 let heads = after.owner_head_checks - before_pulse.owner_head_checks;
                 assert!(
@@ -12348,9 +12376,11 @@ fn run_grown_long_mode(mode: &str, expect_weak: bool) {
                         && inited <= 1
                         && discover <= 1
                         && registered <= 1
+                        && parsed <= 1
+                        && deferred <= 1
                         && edges <= 1
                         && heads <= 1,
-                    "pulse {pulses} exceeded budget 1: bytes={bytes} init={inited} discover={discover} registered={registered} edges={edges} heads={heads}"
+                    "pulse {pulses} exceeded budget 1: bytes={bytes} init={inited} discover={discover} registered={registered} parsed={parsed} deferred={deferred} edges={edges} heads={heads}"
                 );
                 assert_eq!(after.sweep_edge_checks, 0, "a pulse must not sweep");
                 if after.weak_mode_bytes - before.weak_mode_bytes >= expected_bytes {
@@ -12374,13 +12404,18 @@ fn run_grown_long_mode(mode: &str, expect_weak: bool) {
             );
             assert_eq!(
                 after.scratch.weak_modes_inited - before.scratch.weak_modes_inited,
-                1,
-                "only the grown slot is initialized"
+                0,
+                "the late parse must not grow the indexed mode cache"
             );
             assert_eq!(
                 after.scratch.mode_discover_inited - before.scratch.mode_discover_inited,
+                0,
+                "the late parse must not grow the discovery sidecar"
+            );
+            assert_eq!(
+                after.mode_late_parsed - before.mode_late_parsed,
                 1,
-                "only one discovery slot is initialized"
+                "one parsed late slot is stored outside the reset-sized vector"
             );
             assert!(
                 parked.with_saved_heap(|heap| heap.locate_named(mt.slot(), "__mode").is_some()),
@@ -12453,8 +12488,8 @@ fn run_grown_long_mode(mode: &str, expect_weak: bool) {
             );
             assert_eq!(
                 meter.scratch.weak_modes_inited - inited_before_total,
-                1,
-                "no grown-suffix slot is initialized in bulk"
+                0,
+                "no indexed slot is initialized by the late parse or sweep"
             );
             Ok(())
         })
@@ -12465,12 +12500,926 @@ fn run_grown_long_mode(mode: &str, expect_weak: bool) {
 /// Three real long modes on the same fixture. `pad .. v` and `pad .. v .. NUL`
 /// must clear (v before any NUL); `pad .. NUL .. v` must keep (the NUL ends the
 /// interpretation). The field bytes stay exact in all three. The per-pulse
-/// checks in `run_grown_long_mode` bound the late reader to one byte, one cache
-/// slot, one discovery slot, one registration, one edge, and one head.
+/// checks in `run_grown_long_mode` bound the late reader to one byte, one
+/// parsed store, one deferred event, one registration, one edge, and one head,
+/// and prove the late path does not grow the reset-sized index vectors.
 #[test]
 fn shared_mode_keep_grown_metatable_long_v_tail_is_budgeted() {
     let pad = "x".repeat(LONG_MODE_PAD);
     run_grown_long_mode(&format!("{pad}v"), true);
     run_grown_long_mode(&format!("{pad}v\0"), true);
     run_grown_long_mode(&format!("{pad}\0v"), false);
+}
+
+// ---------------------------------------------------------------------------
+// Follow-up review: in-place `__mode` rewrites, owner transition, root batch,
+// bounded late work, and deferred identity.
+// ---------------------------------------------------------------------------
+
+/// Drive one late parse with budget one until it has read exactly `want`
+/// bytes. A late read never charges more than one byte per pulse.
+fn pulse_until_late_bytes(parked: &mut ParkedMark<'_>, base: u64, want: u64) {
+    let mut pulses = 0u32;
+    while parked.meter().weak_mode_bytes - base < want {
+        let view = parked.pulse(1);
+        assert!(
+            !view.finished,
+            "the cycle finished before the late read reached {want} bytes"
+        );
+        pulses += 1;
+        assert!(pulses < 512, "the late read did not reach {want} bytes");
+    }
+    assert_eq!(
+        parked.meter().weak_mode_bytes - base,
+        want,
+        "one late byte per pulse"
+    );
+}
+
+/// Run the saved mark until the late window has no mode or deferred work
+/// left. The pulse that leaves the window also spends its unit on the
+/// resumed roots/gray step, so the caller must not expect a byte count.
+fn pulse_until_late_quiet(parked: &mut ParkedMark<'_>) {
+    let mut pulses = 0u32;
+    while parked.phase_name() == "mode-late" {
+        let view = parked.pulse(1);
+        assert!(!view.finished, "the cycle finished inside the late window");
+        pulses += 1;
+        assert!(pulses < 512, "the late window did not become quiet");
+    }
+}
+
+fn attach_shared_metatable(parked: &mut ParkedMark<'_>, graph: &SharedModeGraph, mt: TableRef) {
+    parked
+        .with_saved_heap(|heap| -> Result<(), HeapError> {
+            heap.set_metatable(graph.left, Some(mt))?;
+            heap.set_metatable(graph.right, Some(mt))?;
+            Ok(())
+        })
+        .expect("attach both owners");
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RewriteWhen {
+    None,
+    BeforePulse,
+    AfterFirstByte,
+    AfterQuiet,
+    UnlinkReinsert,
+}
+
+/// One real grown metatable, one in-place `__mode` rewrite at the requested
+/// phase, and the end-of-cycle outcome for both original graphs.
+fn run_rewrite_arm(
+    label: &'static str,
+    initial: &'static str,
+    rewritten: &'static str,
+    when: RewriteWhen,
+    expect_weak: bool,
+) {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits(20, 8, 32)).expect("install");
+        let graph = heap::with_heap(&mut host, plant_shared_mode_graph).expect("plant");
+        heap::open_fixed_step(&mut host).expect("open");
+        let mut mt_copy = None;
+        let mut bytes_before_rewrite = 0u64;
+        resume_weak(&mut host, |parked| {
+            pause_after_both_weak_edges(parked, &graph);
+            let mt = grow_one_table(parked);
+            parked
+                .with_saved_heap(|heap| heap.set_mode_scalar(mt, Value::string(initial)))
+                .expect("write the initial raw __mode");
+            attach_shared_metatable(parked, &graph, mt);
+            let base = parked.meter().weak_mode_bytes;
+            match when {
+                RewriteWhen::None | RewriteWhen::BeforePulse => {}
+                RewriteWhen::AfterFirstByte | RewriteWhen::UnlinkReinsert => {
+                    pulse_until_late_bytes(parked, base, 1);
+                    assert_eq!(
+                        parked.phase_name(),
+                        "mode-late",
+                        "{label}: the rewrite must land in the in-flight parse"
+                    );
+                }
+                RewriteWhen::AfterQuiet => {
+                    pulse_until_late_bytes(parked, base, long_mode_read_bytes(initial));
+                    pulse_until_late_quiet(parked);
+                    assert_ne!(
+                        parked.phase_name(),
+                        "mode-late",
+                        "{label}: the first parse must be cached before the rewrite"
+                    );
+                }
+            }
+            bytes_before_rewrite = parked.meter().weak_mode_bytes;
+            let registrations_before_rewrite = parked.meter().mode_late_registrations;
+            let old_record = parked
+                .with_saved_heap(|heap| heap.locate_named(mt.slot(), "__mode"))
+                .expect("the initial mode record");
+            match when {
+                RewriteWhen::None => {}
+                RewriteWhen::UnlinkReinsert => {
+                    parked
+                        .with_saved_heap(|heap| -> Result<(), HeapError> {
+                            heap.set_mode_scalar(mt, Value::Null)?;
+                            assert!(
+                                heap.locate_named(mt.slot(), "__mode").is_none(),
+                                "{label}: the first record must really unlink"
+                            );
+                            heap.set_mode_scalar(mt, Value::string(rewritten))
+                        })
+                        .expect("unlink and reinsert the raw __mode");
+                }
+                _ => {
+                    parked
+                        .with_saved_heap(|heap| heap.set_mode_scalar(mt, Value::string(rewritten)))
+                        .expect("rewrite the same raw __mode record");
+                    let new_record = parked
+                        .with_saved_heap(|heap| heap.locate_named(mt.slot(), "__mode"))
+                        .expect("the rewritten mode record");
+                    assert_eq!(
+                        new_record, old_record,
+                        "{label}: an in-place rewrite keeps the same record index"
+                    );
+                }
+            }
+            assert_eq!(
+                parked.with_saved_heap(|heap| heap.named_value(mt, "__mode")),
+                Ok(Value::string(rewritten)),
+                "{label}: the stored field carries the final bytes"
+            );
+            if matches!(when, RewriteWhen::AfterQuiet) {
+                assert_eq!(
+                    parked.meter().mode_late_registrations,
+                    registrations_before_rewrite,
+                    "{label}: a cached mode rewrite does not queue a second parse"
+                );
+                assert_eq!(
+                    parked.meter().weak_mode_bytes,
+                    bytes_before_rewrite,
+                    "{label}: a cached mode rewrite does not read the new bytes in this cycle"
+                );
+            }
+            mt_copy = Some(mt);
+        });
+        finish_shared_mode_cycle(&mut host);
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            let mt = mt_copy.expect("grown metatable");
+            assert_eq!(
+                heap.named_value(mt, "__mode"),
+                Ok(Value::string(rewritten)),
+                "{label}: the final field bytes survive the cycle"
+            );
+            let outcome = read_shared_mode_outcome(heap, &graph)?;
+            let cases = (
+                outcome.left_value,
+                outcome.left_child,
+                outcome.right_value,
+                outcome.right_child,
+            );
+            if expect_weak {
+                assert_eq!(
+                    cases,
+                    (false, false, false, false),
+                    "{label}: a value-weak final mode must clear both original graphs"
+                );
+                assert_eq!(outcome.left_edge, None, "{label}: left subj cleared");
+                assert_eq!(outcome.right_edge, None, "{label}: right subj cleared");
+            } else {
+                assert_eq!(
+                    cases,
+                    (true, true, true, true),
+                    "{label}: a strong final mode must keep both original graphs and successors"
+                );
+                assert_eq!(
+                    outcome.left_edge,
+                    Some(graph.left_value),
+                    "{label}: left subj kept"
+                );
+                assert_eq!(
+                    outcome.right_edge,
+                    Some(graph.right_value),
+                    "{label}: right subj kept"
+                );
+            }
+            assert!(
+                !outcome.orphan,
+                "{label}: the independent weak observer still clears its orphan"
+            );
+            assert_eq!(
+                heap.scan_meter().weak_mode_bytes - bytes_before_rewrite,
+                if matches!(when, RewriteWhen::AfterQuiet) {
+                    0
+                } else {
+                    long_mode_read_bytes(rewritten)
+                },
+                "{label}: the reader stops at the first NUL or at the final byte"
+            );
+            Ok(())
+        })
+        .expect("rewrite arm");
+    });
+}
+
+#[test]
+fn shared_mode_rewrite_vx_to_x_after_first_byte_keeps_both_graphs() {
+    run_rewrite_arm(
+        "vx -> x after the first byte",
+        "vx",
+        "x",
+        RewriteWhen::AfterFirstByte,
+        false,
+    );
+}
+
+#[test]
+fn shared_mode_rewrite_xx_to_vx_after_first_byte_clears_both_graphs() {
+    run_rewrite_arm(
+        "xx -> vx after the first byte",
+        "xx",
+        "vx",
+        RewriteWhen::AfterFirstByte,
+        true,
+    );
+}
+
+#[test]
+fn shared_mode_rewrite_vx_to_x_nul_v_after_first_byte_keeps_both_graphs() {
+    run_rewrite_arm(
+        "vx -> x NUL v after the first byte",
+        "vx",
+        "x\0v",
+        RewriteWhen::AfterFirstByte,
+        false,
+    );
+}
+
+#[test]
+fn shared_mode_rewrite_xx_to_vx_before_the_first_byte_clears_both_graphs() {
+    run_rewrite_arm(
+        "xx -> vx before the first byte",
+        "xx",
+        "vx",
+        RewriteWhen::BeforePulse,
+        true,
+    );
+}
+
+#[test]
+fn shared_mode_unlink_reinsert_x_after_first_byte_keeps_both_graphs() {
+    run_rewrite_arm(
+        "vx unlink reinsert x after the first byte",
+        "vx",
+        "x",
+        RewriteWhen::UnlinkReinsert,
+        false,
+    );
+}
+
+#[test]
+fn shared_mode_rewrite_cached_v_to_x_keeps_the_cached_weak_mode() {
+    run_rewrite_arm("cached v -> x", "v", "x", RewriteWhen::AfterQuiet, true);
+}
+
+#[test]
+fn shared_mode_grown_xx_metatable_keeps_both_graphs() {
+    run_rewrite_arm(
+        "grown xx without rewrite",
+        "xx",
+        "xx",
+        RewriteWhen::None,
+        false,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Owner transition through an unresolved weak metatable.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug)]
+enum TransitionArm {
+    DirectStrong,
+    LateOnly,
+    LateThenStrong,
+}
+
+fn run_owner_transition(arm: TransitionArm) {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits(20, 8, 32)).expect("install");
+        let graph = heap::with_heap(&mut host, plant_shared_mode_graph).expect("plant");
+        heap::open_fixed_step(&mut host).expect("open");
+        let mut final_mt = None;
+        resume_weak(&mut host, |parked| {
+            pause_after_both_weak_edges(parked, &graph);
+            let mt = match arm {
+                TransitionArm::DirectStrong => {
+                    attach_shared_metatable(parked, &graph, graph.strong_mt);
+                    graph.strong_mt
+                }
+                TransitionArm::LateOnly | TransitionArm::LateThenStrong => {
+                    let late = grow_one_table(parked);
+                    parked
+                        .with_saved_heap(|heap| heap.set_mode_scalar(late, Value::string("v")))
+                        .expect("write the late v");
+                    attach_shared_metatable(parked, &graph, late);
+                    if matches!(arm, TransitionArm::LateThenStrong) {
+                        parked
+                            .with_saved_heap(|heap| -> Result<(), HeapError> {
+                                heap.set_metatable(graph.left, Some(graph.strong_mt))?;
+                                heap.set_metatable(graph.right, Some(graph.strong_mt))?;
+                                Ok(())
+                            })
+                            .expect("move off the unresolved weak metatable before any pulse");
+                    }
+                    late
+                }
+            };
+            final_mt = Some(if matches!(arm, TransitionArm::LateOnly) {
+                mt
+            } else {
+                graph.strong_mt
+            });
+            assert_eq!(parked.metatable(graph.left), Ok(final_mt));
+            assert_eq!(parked.metatable(graph.right), Ok(final_mt));
+        });
+        finish_shared_mode_cycle(&mut host);
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            let mt = final_mt.expect("final metatable");
+            assert_eq!(heap.metatable(graph.left)?, Some(mt));
+            assert_eq!(heap.metatable(graph.right)?, Some(mt));
+            let outcome = read_shared_mode_outcome(heap, &graph)?;
+            let cases = (
+                outcome.left_value,
+                outcome.left_child,
+                outcome.right_value,
+                outcome.right_child,
+            );
+            match arm {
+                TransitionArm::DirectStrong | TransitionArm::LateThenStrong => {
+                    assert_eq!(
+                        cases,
+                        (true, true, true, true),
+                        "{arm:?}: the final strong metatable keeps both original graphs"
+                    );
+                    assert_eq!(outcome.left_edge, Some(graph.left_value));
+                    assert_eq!(outcome.right_edge, Some(graph.right_value));
+                }
+                TransitionArm::LateOnly => {
+                    assert_eq!(
+                        cases,
+                        (false, false, false, false),
+                        "{arm:?}: the single late weak transition stays weak"
+                    );
+                    assert_eq!(outcome.left_edge, None);
+                    assert_eq!(outcome.right_edge, None);
+                }
+            }
+            assert!(!outcome.orphan, "{arm:?}: the independent orphan clears");
+            Ok(())
+        })
+        .expect("transition arm");
+    });
+}
+
+#[test]
+fn shared_mode_owner_weak_late_then_strong_keeps_both_graphs() {
+    run_owner_transition(TransitionArm::LateThenStrong);
+}
+
+#[test]
+fn shared_mode_owner_weak_late_only_clears_both_graphs() {
+    run_owner_transition(TransitionArm::LateOnly);
+}
+
+#[test]
+fn shared_mode_owner_direct_strong_keeps_both_graphs() {
+    run_owner_transition(TransitionArm::DirectStrong);
+}
+
+// ---------------------------------------------------------------------------
+// Safepoint root batch at an active late-mode byte.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug)]
+enum BatchArm {
+    WithBatch,
+    WithoutBatch,
+    StaleRejected,
+}
+
+fn run_late_root_batch(arm: BatchArm) {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits(24, 8, 40)).expect("install");
+        let graph = heap::with_heap(&mut host, plant_shared_mode_graph).expect("plant");
+        heap::open_fixed_step(&mut host).expect("open");
+        let mut target_copy = None;
+        resume_weak(&mut host, |parked| {
+            pause_after_both_weak_edges(parked, &graph);
+            let target = grow_one_table(parked);
+            let mt = grow_one_table(parked);
+            parked
+                .with_saved_heap(|heap| heap.set_mode_scalar(mt, Value::string("vv")))
+                .expect("write the late mode");
+            attach_shared_metatable(parked, &graph, mt);
+            assert!(!parked.marked(target), "the batch target starts white");
+            let base = parked.meter().weak_mode_bytes;
+            pulse_until_late_bytes(parked, base, 1);
+            assert_eq!(parked.phase_name(), "mode-late");
+            match arm {
+                BatchArm::WithBatch => {
+                    let before = parked.meter();
+                    let view = parked
+                        .pulse_with_root_batch(1, &[super::Rooted::Table(target)])
+                        .expect("a live white target is a valid batch");
+                    assert_eq!(
+                        view.meter.parked_root_batch_accepts,
+                        before.parked_root_batch_accepts + 1,
+                        "the same call accepts the submitted root once"
+                    );
+                    assert_eq!(
+                        view.meter.weak_mode_bytes,
+                        before.weak_mode_bytes + 1,
+                        "the late byte is the unit this pulse charged"
+                    );
+                    assert!(
+                        parked.marked(target),
+                        "the accepted target is marked in the same call, before any gray step"
+                    );
+                }
+                BatchArm::WithoutBatch => {
+                    let before = parked.meter();
+                    let view = parked.pulse(1);
+                    assert_eq!(
+                        view.meter.weak_mode_bytes,
+                        before.weak_mode_bytes + 1,
+                        "the late byte is the ordinary unit"
+                    );
+                    assert!(
+                        !parked.marked(target),
+                        "an unsubmitted white target stays white"
+                    );
+                }
+                BatchArm::StaleRejected => {
+                    let stale = grow_one_table(parked);
+                    parked
+                        .with_saved_heap(|heap| heap.rollback(stale))
+                        .expect("rollback the stale target");
+                    let before = parked.meter();
+                    let phase = parked.phase_name();
+                    let error =
+                        match parked.pulse_with_root_batch(1, &[super::Rooted::Table(stale)]) {
+                            Ok(_) => panic!("a stale root batch must be refused"),
+                            Err(error) => error,
+                        };
+                    assert_eq!(error, HeapError::StaleHandle);
+                    assert_eq!(
+                        parked.meter().weak_mode_bytes,
+                        before.weak_mode_bytes,
+                        "a refused batch does not spend the byte unit"
+                    );
+                    assert_eq!(
+                        parked.meter().parked_root_batch_accepts,
+                        before.parked_root_batch_accepts,
+                        "a refused batch does not count as accepted"
+                    );
+                    assert_eq!(
+                        parked.phase_name(),
+                        phase,
+                        "a refusal does not move the phase"
+                    );
+                    let view = parked.pulse(1);
+                    assert!(!view.finished);
+                }
+            }
+            target_copy = Some(target);
+        });
+        finish_shared_mode_cycle(&mut host);
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            let target = target_copy.expect("batch target");
+            match arm {
+                BatchArm::WithBatch => {
+                    assert!(
+                        heap.alive(target),
+                        "the accepted root survives without repeating the batch"
+                    );
+                }
+                BatchArm::WithoutBatch | BatchArm::StaleRejected => {
+                    assert!(!heap.alive(target), "an unaccepted white target clears");
+                }
+            }
+            let outcome = read_shared_mode_outcome(heap, &graph)?;
+            assert_eq!(
+                (
+                    outcome.left_value,
+                    outcome.left_child,
+                    outcome.right_value,
+                    outcome.right_child,
+                ),
+                (false, false, false, false),
+                "{arm:?}: the late v clears both original graphs"
+            );
+            assert!(!outcome.orphan);
+            Ok(())
+        })
+        .expect("batch arm");
+    });
+}
+
+#[test]
+fn shared_mode_root_batch_during_late_byte_marks_target_once() {
+    run_late_root_batch(BatchArm::WithBatch);
+}
+
+#[test]
+fn shared_mode_root_batch_absent_during_late_byte_leaves_target_white() {
+    run_late_root_batch(BatchArm::WithoutBatch);
+}
+
+#[test]
+fn shared_mode_root_batch_stale_during_late_byte_is_refused() {
+    run_late_root_batch(BatchArm::StaleRejected);
+}
+
+// ---------------------------------------------------------------------------
+// Bounded late work: repeated writes on one live edge, deferred identity.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn shared_mode_rewrite_one_live_edge_keeps_only_the_latest_value() {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits(24, 8, 40)).expect("install");
+        let graph = heap::with_heap(&mut host, plant_shared_mode_graph).expect("plant");
+        heap::open_fixed_step(&mut host).expect("open");
+        let mut values = None;
+        resume_weak(&mut host, |parked| {
+            pause_after_both_weak_edges(parked, &graph);
+            let mt = grow_one_table(parked);
+            parked
+                .with_saved_heap(|heap| heap.set_mode_scalar(mt, Value::string("x")))
+                .expect("write the pending strong mode");
+            attach_shared_metatable(parked, &graph, mt);
+            let first = grow_one_table(parked);
+            let second = grow_one_table(parked);
+            let last = grow_one_table(parked);
+            for value in [first, second, last] {
+                assert!(!parked.marked(value));
+            }
+            let live_edges = parked.stats().live_edges;
+            let events_before = parked.meter().mode_late_events;
+            let reuses_before = parked.meter().mode_late_event_reuses;
+            parked
+                .with_saved_heap(|heap| -> Result<(), HeapError> {
+                    heap.set_named_edge(graph.left, "subj", first)?;
+                    assert_eq!(
+                        heap.stats().live_edges,
+                        live_edges,
+                        "first overwrite keeps one edge"
+                    );
+                    heap.set_named_edge(graph.left, "subj", second)?;
+                    assert_eq!(
+                        heap.stats().live_edges,
+                        live_edges,
+                        "second overwrite keeps one edge"
+                    );
+                    heap.set_named_edge(graph.left, "subj", last)?;
+                    assert_eq!(
+                        heap.stats().live_edges,
+                        live_edges,
+                        "third overwrite keeps one edge"
+                    );
+                    Ok(())
+                })
+                .expect("overwrite the same live edge three times");
+            assert_eq!(
+                parked.meter().mode_late_events - events_before,
+                1,
+                "one live edge keeps one deferred site"
+            );
+            assert_eq!(
+                parked.meter().mode_late_event_reuses - reuses_before,
+                2,
+                "the later overwrites update that site in place"
+            );
+            assert_eq!(
+                parked.with_saved_heap(|heap| heap.named_edge(graph.left, "subj")),
+                Ok(Some(last))
+            );
+            values = Some((first, second, last));
+        });
+        finish_shared_mode_cycle(&mut host);
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            let (first, second, last) = values.expect("written values");
+            assert!(
+                heap.alive(last),
+                "the live final value on a strong owner edge survives"
+            );
+            assert!(
+                !heap.alive(first),
+                "an overwritten value must not be retained by a deferred replay"
+            );
+            assert!(
+                !heap.alive(second),
+                "an overwritten value must not be retained by a deferred replay"
+            );
+            assert_eq!(heap.named_edge(graph.left, "subj")?, Some(last));
+            assert!(heap.alive(graph.right_value) && heap.alive(graph.right_child));
+            assert!(!heap.alive(graph.orphan));
+            Ok(())
+        })
+        .expect("live-edge rewrite");
+    });
+}
+
+#[test]
+fn shared_mode_late_work_is_slot_keyed_and_coalesced() {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits(40, 8, 64)).expect("install");
+        let graph = heap::with_heap(&mut host, plant_shared_mode_graph).expect("plant");
+        heap::open_fixed_step(&mut host).expect("open");
+        resume_weak(&mut host, |parked| {
+            pause_after_both_weak_edges(parked, &graph);
+            let before = parked.meter();
+            let mut filler = Vec::new();
+            for _ in 0..8 {
+                filler.push(grow_one_table(parked));
+            }
+            let far = grow_one_table(parked);
+            let near = grow_one_table(parked);
+            parked
+                .with_saved_heap(|heap| -> Result<(), HeapError> {
+                    heap.set_mode_scalar(far, Value::string("v"))?;
+                    heap.set_mode_scalar(near, Value::string("x"))?;
+                    heap.set_metatable(graph.left, Some(far))?;
+                    heap.set_metatable(graph.right, Some(far))?;
+                    heap.set_metatable(graph.left, Some(near))?;
+                    heap.set_metatable(graph.left, Some(graph.strong_mt))?;
+                    heap.set_metatable(graph.right, Some(graph.strong_mt))?;
+                    Ok(())
+                })
+                .expect("far then near then strong before any pulse");
+            let after = parked.meter();
+            assert_eq!(
+                after.mode_late_registrations - before.mode_late_registrations,
+                2,
+                "the far and near metatables are each queued once"
+            );
+            assert_eq!(
+                after.mode_late_events - before.mode_late_events,
+                2,
+                "one deferred owner check per owner, not per setter"
+            );
+            assert_eq!(
+                after.mode_late_event_reuses - before.mode_late_event_reuses,
+                3,
+                "the later setters coalesce into the existing owner checks"
+            );
+            assert_eq!(
+                after.mode_late_lookups - before.mode_late_lookups,
+                7,
+                "seven setters perform seven constant route lookups"
+            );
+            assert_eq!(
+                after.weak_mode_bytes, before.weak_mode_bytes,
+                "no setter reads a mode byte"
+            );
+            assert_eq!(
+                after.scratch.weak_modes_inited, before.scratch.weak_modes_inited,
+                "no setter grows the indexed mode cache"
+            );
+            assert_eq!(
+                after.scratch.mode_discover_inited, before.scratch.mode_discover_inited,
+                "no setter grows the discovery sidecar"
+            );
+            let _ = filler;
+
+            let mut pulses = 0u32;
+            while parked.meter().mode_late_deferred - before.mode_late_deferred < 2 {
+                let prior = parked.meter();
+                let view = parked.pulse(1);
+                let now = view.meter;
+                let bytes = now.weak_mode_bytes - prior.weak_mode_bytes;
+                let opened = now.weak_mode_edge_checks - prior.weak_mode_edge_checks;
+                let parsed = now.mode_late_parsed - prior.mode_late_parsed;
+                let deferred = now.mode_late_deferred - prior.mode_late_deferred;
+                assert!(
+                    bytes <= 1 && opened <= 1 && parsed <= 1 && deferred <= 1,
+                    "pulse {pulses} exceeded budget 1: bytes={bytes} open={opened} parsed={parsed} deferred={deferred}"
+                );
+                assert!(!view.finished, "the cycle finished inside the late window");
+                pulses += 1;
+                assert!(pulses < 256, "the late window did not drain");
+            }
+            assert_eq!(
+                parked.meter().owner_rescan_schedules - before.owner_rescan_schedules,
+                2,
+                "the final strong transition schedules both started owners"
+            );
+            assert_eq!(
+                parked.meter().mode_late_parsed - before.mode_late_parsed,
+                2,
+                "both far and near modes are parsed once"
+            );
+            pulse_until_late_quiet(parked);
+        });
+        finish_shared_mode_cycle(&mut host);
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            assert_eq!(heap.metatable(graph.left)?, Some(graph.strong_mt));
+            assert_eq!(heap.metatable(graph.right)?, Some(graph.strong_mt));
+            let outcome = read_shared_mode_outcome(heap, &graph)?;
+            assert_eq!(
+                (
+                    outcome.left_value,
+                    outcome.left_child,
+                    outcome.right_value,
+                    outcome.right_child,
+                ),
+                (true, true, true, true),
+                "the coalesced final strong transition keeps both graphs"
+            );
+            assert_eq!(outcome.left_edge, Some(graph.left_value));
+            assert_eq!(outcome.right_edge, Some(graph.right_value));
+            assert!(!outcome.orphan);
+            Ok(())
+        })
+        .expect("slot-keyed late work");
+    });
+}
+
+#[test]
+fn shared_mode_deferred_object_key_delete_does_not_replay() {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits(24, 8, 40)).expect("install");
+        let graph = heap::with_heap(&mut host, plant_shared_mode_graph).expect("plant");
+        heap::open_fixed_step(&mut host).expect("open");
+        let mut objects = None;
+        resume_weak(&mut host, |parked| {
+            pause_after_both_weak_edges(parked, &graph);
+            let mt = grow_one_table(parked);
+            parked
+                .with_saved_heap(|heap| heap.set_mode_scalar(mt, Value::string("x")))
+                .expect("write the pending strong mode");
+            attach_shared_metatable(parked, &graph, mt);
+            let key = grow_one_table(parked);
+            let value = grow_one_table(parked);
+            parked
+                .with_saved_heap(|heap| -> Result<(), HeapError> {
+                    heap.set_object_edge(graph.left, key, value)
+                })
+                .expect("insert the object key while the mode is pending");
+            assert!(
+                parked.object_index(graph.left, key).is_some(),
+                "the object key is present before the delete"
+            );
+            parked
+                .with_saved_heap(|heap| -> Result<(), HeapError> {
+                    heap.clear_object_edge(graph.left, key)
+                })
+                .expect("delete the object key before any late work");
+            assert!(
+                parked.object_index(graph.left, key).is_none(),
+                "the object key is really unlinked"
+            );
+            objects = Some((key, value));
+        });
+        finish_shared_mode_cycle(&mut host);
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            let (key, value) = objects.expect("object key pair");
+            assert!(
+                !heap.alive(key),
+                "a deleted object key must not be replayed by a deferred write"
+            );
+            assert!(
+                !heap.alive(value),
+                "a deleted object-key value must not be replayed"
+            );
+            assert!(heap.alive(graph.left_value) && heap.alive(graph.left_child));
+            assert!(heap.alive(graph.right_value) && heap.alive(graph.right_child));
+            assert!(!heap.alive(graph.orphan));
+            Ok(())
+        })
+        .expect("deferred object-key delete");
+    });
+}
+
+#[test]
+fn shared_mode_object_key_value_overwrite_keeps_only_the_latest_value() {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits(24, 8, 40)).expect("install");
+        let graph = heap::with_heap(&mut host, plant_shared_mode_graph).expect("plant");
+        heap::open_fixed_step(&mut host).expect("open");
+        let mut objects = None;
+        resume_weak(&mut host, |parked| {
+            pause_after_both_weak_edges(parked, &graph);
+            let mt = grow_one_table(parked);
+            parked
+                .with_saved_heap(|heap| heap.set_mode_scalar(mt, Value::string("x")))
+                .expect("write the pending strong mode");
+            attach_shared_metatable(parked, &graph, mt);
+            let key = grow_one_table(parked);
+            let first = grow_one_table(parked);
+            let last = grow_one_table(parked);
+            let events_before = parked.meter().mode_late_events;
+            let reuses_before = parked.meter().mode_late_event_reuses;
+            parked
+                .with_saved_heap(|heap| -> Result<(), HeapError> {
+                    heap.set_object_edge(graph.left, key, first)?;
+                    heap.set_object_edge(graph.left, key, last)
+                })
+                .expect("insert then overwrite the same object key");
+            assert_eq!(
+                parked.meter().mode_late_events - events_before,
+                1,
+                "the object-key edge keeps one deferred site"
+            );
+            assert_eq!(
+                parked.meter().mode_late_event_reuses - reuses_before,
+                1,
+                "the value overwrite updates that site in place"
+            );
+            objects = Some((key, first, last));
+        });
+        finish_shared_mode_cycle(&mut host);
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            let (key, first, last) = objects.expect("object key values");
+            assert!(heap.alive(key), "the live object key survives");
+            assert!(heap.alive(last), "the live final value survives");
+            assert!(
+                !heap.alive(first),
+                "an overwritten object-key value must not be retained"
+            );
+            assert!(heap.alive(graph.left_value) && heap.alive(graph.left_child));
+            assert!(heap.alive(graph.right_value) && heap.alive(graph.right_child));
+            assert!(!heap.alive(graph.orphan));
+            Ok(())
+        })
+        .expect("object-key overwrite");
+    });
+}
+
+#[test]
+fn shared_mode_reused_slot_uses_the_current_generation() {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits(20, 8, 32)).expect("install");
+        let graph = heap::with_heap(&mut host, plant_shared_mode_graph).expect("plant");
+        heap::open_fixed_step(&mut host).expect("open");
+        let mut mt_copy = None;
+        resume_weak(&mut host, |parked| {
+            pause_after_both_weak_edges(parked, &graph);
+            let old = grow_one_table(parked);
+            parked
+                .with_saved_heap(|heap| heap.set_mode_scalar(old, Value::string("kv")))
+                .expect("write the first generation mode");
+            let base = parked.meter().weak_mode_bytes;
+            pulse_until_late_bytes(parked, base, 2);
+            assert_eq!(parked.meter().weak_mode_bytes - base, 2);
+            parked
+                .with_saved_heap(|heap| heap.rollback(old))
+                .expect("release the first generation");
+            let reused = grow_one_table(parked);
+            assert_eq!(
+                reused.slot(),
+                old.slot(),
+                "the second metatable reuses the released slot"
+            );
+            assert_ne!(
+                reused.generation(),
+                old.generation(),
+                "a released slot is reused with a new generation"
+            );
+            parked
+                .with_saved_heap(|heap| heap.set_mode_scalar(reused, Value::string("x")))
+                .expect("write the second generation strong mode");
+            attach_shared_metatable(parked, &graph, reused);
+            mt_copy = Some(reused);
+        });
+        finish_shared_mode_cycle(&mut host);
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            let mt = mt_copy.expect("reused metatable");
+            assert_eq!(heap.metatable(graph.left)?, Some(mt));
+            let outcome = read_shared_mode_outcome(heap, &graph)?;
+            assert_eq!(
+                (
+                    outcome.left_value,
+                    outcome.left_child,
+                    outcome.right_value,
+                    outcome.right_child,
+                ),
+                (true, true, true, true),
+                "the reused slot's final x must not inherit the old generation's kv mode"
+            );
+            assert_eq!(outcome.left_edge, Some(graph.left_value));
+            assert_eq!(outcome.right_edge, Some(graph.right_value));
+            assert!(!outcome.orphan);
+            Ok(())
+        })
+        .expect("reused-slot generation");
+    });
 }
