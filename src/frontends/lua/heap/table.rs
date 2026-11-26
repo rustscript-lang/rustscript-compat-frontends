@@ -274,6 +274,10 @@ struct Slot {
     /// parse for the current generation. A reused slot cannot inherit the
     /// mode of an older generation.
     mode_generation: u32,
+    /// Mark round that wrote the parsed mode. The reset-sized mode vector is
+    /// rebuilt each round, but the slot generation survives; a stamp from an
+    /// earlier round is not a current observation of the direct field.
+    mode_round: u64,
     /// This table is linked in the saved mark's late-mode parse queue. The
     /// links live on the slot, so a setter append and a release unlink are
     /// constant work and allocate nothing.
@@ -284,6 +288,10 @@ struct Slot {
     /// `old` is the first tuple and `new` is the latest tuple.
     late_owner_epoch: u64,
     late_owner_old: Option<(u32, u32)>,
+    /// Old weak observation captured when the check was queued. The old
+    /// metatable can be released before the queued check runs; this keeps the
+    /// value/key bits that were actually observed then.
+    late_owner_old_mode: Option<WeakMode>,
     late_owner_new: Option<(u32, u32)>,
     late_owner_prev: Option<u32>,
     late_owner_next: Option<u32>,
@@ -1043,11 +1051,13 @@ impl LuaHeap {
         slot.mode_edge = None;
         slot.mode_epoch = 0;
         slot.mode_generation = 0;
+        slot.mode_round = 0;
         slot.late_mode_epoch = 0;
         slot.late_mode_prev = None;
         slot.late_mode_next = None;
         slot.late_owner_epoch = 0;
         slot.late_owner_old = None;
+        slot.late_owner_old_mode = None;
         slot.late_owner_new = None;
         slot.late_owner_prev = None;
         slot.late_owner_next = None;
@@ -1074,11 +1084,13 @@ impl LuaHeap {
             mode_edge: None,
             mode_epoch: 0,
             mode_generation: 0,
+            mode_round: 0,
             late_mode_epoch: 0,
             late_mode_prev: None,
             late_mode_next: None,
             late_owner_epoch: 0,
             late_owner_old: None,
+            late_owner_old_mode: None,
             late_owner_new: None,
             late_owner_prev: None,
             late_owner_next: None,
@@ -3214,6 +3226,7 @@ impl LuaHeap {
         slot.mode_edge = None;
         slot.mode_epoch = 0;
         slot.mode_generation = 0;
+        slot.mode_round = 0;
         slot.discover_generation = 0;
         slot.discover_batch = 0;
         if slot.generation >= self.limits.max_generation {

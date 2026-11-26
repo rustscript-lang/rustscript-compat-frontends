@@ -14,6 +14,19 @@
 //! head, or one outgoing edge or gap. Target checks and the metatable check
 //! ride with the edge or the owner head. A zero budget does not read the graph.
 //!
+//! Late work is bounded by live sites, not by mutation count: one parse per
+//! metatable slot (intrusive queue), one deferred transition check per owner,
+//! and one deferred target per edge record (coalesced in place). A known mode
+//! is decided by the setter; only a mode still being read queues deferred
+//! work, so repeated overwrites of one marked edge do not starve ordinary
+//! Gray steps. The two implementation costs are explicit rather than hidden:
+//! a late parse stores into the record-keyed map, one O(log L) insertion and
+//! one such query per owner head, with L bounded by live metatable slots; a
+//! deferred replay pushes one target into the Gray `Vec`, whose geometric
+//! growth may copy the current length once at a capacity boundary. Those
+//! copies are amortized and total O(live nodes); every ordinary pulse still
+//! charges at most one of the listed units.
+//!
 //! A safepoint root batch is not one of those units. `accept_root_batch` is
 //! open in Roots, Gray, or the late sub-phase: phase, then root quota, then
 //! every typed handle, before any mark. Those prechecks do not increment the
@@ -80,6 +93,10 @@ pub(super) struct MarkState {
     rescan_owner: Option<u32>,
     rescan_cursor: Option<u32>,
     rescan_mode: WeakMode,
+    /// Metatable tuple the open rescan's mode was read from. A setter that
+    /// changes the tuple before the next record is charged makes the cached
+    /// mode stale; the charge re-reads it.
+    rescan_meta: Option<(u32, u32)>,
     /// Indexed by metatable slot; initialized alongside the weak-mode cache.
     /// Stamps from completed passes are left in place and no longer match.
     discover_marks: Vec<ModeDiscoveryMark>,
@@ -207,6 +224,7 @@ impl MarkState {
             rescan_owner: None,
             rescan_cursor: None,
             rescan_mode: WeakMode::default(),
+            rescan_meta: None,
             discover_marks: Vec::new(),
             discover_batch: 0,
             discover_next: false,
@@ -1064,6 +1082,7 @@ fn store_cache_mode(
 ) {
     if let Some(stored) = heap.slots.get_mut(slot as usize) {
         stored.mode_generation = generation;
+        stored.mode_round = state.rescan_epoch;
     }
     let in_indexed = state
         .modes
@@ -1099,8 +1118,8 @@ fn step_mode_late(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
     if state.late_mode_head.is_some() {
         return step_late_mode(heap, state);
     }
-    if let Some((owner, old_tuple, new_tuple)) = pop_late_owner(heap, state) {
-        apply_owner_check(heap, state, owner, old_tuple, new_tuple);
+    if let Some((owner, old_tuple, new_tuple, old_mode)) = pop_late_owner(heap, state) {
+        apply_owner_check(heap, state, owner, old_tuple, new_tuple, old_mode);
         return true;
     }
     if let Some((index, owner, key, value)) = pop_late_edge(heap, state) {
@@ -1232,16 +1251,23 @@ fn push_late_owner(heap: &mut LuaHeap, state: &mut MarkState, owner: u32) {
 fn pop_late_owner(
     heap: &mut LuaHeap,
     state: &mut MarkState,
-) -> Option<(u32, Option<(u32, u32)>, Option<(u32, u32)>)> {
+) -> Option<(
+    u32,
+    Option<(u32, u32)>,
+    Option<(u32, u32)>,
+    Option<WeakMode>,
+)> {
     let owner = state.late_owner_head?;
     let stored = heap.slots.get(owner as usize)?;
     let old_tuple = stored.late_owner_old;
+    let old_mode = stored.late_owner_old_mode;
     let new_tuple = stored.late_owner_new;
     let next = stored.late_owner_next;
     {
         let stored = &mut heap.slots[owner as usize];
         stored.late_owner_epoch = 0;
         stored.late_owner_old = None;
+        stored.late_owner_old_mode = None;
         stored.late_owner_new = None;
         stored.late_owner_prev = None;
         stored.late_owner_next = None;
@@ -1255,7 +1281,7 @@ fn pop_late_owner(
         }
         None => state.late_owner_tail = None,
     }
-    Some((owner, old_tuple, new_tuple))
+    Some((owner, old_tuple, new_tuple, old_mode))
 }
 
 fn push_late_edge(heap: &mut LuaHeap, state: &mut MarkState, index: u32) {
@@ -1340,13 +1366,25 @@ fn apply_owner_check(
     owner: u32,
     old_tuple: Option<(u32, u32)>,
     new_tuple: Option<(u32, u32)>,
+    observed_old_mode: Option<WeakMode>,
 ) {
     let live = heap.slots.get(owner as usize).is_some_and(|stored| {
         stored.kind == HandleKind::Table && matches!(stored.state, SlotState::Live { .. })
     });
-    if live && old_tuple != new_tuple {
-        let old_mode = mode_before_direct_delete(heap, state, old_tuple)
-            .unwrap_or_else(|| mode_of_tuple(heap, state, old_tuple));
+    // The coalesced record keeps the first old tuple and the latest new one.
+    // Only apply it while the owner really points at that final attachment;
+    // a later setter updates the record, so a mismatch is not this check's
+    // observation.
+    let final_attachment = live
+        && heap
+            .slots
+            .get(owner as usize)
+            .is_some_and(|stored| stored.metatable == new_tuple);
+    if final_attachment && old_tuple != new_tuple {
+        let old_mode = observed_old_mode.unwrap_or_else(|| {
+            mode_before_direct_delete(heap, state, old_tuple)
+                .unwrap_or_else(|| mode_of_tuple(heap, state, old_tuple))
+        });
         let new_mode = mode_of_tuple(heap, state, new_tuple);
         if (old_mode.keys && !new_mode.keys) || (old_mode.values && !new_mode.values) {
             schedule_started_owner(heap, state, owner);
@@ -1385,6 +1423,7 @@ fn clear_late_slot(stored: &mut Slot) {
     stored.late_mode_next = None;
     stored.late_owner_epoch = 0;
     stored.late_owner_old = None;
+    stored.late_owner_old_mode = None;
     stored.late_owner_new = None;
     stored.late_owner_prev = None;
     stored.late_owner_next = None;
@@ -1526,8 +1565,22 @@ fn queue_owner_check(
         heap.scan.mode_late_event_reuses += 1;
         return;
     }
+    // Capture the old observation while the old metatable can still be
+    // resolved. A release before the deferred check must not turn an
+    // observed weak side into an apparent strong one. An old mode that is
+    // itself still being read stays unresolved; the parse queue drains before
+    // this check runs.
+    let old_mode = if late_mode_unknown(heap, state, old_tuple) {
+        None
+    } else {
+        Some(
+            mode_before_direct_delete(heap, state, old_tuple)
+                .unwrap_or_else(|| mode_of_tuple(heap, state, old_tuple)),
+        )
+    };
     let stored = &mut heap.slots[owner as usize];
     stored.late_owner_old = old_tuple;
+    stored.late_owner_old_mode = old_mode;
     stored.late_owner_new = new_tuple;
     push_late_owner(heap, state, owner);
     heap.scan.mode_late_events += 1;
@@ -1763,6 +1816,20 @@ fn charge_edge(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
 }
 
 fn charge_rescan(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
+    // An open rescan captured its mode at the head. If a setter replaced the
+    // owner's metatable before this record is charged, the old strength is
+    // stale. The late parse queue drains before Gray resumes, so the cached
+    // current mode is final here. A missing or reused tuple reads strong.
+    if let Some(owner) = state.rescan_owner {
+        let current = heap
+            .slots
+            .get(owner as usize)
+            .and_then(|stored| stored.metatable);
+        if current != state.rescan_meta {
+            state.rescan_meta = current;
+            state.rescan_mode = cached_owner_mode(heap, state, owner);
+        }
+    }
     let cursor = state.rescan_cursor.expect("rescan unit has a cursor");
     let next = heap.edge_slots[cursor as usize].next;
     state.rescan_cursor = next;
@@ -1863,12 +1930,14 @@ fn open_rescan(heap: &mut LuaHeap, state: &mut MarkState, slot: u32) -> bool {
     if stored.kind != HandleKind::Table || !matches!(stored.state, SlotState::Live { .. }) {
         return false;
     }
+    let meta = stored.metatable;
     let mode = cached_owner_mode(heap, state, slot);
     heap.scan.owner_head_checks += 1;
     heap.scan.owner_rescan_heads += 1;
     state.rescan_cursor = heap.slots[slot as usize].edge_head;
     state.rescan_owner = Some(slot);
     state.rescan_mode = mode;
+    state.rescan_meta = meta;
     true
 }
 
@@ -2069,8 +2138,10 @@ fn note_weak_started(heap: &mut LuaHeap, state: &mut MarkState, slot: u32) {
 }
 
 /// Parsed mode for one metatable slot generation. The indexed reset cache and
-/// the late map are both checked against the parse generation stored on the
-/// slot, so a released and reused slot cannot inherit an older mode.
+/// the late map are both checked against the parse generation and the round
+/// stamp stored on the slot, so a released and reused slot cannot inherit an
+/// older mode and a cache written in an earlier round is not a current
+/// observation of the direct field.
 fn mode_for_slot(
     heap: &LuaHeap,
     state: &MarkState,
@@ -2078,7 +2149,10 @@ fn mode_for_slot(
     generation: u32,
 ) -> Option<WeakMode> {
     let stored = heap.slots.get(slot as usize)?;
-    if stored.generation != generation || stored.mode_generation != generation {
+    if stored.generation != generation
+        || stored.mode_generation != generation
+        || stored.mode_round != state.rescan_epoch
+    {
         return None;
     }
     if let Some(modes) = state.modes.as_ref()
@@ -2304,6 +2378,16 @@ impl LuaHeap {
         })
     }
 
+    /// Actual Gray stack length and capacity. Test-only: the capacity is not
+    /// part of the production meter, but the tests must show a real boundary
+    /// crossing rather than infer growth from a push count.
+    #[cfg(test)]
+    pub fn saved_mark_gray_shape(&self) -> Option<(usize, usize)> {
+        self.mark
+            .as_ref()
+            .map(|state| (state.gray.len(), state.gray.capacity()))
+    }
+
     /// Live marked bit of one table. Does not walk an edge or change the bit.
     #[cfg(test)]
     pub fn table_marked(&self, table: TableRef) -> bool {
@@ -2398,9 +2482,10 @@ impl LuaHeap {
     /// that is not yet marked does not enter the gray queue. A field whose
     /// metatable is still being read records the target on the edge record and
     /// lets the budgeted late parse decide; a weak arm must not mark it early.
-    /// A later write updates the same record in place, so repeated overwrites
-    /// of one live edge keep one deferred site. This does not call `owner_mode`
-    /// and does not move either cursor.
+    /// Once the mode is known, the same call decides immediately instead of
+    /// queueing a later event. A later write updates the pending record in
+    /// place, so repeated overwrites of one live edge keep one deferred site.
+    /// This does not call `owner_mode` and does not move either cursor.
     pub(super) fn barrier_strong_field(
         &mut self,
         owner: u32,
@@ -2412,9 +2497,13 @@ impl LuaHeap {
         };
         if state.write_barriers_open() && discovered_table(self, owner) {
             let unknown = owner_mode_unknown(self, &state, owner);
-            queue_edge_value(self, &mut state, index, owner, target);
-            if !unknown
-                && let Some((slot, generation)) = target
+            if unknown {
+                // The mode is being read; record the latest target on this
+                // edge record and let the budgeted parse decide. A known mode
+                // must decide now: queueing it would inject one ModeLate unit
+                // per overwrite and starve ordinary Gray work.
+                queue_edge_value(self, &mut state, index, owner, target);
+            } else if let Some((slot, generation)) = target
                 && !cached_values_weak(self, &state, owner)
             {
                 enqueue_barrier_target(self, &mut state, slot, generation, HandleKind::Table);
@@ -2577,8 +2666,9 @@ impl LuaHeap {
     /// A string value is not a table node. An owner that is not yet marked is
     /// left for the continued scan. Successors stay on the gray queue. A new
     /// metatable still being read records the key and value on the new edge
-    /// record, so a weak side is not marked early. A later write merges into
-    /// that same record. This does not move the pending cursor.
+    /// record, so a weak side is not marked early. A known mode decides in
+    /// this call and queues no later event. A later write merges into that
+    /// same record. This does not move the pending cursor.
     pub(super) fn barrier_new_table_key(
         &mut self,
         owner: u32,
@@ -2592,15 +2682,19 @@ impl LuaHeap {
         };
         if state.write_barriers_open() && discovered_table(self, owner) {
             let unknown = owner_mode_unknown(self, &state, owner);
-            queue_edge_key(
-                self,
-                &mut state,
-                index,
-                owner,
-                (key_slot, key_generation),
-                value,
-            );
-            if !unknown {
+            if unknown {
+                queue_edge_key(
+                    self,
+                    &mut state,
+                    index,
+                    owner,
+                    (key_slot, key_generation),
+                    value,
+                );
+            } else {
+                // A known mode decides now. The deferred record is only for a
+                // mode that is still being read; queueing every insertion
+                // would make each new key cost a later ModeLate unit.
                 let mode = cached_owner_mode(self, &state, owner);
                 if !mode.keys {
                     enqueue_barrier_target(
@@ -2623,21 +2717,25 @@ impl LuaHeap {
 
     /// Registers a direct `__mode` write made while mutation is open. The
     /// setter only bumps the record version and links the metatable slot into
-    /// the late parse queue. A write on a slot that is already queued keeps
-    /// the one queue entry and invalidates the open parse, which restarts at
-    /// byte zero. No string is read and no indexed cache is grown here.
+    /// the late parse queue. A current-round parsed cache for the same slot
+    /// generation is already readable and needs no second read; a cache left
+    /// by an earlier round is stale and must not block this write. A write on
+    /// a slot that is already queued keeps the one queue entry and
+    /// invalidates the open parse, which restarts at byte zero. No string is
+    /// read and no indexed cache is grown here.
     pub(super) fn note_late_mode_write(&mut self, owner: u32) {
         let Some(mut state) = self.mark.take() else {
             return;
         };
         if state.write_barriers_open() {
             self.scan.mode_late_lookups += 1;
+            let current_mode = self.slots[owner as usize].kind == HandleKind::Table
+                && self.slots[owner as usize].mode_generation
+                    == self.slots[owner as usize].generation
+                && self.slots[owner as usize].mode_round == state.rescan_epoch;
             if self.slots[owner as usize].late_mode_epoch == state.rescan_epoch {
                 self.scan.mode_late_cancels += 1;
-            } else if self.slots[owner as usize].kind == HandleKind::Table
-                && self.slots[owner as usize].mode_generation
-                    != self.slots[owner as usize].generation
-            {
+            } else if !current_mode {
                 push_late_mode(self, &mut state, owner);
                 self.scan.mode_late_registrations += 1;
             }

@@ -13423,3 +13423,1833 @@ fn shared_mode_reused_slot_uses_the_current_generation() {
         .expect("reused-slot generation");
     });
 }
+
+// ---------------------------------------------------------------------------
+// Re-review 0248456: cache identity must include the current round.
+// ---------------------------------------------------------------------------
+
+struct CrossRoundGraph {
+    mt: TableRef,
+    owner: TableRef,
+    gate: TableRef,
+    gate_record: u32,
+}
+
+/// One metatable parsed by a real reset walk, one already-marked owner that is
+/// queued but not opened, and a gate record that pauses Gray before the owner.
+fn plant_cross_round_graph(heap: &mut LuaHeap) -> Result<CrossRoundGraph, HeapError> {
+    let mt = heap.alloc()?;
+    heap.set_mode_scalar(mt, Value::string("v"))?;
+    let owner = heap.alloc()?;
+    heap.set_metatable(owner, Some(mt))?;
+    let gate = heap.alloc()?;
+    heap.set_named_scalar(gate, "first", Value::Bool(true))?;
+    heap.set_named_scalar(gate, "second", Value::Bool(true))?;
+    let (_, gate_record) = heap
+        .locate_named(gate.slot(), "second")
+        .expect("gate second record");
+    let frame = heap.enter_roots(2)?;
+    // Gray is LIFO: the gate is popped first, so the owner is marked but not
+    // opened when the test writes the mode.
+    heap.write_root(frame, 0, owner)?;
+    heap.write_root(frame, 1, gate)?;
+    Ok(CrossRoundGraph {
+        mt,
+        owner,
+        gate,
+        gate_record,
+    })
+}
+
+fn attach_cross_round_value(
+    heap: &mut LuaHeap,
+    owner: TableRef,
+) -> Result<(TableRef, TableRef), HeapError> {
+    let value = heap.alloc()?;
+    let child = heap.alloc()?;
+    heap.set_named_edge(owner, "subj", value)?;
+    heap.set_named_edge(value, "next", child)?;
+    Ok((value, child))
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CrossRoundArm {
+    /// Business arm: the direct `__mode` was parsed in round 1, removed
+    /// between rounds, and a fresh `v` is written in round 2 Gray.
+    StaleCacheWrite,
+    /// Control: the same metatable has its field at reset of this round.
+    ParsedCurrentRound,
+    /// Control: the metatable is live but unattached at reset; it is attached
+    /// during Gray and was already parsed by the reset walk.
+    UnpublishedParse,
+    /// Control: a second, later round parses the live field again.
+    Rerun,
+}
+
+fn run_cross_round_mode(arm: CrossRoundArm) {
+    let mut heap = LuaHeap::new(limits(16, 8, 24));
+    let graph = plant_cross_round_graph(&mut heap).expect("plant cross-round graph");
+    heap.collect();
+    assert!(
+        heap.alive(graph.mt),
+        "the metatable is marked through its owner"
+    );
+    assert!(heap.alive(graph.owner));
+    assert!(heap.alive(graph.gate));
+    // `pause_at` identifies the round by `mark_passes`; restart the counters
+    // after the first round so this one is pass one again.
+    heap.take_scan_meter();
+
+    if matches!(arm, CrossRoundArm::StaleCacheWrite) {
+        heap.set_mode_scalar(graph.mt, Value::Null)
+            .expect("remove the direct __mode between rounds");
+        assert!(
+            heap.locate_named(graph.mt.slot(), "__mode").is_none(),
+            "the direct mode record must be really unlinked"
+        );
+    }
+    if matches!(arm, CrossRoundArm::UnpublishedParse) {
+        // Keep one attached metatable without `__mode` so the reset walk still
+        // parses every live slot's mode edge; the `v` metatable itself stays
+        // unattached until Gray.
+        let keeper = heap.alloc().expect("keeper metatable");
+        heap.set_metatable(graph.owner, Some(keeper))
+            .expect("attach the strong keeper before the next round");
+        assert_eq!(heap.metatable(graph.owner), Ok(Some(keeper)));
+    }
+
+    let (value, child) = attach_cross_round_value(&mut heap, graph.owner)
+        .expect("insert this round's value and successor");
+
+    let (before, after_mark) = {
+        let mut parked = ParkedMark::start(&mut heap).expect("start the cross-round mark");
+        let pending = pause_at(&mut parked, graph.gate.slot(), graph.gate_record);
+        assert_eq!(parked.phase_name(), "gray");
+        assert_eq!(pending.owner, graph.gate.slot());
+        assert_eq!(pending.cursor, graph.gate_record);
+        assert!(
+            parked.marked(graph.owner),
+            "the owner is queued, not opened"
+        );
+        assert!(!parked.marked(value), "the value is still white");
+        assert!(
+            parked.pending().map(|scan| scan.owner) != Some(graph.owner.slot()),
+            "the owner's ordinary scan has not started"
+        );
+
+        let before = parked.meter();
+        match arm {
+            CrossRoundArm::StaleCacheWrite => {
+                parked
+                    .with_saved_heap(|heap| heap.set_mode_scalar(graph.mt, Value::string("v")))
+                    .expect("write the fresh v in the second round");
+                let after = parked.meter();
+                assert_eq!(
+                    after.mode_late_registrations - before.mode_late_registrations,
+                    1,
+                    "a stale same-generation cache must not block the late registration"
+                );
+                assert_eq!(
+                    parked.with_saved_heap(|heap| heap.named_value(graph.mt, "__mode")),
+                    Ok(Value::string("v")),
+                    "the raw field must really hold v"
+                );
+            }
+            CrossRoundArm::UnpublishedParse => {
+                parked
+                    .with_saved_heap(|heap| heap.set_metatable(graph.owner, Some(graph.mt)))
+                    .expect("attach the already-parsed metatable during Gray");
+                let after = parked.meter();
+                assert_eq!(
+                    after.mode_late_registrations, before.mode_late_registrations,
+                    "a parsed current-round mode needs no late registration"
+                );
+                assert_eq!(
+                    after.mode_late_parsed, before.mode_late_parsed,
+                    "an unpublished but parsed metatable is not re-read late"
+                );
+                assert_eq!(
+                    parked.metatable(graph.owner),
+                    Ok(Some(graph.mt)),
+                    "the final attachment is the parsed metatable"
+                );
+            }
+            CrossRoundArm::ParsedCurrentRound | CrossRoundArm::Rerun => {
+                assert_eq!(
+                    parked.meter().mode_late_registrations,
+                    before.mode_late_registrations,
+                    "this arm writes no mode; the reset cache is the only source"
+                );
+            }
+        }
+
+        let mut view = parked.pulse(64);
+        while !view.finished {
+            view = parked.pulse(64);
+        }
+        let after_mark = parked.meter();
+        parked.complete().expect("sweep the cross-round mark");
+        (before, after_mark)
+    };
+
+    assert!(
+        !heap.alive(value),
+        "the weak value must clear in this cycle"
+    );
+    assert!(!heap.alive(child), "its strong successor clears with it");
+    assert_eq!(
+        heap.named_edge(graph.owner, "subj"),
+        Ok(None),
+        "the weak entry clears or becomes a cursor gap"
+    );
+    assert!(heap.alive(graph.owner) && heap.alive(graph.mt));
+    match arm {
+        CrossRoundArm::StaleCacheWrite => {
+            assert_eq!(
+                after_mark.weak_mode_bytes - before.weak_mode_bytes,
+                1,
+                "the fresh v is read exactly once, on the late path"
+            );
+            assert_eq!(
+                after_mark.mode_late_parsed - before.mode_late_parsed,
+                1,
+                "one parsed late mode is stored"
+            );
+            assert_eq!(
+                after_mark.scratch.weak_modes_inited, before.scratch.weak_modes_inited,
+                "the second-round late read must not size the indexed cache"
+            );
+            assert_eq!(
+                after_mark.scratch.mode_discover_inited, before.scratch.mode_discover_inited,
+                "the second-round late read must not size the discovery sidecar"
+            );
+        }
+        CrossRoundArm::ParsedCurrentRound => {
+            assert_eq!(
+                after_mark.mode_late_registrations, before.mode_late_registrations,
+                "a reset-parsed mode does not register a late read"
+            );
+            assert_eq!(
+                after_mark.weak_mode_bytes, before.weak_mode_bytes,
+                "the reset parse finished before Gray"
+            );
+        }
+        CrossRoundArm::UnpublishedParse => {
+            assert_eq!(
+                after_mark.mode_late_registrations, before.mode_late_registrations,
+                "the attach did not register a late read"
+            );
+        }
+        CrossRoundArm::Rerun => {}
+    }
+
+    if matches!(arm, CrossRoundArm::Rerun) {
+        let (value2, child2) =
+            attach_cross_round_value(&mut heap, graph.owner).expect("insert the rerun value");
+        heap.take_scan_meter();
+        {
+            let mut parked = ParkedMark::start(&mut heap).expect("start the rerun mark");
+            pause_at(&mut parked, graph.gate.slot(), graph.gate_record);
+            let before = parked.meter();
+            let mut view = parked.pulse(64);
+            while !view.finished {
+                view = parked.pulse(64);
+            }
+            let after_mark = parked.meter();
+            parked.complete().expect("sweep the rerun mark");
+            assert_eq!(
+                after_mark.mode_late_registrations, before.mode_late_registrations,
+                "the rerun uses the reset cache, not a late registration"
+            );
+        }
+        assert!(
+            !heap.alive(value2),
+            "a later round still parses the live field"
+        );
+        assert!(!heap.alive(child2));
+        assert_eq!(heap.named_edge(graph.owner, "subj"), Ok(None));
+    }
+}
+
+#[test]
+fn cross_round_stale_cache_does_not_block_a_gray_mode_write() {
+    run_cross_round_mode(CrossRoundArm::StaleCacheWrite);
+}
+
+#[test]
+fn cross_round_parsed_current_round_clears_the_weak_value() {
+    run_cross_round_mode(CrossRoundArm::ParsedCurrentRound);
+}
+
+#[test]
+fn cross_round_unpublished_metatable_uses_the_reset_parse() {
+    run_cross_round_mode(CrossRoundArm::UnpublishedParse);
+}
+
+#[test]
+fn cross_round_rerun_parses_the_live_field_again() {
+    run_cross_round_mode(CrossRoundArm::Rerun);
+}
+
+/// A cached rewrite is qualified by who has already scanned and by the next
+/// round. Both original owners are scanned weak under v before the record is
+/// rewritten to x; a new owner sharing the same metatable is not scanned yet.
+/// This round keeps the already parsed v for both: the unscanned owner's
+/// first read also uses the cache, so its new value clears. The next round
+/// parses the live x field and keeps fresh values. This is the documented
+/// cached-rewrite boundary, not a claim that public step counts identify a
+/// phase.
+#[test]
+fn cached_mode_rewrite_qualifies_scanned_unscanned_and_the_next_round() {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits(32, 8, 48)).expect("install");
+        let graph = heap::with_heap(&mut host, plant_shared_mode_graph).expect("plant");
+        heap::open_fixed_step(&mut host).expect("open");
+        let mut late_copy = None;
+        let mut fresh_copy = None;
+        resume_weak(&mut host, |parked| {
+            pause_after_both_weak_edges(parked, &graph);
+            let late = grow_one_table(parked);
+            parked
+                .with_saved_heap(|heap| heap.set_mode_scalar(late, Value::string("v")))
+                .expect("write the initial v");
+            attach_shared_metatable(parked, &graph, late);
+            let base = parked.meter().weak_mode_bytes;
+            pulse_until_late_bytes(parked, base, 1);
+            pulse_until_late_quiet(parked);
+            assert_eq!(
+                parked.meter().mode_late_parsed,
+                1,
+                "the current-round v is already parsed"
+            );
+            let registrations = parked.meter().mode_late_registrations;
+            let bytes = parked.meter().weak_mode_bytes;
+            parked
+                .with_saved_heap(|heap| heap.set_mode_scalar(late, Value::string("x")))
+                .expect("rewrite the same record to x");
+            assert_eq!(
+                parked.meter().mode_late_registrations,
+                registrations,
+                "a current-round cached rewrite does not queue a second parse"
+            );
+            assert_eq!(
+                parked.meter().weak_mode_bytes,
+                bytes,
+                "a cached rewrite reads no more bytes in this round"
+            );
+            let fresh = grow_one_table(parked);
+            let fresh_value = grow_one_table(parked);
+            parked
+                .with_saved_heap(|heap| -> Result<(), HeapError> {
+                    heap.set_metatable(fresh, Some(late))?;
+                    heap.set_named_edge(fresh, "subj", fresh_value)?;
+                    Ok(())
+                })
+                .expect("attach and fill the unscanned owner");
+            assert!(
+                !parked.marked(fresh_value),
+                "the unscanned owner's value starts white"
+            );
+            parked
+                .accept_root_batch(&[super::Rooted::Table(fresh)])
+                .expect("mark the unscanned owner");
+            fresh_copy = Some((fresh, fresh_value));
+            late_copy = Some(late);
+        });
+        finish_shared_mode_cycle(&mut host);
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            let (fresh, fresh_value) = fresh_copy.expect("fresh owner");
+            let late = late_copy.expect("late metatable");
+            assert!(heap.alive(fresh), "the marked fresh owner survives");
+            assert!(
+                !heap.alive(fresh_value),
+                "the unscanned owner's first read uses the cached v and clears"
+            );
+            let outcome = read_shared_mode_outcome(heap, &graph)?;
+            assert_eq!(
+                (
+                    outcome.left_value,
+                    outcome.left_child,
+                    outcome.right_value,
+                    outcome.right_child,
+                ),
+                (false, false, false, false),
+                "the already scanned owners keep the cached v this round"
+            );
+            assert_eq!(heap.named_value(late, "__mode"), Ok(Value::string("x")));
+            assert_eq!(heap.metatable(graph.left)?, Some(late));
+            assert_eq!(heap.metatable(graph.right)?, Some(late));
+            assert_eq!(heap.metatable(fresh)?, Some(late));
+            Ok(())
+        })
+        .expect("cached rewrite this round");
+
+        let next_values = heap::with_heap(&mut host, |heap| -> Result<_, HeapError> {
+            let late = late_copy.expect("late metatable");
+            assert_eq!(heap.named_value(late, "__mode"), Ok(Value::string("x")));
+            let left = heap.alloc()?;
+            let right = heap.alloc()?;
+            heap.set_named_edge(graph.left, "again", left)?;
+            heap.set_named_edge(graph.right, "again", right)?;
+            Ok((left, right))
+        })
+        .expect("next-round values");
+        heap::collect(&mut host).expect("next full collection");
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            let (left, right) = next_values;
+            assert!(
+                heap.alive(left) && heap.alive(right),
+                "the next round parses the live x field and keeps fresh values"
+            );
+            assert_eq!(heap.named_edge(graph.left, "again")?, Some(left));
+            assert_eq!(heap.named_edge(graph.right, "again")?, Some(right));
+            Ok(())
+        })
+        .expect("next round strong");
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Re-review 0248456: the deferred owner check keeps the observed old mode.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug)]
+enum ReleasedOldArm {
+    FinalStrong,
+    FinalWeak,
+}
+
+fn run_released_old_metatable(arm: ReleasedOldArm) {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits(24, 8, 40)).expect("install");
+        let graph = heap::with_heap(&mut host, plant_shared_mode_graph).expect("plant");
+        heap::open_fixed_step(&mut host).expect("open");
+        let mut final_mt = None;
+        let mut schedules_before = 0u64;
+        resume_weak(&mut host, |parked| {
+            pause_after_both_weak_edges(parked, &graph);
+            schedules_before = parked.meter().owner_rescan_schedules;
+            let late = grow_one_table(parked);
+            parked
+                .with_saved_heap(|heap| heap.set_mode_scalar(late, Value::string("v")))
+                .expect("write the late v");
+            attach_shared_metatable(parked, &graph, late);
+            assert_eq!(
+                parked.meter().owner_rescan_schedules,
+                schedules_before,
+                "the unknown late mode only records owner checks"
+            );
+            parked
+                .with_saved_heap(|heap| heap.rollback(graph.shared))
+                .expect("release the old metatable while it is still recorded as old");
+            assert!(
+                !parked.with_saved_heap(|heap| heap.alive(graph.shared)),
+                "the old metatable is really released"
+            );
+            let reused = grow_one_table(parked);
+            assert_eq!(
+                reused.slot(),
+                graph.shared.slot(),
+                "the released old metatable slot is reused"
+            );
+            assert_ne!(
+                reused.generation(),
+                graph.shared.generation(),
+                "reuse gets a new generation"
+            );
+            let final_mt_value = match arm {
+                ReleasedOldArm::FinalStrong => graph.strong_mt,
+                ReleasedOldArm::FinalWeak => {
+                    let weak = grow_one_table(parked);
+                    parked
+                        .with_saved_heap(|heap| heap.set_mode_scalar(weak, Value::string("v")))
+                        .expect("write the final weak v");
+                    weak
+                }
+            };
+            parked
+                .with_saved_heap(|heap| -> Result<(), HeapError> {
+                    heap.set_metatable(graph.left, Some(final_mt_value))?;
+                    heap.set_metatable(graph.right, Some(final_mt_value))?;
+                    Ok(())
+                })
+                .expect("attach the final metatable");
+            assert_eq!(
+                parked.metatable(graph.left),
+                Ok(Some(final_mt_value)),
+                "the recorded final tuple is the actual left attachment"
+            );
+            assert_eq!(
+                parked.metatable(graph.right),
+                Ok(Some(final_mt_value)),
+                "the recorded final tuple is the actual right attachment"
+            );
+            assert!(!parked.marked(graph.left_value));
+            assert!(!parked.marked(graph.right_value));
+            final_mt = Some(final_mt_value);
+        });
+        finish_shared_mode_cycle(&mut host);
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            let final_mt = final_mt.expect("final metatable");
+            assert_eq!(heap.metatable(graph.left)?, Some(final_mt));
+            assert_eq!(heap.metatable(graph.right)?, Some(final_mt));
+            assert!(heap.alive(graph.left) && heap.alive(graph.right));
+            let outcome = read_shared_mode_outcome(heap, &graph)?;
+            match arm {
+                ReleasedOldArm::FinalStrong => {
+                    assert_eq!(
+                        (
+                            outcome.left_value,
+                            outcome.left_child,
+                            outcome.right_value,
+                            outcome.right_child,
+                        ),
+                        (true, true, true, true),
+                        "the released old v must still drive a strong rescan"
+                    );
+                    assert_eq!(
+                        outcome.left_edge,
+                        Some(graph.left_value),
+                        "the left original value keeps its identity"
+                    );
+                    assert_eq!(
+                        outcome.right_edge,
+                        Some(graph.right_value),
+                        "the right original value keeps its identity"
+                    );
+                    assert_eq!(
+                        heap.locate_named(graph.left.slot(), "subj")
+                            .map(|(_, index)| index),
+                        Some(graph.left_value_record),
+                        "the current strong edge keeps its original record"
+                    );
+                    assert_eq!(
+                        heap.scan_meter().owner_rescan_schedules,
+                        schedules_before + 2,
+                        "both started owners are scheduled after the old release"
+                    );
+                }
+                ReleasedOldArm::FinalWeak => {
+                    assert_eq!(
+                        (
+                            outcome.left_value,
+                            outcome.left_child,
+                            outcome.right_value,
+                            outcome.right_child,
+                        ),
+                        (false, false, false, false),
+                        "an old v to final v transition stays weak"
+                    );
+                    assert_eq!(outcome.left_edge, None);
+                    assert_eq!(outcome.right_edge, None);
+                    assert_eq!(
+                        heap.scan_meter().owner_rescan_schedules,
+                        schedules_before,
+                        "no strong rescan is scheduled for the weak arm"
+                    );
+                }
+            }
+            assert!(
+                !outcome.orphan,
+                "the independent orphan clears in both arms"
+            );
+            assert!(!outcome.dust);
+            Ok(())
+        })
+        .expect("released old metatable");
+    });
+}
+
+#[test]
+fn shared_mode_released_old_metatable_final_strong_keeps_both_graphs() {
+    run_released_old_metatable(ReleasedOldArm::FinalStrong);
+}
+
+#[test]
+fn shared_mode_released_old_metatable_final_weak_clears_both_graphs() {
+    run_released_old_metatable(ReleasedOldArm::FinalWeak);
+}
+
+// Trace for the two tests above: the old metatable is the fixture's preexisting
+// `shared` slot, which lies inside the reset-sized discovery sidecar. `rollback`
+// unlinks its direct `__mode` edge while mutation is open, so the existing
+// delete-discovery rule arms the same-generation stamp; `mode_before_direct_delete`
+// restores the value bit even after the slot is reused. That path is already
+// covered by the discovery mechanism and is a control. A metatable grown after
+// ModeInit has no sidecar entry; its release clears the slot stamp, so the old
+// observation must be captured when the deferred check is queued. The next
+// fixture is the business witness for that grown-slot path.
+
+#[derive(Clone, Copy, Debug)]
+enum GrownOldFinal {
+    Strong,
+    Weak,
+}
+
+fn run_grown_old_release(final_mode: GrownOldFinal) {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits(28, 8, 48)).expect("install");
+        let graph = heap::with_heap(&mut host, plant_shared_mode_graph).expect("plant");
+        heap::open_fixed_step(&mut host).expect("open");
+        let mut final_mt = None;
+        let mut schedules_before = 0u64;
+        let mut handles = None;
+        resume_weak(&mut host, |parked| {
+            pause_after_both_weak_edges(parked, &graph);
+            schedules_before = parked.meter().owner_rescan_schedules;
+            let old_mt = grow_one_table(parked);
+            parked
+                .with_saved_heap(|heap| heap.set_mode_scalar(old_mt, Value::string("v")))
+                .expect("write the grown old v");
+            let left = grow_one_table(parked);
+            let right = grow_one_table(parked);
+            let left_value = grow_one_table(parked);
+            let left_child = grow_one_table(parked);
+            let right_value = grow_one_table(parked);
+            let right_child = grow_one_table(parked);
+            parked
+                .with_saved_heap(|heap| -> Result<(), HeapError> {
+                    heap.set_metatable(left, Some(old_mt))?;
+                    heap.set_metatable(right, Some(old_mt))?;
+                    heap.set_named_edge(left, "subj", left_value)?;
+                    heap.set_named_edge(left_value, "next", left_child)?;
+                    heap.set_named_edge(right, "subj", right_value)?;
+                    heap.set_named_edge(right_value, "next", right_child)?;
+                    Ok(())
+                })
+                .expect("plant the grown-old owners");
+            let left_subj = parked
+                .with_saved_heap(|heap| heap.locate_named(left.slot(), "subj").map(|(_, i)| i))
+                .expect("left subj record");
+            let right_subj = parked
+                .with_saved_heap(|heap| heap.locate_named(right.slot(), "subj").map(|(_, i)| i))
+                .expect("right subj record");
+            parked
+                .accept_root_batch(&[super::Rooted::Table(left), super::Rooted::Table(right)])
+                .expect("mark both grown-old owners");
+            let mut opened = false;
+            for _ in 0..HARNESS_BOUND {
+                if let Some(pending) = parked.pending()
+                    && pending.owner == left.slot()
+                    && pending.cursor == left_subj
+                {
+                    opened = true;
+                    break;
+                }
+                assert!(
+                    !parked.pulse(1).finished,
+                    "the cycle finished before the grown-old left owner opened"
+                );
+            }
+            assert!(
+                opened,
+                "the left grown-old owner must be open before its value target"
+            );
+            assert!(
+                !parked.marked(left_value) && !parked.marked(right_value),
+                "both grown-old owners were scanned weakly"
+            );
+            let late = grow_one_table(parked);
+            let mode = match final_mode {
+                GrownOldFinal::Strong => "x",
+                GrownOldFinal::Weak => "v",
+            };
+            parked
+                .with_saved_heap(|heap| heap.set_mode_scalar(late, Value::string(mode)))
+                .expect("write the final late mode");
+            parked
+                .with_saved_heap(|heap| -> Result<(), HeapError> {
+                    heap.set_metatable(left, Some(late))?;
+                    heap.set_metatable(right, Some(late))?;
+                    Ok(())
+                })
+                .expect("attach the unresolved final metatable");
+            assert_eq!(
+                parked.meter().owner_rescan_schedules,
+                schedules_before,
+                "the unresolved final mode only records owner checks"
+            );
+            parked
+                .with_saved_heap(|heap| heap.rollback(old_mt))
+                .expect("release the grown old metatable before its parse was recorded");
+            assert!(
+                !parked.with_saved_heap(|heap| heap.alive(old_mt)),
+                "the grown old metatable is really released"
+            );
+            let reused = grow_one_table(parked);
+            assert_eq!(
+                reused.slot(),
+                old_mt.slot(),
+                "the grown old metatable slot is reused"
+            );
+            assert_ne!(reused.generation(), old_mt.generation());
+            for owner in [left, right] {
+                assert_eq!(
+                    parked.metatable(owner),
+                    Ok(Some(late)),
+                    "the final attachment is the late metatable"
+                );
+            }
+            assert!(!parked.marked(left_value) && !parked.marked(right_value));
+            final_mt = Some(late);
+            handles = Some((
+                left,
+                right,
+                left_value,
+                left_child,
+                right_value,
+                right_child,
+                left_subj,
+                right_subj,
+            ));
+        });
+        finish_shared_mode_cycle(&mut host);
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            let late = final_mt.expect("final metatable");
+            let (
+                left,
+                right,
+                left_value,
+                left_child,
+                right_value,
+                right_child,
+                left_subj,
+                right_subj,
+            ) = handles.expect("grown handles");
+            assert_eq!(heap.metatable(left)?, Some(late));
+            assert_eq!(heap.metatable(right)?, Some(late));
+            assert!(heap.alive(left) && heap.alive(right));
+            match final_mode {
+                GrownOldFinal::Strong => {
+                    assert!(
+                        heap.alive(left_value)
+                            && heap.alive(left_child)
+                            && heap.alive(right_value)
+                            && heap.alive(right_child),
+                        "the captured old v must drive a strong rescan after the old release"
+                    );
+                    assert_eq!(
+                        heap.named_edge(left, "subj")?,
+                        Some(left_value),
+                        "the left original value keeps its identity"
+                    );
+                    assert_eq!(
+                        heap.named_edge(right, "subj")?,
+                        Some(right_value),
+                        "the right original value keeps its identity"
+                    );
+                    assert_eq!(
+                        heap.locate_named(left.slot(), "subj").map(|(_, i)| i),
+                        Some(left_subj),
+                        "the current strong edge keeps its original record"
+                    );
+                    assert_eq!(
+                        heap.locate_named(right.slot(), "subj").map(|(_, i)| i),
+                        Some(right_subj)
+                    );
+                    assert_eq!(
+                        heap.scan_meter().owner_rescan_schedules,
+                        schedules_before + 2,
+                        "both grown-old owners are rescanned strong"
+                    );
+                }
+                GrownOldFinal::Weak => {
+                    assert!(
+                        !heap.alive(left_value)
+                            && !heap.alive(left_child)
+                            && !heap.alive(right_value)
+                            && !heap.alive(right_child),
+                        "a final weak mode clears the grown-old graphs"
+                    );
+                    assert_eq!(heap.named_edge(left, "subj")?, None);
+                    assert_eq!(heap.named_edge(right, "subj")?, None);
+                    assert_eq!(
+                        heap.scan_meter().owner_rescan_schedules,
+                        schedules_before,
+                        "the final weak arm schedules no rescan"
+                    );
+                }
+            }
+            assert!(
+                !heap.alive(graph.orphan),
+                "the independent weak orphan clears"
+            );
+            Ok(())
+        })
+        .expect("grown old release");
+    });
+}
+
+#[test]
+fn shared_mode_grown_old_metatable_release_final_strong_keeps_the_captured_graphs() {
+    run_grown_old_release(GrownOldFinal::Strong);
+}
+
+#[test]
+fn shared_mode_grown_old_metatable_release_final_weak_clears_the_captured_graphs() {
+    run_grown_old_release(GrownOldFinal::Weak);
+}
+
+// ---------------------------------------------------------------------------
+// Re-review 0248456: release/reuse invalidates queued owners and edge records.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn queued_owner_release_under_saved_mark_clears_tags_and_keeps_the_current_graphs() {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits(28, 8, 48)).expect("install");
+        let graph = heap::with_heap(&mut host, plant_shared_mode_graph).expect("plant");
+        heap::open_fixed_step(&mut host).expect("open");
+        let mut fresh = None;
+        let mut fresh_value = None;
+        let mut schedules_before = 0u64;
+        let mut deferred_before = 0u64;
+        resume_weak(&mut host, |parked| {
+            pause_after_both_weak_edges(parked, &graph);
+            schedules_before = parked.meter().owner_rescan_schedules;
+            deferred_before = parked.meter().mode_late_deferred;
+            let late = grow_one_table(parked);
+            parked
+                .with_saved_heap(|heap| heap.set_mode_scalar(late, Value::string("x")))
+                .expect("write the strong late mode");
+            attach_shared_metatable(parked, &graph, late);
+            // The left owner check is the current head of the intrusive queue.
+            parked
+                .with_saved_heap(|heap| heap.rollback(graph.left))
+                .expect("release the queued head owner");
+            assert!(
+                !parked.with_saved_heap(|heap| heap.alive(graph.left)),
+                "the queued owner is really released"
+            );
+            let replaced = grow_one_table(parked);
+            assert_eq!(
+                replaced.slot(),
+                graph.left.slot(),
+                "the released owner slot is reused"
+            );
+            assert_ne!(replaced.generation(), graph.left.generation());
+            let (mode_epoch, owner_epoch) = parked.with_saved_heap(|heap| {
+                let slot = &heap.slots[replaced.slot() as usize];
+                (slot.late_mode_epoch, slot.late_owner_epoch)
+            });
+            assert_eq!(mode_epoch, 0, "reuse inherits no late-mode tag");
+            assert_eq!(owner_epoch, 0, "reuse inherits no queued-owner tag");
+            parked
+                .with_saved_heap(|heap| -> Result<(), HeapError> {
+                    heap.set_metatable(replaced, Some(graph.strong_mt))?;
+                    let value = heap.alloc()?;
+                    heap.set_named_edge(replaced, "subj", value)?;
+                    Ok(())
+                })
+                .expect("attach the reused owner strong and add its value");
+            let value = parked
+                .with_saved_heap(|heap| heap.named_edge(replaced, "subj"))
+                .expect("fresh subj")
+                .expect("fresh value");
+            let frame = parked
+                .with_saved_heap(|heap| heap.current_frame())
+                .expect("root frame");
+            parked
+                .write_table_root(frame, 4, replaced)
+                .expect("the released owner's root slot is free");
+            assert_eq!(
+                parked.metatable(replaced),
+                Ok(Some(graph.strong_mt)),
+                "the reused owner keeps its own strong attachment"
+            );
+            assert!(!parked.marked(value));
+            fresh = Some(replaced);
+            fresh_value = Some(value);
+        });
+        finish_shared_mode_cycle(&mut host);
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            let replaced = fresh.expect("reused owner");
+            let value = fresh_value.expect("fresh value");
+            assert!(!heap.alive(graph.left), "the queued owner is swept");
+            assert!(!heap.alive(graph.left_value) && !heap.alive(graph.left_child));
+            assert_eq!(
+                heap.named_edge(graph.left, "subj"),
+                Err(HeapError::StaleHandle)
+            );
+            assert!(heap.alive(replaced), "the reused owner survives");
+            assert!(heap.alive(value), "its strong value survives");
+            assert_eq!(
+                heap.named_edge(replaced, "subj")?,
+                Some(value),
+                "the current strong edge keeps its value"
+            );
+            assert_eq!(heap.metatable(replaced)?, Some(graph.strong_mt));
+            assert!(heap.alive(graph.right_value) && heap.alive(graph.right_child));
+            assert_eq!(
+                heap.named_edge(graph.right, "subj")?,
+                Some(graph.right_value)
+            );
+            assert!(!heap.alive(graph.orphan));
+            assert_eq!(
+                heap.scan_meter().owner_rescan_schedules,
+                schedules_before + 1,
+                "only the surviving right owner is rescanned; the released check is gone"
+            );
+            assert_eq!(
+                heap.scan_meter().mode_late_deferred,
+                deferred_before + 1,
+                "only the surviving owner check is consumed"
+            );
+            Ok(())
+        })
+        .expect("queued owner release");
+    });
+}
+
+#[test]
+fn queued_edge_record_release_and_reuse_keeps_only_the_current_strong_value() {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits(28, 8, 48)).expect("install");
+        let graph = heap::with_heap(&mut host, plant_shared_mode_graph).expect("plant");
+        heap::open_fixed_step(&mut host).expect("open");
+        let mut objects = None;
+        let mut record_copy = None;
+        resume_weak(&mut host, |parked| {
+            pause_after_both_weak_edges(parked, &graph);
+            let late = grow_one_table(parked);
+            parked
+                .with_saved_heap(|heap| heap.set_mode_scalar(late, Value::string("x")))
+                .expect("write the strong late mode");
+            attach_shared_metatable(parked, &graph, late);
+            let doomed = grow_one_table(parked);
+            parked
+                .with_saved_heap(|heap| heap.set_named_edge(graph.left, "pending", doomed))
+                .expect("insert the queued edge target");
+            let record = parked
+                .with_saved_heap(|heap| heap.locate_named(graph.left.slot(), "pending"))
+                .expect("pending record")
+                .1;
+            assert!(
+                !parked.marked(doomed),
+                "the pending strong mode defers the inserted target"
+            );
+            parked
+                .with_saved_heap(|heap| heap.set_named_scalar(graph.left, "pending", Value::Null))
+                .expect("delete the queued edge record");
+            assert!(
+                parked.with_saved_heap(|heap| heap
+                    .locate_named(graph.left.slot(), "pending")
+                    .is_none()),
+                "the queued record is really unlinked"
+            );
+            let (late_epoch, late_owner, late_value, late_key) = parked.with_saved_heap(|heap| {
+                let slot = &heap.edge_slots[record as usize];
+                (
+                    slot.late_epoch,
+                    slot.late_owner,
+                    slot.late_value,
+                    slot.late_key,
+                )
+            });
+            assert_eq!(late_epoch, 0, "released edge record clears its late tag");
+            assert_eq!(late_owner, 0);
+            assert_eq!(late_value, None);
+            assert_eq!(late_key, None);
+            let kept = grow_one_table(parked);
+            parked
+                .with_saved_heap(|heap| heap.set_named_edge(graph.left, "pending", kept))
+                .expect("reinsert the record with the current strong target");
+            let reused = parked
+                .with_saved_heap(|heap| heap.locate_named(graph.left.slot(), "pending"))
+                .expect("reused record")
+                .1;
+            assert_eq!(
+                reused, record,
+                "the free record is reused for the current edge"
+            );
+            assert!(
+                !parked.marked(kept),
+                "the reused event defers the new target"
+            );
+            objects = Some((doomed, kept));
+            record_copy = Some(reused);
+        });
+        finish_shared_mode_cycle(&mut host);
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            let (doomed, kept) = objects.expect("edge targets");
+            let record = record_copy.expect("record");
+            assert!(!heap.alive(doomed), "the obsolete target clears");
+            assert!(heap.alive(kept), "the current strong target survives");
+            assert_eq!(
+                heap.named_edge(graph.left, "pending")?,
+                Some(kept),
+                "the current strong edge keeps its value"
+            );
+            assert_eq!(
+                heap.locate_named(graph.left.slot(), "pending")
+                    .map(|(_, i)| i),
+                Some(record),
+                "the current edge keeps the original new record and key"
+            );
+            assert!(heap.alive(graph.left_value) && heap.alive(graph.left_child));
+            assert!(heap.alive(graph.right_value) && heap.alive(graph.right_child));
+            let slot = &heap.edge_slots[record as usize];
+            assert_eq!(
+                slot.late_epoch, 0,
+                "a kept edge record ends with no late tag"
+            );
+            assert_eq!(slot.late_value, None);
+            assert_eq!(slot.late_key, None);
+            assert!(!heap.alive(graph.orphan));
+            Ok(())
+        })
+        .expect("queued edge release");
+    });
+}
+
+#[test]
+fn queued_owner_and_edge_tags_are_cleared_after_the_mark_is_abandoned() {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits(28, 8, 56)).expect("install");
+        let graph = heap::with_heap(&mut host, plant_shared_mode_graph).expect("plant");
+        heap::open_fixed_step(&mut host).expect("open");
+        let mut doomed = None;
+        let mut late_slot = None;
+        let mut pending_record = None;
+        let mut replaced_after = None;
+        let mut kept_after = None;
+        {
+            heap::with_heap(&mut host, |heap| {
+                let mut parked = ParkedMark::resume(heap).expect("resume saved mark");
+                parking_for_abandon(
+                    &mut parked,
+                    &graph,
+                    &mut doomed,
+                    &mut late_slot,
+                    &mut pending_record,
+                );
+                // Dropping without `park` abandons the saved mark.
+                Ok::<(), HeapError>(())
+            })
+            .expect("abandon");
+        }
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            assert!(
+                heap.mark.is_none(),
+                "the abandoned mark really left the heap"
+            );
+            assert!(
+                heap.slots[graph.left.slot() as usize].late_owner_epoch != 0
+                    || heap.slots[graph.right.slot() as usize].late_owner_epoch != 0,
+                "queue tags exist before release"
+            );
+            let late = late_slot.expect("late metatable");
+            assert_ne!(
+                heap.slots[late.slot() as usize].late_mode_epoch,
+                0,
+                "the late-mode tag exists before release"
+            );
+            heap.rollback(graph.left)?;
+            assert!(
+                !heap.alive(graph.left),
+                "the queued owner is released under no mark"
+            );
+            assert_eq!(
+                heap.slots[graph.left.slot() as usize].late_owner_epoch,
+                0,
+                "release clears the abandoned owner tag"
+            );
+            assert!(
+                heap.named_edge(graph.left, "subj").is_err(),
+                "the released owner handle is no longer readable"
+            );
+            let record = pending_record.expect("pending record index");
+            assert_eq!(
+                heap.edge_slots[record as usize].late_epoch, 0,
+                "releasing the owner clears the abandoned edge tag"
+            );
+            let replaced = heap.alloc()?;
+            assert_eq!(
+                replaced.slot(),
+                graph.left.slot(),
+                "the abandoned owner slot is reused"
+            );
+            assert_eq!(
+                heap.slots[replaced.slot() as usize].late_owner_epoch,
+                0,
+                "reuse starts with no inherited owner tag"
+            );
+            let target = doomed.expect("doomed edge target");
+            let kept = heap.alloc()?;
+            heap.set_metatable(replaced, Some(graph.strong_mt))?;
+            heap.set_named_edge(replaced, "subj", kept)?;
+            heap.rollback(late)?;
+            assert_eq!(
+                heap.slots[late.slot() as usize].late_mode_epoch,
+                0,
+                "release clears the abandoned mode tag"
+            );
+            let reused_mt = heap.alloc()?;
+            assert_eq!(reused_mt.slot(), late.slot());
+            assert_eq!(
+                heap.slots[reused_mt.slot() as usize].late_mode_epoch,
+                0,
+                "the reused metatable slot inherits no mode tag"
+            );
+            heap.set_metatable(graph.right, Some(graph.strong_mt))?;
+            let frame = heap.current_frame().expect("root frame");
+            heap.write_root(frame, 4, replaced)?;
+            let _ = (target, reused_mt);
+            replaced_after = Some(replaced);
+            kept_after = Some(kept);
+            Ok(())
+        })
+        .expect("abandoned release");
+        heap::collect(&mut host).expect("fresh full collection");
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            let target = doomed.expect("doomed target");
+            let replaced = replaced_after.expect("reused owner");
+            let kept = kept_after.expect("kept value");
+            assert!(!heap.alive(graph.left));
+            assert!(!heap.alive(target), "the obsolete queued target clears");
+            assert!(!heap.alive(graph.left_value) && !heap.alive(graph.left_child));
+            assert!(heap.alive(replaced), "the reused owner survives");
+            assert!(heap.alive(kept), "its strong value survives");
+            assert_eq!(
+                heap.named_edge(replaced, "subj")?,
+                Some(kept),
+                "the current strong edge keeps its value"
+            );
+            assert!(heap.alive(graph.right_value) && heap.alive(graph.right_child));
+            assert_eq!(
+                heap.named_edge(graph.right, "subj")?,
+                Some(graph.right_value)
+            );
+            Ok(())
+        })
+        .expect("abandoned outcome");
+    });
+}
+
+fn parking_for_abandon(
+    parked: &mut ParkedMark<'_>,
+    graph: &SharedModeGraph,
+    doomed: &mut Option<TableRef>,
+    late_slot: &mut Option<TableRef>,
+    pending_record: &mut Option<u32>,
+) {
+    pause_after_both_weak_edges(parked, graph);
+    let late = grow_one_table(parked);
+    parked
+        .with_saved_heap(|heap| heap.set_mode_scalar(late, Value::string("v")))
+        .expect("write the abandoned late v");
+    attach_shared_metatable(parked, graph, late);
+    let target = grow_one_table(parked);
+    parked
+        .with_saved_heap(|heap| heap.set_named_edge(graph.left, "pending", target))
+        .expect("insert the abandoned queued edge target");
+    parked.with_saved_heap(|heap| {
+        let left = &heap.slots[graph.left.slot() as usize];
+        let right = &heap.slots[graph.right.slot() as usize];
+        assert_ne!(left.late_owner_epoch, 0);
+        assert_ne!(right.late_owner_epoch, 0);
+        let late_slot_stored = &heap.slots[late.slot() as usize];
+        assert_ne!(late_slot_stored.late_mode_epoch, 0);
+        let (_, pending) = heap
+            .locate_named(graph.left.slot(), "pending")
+            .expect("pending");
+        assert_ne!(
+            heap.edge_slots[pending as usize].late_epoch, 0,
+            "the abandoned edge record carries a queue tag before release"
+        );
+        *pending_record = Some(pending);
+    });
+    *doomed = Some(target);
+    *late_slot = Some(late);
+}
+
+// ---------------------------------------------------------------------------
+// Re-review 0248456: a rescan opened strong must re-read a late weak switch.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug)]
+enum RescanSwitchArm {
+    OrdinaryWeak,
+    ResumedStrong,
+    LateWeakAfterHead,
+}
+
+fn run_rescan_switch(arm: RescanSwitchArm) {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits(24, 8, 40)).expect("install");
+        let graph = heap::with_heap(&mut host, plant_shared_mode_graph).expect("plant");
+        heap::open_fixed_step(&mut host).expect("open");
+        let mut switched = None;
+        let mut paused_at_left_value = false;
+        resume_weak(&mut host, |parked| {
+            pause_after_both_weak_edges(parked, &graph);
+            if matches!(arm, RescanSwitchArm::OrdinaryWeak) {
+                return;
+            }
+            attach_shared_metatable(parked, &graph, graph.strong_mt);
+            let mut opened = false;
+            for _ in 0..HARNESS_BOUND {
+                if let Some(pending) = parked.pending_rescan()
+                    && pending.owner == graph.left.slot()
+                    && pending.cursor == graph.left_value_record
+                {
+                    opened = true;
+                    break;
+                }
+                assert!(
+                    !parked.pulse(1).finished,
+                    "the cycle finished before the left rescan reached its first target"
+                );
+            }
+            assert!(
+                opened,
+                "the left rescan head must be open right before its value target"
+            );
+            paused_at_left_value = true;
+            assert!(
+                parked.marked(graph.right_value) && parked.marked(graph.right_child),
+                "the already-rescanned right owner was marked strong before the switch"
+            );
+            assert!(
+                !parked.marked(graph.left_value),
+                "the left target is still white when the head is open"
+            );
+            if matches!(arm, RescanSwitchArm::LateWeakAfterHead) {
+                let late = grow_one_table(parked);
+                parked
+                    .with_saved_heap(|heap| heap.set_mode_scalar(late, Value::string("v")))
+                    .expect("write the late weak v");
+                attach_shared_metatable(parked, &graph, late);
+                assert_eq!(
+                    parked.metatable(graph.left),
+                    Ok(Some(late)),
+                    "the final attachment really is the late weak metatable"
+                );
+                assert!(
+                    !parked.marked(graph.left_value),
+                    "the switch itself must not mark the white target"
+                );
+                switched = Some(late);
+            }
+        });
+        finish_shared_mode_cycle(&mut host);
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            let outcome = read_shared_mode_outcome(heap, &graph)?;
+            match arm {
+                RescanSwitchArm::OrdinaryWeak => {
+                    assert_eq!(
+                        (
+                            outcome.left_value,
+                            outcome.left_child,
+                            outcome.right_value,
+                            outcome.right_child,
+                        ),
+                        (false, false, false, false),
+                        "the ordinary weak control clears both graphs"
+                    );
+                    assert_eq!(outcome.left_edge, None);
+                    assert_eq!(outcome.right_edge, None);
+                }
+                RescanSwitchArm::ResumedStrong => {
+                    assert_eq!(
+                        (
+                            outcome.left_value,
+                            outcome.left_child,
+                            outcome.right_value,
+                            outcome.right_child,
+                        ),
+                        (true, true, true, true),
+                        "a rescan that keeps its strength marks both graphs"
+                    );
+                    assert_eq!(outcome.left_edge, Some(graph.left_value));
+                    assert_eq!(outcome.right_edge, Some(graph.right_value));
+                }
+                RescanSwitchArm::LateWeakAfterHead => {
+                    assert!(
+                        paused_at_left_value,
+                        "the late switch must happen while the left head is open"
+                    );
+                    assert_eq!(
+                        (outcome.left_value, outcome.left_child),
+                        (false, false),
+                        "resuming with old strength must not mark the white left target or child"
+                    );
+                    assert_eq!(
+                        outcome.left_edge, None,
+                        "the weak left entry clears after the late switch"
+                    );
+                    assert_eq!(
+                        (outcome.right_value, outcome.right_child),
+                        (true, true),
+                        "the already-rescanned right graph keeps its strong marks"
+                    );
+                }
+            }
+            let late = switched;
+            if let Some(late) = late {
+                assert_eq!(heap.metatable(graph.left)?, Some(late));
+                assert_eq!(heap.metatable(graph.right)?, Some(late));
+            }
+            assert!(!outcome.orphan, "the independent orphan always clears");
+            assert!(!outcome.dust);
+            Ok(())
+        })
+        .expect("rescan switch arm");
+    });
+}
+
+#[test]
+fn shared_mode_late_weak_switch_after_open_rescan_does_not_mark_white_targets() {
+    run_rescan_switch(RescanSwitchArm::LateWeakAfterHead);
+}
+
+#[test]
+fn shared_mode_ordinary_weak_scan_clears_both_graphs() {
+    run_rescan_switch(RescanSwitchArm::OrdinaryWeak);
+}
+
+#[test]
+fn shared_mode_resumed_strong_rescan_keeps_both_graphs() {
+    run_rescan_switch(RescanSwitchArm::ResumedStrong);
+}
+
+// ---------------------------------------------------------------------------
+// Re-review 0248456: known-mode overwrites must not starve ordinary Gray work.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn known_mode_live_edge_overwrites_advance_one_ordinary_gray_unit_per_pulse() {
+    let mut heap = LuaHeap::new(limits(12, 8, 24));
+    let strong_mt = heap.alloc().expect("strong metatable");
+    let a = heap.alloc().expect("first marked value");
+    let b = heap.alloc().expect("second marked value");
+    let target = heap.alloc().expect("marked owner");
+    heap.set_metatable(target, Some(strong_mt))
+        .expect("attach the known strong metatable");
+    heap.set_edge(target, KEY_X, a)
+        .expect("install the fixed live edge");
+    let gate = heap.alloc().expect("unrelated owner");
+    heap.set_named_scalar(gate, "g0", Value::Bool(true))
+        .expect("gate record 0");
+    heap.set_named_scalar(gate, "g1", Value::Bool(true))
+        .expect("gate record 1");
+    heap.set_named_scalar(gate, "g2", Value::Bool(true))
+        .expect("gate record 2");
+    let g0_record = heap.locate_named(gate.slot(), "g0").expect("gate g0").1;
+    let g1_record = heap.locate_named(gate.slot(), "g1").expect("gate g1").1;
+    let g2_record = heap.locate_named(gate.slot(), "g2").expect("gate g2").1;
+    let frame = heap.enter_roots(4).expect("roots");
+    heap.write_root(frame, 0, gate).expect("root gate");
+    heap.write_root(frame, 1, a).expect("root a");
+    heap.write_root(frame, 2, b).expect("root b");
+    heap.write_root(frame, 3, target).expect("root target");
+
+    {
+        let mut parked = ParkedMark::start(&mut heap).expect("start mark");
+        pause_at(&mut parked, gate.slot(), g0_record);
+        assert!(
+            parked.marked(target),
+            "the target owner is marked before the writes"
+        );
+        assert!(
+            !parked
+                .pending()
+                .map(|scan| scan.owner == target.slot())
+                .unwrap_or(false),
+            "the target owner is already fully scanned"
+        );
+        let before = parked.meter();
+        let mut expected_cursor = g1_record;
+        for (index, value) in [b, a].into_iter().enumerate() {
+            parked
+                .with_saved_heap(|heap| heap.set_edge(target, KEY_X, value))
+                .expect("overwrite the fixed live edge");
+            let before_pulse = parked.meter();
+            assert_eq!(
+                before_pulse.mode_late_events, before.mode_late_events,
+                "write {index}: a known-mode overwrite must not add a deferred event"
+            );
+            assert_eq!(
+                before_pulse.mode_late_lookups, before.mode_late_lookups,
+                "write {index}: a known-mode overwrite must not route through the late lookup"
+            );
+            let view = parked.pulse(1);
+            assert!(!view.finished, "the unrelated gate still has records");
+            let now = view.meter;
+            assert_eq!(
+                now.outgoing_edge_checks - before_pulse.outgoing_edge_checks,
+                1,
+                "write {index}: the pulse must advance one unrelated ordinary Gray edge"
+            );
+            assert_eq!(
+                now.mode_late_events, before.mode_late_events,
+                "write {index}: no late work is created by the overwrite"
+            );
+            assert_eq!(
+                now.mode_late_deferred, before.mode_late_deferred,
+                "write {index}: no deferred late unit is consumed"
+            );
+            assert_eq!(
+                parked.pending().map(|scan| (scan.owner, scan.cursor)),
+                Some((gate.slot(), expected_cursor)),
+                "write {index}: the gate cursor advances in the same pass"
+            );
+            if index == 0 {
+                expected_cursor = g2_record;
+            }
+        }
+        assert_eq!(parked.phase_name(), "gray", "no ModeLate window intervened");
+        assert!(
+            parked.marked(a) && parked.marked(b),
+            "both values were already marked roots"
+        );
+        let mut view = parked.pulse(64);
+        while !view.finished {
+            view = parked.pulse(64);
+        }
+        parked.complete().expect("sweep the starvation mark");
+    }
+
+    assert!(heap.alive(target) && heap.alive(gate));
+    assert!(heap.alive(a) && heap.alive(b));
+    assert_eq!(
+        heap.edge(target, KEY_X),
+        Ok(Some(a)),
+        "the latest written value stays on the original live edge"
+    );
+    assert_eq!(
+        heap.locate_named(target.slot(), "__mode"),
+        None,
+        "the known strong metatable has no mode record"
+    );
+    let meter = heap.scan_meter();
+    assert_eq!(meter.mode_late_events, 0, "no event was ever queued");
+    assert_eq!(meter.mode_late_deferred, 0, "no deferred unit was consumed");
+}
+
+/// Late parses are stored outside the reset-sized vector. Three live
+/// metatables are queued: a high slot first, then a reused lower slot, then a
+/// third higher slot. The intrusive queue is write-ordered, the map insert is
+/// one charged store per parse, and no indexed vector or discovery sidecar is
+/// sized. Two owners receive the deferred transition checks; repeated writes
+/// coalesce instead of extending the backlog.
+#[test]
+fn late_mode_queue_is_bounded_by_live_sites_and_stores_outside_the_vectors() {
+    crate::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits(32, 8, 48)).expect("install");
+        let graph = heap::with_heap(&mut host, plant_shared_mode_graph).expect("plant");
+        heap::open_fixed_step(&mut host).expect("open");
+        let mut spaces = None;
+        resume_weak(&mut host, |parked| {
+            pause_after_both_weak_edges(parked, &graph);
+            let before = parked.meter();
+            let high = grow_one_table(parked);
+            parked
+                .with_saved_heap(|heap| heap.set_mode_scalar(high, Value::string("v")))
+                .expect("write the high-slot mode first");
+            // `dust` is an early, unrooted slot. Releasing it and allocating
+            // again gives the second metatable a lower slot than the first.
+            parked
+                .with_saved_heap(|heap| heap.rollback(graph.dust))
+                .expect("release the early slot");
+            let low = grow_one_table(parked);
+            assert!(
+                low.slot() < high.slot(),
+                "the second metatable reuses a lower slot after the first is queued"
+            );
+            parked
+                .with_saved_heap(|heap| heap.set_mode_scalar(low, Value::string("v")))
+                .expect("write the lower-slot mode second");
+            let third = grow_one_table(parked);
+            parked
+                .with_saved_heap(|heap| heap.set_mode_scalar(third, Value::string("v")))
+                .expect("write a third unattached mode");
+            attach_shared_metatable(parked, &graph, low);
+            parked
+                .with_saved_heap(|heap| heap.set_metatable(graph.left, Some(high)))
+                .expect("attach the left owner to the high-slot mode");
+            // Repeats must coalesce on the slot tags and owner records.
+            parked
+                .with_saved_heap(|heap| heap.set_mode_scalar(high, Value::string("v")))
+                .expect("rewrite the queued mode in place");
+            parked
+                .with_saved_heap(|heap| -> Result<(), HeapError> {
+                    heap.set_metatable(graph.left, Some(high))?;
+                    heap.set_metatable(graph.right, Some(low))?;
+                    Ok(())
+                })
+                .expect("reapply the same attachments");
+            let after = parked.meter();
+            assert_eq!(
+                after.mode_late_registrations - before.mode_late_registrations,
+                3,
+                "three live metatables queue one parse each, not one per write"
+            );
+            assert_eq!(
+                after.mode_late_cancels - before.mode_late_cancels,
+                1,
+                "the repeat write restarts the queued high-slot parse in place"
+            );
+            assert_eq!(
+                after.mode_late_events - before.mode_late_events,
+                2,
+                "one deferred owner check per live owner, not per setter"
+            );
+            assert_eq!(
+                after.mode_late_event_reuses - before.mode_late_event_reuses,
+                1,
+                "the later high-slot setter reuses the left owner check; a same-tuple setter does not touch the queue"
+            );
+            assert_eq!(
+                after.weak_mode_bytes, before.weak_mode_bytes,
+                "the setter reads no mode byte"
+            );
+            assert_eq!(
+                after.scratch.weak_modes_inited, before.scratch.weak_modes_inited,
+                "the setter does not size the indexed vector"
+            );
+            assert_eq!(
+                after.scratch.mode_discover_inited, before.scratch.mode_discover_inited,
+                "the setter does not size the discovery sidecar"
+            );
+
+            let mut pulses = 0u32;
+            loop {
+                let prior = parked.meter();
+                let view = parked.pulse(1);
+                let now = view.meter;
+                let bytes = now.weak_mode_bytes - prior.weak_mode_bytes;
+                let opened = now.weak_mode_edge_checks - prior.weak_mode_edge_checks;
+                let parsed = now.mode_late_parsed - prior.mode_late_parsed;
+                let deferred = now.mode_late_deferred - prior.mode_late_deferred;
+                let heads = now.owner_head_checks - prior.owner_head_checks;
+                let edges = now.outgoing_edge_checks - prior.outgoing_edge_checks;
+                assert!(
+                    bytes <= 1
+                        && opened <= 1
+                        && parsed <= 1
+                        && deferred <= 1
+                        && heads <= 1
+                        && edges <= 1,
+                    "pulse {pulses} exceeded budget 1: bytes={bytes} open={opened} parsed={parsed} deferred={deferred} heads={heads} edges={edges}"
+                );
+                if parked.phase_name() != "mode-late" {
+                    break;
+                }
+                assert!(
+                    !view.finished,
+                    "the cycle finished inside the bounded late window"
+                );
+                pulses += 1;
+                assert!(pulses < 512, "the late window did not drain");
+            }
+            let end = parked.meter();
+            assert_eq!(
+                end.mode_late_parsed - before.mode_late_parsed,
+                3,
+                "each live metatable stores exactly one parsed mode"
+            );
+            assert_eq!(
+                end.scratch.weak_modes_inited, before.scratch.weak_modes_inited,
+                "the late parses store outside the reset-sized vector"
+            );
+            assert_eq!(
+                end.scratch.mode_discover_inited, before.scratch.mode_discover_inited,
+                "the late parses store outside the discovery sidecar"
+            );
+            assert_eq!(
+                end.mode_late_deferred - before.mode_late_deferred,
+                2,
+                "only the two queued owner checks are consumed"
+            );
+            assert!(
+                parked
+                    .metatable(graph.left)
+                    .expect("left metatable")
+                    .is_some()
+            );
+            assert!(
+                parked
+                    .metatable(graph.right)
+                    .expect("right metatable")
+                    .is_some()
+            );
+            spaces = Some((high, low, third));
+        });
+        finish_shared_mode_cycle(&mut host);
+        heap::with_heap(&mut host, |heap| -> Result<(), HeapError> {
+            let (high, low, third) = spaces.expect("metatable spaces");
+            assert!(
+                heap.alive(high) && heap.alive(low),
+                "the attached metatables are marked through their owners"
+            );
+            assert!(
+                !heap.alive(third),
+                "an unattached metatable is not rooted by its queued mode parse"
+            );
+            assert_eq!(heap.metatable(graph.left)?, Some(high));
+            assert_eq!(heap.metatable(graph.right)?, Some(low));
+            let outcome = read_shared_mode_outcome(heap, &graph)?;
+            assert_eq!(
+                (
+                    outcome.left_value,
+                    outcome.left_child,
+                    outcome.right_value,
+                    outcome.right_child,
+                ),
+                (false, false, false, false),
+                "both owners stay weak under their final metatables"
+            );
+            assert_eq!(outcome.left_edge, None);
+            assert_eq!(outcome.right_edge, None);
+            assert!(!outcome.orphan);
+            let meter = heap.scan_meter();
+            assert!(meter.mode_late_parsed >= 3, "three late parses were stored");
+            Ok(())
+        })
+        .expect("bounded late queue");
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Re-review 0248456: deferred replay Gray capacity movement is measured.
+// ---------------------------------------------------------------------------
+
+fn gray_shape(parked: &mut ParkedMark<'_>) -> (usize, usize) {
+    parked
+        .with_saved_heap(|heap| heap.saved_mark_gray_shape())
+        .expect("saved mark gray shape")
+}
+
+/// Drive the late byte reader with budget one until one whole mode parse is
+/// stored. The pulse that completes the parse does not also consume a deferred
+/// owner or edge check.
+fn pulse_until_late_parsed(parked: &mut ParkedMark<'_>) {
+    let base = parked.meter().mode_late_parsed;
+    let mut pulses = 0u32;
+    while parked.meter().mode_late_parsed == base {
+        let view = parked.pulse(1);
+        assert!(!view.finished, "the cycle finished before the mode parse");
+        pulses += 1;
+        assert!(pulses < 256, "the mode parse did not finish");
+    }
+    assert_eq!(
+        parked.meter().mode_late_parsed - base,
+        1,
+        "one parse store per completed late mode"
+    );
+}
+
+/// Consume exactly one deferred owner check. The Gray stack must not move.
+fn consume_one_deferred(parked: &mut ParkedMark<'_>, label: &str) {
+    let before = parked.meter();
+    let shape = gray_shape(parked);
+    let view = parked.pulse(1);
+    assert!(!view.finished, "{label}: the gate work remains");
+    let now = view.meter;
+    assert_eq!(
+        now.mode_late_deferred - before.mode_late_deferred,
+        1,
+        "{label}: one deferred unit is consumed"
+    );
+    assert_eq!(
+        now.scratch.work_pushed, before.scratch.work_pushed,
+        "{label}: an owner check does not push to Gray"
+    );
+    assert_eq!(gray_shape(parked), shape, "{label}: Gray did not move");
+}
+
+fn fill_gray_to_capacity(parked: &mut ParkedMark<'_>) -> (usize, usize) {
+    loop {
+        let (len, cap) = gray_shape(parked);
+        if len == cap {
+            return (len, cap);
+        }
+        let need = cap - len;
+        let mut batch = Vec::with_capacity(need);
+        for _ in 0..need {
+            let filler = parked
+                .with_saved_heap(|heap| heap.alloc())
+                .expect("gray filler");
+            batch.push(super::Rooted::Table(filler));
+        }
+        parked
+            .accept_root_batch(&batch)
+            .expect("fill the gray stack to its current capacity");
+    }
+}
+
+/// Two real Gray capacity boundaries. The first deferred edge target is
+/// replayed when `len == cap`; its push copies the current capacity once and
+/// doubles it. The test refills that new capacity and repeats with a second
+/// live edge, so the evidence is two boundaries, not one insertion. Each
+/// late parse and deferred check is still one pulse unit; the copy is the
+/// explicit amortized tradeoff, bounded by live nodes.
+#[test]
+fn late_deferred_gray_push_reports_the_actual_capacity_boundaries() {
+    let mut heap = LuaHeap::new(limits(40, 16, 64));
+    let owner = heap.alloc().expect("owner");
+    let old = heap.alloc().expect("old value");
+    heap.set_edge(owner, KEY_X, old).expect("fixed live edge");
+    let gate = heap.alloc().expect("gate");
+    heap.set_named_scalar(gate, "g0", Value::Bool(true))
+        .expect("gate record");
+    let gate_record = heap.locate_named(gate.slot(), "g0").expect("gate").1;
+    let frame = heap.enter_roots(2).expect("roots");
+    // Gray is LIFO: the gate pauses before the owner opens.
+    heap.write_root(frame, 0, owner).expect("root owner");
+    heap.write_root(frame, 1, gate).expect("root gate");
+
+    let mut boundaries = Vec::new();
+    let live_targets;
+    {
+        let mut parked = ParkedMark::start(&mut heap).expect("start mark");
+        pause_at(&mut parked, gate.slot(), gate_record);
+        assert!(parked.marked(owner));
+        assert_eq!(
+            parked.pending().map(|scan| scan.owner),
+            Some(gate.slot()),
+            "the owner is marked but not opened"
+        );
+        let m1 = parked
+            .with_saved_heap(|heap| heap.alloc())
+            .expect("grown first metatable");
+        parked
+            .with_saved_heap(|heap| heap.set_mode_scalar(m1, Value::string("x")))
+            .expect("first strong late mode");
+        parked
+            .with_saved_heap(|heap| heap.set_metatable(owner, Some(m1)))
+            .expect("attach the pending first metatable");
+        let t1 = parked
+            .with_saved_heap(|heap| heap.alloc())
+            .expect("first white target");
+        parked
+            .with_saved_heap(|heap| heap.set_edge(owner, KEY_X, t1))
+            .expect("overwrite the fixed edge while the mode is pending");
+        assert!(
+            !parked.marked(t1),
+            "the pending strong mode defers the first target"
+        );
+        pulse_until_late_parsed(&mut parked);
+        consume_one_deferred(&mut parked, "first owner check");
+        assert_eq!(
+            gray_shape(&mut parked).0,
+            2,
+            "the owner and its marked metatable are queued"
+        );
+        let before_shape = fill_gray_to_capacity(&mut parked);
+        assert_eq!(
+            before_shape,
+            (before_shape.0, before_shape.0),
+            "the gray stack is exactly at its capacity before the deferred push"
+        );
+        assert!(!parked.marked(t1));
+        let before = parked.meter();
+        let view = parked.pulse(1);
+        assert!(!view.finished, "the gate work remains after one replay");
+        let now = view.meter;
+        assert_eq!(
+            now.mode_late_deferred - before.mode_late_deferred,
+            1,
+            "the pulse consumed exactly one deferred edge record"
+        );
+        assert_eq!(
+            now.scratch.work_pushed - before.scratch.work_pushed,
+            1,
+            "the deferred replay marked exactly one target"
+        );
+        assert!(parked.marked(t1));
+        let after_shape = gray_shape(&mut parked);
+        assert_eq!(
+            after_shape.0,
+            before_shape.0 + 1,
+            "one target joined the gray stack"
+        );
+        assert!(
+            after_shape.1 > before_shape.1,
+            "the push crossed a real capacity boundary: before={:?} after={:?}",
+            before_shape,
+            after_shape
+        );
+        boundaries.push((before_shape, after_shape));
+
+        let m2 = parked
+            .with_saved_heap(|heap| heap.alloc())
+            .expect("grown second metatable");
+        parked
+            .with_saved_heap(|heap| heap.set_mode_scalar(m2, Value::string("x")))
+            .expect("second strong late mode");
+        parked
+            .with_saved_heap(|heap| heap.set_metatable(owner, Some(m2)))
+            .expect("attach the pending second metatable");
+        let t2 = parked
+            .with_saved_heap(|heap| heap.alloc())
+            .expect("second white target");
+        parked
+            .with_saved_heap(|heap| heap.set_edge(owner, KEY_X, t2))
+            .expect("overwrite the same live edge again");
+        assert!(
+            !parked.marked(t2),
+            "the pending mode defers the second target"
+        );
+        pulse_until_late_parsed(&mut parked);
+        consume_one_deferred(&mut parked, "second owner check");
+        let refilled = fill_gray_to_capacity(&mut parked);
+        assert_eq!(
+            refilled,
+            (refilled.0, refilled.0),
+            "the grown stack is refilled to its new capacity before the second replay"
+        );
+        assert!(!parked.marked(t2));
+        let before = parked.meter();
+        let view = parked.pulse(1);
+        assert!(!view.finished);
+        let now = view.meter;
+        assert_eq!(
+            now.mode_late_deferred - before.mode_late_deferred,
+            1,
+            "the second replay consumed one deferred edge record"
+        );
+        assert_eq!(now.scratch.work_pushed - before.scratch.work_pushed, 1);
+        assert!(parked.marked(t2));
+        let after_shape = gray_shape(&mut parked);
+        assert_eq!(after_shape.0, refilled.0 + 1);
+        assert!(
+            after_shape.1 > refilled.1,
+            "the second push crossed another real capacity boundary: before={:?} after={:?}",
+            refilled,
+            after_shape
+        );
+        boundaries.push((refilled, after_shape));
+
+        let mut view = parked.pulse(64);
+        while !view.finished {
+            view = parked.pulse(64);
+        }
+        parked.complete().expect("sweep the capacity mark");
+        live_targets = Some((m1, m2, t1, t2));
+    }
+
+    let (m1, m2, t1, t2) = live_targets.expect("capacity targets");
+    assert!(heap.alive(owner) && heap.alive(gate));
+    assert!(heap.alive(m1) && heap.alive(m2));
+    assert!(heap.alive(t1) && heap.alive(t2));
+    assert_eq!(
+        heap.edge(owner, KEY_X),
+        Ok(Some(t2)),
+        "the fixed edge keeps its latest strong target"
+    );
+    assert!(boundaries.len() == 2);
+    eprintln!("observed gray capacity shapes: {boundaries:?}");
+    // The copy cost of each boundary pulse is at most the old capacity, and
+    // the geometric growth keeps the total copied elements linear in live
+    // pushes.
+}
