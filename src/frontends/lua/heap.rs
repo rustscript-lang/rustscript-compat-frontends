@@ -651,8 +651,20 @@ pub(crate) fn collect_pending_finalizers(
     if heap.has_saved_mark() {
         return Err(HeapError::MarkActive);
     }
+    let base = with_heap(host, |heap| Ok(heap.pending_finalizer_count()))?;
     let marked = with_heap(host, |heap| Ok(heap.mark_and_pending_tokens()))?;
-    verify_pending_finalizers(host)?;
+    if let Err(error) = verify_pending_finalizers(host) {
+        // This is the owner-verification preflight's own transaction: remove
+        // only the records and flags appended by this selecting pass. Earlier
+        // valid records are untouched, no doomed token has been closed yet,
+        // and no weak edge has been published, so the two later failure
+        // prefixes are not mixed into this rollback.
+        with_heap(host, |heap| {
+            heap.discard_pending_finalizers_from(base);
+            Ok(())
+        })?;
+        return Err(error);
+    }
     close_then_halt_at_publish(host, marked)
 }
 
@@ -662,7 +674,8 @@ pub(crate) fn collect_pending_finalizers(
 /// The borrow ends before the next record. This runs after the selecting mark
 /// and before any doomed token closes or any weak edge is published. A
 /// missing or wrong token returns [`HeapError::TokenMismatch`] or the real
-/// scope error; no record is mutated.
+/// scope error; no record is mutated. The caller then discards only the
+/// records appended by this pass.
 fn verify_pending_finalizers(host: &HostContext) -> Result<(), HeapError> {
     let Some(heap) = host.scope_state::<LuaHeap>() else {
         return Err(HeapError::SweepDenied);

@@ -515,6 +515,10 @@ impl<'a> SweepSession<'a> {
         match slot.state {
             SlotState::Live { marked: false } => {
                 assert!(
+                    !slot.pending_finalizer,
+                    "lua heap sweep selected pending-finalizer slot {index} as dead; the mark must retain every live pending record"
+                );
+                assert!(
                     slot.token.is_none(),
                     "lua heap sweep reached dead slot {index} with a bound host token; the host collector must close it and clear the binding before sweep"
                 );
@@ -685,7 +689,13 @@ impl<'a> SweepSession<'a> {
                     self.typed(*slot, *generation, HandleKind::Upvalue)
                 }
                 EdgeValue::Userdata { slot, generation } => {
+                    // A value-weak pending userdata is value-dead even though
+                    // it stays marked and retained. A guest-cursor key can
+                    // publish that as a gap; a bare userdata key cannot, so
+                    // the whole `kv`/`v` record is dropped instead of keeping
+                    // the retained object as a strong value.
                     self.typed(*slot, *generation, HandleKind::Userdata)
+                        && !(weak && self.pending(*slot, *generation))
                 }
             };
         let key_ok = match &edge.key {
