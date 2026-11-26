@@ -1820,6 +1820,20 @@ impl LuaHeap {
         }
     }
 
+    /// Test-only: writes a stored nil under a named field without deleting the
+    /// record. This is the same scalar-null representation weak publication
+    /// leaves as a cursor gap; the private raw `__gc` lookup must treat it as
+    /// absent rather than as a value.
+    #[cfg(test)]
+    pub(crate) fn set_named_gap_test_control(
+        &mut self,
+        from: TableRef,
+        name: &str,
+    ) -> Result<(), HeapError> {
+        self.require_live(from)?;
+        self.write_edge(from, EdgeKey::named(name), EdgeValue::Scalar(Value::Null))
+    }
+
     /// Removes one ordinary UTF-8 field while a sweep tail is saved.
     ///
     /// [`Self::require_live`] runs before the tail check, so a stale or

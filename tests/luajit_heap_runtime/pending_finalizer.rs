@@ -1360,6 +1360,54 @@ fn raw_gc_missing_or_nil_on_a_long_chain_is_not_selected() {
 }
 
 #[test]
+fn raw_gc_stored_cursor_gap_on_a_long_chain_is_not_selected() {
+    let mut receipt = None;
+    crate::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits()).expect("install");
+        let userdata = heap::publish_userdata(&mut host).expect("userdata");
+        let raw = bound_raw(&mut host, userdata);
+        let metatable_slot = heap::with_heap(&mut host, |heap| {
+            let metatable = raw_gc_chain(heap, 8, Some(5))?;
+            heap.set_named_gap_test_control(metatable, "__gc")?;
+            heap.set_userdata_metatable(userdata, Some(metatable))?;
+            let weak = weak_table(heap, "v")?;
+            heap.set_number_userdata(weak, 1.0, userdata)?;
+            let frame = heap.enter_roots(1)?;
+            heap.write_root(frame, 0, weak)?;
+            Ok(metatable.slot())
+        })
+        .expect("gap lattice");
+        heap::with_heap(&mut host, |heap| {
+            heap.clear_pending_gc_edge_trace();
+            Ok(())
+        })
+        .expect("clear trace");
+        let _ = heap::take_scan_meter(&mut host);
+        let boundary = publish_boundary(&mut host);
+        assert!(matches!(boundary, PublishedBoundary::Published { .. }));
+        let meter = heap::take_scan_meter(&mut host).expect("gap meter");
+        let trace =
+            heap::with_heap(&mut host, |heap| Ok(heap.pending_gc_edge_trace())).expect("gap trace");
+        assert_eq!(
+            meter.pending_finalizers_selected, 0,
+            "a stored cursor gap is not a raw __gc value"
+        );
+        assert_eq!(meter.pending_finalizer_gc_lookups, 1);
+        assert_eq!(
+            meter.pending_finalizer_gc_edge_checks, 6,
+            "the lookup stops at the stored gap and reads only records before it"
+        );
+        assert_eq!(trace.len(), 6);
+        assert!(trace.iter().all(|(slot, _)| *slot == metatable_slot));
+        assert_eq!(meter.token_closes, 1);
+        assert!(!userdata_token_open(&host, raw));
+        receipt = Some(());
+    });
+    receipt.expect("gap arm");
+}
+
+#[test]
 fn shared_metatable_raw_gc_chain_is_read_once_for_multiple_candidates() {
     let mut receipt = None;
     crate::support::with_idle_vm(|vm| {
