@@ -942,6 +942,13 @@ pub struct LuaHeap {
     /// leave this unchanged, so its work stays independent of the graph size.
     #[cfg(test)]
     rollback_owner_visits: u64,
+    /// Slot indices actually indexed by sweep selection and by the
+    /// registered-reservation identity guard. Test-only: the pushes record
+    /// the real indexing points and never read another slot. Tests clear the
+    /// trace after Mark, so a shared Select pulse trace starts at the cursor.
+    /// Interior mutability keeps the identity guard's `&self` read-only.
+    #[cfg(test)]
+    selection_slot_trace: std::cell::RefCell<Vec<u32>>,
 }
 
 /// One typed-issuer userdata reservation, keyed by its exact slot and
@@ -1028,6 +1035,8 @@ impl LuaHeap {
             pending_userdata: None,
             #[cfg(test)]
             rollback_owner_visits: 0,
+            #[cfg(test)]
+            selection_slot_trace: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -3051,6 +3060,8 @@ impl LuaHeap {
         let pending = self.pending_userdata?;
         pending.raw?;
         let slot = self.slots.get(pending.slot as usize)?;
+        #[cfg(test)]
+        self.selection_slot_trace.borrow_mut().push(pending.slot);
         if slot.generation == pending.generation
             && slot.kind == HandleKind::Userdata
             && slot.token.is_none()
@@ -3435,6 +3446,18 @@ impl LuaHeap {
     #[cfg(test)]
     pub(crate) fn rollback_owner_visits(&self) -> u64 {
         self.rollback_owner_visits
+    }
+
+    /// Clears the recorded selection slot indices. Test-only.
+    #[cfg(test)]
+    pub(super) fn clear_selection_slot_trace(&mut self) {
+        self.selection_slot_trace.borrow_mut().clear();
+    }
+
+    /// Slot indices actually indexed since the last clear. Test-only.
+    #[cfg(test)]
+    pub(super) fn selection_slot_trace(&self) -> Vec<u32> {
+        self.selection_slot_trace.borrow().clone()
     }
 
     /// Current occupancy. Peaks count storage, not only live objects.

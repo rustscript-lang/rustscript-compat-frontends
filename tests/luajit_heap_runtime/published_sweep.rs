@@ -23,7 +23,7 @@
 //! `clear_exact_token` is the close primitive. Host collect is refused before
 //! it runs, so a saved tail never reaches it.
 
-use super::{MarkSession, ParkedMark};
+use super::{MarkSession, ParkedMark, SlotState, SweepSession};
 use vm::Value;
 
 use crate::heap::{
@@ -970,6 +970,169 @@ fn host_collect_closes_bound_userdata_before_the_shared_select() {
             None
         );
         let _ = frame;
+    });
+}
+
+/// Select spends one unit on one slot. A registered reservation is a
+/// host-retained node, so the mark marks it; an ordinary unrooted node
+/// allocated first is the dead slot the first selection unit reads. The trace
+/// records the indices the actual indexing points touched: the selected slot,
+/// and (before the fix) the reservation slot that the identity guard read
+/// without charging it.
+#[test]
+fn select_unit_indexes_only_the_selected_dead_slot() {
+    crate::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits()).expect("install");
+        let resources_before = host.resource_count();
+
+        // D is an ordinary unrooted table and takes the first slot.
+        let dead = heap::with_heap(&mut host, LuaHeap::alloc).expect("ordinary dead table");
+        // R is a real Core registration that the controlled rollback refusal
+        // leaves staged on the private heap record.
+        heap::arm_userdata_rollback_refusal(&mut host).expect("arm refusal");
+        heap::publish_userdata_after_register_failure(&mut host).expect_err("refused rollback");
+        let witness = heap::last_userdata_post_register_failure(&host).expect("refusal witness");
+        assert_eq!(witness.pending_raw, Some(witness.raw));
+        assert!(userdata_token_open(&host, witness.raw));
+        let dead_slot = dead.slot();
+        assert_eq!(dead_slot, 0, "D is the first slot read");
+        assert_eq!(witness.slot, 1, "R follows D in the slot vector");
+        assert_eq!(witness.generation, 1);
+
+        let modes = heap::with_heap(&mut host, |heap| {
+            let modes = heap.drain_mark();
+            let mark_trace = heap.selection_slot_trace().to_vec();
+            eprintln!("mark slot trace: {mark_trace:?}");
+            // Mark completes here. Clear the diagnostic trace so the shared
+            // pulse below starts at the selection cursor.
+            heap.clear_selection_slot_trace();
+            Ok(modes)
+        })
+        .expect("finished mark");
+        let mark_meter = heap::take_scan_meter(&mut host).expect("mark meter");
+        assert_eq!(mark_meter.mark_passes, 1);
+
+        let (spent, finished, trace, dead_pushes) = heap::with_heap(&mut host, |heap| {
+            let mut session = SweepSession::start(heap, modes);
+            let view = session.pulse(1);
+            let spent = view.spent;
+            let finished = view.finished;
+            drop(session);
+            let trace = heap.selection_slot_trace().to_vec();
+            let meter = heap.take_scan_meter();
+            Ok((spent, finished, trace, meter.scratch.dead_slots_pushed))
+        })
+        .expect("first shared selection pulse");
+        eprintln!(
+            "first pulse: trace={trace:?} spent={spent:?} finished={finished} dead_pushes={dead_pushes}"
+        );
+
+        assert_eq!(spent.total(), 1, "one selection unit");
+        assert_eq!(spent.selection, 1);
+        assert!(!finished);
+        assert_eq!(dead_pushes, 1, "only D entered the dead set");
+        assert_eq!(
+            trace,
+            vec![dead_slot],
+            "the selection unit indexed only the slot it selected"
+        );
+        assert!(heap::with_heap(&mut host, |heap| Ok(heap.alive(dead))).expect("dead physical"));
+        assert!(
+            heap::with_heap(&mut host, |heap| Ok(heap.userdata_alive(witness.userdata)))
+                .expect("reservation live")
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| Ok(heap
+                .slot_generation(witness.slot)
+                .expect("slot")))
+            .expect("reservation generation"),
+            witness.generation
+        );
+        assert_eq!(
+            heap::pending_userdata_raw(&mut host, witness.userdata).expect("staged after pulse"),
+            Some(witness.raw)
+        );
+        assert!(userdata_token_open(&host, witness.raw));
+        assert_eq!(host.resource_count(), resources_before + 1);
+    });
+}
+
+/// Diagnostic fault: remove the mark retention for R and reach it through the
+/// same shared Select. The guard must refuse before the dead list, weak
+/// publication, release, or a generation change. The ordinary published-token
+/// refusal stays a separate arm, covered by the two pure-sweep exacts.
+#[test]
+fn select_refuses_an_unmarked_registered_reservation() {
+    crate::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits()).expect("install");
+        let resources_before = host.resource_count();
+        heap::arm_userdata_rollback_refusal(&mut host).expect("arm refusal");
+        heap::publish_userdata_after_register_failure(&mut host).expect_err("refused rollback");
+        let witness = heap::last_userdata_post_register_failure(&host).expect("refusal witness");
+        let slot = witness.slot;
+        let generation = witness.generation;
+
+        let modes = heap::with_heap(&mut host, |heap| {
+            let modes = heap.drain_mark();
+            // Diagnostic fault: drop only the mark bit the retention added,
+            // so this exact registered reservation reaches Select unmarked.
+            heap.slots[slot as usize].state = SlotState::Live { marked: false };
+            heap.clear_selection_slot_trace();
+            Ok(modes)
+        })
+        .expect("finished mark");
+        let _ = heap::take_scan_meter(&mut host).expect("mark meter");
+
+        let refused = heap::with_heap(&mut host, |heap| {
+            let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut session = SweepSession::start(heap, modes);
+                session.pulse(1);
+            }))
+            .is_err();
+            Ok(refused)
+        })
+        .expect("selection refusal");
+        assert!(
+            refused,
+            "the shared Select must refuse an unmarked registered reservation"
+        );
+
+        let meter = heap::take_scan_meter(&mut host).expect("refusal meter");
+        assert_eq!(
+            meter.scratch.dead_slots_pushed, 0,
+            "R did not enter the dead set"
+        );
+        assert_eq!(
+            meter.scratch.sweep_bitmap_inited, 0,
+            "no snapshot ran, so no owner was published"
+        );
+        assert_eq!(meter.sweep_edge_checks, 0, "no owner walk ran");
+        assert_eq!(meter.token_closes, 0);
+        assert_eq!(heap::stats(&mut host).expect("stats").collections, 0);
+        assert!(
+            heap::with_heap(&mut host, |heap| Ok(heap.userdata_alive(witness.userdata)))
+                .expect("reservation live")
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| Ok(heap
+                .slot_generation(slot)
+                .expect("slot")))
+            .expect("generation"),
+            generation,
+            "the refusal did not advance the reservation slot"
+        );
+        assert_eq!(
+            heap::pending_userdata_raw(&mut host, witness.userdata).expect("staged after refusal"),
+            Some(witness.raw)
+        );
+        assert!(userdata_token_open(&host, witness.raw));
+        assert_eq!(
+            host.resource_count(),
+            resources_before + 1,
+            "the refusal did not close the Core token"
+        );
     });
 }
 

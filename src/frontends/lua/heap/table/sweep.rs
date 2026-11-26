@@ -487,14 +487,34 @@ impl<'a> SweepSession<'a> {
         self.index += 1;
         self.heap.scan.node_slot_visits += 1;
         self.pulse_spent.selection += 1;
-        match self.heap.slots[index].state {
+        #[cfg(test)]
+        self.heap
+            .selection_slot_trace
+            .borrow_mut()
+            .push(index as u32);
+        // One selection unit reads one slot. The registered reservation is a
+        // host-retained node: compare the record's slot number with the slot
+        // just read, and only an exact match checks this same borrowed slot
+        // for a registered raw, generation, kind, liveness, and an unbound
+        // token. A non-matching record is one record read, not a second slot
+        // index, so the unit never re-reads the reservation slot through the
+        // vector.
+        let slot = &self.heap.slots[index];
+        match slot.state {
             SlotState::Live { marked: false } => {
                 assert!(
-                    self.heap.slots[index].token.is_none(),
+                    slot.token.is_none(),
                     "lua heap sweep reached dead slot {index} with a bound host token; the host collector must close it and clear the binding before sweep"
                 );
                 assert!(
-                    self.heap.registered_pending_userdata_slot() != Some(index as u32),
+                    !self.heap.pending_userdata.is_some_and(|pending| {
+                        pending.slot as usize == index
+                            && pending.raw.is_some()
+                            && slot.generation == pending.generation
+                            && slot.kind == HandleKind::Userdata
+                            && slot.token.is_none()
+                            && matches!(slot.state, SlotState::Live { .. })
+                    }),
                     "lua heap sweep reached the registered userdata reservation at slot {index}; the mark must retain it"
                 );
                 self.dead.push(index as u32);
