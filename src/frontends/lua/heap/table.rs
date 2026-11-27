@@ -12,7 +12,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use vm::{HostContextError, Value};
+use vm::{CallableValue, HostContextError, Value};
 
 use super::handle::{ClosureRef, HandleKind, TableRef, UpvalueRef, UserdataRef};
 
@@ -113,6 +113,14 @@ pub enum HeapError {
     SweepPending,
     /// No heap is installed, or no published sweep tail can accept this resume.
     SweepDenied,
+    /// The closure-slot callable carrier does not admit an environment with
+    /// captures. Core's empty Lua environment container is not a capture.
+    CallableHasEnvironment,
+    /// This live closure generation already holds one carrier. Rebinding,
+    /// including with a different Arc, is refused and the stored Arc stays.
+    CarrierAlreadyBound,
+    /// This live closure generation holds no callable carrier.
+    CarrierNotBound,
 }
 
 impl HeapError {
@@ -144,6 +152,13 @@ impl fmt::Display for HeapError {
             Self::MarkActive => write!(formatter, "lua mark is already active"),
             Self::SweepPending => write!(formatter, "lua sweep is still pending"),
             Self::SweepDenied => write!(formatter, "lua sweep denied this resume"),
+            Self::CallableHasEnvironment => {
+                write!(formatter, "lua closure carrier callable has an environment")
+            }
+            Self::CarrierAlreadyBound => {
+                write!(formatter, "lua closure carrier already bound")
+            }
+            Self::CarrierNotBound => write!(formatter, "lua closure carrier is not bound"),
         }
     }
 }
@@ -249,6 +264,24 @@ enum SlotState {
     Retired,
 }
 
+/// One issued value bound to a slot for its current generation.
+///
+/// A table slot holds the VM array issued by [`LuaHeap::issue_carrier`]; a
+/// closure slot holds the exact no-capture Core `Value::Callable` Arc a guest
+/// binding handed to the private registration entry. Neither variant is a mark
+/// edge, a root, or a Core resource. [`LuaHeap::release_slot`] clears the
+/// field for the retired generation, and a reused slot starts empty.
+///
+/// Reusing the existing carrier field keeps the one-carrier-per-generation
+/// invariant and prevents a table and a callable from coexisting. The enum is
+/// one tag plus the same one-word pointer, so the per-slot record grows by one
+/// word, the same as an extra `Option<Arc<...>>` field would, without a second
+/// field to reset on release and reuse.
+enum SlotCarrier {
+    Table(Arc<Vec<Value>>),
+    Callable(Arc<CallableValue>),
+}
+
 struct Slot {
     generation: u32,
     kind: HandleKind,
@@ -256,10 +289,12 @@ struct Slot {
     /// Raw resource handle for this node. Ownership metadata only: the mark
     /// phase does not read it, so the token is not a GC root.
     token: Option<u64>,
-    /// Canonical VM array for this generation, if issued. The slot owns the
-    /// array so a field can read it back while the node is live. It contains
-    /// identity only, not object edges, and does not participate in marking.
-    carrier: Option<Arc<Vec<Value>>>,
+    /// One carrier for this live generation. A table slot owns the VM array
+    /// so a field can read it back while the node is live. A closure slot owns
+    /// the exact Core script callable the private test entry registered. The
+    /// field is identity only, not an object edge, and does not participate in
+    /// marking. Release clears it before reuse.
+    carrier: Option<SlotCarrier>,
     /// Optional metatable. Not a field key and not an edge record.
     metatable: Option<(u32, u32)>,
     /// This live userdata was selected by the private pending-finalizer scan.
@@ -1591,7 +1626,7 @@ impl LuaHeap {
             Value::Array(issued) => Arc::clone(issued),
             _ => unreachable!("Value::array returns an array"),
         };
-        self.slots[index].carrier = Some(carrier);
+        self.slots[index].carrier = Some(SlotCarrier::Table(carrier));
         Ok(value)
     }
 
@@ -1621,8 +1656,73 @@ impl LuaHeap {
             Value::Array(issued) => Arc::clone(issued),
             _ => unreachable!("Value::array returns an array"),
         };
-        self.slots[index].carrier = Some(carrier);
+        self.slots[index].carrier = Some(SlotCarrier::Table(carrier));
         Ok(value)
+    }
+
+    /// Binds one exact Core script callable to a live closure generation.
+    ///
+    /// `callable` is the value a guest binding of the same VM handed to the
+    /// private test entry. This entry cannot re-check Core ownership:
+    /// `Vm::owns_callable` is not visible to this crate, so the guest binding
+    /// call is the issuance evidence. `capture_slots` is the exact compiled
+    /// prototype capture count for this callable in the same VM; it is the
+    /// caller's admission evidence for the environment check.
+    ///
+    /// Core attaches an empty `CallableEnvironment` container to every Lua
+    /// `CallableKind::Closure`, including a chunk-level function with no
+    /// captures, so `env.is_some()` alone would refuse every real Lua
+    /// callable. This slice admits only a callable with zero capture slots and
+    /// refuses any environment with captures before the slot changes; it does
+    /// not read or drop a capture graph. A live generation holds at most one
+    /// carrier, so a second bind, including one with a different Arc, is
+    /// refused and the stored Arc stays. A failed bind stores no Arc.
+    ///
+    /// The callable is one identity carrier like the issued table array: mark
+    /// does not read it, it is not a root or an edge, and it does not add scan
+    /// work. Release clears it with the slot, and a reused generation starts
+    /// empty.
+    pub(crate) fn bind_closure_callable(
+        &mut self,
+        closure: ClosureRef,
+        callable: Arc<CallableValue>,
+        capture_slots: usize,
+    ) -> Result<(), HeapError> {
+        self.require_closure(closure)?;
+        if capture_slots != 0 {
+            return Err(HeapError::CallableHasEnvironment);
+        }
+        let index = closure.slot() as usize;
+        if self.slots[index].carrier.is_some() {
+            return Err(HeapError::CarrierAlreadyBound);
+        }
+        self.ensure_sweep_open()?;
+        self.slots[index].carrier = Some(SlotCarrier::Callable(callable));
+        Ok(())
+    }
+
+    /// Returns the exact Arc bound to one live closure generation.
+    ///
+    /// The handle's domain, kind, slot, and generation are checked first. An
+    /// unbound generation is [`HeapError::CarrierNotBound`]. There is no
+    /// prototype or schema lookup: the stored Arc is the only identity.
+    pub(crate) fn closure_callable(
+        &self,
+        closure: ClosureRef,
+    ) -> Result<Arc<CallableValue>, HeapError> {
+        self.require_closure(closure)?;
+        match self.slots[closure.slot() as usize].carrier.as_ref() {
+            Some(SlotCarrier::Callable(callable)) => Ok(Arc::clone(callable)),
+            Some(SlotCarrier::Table(_)) | None => Err(HeapError::CarrierNotBound),
+        }
+    }
+
+    /// Test-only: a closure handle naming this live table's slot and
+    /// generation. The kind check must refuse it before any carrier access.
+    /// This is not a handle constructor for guests or production code.
+    #[cfg(test)]
+    pub(crate) fn closure_handle_for_table(&self, table: TableRef) -> ClosureRef {
+        ClosureRef::closure(self.domain, table.slot(), table.generation())
     }
 
     /// Classifies a guest value against this heap.
@@ -1657,7 +1757,10 @@ impl LuaHeap {
         if !matches!(stored.state, SlotState::Live { .. }) {
             return None;
         }
-        let current = stored.carrier.as_ref()?;
+        let current = match stored.carrier.as_ref()? {
+            SlotCarrier::Table(current) => current,
+            SlotCarrier::Callable(_) => return None,
+        };
         if !Arc::ptr_eq(current, issued) {
             return None;
         }
@@ -2956,10 +3059,14 @@ impl LuaHeap {
     /// Clones the slot's issued carrier for a field read. This does not add a root.
     pub fn issued_value(&self, table: TableRef) -> Result<Value, HeapError> {
         self.require_live(table)?;
-        let carrier = self.slots[table.slot() as usize]
+        let carrier = match self.slots[table.slot() as usize]
             .carrier
             .as_ref()
-            .ok_or(HeapError::StaleHandle)?;
+            .ok_or(HeapError::StaleHandle)?
+        {
+            SlotCarrier::Table(carrier) => carrier,
+            SlotCarrier::Callable(_) => return Err(HeapError::StaleHandle),
+        };
         Ok(Value::Array(Arc::clone(carrier)))
     }
 
@@ -4702,6 +4809,40 @@ impl<'a> SelectingPendingMark<'a> {
     pub(crate) fn pulse(&mut self, budget: u64) -> (bool, ScanMeter) {
         let view = self.session.pulse(budget);
         (view.finished, view.meter)
+    }
+}
+
+/// Compile-surface guard for the private callable carrier in test binaries
+/// that do not run the file-entry witness. This does not fabricate a
+/// callable: `bind_closure_callable` is referenced by function type only,
+/// while the two handle-level refusals really run.
+#[cfg(test)]
+mod callable_carrier_surface {
+    use super::*;
+
+    type BindFn = fn(&mut LuaHeap, ClosureRef, Arc<CallableValue>, usize) -> Result<(), HeapError>;
+    type GetFn = fn(&LuaHeap, ClosureRef) -> Result<Arc<CallableValue>, HeapError>;
+    type ProbeFn = fn(&LuaHeap, TableRef) -> ClosureRef;
+
+    #[test]
+    fn private_callable_carrier_surface_is_reachable() {
+        let _bind: BindFn = LuaHeap::bind_closure_callable;
+        let _get: GetFn = LuaHeap::closure_callable;
+        let _probe: ProbeFn = LuaHeap::closure_handle_for_table;
+
+        let mut foreign = LuaHeap::new(HeapLimits::production());
+        let foreign_handle = foreign.alloc_closure().expect("foreign closure");
+        let mut heap = LuaHeap::new(HeapLimits::production());
+        assert!(matches!(
+            heap.closure_callable(foreign_handle),
+            Err(HeapError::WrongDomain)
+        ));
+        let table = heap.alloc().expect("table");
+        let wrong_kind = heap.closure_handle_for_table(table);
+        assert!(matches!(
+            heap.closure_callable(wrong_kind),
+            Err(HeapError::WrongKind)
+        ));
     }
 }
 

@@ -32,6 +32,9 @@ mod root_handoff;
 #[path = "compiler_lua_completion_tests/active_finalizer.rs"]
 mod active_finalizer;
 
+#[path = "compiler_lua_completion_tests/callable_carrier.rs"]
+mod callable_carrier;
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
