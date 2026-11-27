@@ -1959,3 +1959,478 @@ fn b2r3_public_slot_replacement_does_not_use_stale_defaults() {
         "a replaced callable must retain its actual arity refusal, never use the old f default"
     );
 }
+
+#[test]
+fn reference_array_dispatcher_returns_native_number_arrays() {
+    // Frontend-only IR regression for the private B1 carrier: only the real
+    // reference-array plugin runs, with the real effective catalog, and no
+    // guest code is compiled or executed (no Core, no VM, no AOT, no source
+    // execution). The owning dispatcher keeps three Number parameters, but
+    // each call must answer one Number vector: its declared result is the
+    // native Array(Number) schema, so the obsolete nominal result interface
+    // must disappear from the frontend schema table.
+    eprintln!("SOURCE_BOUNDARY source_attempt=1 Core=0 guest=0");
+    let source = "const a: number[] = [1, 2, 3]; a[0];";
+    let catalog = ref_catalog();
+    let context = vm::SourceFrontendContext {
+        source_id: 0,
+        original_path: None,
+        phase: vm::compiler::ParsePhase::Standalone,
+        host_api_catalog: Some(&catalog),
+        imports: &[],
+    };
+    let ir = vm::SourcePlugin::parse_source(
+        &pd_vm_compat_frontends::TYPESCRIPT_REFERENCE_ARRAY_PLUGIN,
+        source,
+        &context,
+    )
+    .expect("the reference-array frontend should parse the admitted number[] literal");
+    eprintln!(
+        "FRONTEND_DONE source_attempt=1 Core=0 guest=0 stmts={} functions={} struct_schemas={}",
+        ir.stmts.len(),
+        ir.functions.len(),
+        ir.struct_schemas.len()
+    );
+    eprintln!("SOURCE_RAW actual_source={source:?}");
+    let carrier = ir.struct_schemas.get("__CompatRefCarrier").unwrap_or_else(|| {
+        panic!(
+            "the frontend stage must declare the private carrier; actual struct_schemas keys: {:?}",
+            ir.struct_schemas.keys().collect::<Vec<_>>()
+        )
+    });
+    eprintln!("SCHEMA_RAW carrier={carrier:?}");
+    let fields = match &carrier.body_schema {
+        vm::TypeSchema::Object(fields) => fields,
+        other => panic!("the carrier body must be an Object schema; actual: {other:?}"),
+    };
+    let dispatcher = fields.get("dispatcher").unwrap_or_else(|| {
+        panic!(
+            "the carrier must expose a dispatcher field; actual fields: {:?}",
+            fields.keys().collect::<Vec<_>>()
+        )
+    });
+    eprintln!("SCHEMA_RAW dispatcher={dispatcher:?}");
+    let (params, result) = match dispatcher {
+        vm::TypeSchema::Callable { params, result } => (params, result),
+        other => panic!("the dispatcher field must be a Callable schema; actual: {other:?}"),
+    };
+    assert_eq!(
+        params.len(),
+        3,
+        "the dispatcher keeps exactly three parameters; actual: {params:?}"
+    );
+    assert!(
+        params
+            .iter()
+            .all(|param| matches!(param, vm::TypeSchema::Number)),
+        "every dispatcher parameter must be the native Number schema; actual: {params:?}"
+    );
+    assert_eq!(
+        result.as_ref(),
+        &vm::TypeSchema::Array(Box::new(vm::TypeSchema::Number)),
+        "the dispatcher result must be one native Array(Number), never a nominal result interface; actual: {result:?}"
+    );
+    assert!(
+        !ir.struct_schemas.contains_key("__CompatRefResult"),
+        "the obsolete result interface must be absent from the frontend schema table; actual keys: {:?}",
+        ir.struct_schemas.keys().collect::<Vec<_>>()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Uniform native `number[]` dispatcher protocol: bounded runtime controls.
+//
+// Appended after the frozen IR regression above. Every case is one fresh,
+// source-certified VM with the JIT disabled, no AOT compilation, exactly
+// 10_000_000 fuel and one `run()`; there is no `invoke`, `start`, `resume` or
+// refuel step. Each assertion reads a value actually observed from the
+// production frontend, the production effective catalog and the real B1
+// runtime, and every selector stays within eight pipelines.
+// ---------------------------------------------------------------------------
+
+type VectorStats = pd_vm_compat_frontends::runtime::array::OwnedArrayRuntimeStats;
+
+/// One bounded native-vector pipeline: fresh certified VM, JIT off, AOT 0,
+/// 10M fuel, exactly one run with bounded stage prints, then terminal reset
+/// accounting. `expected_live` is the exact host-resource baseline observed
+/// before the reset; `None` means "print the real count without pinning it".
+/// `expected_registered` is the exact factory count this pipeline requests:
+/// one for a single owning factory, two for the snapshot case whose frontend
+/// materialises its own copied carrier. It is kept as an explicit per-case
+/// contract and is never derived from `expected_live`.
+/// The returned stats were observed before the reset.
+fn native_vector_case(
+    label: &str,
+    source: &str,
+    expected_live: Option<usize>,
+    expected_registered: usize,
+) -> (Value, VectorStats) {
+    eprintln!(
+        "NATIVE_VECTOR_SOURCE label={label} source_attempt=1 Core=1 guest=1 stage=before_source"
+    );
+    let (mut machine, _) = ref_vm(source, default_limits(), false);
+    eprintln!("NATIVE_VECTOR_FRONTEND label={label} stage=after_core certified_probe=true");
+    assert!(
+        machine
+            .capture_certification_stats()
+            .is_some_and(|stats| stats.valid),
+        "{label}: the reference-array VM must stay source-certified"
+    );
+    machine.set_jit_config(vm::JitConfig {
+        enabled: false,
+        ..vm::JitConfig::default()
+    });
+    machine.set_fuel(10_000_000);
+    eprintln!(
+        "NATIVE_VECTOR_PREFLIGHT label={label} stage=before_run fuel={:?} jit={} aot_execs={}",
+        machine.get_fuel(),
+        machine.jit_config().enabled,
+        machine.aot_exec_count()
+    );
+    let value = run_value(&mut machine);
+    eprintln!("NATIVE_VECTOR_RAW label={label} value={value:?}");
+    assert!(
+        !machine.jit_config().enabled,
+        "{label}: this control must run without the JIT"
+    );
+    assert_eq!(
+        machine.aot_exec_count(),
+        0,
+        "{label}: no native AOT execution"
+    );
+    assert_eq!(
+        machine.jit_native_exec_count(),
+        0,
+        "{label}: no JIT-native execution"
+    );
+    let stats = pd_vm_compat_frontends::runtime::array::owned_array_runtime_stats(&mut machine)
+        .expect("the owned-array directory must exist after one run");
+    eprintln!(
+        "NATIVE_VECTOR_DIRECTORY label={label} pending={} registered={} reserved_bytes={}",
+        stats.pending, stats.registered, stats.reserved_bytes
+    );
+    let live_resources = machine.host_context().resource_count();
+    eprintln!("NATIVE_VECTOR_BASELINE label={label} live_host_resources={live_resources}");
+    assert_eq!(
+        stats.pending, 0,
+        "{label}: the factory registers before returning"
+    );
+    assert_eq!(
+        stats.registered, expected_registered,
+        "{label}: exact requested owning-factory count before the reset"
+    );
+    if let Some(expected) = expected_live {
+        assert_eq!(
+            live_resources, expected,
+            "{label}: exact live host-resource baseline before the reset"
+        );
+    }
+    machine
+        .reset_for_reuse()
+        .expect("terminal reset after one bounded run");
+    assert_eq!(
+        machine.host_context().resource_count(),
+        0,
+        "{label}: reset releases every host resource"
+    );
+    assert!(
+        pd_vm_compat_frontends::runtime::array::owned_array_runtime_stats(&mut machine).is_none(),
+        "{label}: reset destroys the owned-array directory"
+    );
+    eprintln!("NATIVE_VECTOR_CLEANUP label={label} resources=0 owned_runtime=none");
+    (value, stats)
+}
+
+fn expect_exact_bool(label: &str, value: Value, expected: bool) {
+    match value {
+        Value::Bool(observed) => assert_eq!(observed, expected, "{label}: exact native Bool"),
+        other => panic!("{label}: expected the exact Bool variant, got {other:?}"),
+    }
+}
+
+#[test]
+fn native_number_vector_dispatch_scalar_reads_and_writes() {
+    // Real Int and Float payloads crossing the single owning dispatcher, read
+    // back through the carrier alias and answered as one native
+    // `Array(Number)`. The alias indexed-assignment read keeps Int 7; the
+    // direct number-helper integer literal acknowledges Float 9.0 (existing ABI).
+    let cases: [(&str, &str, Value); 4] = [
+        (
+            "int-read-after-alias-write",
+            "const a = [1, 2, 3];\nconst b = a;\nb[0] = 7;\n__compat_ref_read(a, 0);\n",
+            Value::Int(7),
+        ),
+        (
+            "float-read-after-alias-write",
+            "const a = [1, 2, 3];\nconst b = a;\nb[1] = 2.5;\n__compat_ref_read(a, 1);\n",
+            Value::Float(2.5),
+        ),
+        (
+            "float-write-acknowledgement",
+            "const a = [0];\n__compat_ref_write(a, 0, 1.5);\n",
+            Value::Float(1.5),
+        ),
+        (
+            "number-helper-integer-literal-acknowledgement",
+            "const a = [0];\n__compat_ref_write(a, 0, 9);\n",
+            Value::Float(9.0),
+        ),
+    ];
+    for (label, source, expected) in cases {
+        let (actual, stats) = native_vector_case(label, source, Some(1), 1);
+        assert_eq!(actual, expected, "{label}: exact observed native value");
+        assert_eq!(stats.registered, 1, "{label}: one owning factory");
+    }
+}
+
+#[test]
+fn native_number_vector_dispatch_length_resize_close_and_collect() {
+    // Operation acknowledgements are the real host Ints (length 2, resize to
+    // the requested 5, close 1) and the safety point collects zero live
+    // owners, all answered as one-element native vectors. The explicit close
+    // takes ownership, so its live-resource count is printed, never pinned.
+    // The collect case must run before its owner's actual use: the owner is
+    // dereferenced afterwards, so the safety point collects nothing and the
+    // stored acknowledgement is zero while the carrier stays live.
+    let cases: [(&str, &str, Value, Option<usize>); 4] = [
+        (
+            "length-acknowledgement",
+            "const a = [4, 5];\n__compat_ref_length(a);\n",
+            Value::Int(2),
+            Some(1),
+        ),
+        (
+            "resize-acknowledgement",
+            "const a = [1];\n__compat_ref_resize(a, 5);\n",
+            Value::Int(5),
+            Some(1),
+        ),
+        (
+            "close-acknowledgement",
+            "const a = [1];\n__compat_ref_close(a);\n",
+            Value::Int(1),
+            None,
+        ),
+        (
+            "collect-acknowledgement-one-live-owner",
+            "const a = [1];\nconst collected = __compat_ref_collect();\n__compat_ref_read(a, 0);\ncollected;\n",
+            Value::Int(0),
+            Some(1),
+        ),
+    ];
+    for (label, source, expected, expected_live) in cases {
+        let (actual, stats) = native_vector_case(label, source, expected_live, 1);
+        assert_eq!(actual, expected, "{label}: exact observed native value");
+        assert_eq!(stats.registered, 1, "{label}: one live owning factory");
+    }
+}
+
+#[test]
+fn native_number_vector_dispatch_presence_controls() {
+    // Presence answers exactly Boolean through `[1]`/`[0]`, including the
+    // integral-but-missing index that is a miss, never a host refusal.
+    let cases = [
+        (
+            "presence-present",
+            "const a = [1, 2, 3];\n__compat_ref_has(a, 1);\n",
+            true,
+        ),
+        (
+            "presence-missing",
+            "const a = [1, 2, 3];\n__compat_ref_has(a, 3);\n",
+            false,
+        ),
+        (
+            "guarded-less-than-true",
+            "const a = [1, 2, 3];\n__compat_ref_lt(a, 0, 2);\n",
+            true,
+        ),
+        (
+            "guarded-greater-than-false",
+            "const a = [1, 2, 3];\n__compat_ref_gt(a, 0, 2);\n",
+            false,
+        ),
+    ];
+    for (label, source, expected) in cases {
+        let (actual, stats) = native_vector_case(label, source, Some(1), 1);
+        expect_exact_bool(label, actual, expected);
+        assert_eq!(stats.registered, 1, "{label}: one owning factory");
+    }
+}
+
+#[test]
+fn native_number_vector_dispatch_guarded_comparison_controls() {
+    // Two-sided comparisons keep both presence checks and both reads in the
+    // exact short-circuit order: a missing side answers false without ever
+    // performing the strict read that would raise a host bounds error.
+    let cases = [
+        (
+            "two-sided-less-than-true",
+            "const a = [1, 2, 3];\n__compat_ref_lt2(a, 0, 2);\n",
+            true,
+        ),
+        (
+            "two-sided-greater-than-false",
+            "const a = [1, 2, 3];\n__compat_ref_gt2(a, 0, 2);\n",
+            false,
+        ),
+        (
+            "missing-first-index-shortcircuits",
+            "const a = [1, 2, 3];\n__compat_ref_lt(a, 9, 4);\n",
+            false,
+        ),
+        (
+            "missing-second-index-shortcircuits",
+            "const a = [1, 2, 3];\n__compat_ref_lt2(a, 0, 9);\n",
+            false,
+        ),
+    ];
+    for (label, source, expected) in cases {
+        let (actual, stats) = native_vector_case(label, source, Some(1), 1);
+        expect_exact_bool(label, actual, expected);
+        assert_eq!(stats.registered, 1, "{label}: one owning factory");
+    }
+}
+
+#[test]
+fn native_number_vector_dispatch_snapshot_copy_is_independent() {
+    // Operation 6 answers the host's already-copied native vector directly:
+    // the copy keeps the pre-mutation element after the single owner moves.
+    let (actual, stats) = native_vector_case(
+        "snapshot-retains-pre-mutation-value",
+        "const a = [0];\na[0] = 7;\nconst snap = __compat_ref_snapshot_values(a);\nconst b = a;\nb[0] = 2.5;\nsnap[0];\n",
+        Some(2),
+        2,
+    );
+    assert_eq!(
+        actual,
+        Value::Int(7),
+        "the snapshot copy must retain the pre-mutation element"
+    );
+    assert_eq!(
+        stats.registered, 2,
+        "one owner backs both aliases plus the snapshot's separate copied carrier"
+    );
+}
+
+#[test]
+fn native_number_vector_dispatch_preserves_nonfinite_numeric_values() {
+    // `is_number` accepts every numeric payload, so non-finite values are
+    // real values here: only *index* checks reject them. The finite overflow
+    // seed is used because the frontend admits finite literals only; the
+    // doubled Float local overflows to infinity without any division.
+    let huge = format!("1{}.0", "0".repeat(308));
+    let nan_source = format!(
+        "const a = [0];\nconst h = {huge};\nconst i = h * h;\na[0] = i - i;\n__compat_ref_read(a, 0);\n"
+    );
+    let infinity_source = format!(
+        "const a = [0];\nconst h = {huge};\nconst i = h * h;\na[0] = i;\n__compat_ref_read(a, 0);\n"
+    );
+    let (nan, nan_stats) = native_vector_case("nan-numeric-value", &nan_source, Some(1), 1);
+    match nan {
+        Value::Float(value) => assert!(
+            value.is_nan(),
+            "the NaN payload must stay the exact Float(NaN) variant"
+        ),
+        other => panic!("nan-numeric-value: expected the exact Float variant, got {other:?}"),
+    }
+    assert_eq!(nan_stats.registered, 1, "one owning factory");
+    let (infinity, infinity_stats) =
+        native_vector_case("positive-infinity-numeric-value", &infinity_source, Some(1), 1);
+    match infinity {
+        Value::Float(value) => assert_eq!(
+            value,
+            f64::INFINITY,
+            "the payload must stay exact positive infinity"
+        ),
+        other => panic!(
+            "positive-infinity-numeric-value: expected the exact Float variant, got {other:?}"
+        ),
+    }
+    assert_eq!(infinity_stats.registered, 1, "one owning factory");
+}
+
+#[test]
+fn native_number_vector_dispatch_rejects_invalid_indices() {
+    // Index admission is unchanged: out-of-bounds, negative and non-finite
+    // indices are refused by the exact current host contract (`arrays::read`
+    // reports one integral-and-in-bounds HostError), never fabricated values.
+    let huge = format!("1{}.0", "0".repeat(308));
+    let cases = [
+        (
+            "out-of-bounds-read".to_owned(),
+            "const a = [1];\nconst x = a[5];\nx;\n".to_owned(),
+        ),
+        (
+            "negative-read".to_owned(),
+            "const a = [1];\nconst x = a[-1];\nx;\n".to_owned(),
+        ),
+        (
+            "non-finite-read".to_owned(),
+            format!(
+                "const a = [1];\nconst h = {huge};\nconst i = h * h;\nconst x = a[i];\nx;\n"
+            ),
+        ),
+    ];
+    for (label, source) in cases {
+        eprintln!(
+            "NATIVE_VECTOR_SOURCE label={label} source_attempt=1 Core=1 guest=1 stage=before_source"
+        );
+        let (mut machine, _) = ref_vm(&source, default_limits(), false);
+        eprintln!("NATIVE_VECTOR_FRONTEND label={label} stage=after_core certified_probe=true");
+        assert!(
+            machine
+                .capture_certification_stats()
+                .is_some_and(|stats| stats.valid),
+            "{label}: the reference-array VM must stay source-certified"
+        );
+        machine.set_jit_config(vm::JitConfig {
+            enabled: false,
+            ..vm::JitConfig::default()
+        });
+        machine.set_fuel(10_000_000);
+        eprintln!(
+            "NATIVE_VECTOR_PREFLIGHT label={label} stage=before_run fuel={:?} jit={}",
+            machine.get_fuel(),
+            machine.jit_config().enabled
+        );
+        let outcome = machine.run();
+        eprintln!("NATIVE_VECTOR_RAW label={label} outcome={outcome:?}");
+        match &outcome {
+            Err(vm::VmError::HostError(message)) => assert_eq!(
+                message.as_str(),
+                "array index must be integral and in bounds",
+                "{label}: expected the exact host index refusal, got {outcome:?}"
+            ),
+            other => panic!("{label}: expected one HostError index refusal, got {other:?}"),
+        }
+        assert_eq!(
+            machine.aot_exec_count(),
+            0,
+            "{label}: no native AOT execution"
+        );
+        assert_eq!(
+            machine.jit_native_exec_count(),
+            0,
+            "{label}: no JIT-native execution"
+        );
+        // An intentional runtime error keeps whatever accounting the real
+        // runtime reports; it is printed, never replaced with an invention.
+        let post_error =
+            pd_vm_compat_frontends::runtime::array::owned_array_runtime_stats(&mut machine);
+        eprintln!("NATIVE_VECTOR_DIRECTORY label={label} post_error_stats={post_error:?}");
+        machine
+            .reset_for_reuse()
+            .expect("terminal reset after an intentional host error");
+        assert_eq!(
+            machine.host_context().resource_count(),
+            0,
+            "{label}: reset releases every host resource"
+        );
+        assert!(
+            pd_vm_compat_frontends::runtime::array::owned_array_runtime_stats(&mut machine).is_none(),
+            "{label}: reset destroys the owned-array directory"
+        );
+        eprintln!("NATIVE_VECTOR_CLEANUP label={label} resources=0 owned_runtime=none");
+    }
+}

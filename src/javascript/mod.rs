@@ -28,17 +28,37 @@
 //! with lossless UTF-16 storage and content equality; see [`lowerer`].
 
 mod admission;
+pub mod analysis;
+pub mod cli;
+pub mod corpus;
+#[cfg(test)]
+mod date_kernel_tests;
+mod global_binding;
 pub(super) mod heap;
+mod iteration;
 mod lowerer;
+#[cfg(test)]
+mod number_string_tests;
 mod parser;
 mod prelude;
+mod private_reachability;
 mod reference;
+mod regexp_lowering;
 mod representation;
 mod scope;
 mod source_map;
 mod string_literal;
 #[cfg(test)]
 mod syntax_tests;
+#[cfg(test)]
+mod uri_kernel_tests;
+#[cfg(test)]
+mod utf16_bridge_tests;
+
+/// Crate-private bridge to the shared ES5 power kernel. The TypeScript
+/// frontend stages and Float-projects its own operands, then reuses this
+/// exact guarded implementation; it stays off the public SDK surface.
+pub(crate) use prelude::math::number_power as ecmascript_number_power;
 
 use std::path::Path;
 
@@ -54,6 +74,10 @@ pub static JAVASCRIPT_ES5_PLUGIN: JavaScriptEs5Plugin = JavaScriptEs5Plugin;
 
 pub fn javascript_es5_flavor() -> SourceFlavor {
     SourceFlavor::Plugin(FrontendId::new("javascript-es5"))
+}
+
+fn es5_number_tag() -> i64 {
+    representation::NUMBER
 }
 
 pub fn javascript_es5_compile_options() -> CompileSourceFileOptions {

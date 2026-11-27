@@ -1,0 +1,14 @@
+{
+  "repository": "https://github.com/tc39/test262",
+  "commit": "7da91bceb9ce7613f87db47ddd1292a2dda58b42",
+  "originals": [
+    {
+      "id": "S11.4.6_A3_T4",
+      "path": "test/suite/ch11/11.4/11.4.6/S11.4.6_A3_T4.js",
+      "bytes": 457
+    }
+  ],
+  "license_original_path": "LICENSE",
+  "adapter": "Raw caller Script body unchanged; prefix function $ERROR(message){'use strict';throw message;} and newline 1; suffix. Minimal own-strict helper only; not full Test262 harness.",
+  "acceptance": "candidate-only; independent review and parent acceptance pending"
+}

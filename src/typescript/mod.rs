@@ -2,6 +2,7 @@ mod array_lowering;
 mod default_lowering;
 mod generator_lowering;
 mod parser;
+mod record_lowering;
 mod validation;
 
 use std::path::Path;
@@ -21,8 +22,12 @@ pub static TYPESCRIPT_REFERENCE_ARRAY_PLUGIN: TypeScriptReferenceArrayPlugin =
     TypeScriptReferenceArrayPlugin;
 pub static LUA_PLUGIN: LuaPlugin = LuaPlugin;
 
-pub fn plugins() -> [&'static dyn SourcePlugin; 2] {
-    [&TYPESCRIPT_PLUGIN, &LUA_PLUGIN]
+pub fn plugins() -> [&'static dyn SourcePlugin; 3] {
+    [
+        &TYPESCRIPT_PLUGIN,
+        &LUA_PLUGIN,
+        &crate::javascript::JAVASCRIPT_ES5_PLUGIN,
+    ]
 }
 
 impl SourcePlugin for TypeScriptPlugin {
@@ -158,13 +163,17 @@ impl SourcePlugin for LuaPlugin {
     }
 }
 
+/// Ordinary default compilation options: the existing TypeScript, Lua and
+/// JavaScript ES5 source plugins with the one exact catalog the default CLI
+/// host services use. The JavaScript entry shares the ES5 admission, lowerer,
+/// `FrontendIr` and certification path; it is not a separate profile.
 pub fn compile_options() -> CompileSourceFileOptions {
     let options = plugins()
         .into_iter()
         .fold(CompileSourceFileOptions::new(), |options, plugin| {
             options.with_source_plugin(plugin)
         });
-    options.with_host_api_catalog(crate::runtime::scalar_error::typescript_error_host_catalog())
+    options.with_host_api_catalog(crate::runtime::cli::reference_array_cli_effective_catalog())
 }
 
 pub fn compile_options_with_catalog(catalog: Arc<vm::HostApiCatalog>) -> CompileSourceFileOptions {
@@ -179,14 +188,18 @@ pub fn reference_array_effective_catalog() -> Arc<vm::HostApiCatalog> {
 /// Fixed accepted B1 prelude for the JS numeric-array realm.
 ///
 /// Parses only the fixed accepted prelude plus empty generated user input;
-/// raw user JS never enters the TypeScript parser. The returned IR keeps its
-/// real function declarations, implementations, host metadata, schemas,
+/// raw user JS never enters the TypeScript parser. The parser drops the six
+/// owned wrapper declarations that no JS-realm consumer calls *before*
+/// merge/predeclare, so every returned declaration, implementation, call
+/// site and semantic sidecar is produced from the filtered AST. The rest of
+/// the prelude stays intact: real function declarations, the owning
+/// dispatcher closure with all operation branches, host imports, schemas,
 /// resource provenance and catalog identity; JS appends generated IR, fresh
 /// slots and root statements without rebuilding host candidate metadata.
 pub(crate) fn js_realm_prelude_ir(
     context: &vm::SourceFrontendContext<'_>,
 ) -> Result<vm::FrontendIr, vm::ParseError> {
-    parser::lower_reference_array("", context)
+    parser::lower_js_realm_prelude(context)
 }
 
 /// Prelude helper identities reused by the JS realm. Indices are resolved
@@ -304,6 +317,14 @@ pub fn collect_typescript_type_hints_at_path_with_options(
 fn format_typescript_type_hints(hints: &mut [vm::compiler::InferredLocalTypeHint]) {
     for hint in hints {
         if let Some(schema) = &hint.schema {
+            // A private numeric-record carrier is the *physical* row, never
+            // the user's type: project the printed label back to the logical
+            // row the nominal was minted from so a hint never spells the
+            // private map-of-closures nominal.
+            if let Some(logical) = record_lowering::logical_of(schema) {
+                hint.inferred_type = format_typescript_schema(logical, &hint.inferred_type);
+                continue;
+            }
             hint.inferred_type = format_typescript_schema(schema, &hint.inferred_type);
         }
     }
@@ -536,6 +557,14 @@ fn format_typescript_schema(schema: &vm::TypeSchema, source_label: &str) -> Stri
                 format_typescript_schema(ok, ok_label),
                 format_typescript_schema(err, err_label)
             )
+        }
+        TypeSchema::Unit => "()".to_owned(),
+        TypeSchema::Option(inner) => {
+            let inner_label = source_label
+                .strip_prefix("Option<")
+                .and_then(|label| label.strip_suffix('>'))
+                .unwrap_or("");
+            format!("Option<{}>", format_typescript_schema(inner, inner_label))
         }
     }
 }

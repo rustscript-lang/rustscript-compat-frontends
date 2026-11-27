@@ -93,9 +93,13 @@ fn forced_run(native: bool) {
     let counters = heap_stale_ints(&tail[5..]);
     // Source-derived allocation count: initial array/functions/object8,
     // method key1, nested construction13, numeric read2, Bool reads2,
-    // string member2 and equality RHS1 =29 real reservations.
+    // string member2 and equality RHS1 = 29 real reservations. The ordinary
+    // bootstrap graph reserves 38 nodes (fourteen realm nodes, seventeen key
+    // strings, three prototype methods with their names and the empty packed
+    // Array prototype); under this every-node-begin probe each of those also
+    // completes one collection, so the exact total is 29 + 38 = 67.
     assert_eq!(
-        counters[0], 29,
+        counters[0], 67,
         "every actual reservation must collect: {counters:?}"
     );
     let raw = backing_snapshot(&mut machine);

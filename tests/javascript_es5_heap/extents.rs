@@ -90,6 +90,10 @@ fn p2_raw_remainders_one_two_three_preserve_tiling_and_exact_charge() {
         )
         .expect("fragment compilation");
         let mut machine = compilation.into_vm().expect("certified fragment VM");
+        machine.set_jit_config(vm::JitConfig {
+            enabled: false,
+            ..vm::JitConfig::default()
+        });
         pd_vm_compat_frontends::runtime::array::initialize_typescript_owned_arrays(
             &mut machine,
             pd_vm_compat_frontends::runtime::array::OwnedArrayLimits::default(),
@@ -100,6 +104,9 @@ fn p2_raw_remainders_one_two_three_preserve_tiling_and_exact_charge() {
             .expect("exact registry");
         machine.set_fuel(10_000_000);
         let outcome = machine.run();
+        assert!(!machine.jit_config().enabled);
+        assert_eq!(machine.aot_exec_count(), 0);
+        assert_eq!(machine.jit_native_exec_count(), 0);
         let marker = machine
             .stack()
             .iter()
@@ -197,6 +204,10 @@ fn p2_collector_links_all_free_islands_across_live_blocks() {
     )
     .expect("real island fixture");
     let mut machine = compilation.into_vm().expect("certified island VM");
+    machine.set_jit_config(vm::JitConfig {
+        enabled: false,
+        ..vm::JitConfig::default()
+    });
     pd_vm_compat_frontends::runtime::array::initialize_typescript_owned_arrays(
         &mut machine,
         pd_vm_compat_frontends::runtime::array::OwnedArrayLimits::default(),
@@ -210,6 +221,9 @@ fn p2_collector_links_all_free_islands_across_live_blocks() {
         machine.run().expect("real island execution"),
         VmStatus::Halted
     );
+    assert!(!machine.jit_config().enabled);
+    assert_eq!(machine.aot_exec_count(), 0);
+    assert_eq!(machine.jit_native_exec_count(), 0);
     let stack = machine.stack();
     let Value::Array(before) = &stack[stack.len() - 2] else {
         panic!("actual island snapshot")

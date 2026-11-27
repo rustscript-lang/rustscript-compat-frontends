@@ -282,6 +282,12 @@ fn wrong_error_options() -> vm::CompileSourceFileOptions {
     pd_vm_compat_frontends::compile_options_with_catalog(wrong_error_catalog())
 }
 
+fn scalar_error_options() -> vm::CompileSourceFileOptions {
+    pd_vm_compat_frontends::compile_options_with_catalog(
+        pd_vm_compat_frontends::runtime::scalar_error::typescript_error_host_catalog(),
+    )
+}
+
 #[test]
 fn production_cli_factory_retains_source_certification_before_guest() {
     let scratch = ScratchTree::new();
@@ -526,8 +532,7 @@ fn original_factorial_native_matches_node_vectors_and_fresh_artifact_routes() {
         let mut retained =
             Vm::new_from_aot_artifact_file_with_jit_config(&artifact, vm::JitConfig::default())
                 .expect("rematerialize original native program");
-        let catalog =
-            pd_vm_compat_frontends::runtime::scalar_error::typescript_error_host_catalog();
+        let catalog = pd_vm_compat_frontends::runtime::cli::reference_array_cli_effective_catalog();
         let mut registry = HostFunctionRegistry::new();
         pd_vm_compat_frontends::runtime::scalar_error::typescript_error_host_module()
             .install_from_catalog(&mut registry, &catalog)
@@ -653,13 +658,11 @@ fn assert_native_original_return(output: &Output, expected: i64, expression: &st
 
 #[test]
 fn imported_module_alias_type_hints_match_prototype_and_runtime_call() {
-    let scratch = ScratchTree::new();
-    let main = factorial_project(&scratch.0);
-    let source = "import { factorial as factorialFromFile } from \"./maths/factorial.ts\";\n\
-                 const alias = factorialFromFile;\n\
-                 const result = alias(6);\n\
-                 result;\n";
-    fs::write(&main, source).expect("write imported-alias TypeScript source");
+    // Persistent importer plus the actual upstream module: no scratch source
+    // tree and no repository copy.
+    let main = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/javascript_es5/default_entry_alias_main.ts");
+    let source = fs::read_to_string(&main).expect("read persistent imported-alias fixture");
     let expected = TypeSchema::Callable {
         params: vec![TypeSchema::Number],
         result: Box::new(TypeSchema::Number),
@@ -667,7 +670,7 @@ fn imported_module_alias_type_hints_match_prototype_and_runtime_call() {
 
     let hints = pd_vm_compat_frontends::collect_typescript_type_hints_at_path_with_options(
         &main,
-        source,
+        &source,
         pd_vm_compat_frontends::compile_options(),
     )
     .expect("path-based hints should resolve the imported module");
@@ -705,7 +708,7 @@ fn imported_module_alias_type_hints_match_prototype_and_runtime_call() {
             .any(|prototype| prototype.schema.as_ref() == Some(&expected)),
         "the exported callable prototype must carry the same number -> number schema"
     );
-    let catalog = pd_vm_compat_frontends::runtime::scalar_error::typescript_error_host_catalog();
+    let catalog = pd_vm_compat_frontends::runtime::cli::reference_array_cli_effective_catalog();
     let mut registry = HostFunctionRegistry::new();
     pd_vm_compat_frontends::runtime::scalar_error::typescript_error_host_module()
         .install_from_catalog(&mut registry, &catalog)
@@ -714,6 +717,7 @@ fn imported_module_alias_type_hints_match_prototype_and_runtime_call() {
     registry
         .bind_vm_cached(&mut machine)
         .expect("imported algorithm host imports are bound");
+    machine.set_fuel(10_000_000);
     assert_eq!(
         machine.run().expect("imported alias call executes"),
         VmStatus::Halted
@@ -1134,16 +1138,22 @@ fn empty_and_wrong_error_catalogs_do_not_satisfy_the_scalar_error_contract() {
 
 #[test]
 fn exact_catalog_without_error_adapter_does_not_grant_host_authority() {
-    let scratch = ScratchTree::new();
-    let entry = scratch.0.join("factorial.ts");
-    fs::write(&entry, ORIGINAL_FACTORIAL).expect("write original entry");
+    // The persistent upstream module itself is the entry: no scratch copy.
+    let entry =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/typescript/factorial.ts");
+    assert_eq!(
+        fs::read(&entry).expect("read persistent factorial entry"),
+        ORIGINAL_FACTORIAL,
+        "the entry must remain the exact upstream module bytes"
+    );
     let catalog = pd_vm_compat_frontends::runtime::scalar_error::typescript_error_host_catalog();
-    let services =
-        vm::cli::CliHostServices::new(catalog, || Ok::<_, VmError>(HostFunctionRegistry::new()));
+    let services = vm::cli::CliHostServices::new(catalog.clone(), || {
+        Ok::<_, VmError>(HostFunctionRegistry::new())
+    });
     let runtime = vm::cli::CliRuntime {
         binary_name: "compat-unbound-authority-test",
         default_source: "unused.ts",
-        compile_options: pd_vm_compat_frontends::compile_options,
+        compile_options: scalar_error_options,
     };
     let error = vm::cli::run_with_args(&runtime, &[entry.display().to_string()], &services)
         .expect_err("catalog metadata alone cannot install the Error host authority");

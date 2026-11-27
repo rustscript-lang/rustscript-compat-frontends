@@ -2,7 +2,11 @@
 //! primitive/UTF-16 observations.
 //!
 //! The shared raw-UTF16 codec (ES5.1 7.8.4 plus the retained sloppy
-//! Annex-B octal extension) feeds both admission and lowering. This target
+//! Annex-B octal extension) feeds both admission and lowering. Alongside
+//! those ES5/Annex-B forms it accepts the Micro braced-quoted `\u{...}`
+//! extension for code points in `0..=0x10FFFF` (UTF-16 encoded), wherever a
+//! quoted literal appears: values, directives, property names, member
+//! accesses, and admitted-but-unlowered bodies. This target
 //! pins: immediate-value payloads from actual boxed fields, runtime string
 //! units/length read from the live guest realm carrier (interpreted plus
 //! one native-SSA mixed observation), property-name decoding through
@@ -19,7 +23,7 @@ use vm::{HostFunctionRegistry, Value, Vm, VmStatus};
 // ---------------------------------------------------------------------------
 
 fn realm_catalog() -> std::sync::Arc<vm::HostApiCatalog> {
-    pd_vm_compat_frontends::reference_array_effective_catalog()
+    pd_vm_compat_frontends::runtime::cli::reference_array_cli_effective_catalog()
 }
 
 fn realm_options(
@@ -44,6 +48,9 @@ fn install_production(registry: &mut HostFunctionRegistry, catalog: &vm::HostApi
     pd_vm_compat_frontends::runtime::scalar_math::typescript_scalar_math_host_module()
         .install_from_catalog(registry, catalog)
         .expect("scalar-math adapter should match the effective catalog");
+    pd_vm_compat_frontends::runtime::scalar_error::typescript_error_host_module()
+        .install_from_catalog(registry, catalog)
+        .expect("scalar-error adapter should match the effective catalog");
     registry
         .allow_builtin("math::floor")
         .expect("math::floor should be allow-listable");
@@ -135,15 +142,12 @@ fn p2_red_sloppy_octal_lookahead_cases_are_rejected() {
 }
 
 #[test]
-fn p2_red_braced_escape_in_unlowered_directive_is_rejected() {
+fn p2_braced_escape_in_unlowered_directive_is_admitted() {
     // The braced escape sits in a function directive prologue the lowerer
-    // skips without decoding; admission must own this position.
+    // skips without decoding; the shared codec now accepts it at admission.
     let source = "var f = function(){ \"\\u{41}\"; \"use strict\"; return 1; }; f()===1;";
-    let text = must_reject_with(source, "unsupported syntax");
-    assert!(
-        text.contains("braced"),
-        "must hit the braced guard, got: {text}"
-    );
+    compile_outcome(source)
+        .expect("braced escape in an unlowered directive prologue must be admitted");
 }
 
 #[test]
@@ -156,15 +160,12 @@ fn p2_red_strict_octal_property_name_is_rejected() {
 }
 
 #[test]
-fn p2_red_post_es5_in_unlowered_branch_rejects_at_admission() {
-    // `if` bodies are admitted-but-unlowered; the post-ES5 token must fail
-    // at admission with the grammar-stage category, not the P0 lowering one.
+fn p2_post_es5_in_unlowered_branch_is_admitted() {
+    // `if` bodies are admitted-but-unlowered; the Micro braced-quoted
+    // extension is now decoded by the shared codec, so this position compiles.
     let source = "if (1) { \"\\u{41}\"; }";
-    let text = must_reject_with(source, "unsupported syntax");
-    assert!(
-        text.contains("braced"),
-        "must hit the braced guard, got: {text}"
-    );
+    compile_outcome(source)
+        .expect("braced escape in an admitted-but-unlowered branch body must be admitted");
 }
 
 #[test]
@@ -769,23 +770,33 @@ fn p2_property_true_duplicate_refusal_remains() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn p2_admission_negatives_cover_positions() {
-    // Post-ES5 braced escapes: value, directive, property, member and
-    // unlowered-body positions share the unsupported category.
+fn p2_admission_braced_literals_in_values_are_admitted() {
+    // The Micro braced-quoted extension is admitted in value,
+    // expression-statement and quoted property-key positions.
     for source in [
         "var s = \"\\u{1D11E}\"; s;",
         "\"\\u{1D11E}\";",
         "({\"\\u{1D11E}\":1});",
+    ] {
+        compile_outcome(source).expect("braced literal in a value position");
+    }
+}
+
+#[test]
+fn p2_admission_braced_literals_in_member_and_bodies_are_admitted() {
+    // Member access, admitted-but-unlowered `while` bodies and function
+    // directive positions share the same codec admission.
+    for source in [
         "var o = {a:1}; o[\"\\u{1D11E}\"];",
         "while (1) { \"\\u{1D11E}\"; }",
         "function f(){ \"\\u{1D11E}\"; return 1; }",
     ] {
-        let text = must_reject_with(source, "unsupported syntax");
-        assert!(
-            text.contains("braced"),
-            "braced guard for {source:?}, got: {text}"
-        );
+        compile_outcome(source).expect("braced literal in a member/body position");
     }
+}
+
+#[test]
+fn p2_admission_negatives_cover_positions() {
     // Raw separators and decimal/lookahead violations are SyntaxErrors.
     for source in [
         "var s = \"a\u{2028}b\"; s;",
@@ -798,6 +809,10 @@ fn p2_admission_negatives_cover_positions() {
     ] {
         must_reject_with(source, "SyntaxError");
     }
+}
+
+#[test]
+fn p2_escaped_backslash_and_continuations_stay_admitted() {
     // Escaped-backslash text and valid continuations stay admitted.
     assert!(compile_outcome("var s = \"\\\\u{1D11E}\"; s===s;").is_ok());
     assert!(compile_outcome("var s = \"a\\\nb\"; s===s;").is_ok());

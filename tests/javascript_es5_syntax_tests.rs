@@ -38,8 +38,19 @@ fn post_es5_declarations_fail_at_admission() {
         "class C {}",
         "`hi`;",
         "2 ** 3;",
+    ] {
+        let text = compile_err(source);
+        assert!(
+            text.contains("unsupported syntax"),
+            "admission must refuse {source:?} before lowering, got: {text}",
+        );
+    }
+}
+
+#[test]
+fn post_es5_declarations_fail_at_admission_rest() {
+    for source in [
         "x ?? y;",
-        "for (var x of y) {}",
         "var o = {a};",
         "function* g(){ yield 1; }",
         "0o17;",
@@ -51,6 +62,18 @@ fn post_es5_declarations_fail_at_admission() {
             "admission must refuse {source:?} before lowering, got: {text}",
         );
     }
+}
+
+#[test]
+fn for_of_var_head_reaches_lowering_when_rhs_is_unbound() {
+    // The original unsupported-list source is unchanged. It is no longer an
+    // admission refusal; `y` is still unbound, so lowering fails.
+    let source = "for (var x of y) {}";
+    let text = compile_err(source);
+    assert!(
+        !text.contains("unsupported syntax") && !text.contains("SyntaxError"),
+        "admitted for-of must reach lowering, not admission refusal: {text}",
+    );
 }
 
 #[test]

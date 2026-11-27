@@ -15,11 +15,22 @@ name = "pd-vm-compat-run"
 path = "src/bin/pd-vm-compat-run.rs"
 
 [dependencies]
-pd-host-function = { git = "https://github.com/rustscript-lang/rustscript", rev = "31973aae3c417826dacedc82a6e5ea19e585bbbb", package = "pd-host-function" }
-pd-vm = { git = "https://github.com/rustscript-lang/rustscript", rev = "31973aae3c417826dacedc82a6e5ea19e585bbbb" }
+pd-host-function = { git = "https://github.com/rustscript-lang/rustscript", rev = "afefa8f014cdf94d4380e60888c4bdc32ed4f260", package = "pd-host-function" }
+pd-vm = { git = "https://github.com/rustscript-lang/rustscript", rev = "afefa8f014cdf94d4380e60888c4bdc32ed4f260" }
 swc_common = "26.0.0"
 swc_ecma_ast = "29.0.2"
 swc_ecma_parser = { version = "46.0.0", default-features = false, features = ["typescript", "stacker"] }
 
 [dev-dependencies]
 serde_json = "1"
+
+# Test build profile: the ES5 gate suite pays a certified prelude compile per
+# test process, so unoptimized builds dominate the wall clock (~7.7x slower on
+# the cheapest selector). Keep debug assertions and overflow checks on: the
+# capacity and bounds gates live in generated IR `assert_stmt` and the
+# compile-time realm budget, not in Rust debug assertions.
+[profile.test]
+opt-level = 2
+debug-assertions = true
+overflow-checks = true
+lto = false

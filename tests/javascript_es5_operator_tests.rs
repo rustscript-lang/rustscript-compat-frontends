@@ -1,7 +1,6 @@
 //! P5-A production expressions; oracle rows are original ES5 source, not IR.
-use pd_vm_compat_frontends::{
-    JAVASCRIPT_ES5_PLUGIN, javascript_es5_flavor, reference_array_effective_catalog,
-};
+use pd_vm_compat_frontends::runtime::cli::reference_array_cli_effective_catalog as reference_array_effective_catalog;
+use pd_vm_compat_frontends::{JAVASCRIPT_ES5_PLUGIN, javascript_es5_flavor};
 use vm::{HostFunctionRegistry, Value, VmStatus};
 // Reuse only the existing test-only observer, never an owning test target.
 #[path = "javascript_es5/arity_observer.rs"]
@@ -31,6 +30,19 @@ fn execute(source: &str, native: bool, observation: Option<observer::Observer>) 
     )
     .unwrap_or_else(|error| panic!("compile {source:?}: {error:?}"));
     let mut machine = compiled.into_vm().expect("source VM");
+    if !native {
+        machine.set_jit_config(vm::JitConfig {
+            enabled: false,
+            ..*machine.jit_config()
+        });
+        assert!(!machine.jit_config().enabled);
+        let counts = (machine.aot_exec_count(), machine.jit_native_exec_count());
+        assert_eq!(counts, (0, 0));
+        eprintln!(
+            "P5_INTERPRETER_BEFORE source={source:?} jit_enabled=false aot_exec={} jit_exec={}",
+            counts.0, counts.1
+        );
+    }
     pd_vm_compat_frontends::runtime::array::initialize_typescript_owned_arrays(
         &mut machine,
         pd_vm_compat_frontends::runtime::array::OwnedArrayLimits::default(),
@@ -49,7 +61,16 @@ fn execute(source: &str, native: bool, observation: Option<observer::Observer>) 
     pd_vm_compat_frontends::runtime::scalar_math::typescript_scalar_math_host_module()
         .install_from_catalog(&mut registry, &catalog)
         .expect("math");
+    pd_vm_compat_frontends::runtime::scalar_error::typescript_error_host_module()
+        .install_from_catalog(&mut registry, &catalog)
+        .expect("scalar-error adapter should match the effective catalog");
     registry.allow_builtin("math::floor").expect("floor");
+    // The ordinary realm's bootstrap publishes its fixed ASCII strings through
+    // the Core bytes initializer, so this capability is part of every emitted
+    // realm program (the Object.keys harness allows the same builtin).
+    registry
+        .allow_builtin("bytes::from_utf8")
+        .expect("bootstrap strings");
     registry.bind_vm_cached(&mut machine).expect("registry");
     machine.set_fuel(10_000_000);
     eprintln!(
@@ -84,6 +105,15 @@ fn execute(source: &str, native: bool, observation: Option<observer::Observer>) 
         let info = machine.dump_aot_info();
         eprintln!("P5_OPERATOR_NATIVE actual_vm_aot_exec_count={count}\n{info}");
         assert!(count > 0 && info.contains("lowering=ssa"), "{info}");
+    }
+    if !native {
+        assert!(!machine.jit_config().enabled);
+        let counts = (machine.aot_exec_count(), machine.jit_native_exec_count());
+        assert_eq!(counts, (0, 0));
+        eprintln!(
+            "P5_INTERPRETER_AFTER source={source:?} jit_enabled=false aot_exec={} jit_exec={}",
+            counts.0, counts.1
+        );
     }
     let stack = machine.stack().to_vec();
     let resources = machine.host_context().resource_count();
@@ -170,19 +200,105 @@ fn original_source_vectors_interpreted() {
 
 #[test]
 fn conditional_binding_kinds_are_conservative_in_all_source_positions() {
-    for source in [
+    for (row, source) in [
         "var x=1; false && (x=false); x+1;",
         "var x=1; true || (x=false); x+1;",
         "function f(){'use strict';var x=1; false && (x=false); x+1;} f();",
         "function f(){'use strict';return;var x=1; false && (x=false); x+1;} f();",
-    ] {
-        refuse(source, "requires numeric operands");
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let value = std::thread::Builder::new().stack_size(33_554_432).spawn(move || {
+            let mut machine = pd_vm_compat_frontends::javascript::cli::compile_javascript_es5_source(source).expect("exact migrated Add source");
+            assert!(!machine.jit_config().enabled);
+            assert_eq!((machine.aot_exec_count(),machine.jit_native_exec_count()),(0,0));
+            machine.set_fuel(10_000_000);
+            let status=machine.run();
+            eprintln!("ADD140B_OPERATOR_VM {}",serde_json::json!({"source":source,"status":format!("{status:?}"),"stack":format!("{:?}",machine.stack()),"jit_enabled":machine.jit_config().enabled,"aot":machine.aot_exec_count(),"jit":machine.jit_native_exec_count()}));
+            assert_eq!(status.unwrap(),VmStatus::Halted);
+            assert!(!machine.jit_config().enabled);
+            assert_eq!((machine.aot_exec_count(),machine.jit_native_exec_count()),(0,0));
+            let value=machine.stack().last().expect("source result").clone();
+            assert!(machine.capture_certification_stats().unwrap().valid);
+            machine.reset_for_reuse().unwrap();
+            if machine.scope_reset_pending() {
+                let mut cx=std::task::Context::from_waker(std::task::Waker::noop());
+                assert!(matches!(machine.poll_reset_for_reuse(&mut cx),std::task::Poll::Ready(Ok(()))));
+            }
+            assert!(!machine.scope_reset_pending());
+            assert_eq!(machine.host_context().resource_count(),0);
+            assert!(!machine.capture_certification_stats().unwrap().valid);
+            assert!(pd_vm_compat_frontends::runtime::array::owned_array_runtime_stats(&mut machine).is_none());
+            eprintln!("ADD140B_OPERATOR_RESET source={source:?} resources=0 pending=false owned_retired=true cert=false");
+            value
+        }).unwrap().join().unwrap();
+        if row < 2 {
+            assert_number(&value, 2.0);
+        } else {
+            let Value::Map(b) = value else {
+                panic!("Undefined box")
+            };
+            assert_eq!(b.get(&Value::string("tag")), Some(&Value::Int(0)));
+        }
+        let script = format!(
+            "let v=(0,eval)({});console.log(JSON.stringify({{kind:typeof v,value:v===undefined?null:v}}));",
+            serde_json::to_string(source).unwrap()
+        );
+        let out = std::process::Command::new("node")
+            .args(["-e", &script])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap(),
+            if row < 2 {
+                serde_json::json!({"kind":"number","value":2})
+            } else {
+                serde_json::json!({"kind":"undefined","value":null})
+            }
+        );
+        eprintln!(
+            "ADD140_LEGACY_NODE {}",
+            serde_json::json!({"source":source,"argv":["node","-e",script],"rc":out.status.code(),"stdout":String::from_utf8_lossy(&out.stdout)})
+        );
     }
-    refuse(
-        "var f; false && (f=function(){'use strict';}); f();",
-        "require a function binding",
-    );
-    refuse("var o; false && (o={}); o.a;", "require an object receiver");
+    // BASE135B and current both admit these exact originals. Skipped writes
+    // leave Undefined; the invalid call/get raises a guest TypeError.
+    fn uncaught(source: &'static str) {
+        std::thread::Builder::new().stack_size(33_554_432).spawn(move || {
+            let mut machine = pd_vm_compat_frontends::javascript::cli::compile_javascript_es5_source(source).expect("exact original compiles");
+            machine.set_jit_config(vm::JitConfig { enabled: false, ..*machine.jit_config() });
+            assert!(!machine.jit_config().enabled);
+            let before = (machine.aot_exec_count(), machine.jit_native_exec_count());
+            assert_eq!(before, (0, 0));
+            machine.set_fuel(10_000_000);
+            let status = machine.run();
+            let after = (machine.aot_exec_count(), machine.jit_native_exec_count());
+            assert_eq!(after, (0, 0));
+            assert!(!machine.jit_config().enabled);
+            eprintln!("P5_CONDITIONAL_UNCAUGHT source={source:?} status={status:?} before={before:?} after={after:?}");
+            assert!(format!("{:?}", status.expect_err("exact uncaught guest throw")).contains("uncaught JavaScript throw"));
+            machine.reset_for_reuse().unwrap();
+            if machine.scope_reset_pending() {
+                let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+                assert!(matches!(machine.poll_reset_for_reuse(&mut cx), std::task::Poll::Ready(Ok(()))));
+            }
+            assert_eq!(machine.host_context().resource_count(), 0);
+        }).unwrap().join().unwrap();
+    }
+    uncaught("var f; false && (f=function(){'use strict';}); f();");
+    uncaught("var o; false && (o={}); o.a;");
+    for source in [
+        "var f; false && (f=function(){'use strict';}); var ok=false;try{f();}catch(e){ok=e.name==='TypeError';}ok&&f===undefined;",
+        "var o; false && (o={}); var ok=false;try{o.a;}catch(e){ok=e.name==='TypeError';}ok&&o===undefined;",
+        "var f; false && (f=function(){'use strict';}); typeof f==='undefined'&&f===undefined;",
+        "var o; false && (o={}); typeof o==='undefined'&&o===undefined;",
+        "var f; true && (f=function(){'use strict';return 7;}); f()===7;",
+        "var o; true && (o={a:7}); o.a===7;",
+    ] {
+        assert_bool(&run(source), true);
+    }
 }
 
 #[test]
@@ -247,14 +363,34 @@ fn syntactic_rhs_is_validated_even_when_skipped_or_post_return() {
     ] {
         refuse(source, "unknown local 'missing'");
     }
-    for source in [
-        "false && (1%2);",
-        "true || (1%2);",
-        "function f(){'use strict';return;false && (1%2);} f();",
+    for (source, expected) in [
+        ("false && (1%true);", Some(false)),
+        ("true || (1%true);", Some(true)),
+        (
+            "function f(){'use strict';return;false && (1%true);} f();",
+            None,
+        ),
     ] {
-        refuse(source, "binary operator");
+        let value = run(source);
+        if let Some(expected) = expected {
+            assert_bool(&value, expected);
+        } else {
+            assert_eq!(field(&value, "tag"), Value::Int(0));
+        }
     }
-    refuse("1 ? 2 : 3;", "primitive expression");
+    for source in [
+        "false && (1%({}));",
+        "true || (1%({}));",
+        "function f(){'use strict';return;false && (1%({}));} f();",
+    ] {
+        refuse(source, "numeric");
+    }
+    // Already admitted on the accepted baseline, independently of remainder.
+    assert!(
+        pd_vm_compat_frontends::javascript::cli::compile_javascript_es5_source("1 ? 2 : 3;")
+            .is_ok()
+    );
+    refuse("1 ? new Object() : 3;", "primitive expression");
     // P6-A admits this runtime if. Completion and branch behavior are in
     // javascript_es5_control_flow_tests; this only retires the obsolete refusal.
     vm::compile_source_with_flavor_and_options(
@@ -265,7 +401,69 @@ fn syntactic_rhs_is_validated_even_when_skipped_or_post_return() {
             .with_host_api_catalog(reference_array_effective_catalog()),
     )
     .expect("runtime if is admitted");
-    refuse("false && (1=='1');", "binary operator");
+    let source = "false && (1=='1');";
+    let mut machine =
+        pd_vm_compat_frontends::javascript::cli::compile_javascript_es5_source(source).unwrap();
+    machine.set_jit_config(vm::JitConfig {
+        enabled: false,
+        ..*machine.jit_config()
+    });
+    assert!(!machine.jit_config().enabled);
+    assert_eq!(
+        (machine.aot_exec_count(), machine.jit_native_exec_count()),
+        (0, 0)
+    );
+    machine.set_fuel(10_000_000);
+    let status = machine.run();
+    eprintln!(
+        "EQ147_LEGACY_VM source={source:?} status={status:?} stack={:?}",
+        machine.stack()
+    );
+    assert_eq!(status.unwrap(), VmStatus::Halted);
+    assert_bool(machine.stack().last().unwrap(), false);
+    assert_eq!(
+        (machine.aot_exec_count(), machine.jit_native_exec_count()),
+        (0, 0)
+    );
+    assert!(machine.capture_certification_stats().unwrap().valid);
+    machine.reset_for_reuse().unwrap();
+    assert!(!machine.scope_reset_pending());
+    assert_eq!(machine.host_context().resource_count(), 0);
+    assert!(!machine.capture_certification_stats().unwrap().valid);
+    assert!(
+        pd_vm_compat_frontends::runtime::array::owned_array_runtime_stats(&mut machine).is_none()
+    );
+    let script = format!(
+        "console.log(JSON.stringify({{kind:typeof (0,eval)({0}),value:(0,eval)({0})}}));",
+        serde_json::to_string(source).unwrap()
+    );
+    let version = std::process::Command::new("timeout")
+        .args(["15", "node", "--version"])
+        .output()
+        .unwrap();
+    let node = std::process::Command::new("timeout")
+        .args(["15", "node", "-e", &script])
+        .output()
+        .unwrap();
+    eprintln!(
+        "EQ147_LEGACY_NODE {}",
+        serde_json::json!({"source":source,"script":script,"rc":node.status.code(),"stdout":String::from_utf8_lossy(&node.stdout),"stderr":String::from_utf8_lossy(&node.stderr),"version":String::from_utf8_lossy(&version.stdout)})
+    );
+    assert!(version.status.success() && node.status.success() && node.stderr.is_empty());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&node.stdout).unwrap(),
+        serde_json::json!({"kind":"boolean","value":false})
+    );
+    let admitted = "false && (1 in 1);";
+    let mut admitted_machine =
+        pd_vm_compat_frontends::javascript::cli::compile_javascript_es5_source(admitted).unwrap();
+    admitted_machine.set_jit_config(vm::JitConfig {
+        enabled: false,
+        ..*admitted_machine.jit_config()
+    });
+    admitted_machine.set_fuel(10_000_000);
+    assert_eq!(admitted_machine.run().unwrap(), VmStatus::Halted);
+    assert_bool(admitted_machine.stack().last().unwrap(), false);
 }
 
 #[test]

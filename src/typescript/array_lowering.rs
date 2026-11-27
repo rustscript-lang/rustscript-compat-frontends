@@ -10,7 +10,7 @@
 //! record containing one owning dispatcher callable.
 //!
 //! Representation (proven by the B1 guest-factory pattern, extended here
-//! to a fixed typed result record):
+//! to a fixed native result vector):
 //!
 //! - Logical `number[]` is distinct from physical storage. Storage is a
 //!   private hygienic guest named record with exactly one typed field,
@@ -25,13 +25,15 @@
 //!   exist because the native SSA backend only branches on statically
 //!   typed booleans: the presence-aware comparison must be computed from
 //!   typed host calls inside the dispatcher body rather than by branching
-//!   on a dynamically read record field in a helper. It returns a private
-//!   fixed fully typed result record `{ number: Number, present: Bool,
-//!   values: Array(Number) }`.
-//!   Numeric operations return the scalar field, presence returns an
-//!   explicitly consumed presence field, and snapshot uses `values`.
-//!   Non-snapshot paths return an explicitly typed empty staging array,
-//!   never a copy of the backing array.
+//!   on a dynamically read record field in a helper.
+//!
+//!   Every call answers exactly one native `Array(Number)` vector. Numeric
+//!   and acknowledgement operations answer a fresh one-element array
+//!   holding the host scalar, presence and guarded comparison operations
+//!   answer `[1]`/`[0]`, snapshot answers the host's already-copied vector
+//!   unchanged, and the default branch answers the safety-point
+//!   acknowledgement. There is no nominal result record and no result
+//!   alias: the projection helpers read element 0 of that vector.
 //! - A generated source-IR factory takes a plain Core `Array(Number)`
 //!   staging input, allocates through the production B1 runtime, builds
 //!   the complete dispatcher, invokes register through it before return,
@@ -57,7 +59,6 @@ use vm::TypeSchema;
 /// predeclare time like any other duplicate.
 pub(crate) const TYPE_CARRIER: &str = "__CompatRefCarrier";
 pub(crate) const TYPE_DISPATCHER: &str = "__CompatRefDispatcher";
-pub(crate) const TYPE_RESULT: &str = "__CompatRefResult";
 
 /// Prelude helper function names.
 pub(crate) const HELPER_MAKE: &str = "__compat_ref_make";
@@ -88,72 +89,68 @@ import { allocate, register, collect, resize } from "__compat_array_owner";
 import { read, write, length, has_index, snapshot, close } from "arrays";
 import { random as __compat_ref_random } from "compat_math";
 import type { Resource } from "rustscript:types";
-interface __CompatRefResult {
-    number: number;
-    present: boolean;
-    values: number[];
-}
-type __CompatRefDispatcher = (operation: number, arg: number, value: number) => __CompatRefResult;
+type __CompatRefDispatcher = (operation: number, arg: number, value: number) => number[];
 interface __CompatRefCarrier {
     dispatcher: __CompatRefDispatcher;
 }
 function __compat_ref_make(initial: number[]): __CompatRefCarrier {
     let owner: Resource<"compat.number_array"> = allocate(initial);
-    const dispatcher: __CompatRefDispatcher = (operation: number, arg: number, value: number): __CompatRefResult => operation === 0
-        ? { number: register(owner), present: true, values: [] }
+    const dispatcher: __CompatRefDispatcher = (operation: number, arg: number, value: number): number[] => operation === 0
+        ? [register(owner)]
         : operation === 1
-        ? { number: read(owner, arg), present: true, values: [] }
+        ? [read(owner, arg)]
         : operation === 2
-        ? { number: write(owner, arg, value), present: true, values: [] }
+        ? [write(owner, arg, value)]
         : operation === 3
-        ? { number: length(owner), present: true, values: [] }
+        ? [length(owner)]
         : operation === 4
-        ? { number: 0, present: has_index(owner, arg), values: [] }
+        ? [has_index(owner, arg) ? 1 : 0]
         : operation === 5
-        ? { number: resize(owner, arg), present: true, values: [] }
+        ? [resize(owner, arg)]
         : operation === 6
-        ? { number: 0, present: true, values: snapshot(owner) }
+        ? snapshot(owner)
         : operation === 7
-        ? { number: close(owner), present: true, values: [] }
+        ? [close(owner)]
         : operation === 9
-        ? { number: 0, present: has_index(owner, arg) && read(owner, arg) < value, values: [] }
+        ? [(has_index(owner, arg) && read(owner, arg) < value) ? 1 : 0]
         : operation === 10
-        ? { number: 0, present: has_index(owner, arg) && read(owner, arg) > value, values: [] }
+        ? [(has_index(owner, arg) && read(owner, arg) > value) ? 1 : 0]
         : operation === 11
-        ? { number: 0, present: has_index(owner, arg) && has_index(owner, value) && read(owner, arg) < read(owner, value), values: [] }
+        ? [(has_index(owner, arg) && has_index(owner, value) && read(owner, arg) < read(owner, value)) ? 1 : 0]
         : operation === 12
-        ? { number: 0, present: has_index(owner, arg) && has_index(owner, value) && read(owner, arg) > read(owner, value), values: [] }
-        : { number: collect(), present: true, values: [] };
+        ? [(has_index(owner, arg) && has_index(owner, value) && read(owner, arg) > read(owner, value)) ? 1 : 0]
+        : [collect()];
     const registration = dispatcher(0, 0, 0);
     return { dispatcher: dispatcher };
 }
 function __compat_ref_read(c: __CompatRefCarrier, i: number): number {
     const d = c.dispatcher;
-    return d(1, i, 0).number;
+    return d(1, i, 0)[0];
 }
 function __compat_ref_write(c: __CompatRefCarrier, i: number, v: number): number {
     const d = c.dispatcher;
-    return d(2, i, v).number;
+    return d(2, i, v)[0];
 }
 function __compat_ref_length(c: __CompatRefCarrier): number {
     const d = c.dispatcher;
-    return d(3, 0, 0).number;
+    return d(3, 0, 0)[0];
 }
 function __compat_ref_has(c: __CompatRefCarrier, i: number): boolean {
     const d = c.dispatcher;
-    return d(4, i, 0).present;
+    const n: number = d(4, i, 0)[0];
+    return n === 1;
 }
 function __compat_ref_snapshot_values(c: __CompatRefCarrier): number[] {
     const d = c.dispatcher;
-    return d(6, 0, 0).values;
+    return d(6, 0, 0);
 }
 function __compat_ref_resize(c: __CompatRefCarrier, n: number): number {
     const d = c.dispatcher;
-    return d(5, n, 0).number;
+    return d(5, n, 0)[0];
 }
 function __compat_ref_close(c: __CompatRefCarrier): number {
     const d = c.dispatcher;
-    return d(7, 0, 0).number;
+    return d(7, 0, 0)[0];
 }
 function __compat_ref_collect(): number {
     return collect();
@@ -163,19 +160,23 @@ function __compat_ref_rand(): number {
 }
 function __compat_ref_lt(c: __CompatRefCarrier, i: number, other: number): boolean {
     const d = c.dispatcher;
-    return d(9, i, other).present;
+    const n: number = d(9, i, other)[0];
+    return n === 1;
 }
 function __compat_ref_gt(c: __CompatRefCarrier, i: number, other: number): boolean {
     const d = c.dispatcher;
-    return d(10, i, other).present;
+    const n: number = d(10, i, other)[0];
+    return n === 1;
 }
 function __compat_ref_lt2(c: __CompatRefCarrier, i1: number, i2: number): boolean {
     const d = c.dispatcher;
-    return d(11, i1, i2).present;
+    const n: number = d(11, i1, i2)[0];
+    return n === 1;
 }
 function __compat_ref_gt2(c: __CompatRefCarrier, i1: number, i2: number): boolean {
     const d = c.dispatcher;
-    return d(12, i1, i2).present;
+    const n: number = d(12, i1, i2)[0];
+    return n === 1;
 }
 "#;
 

@@ -31,7 +31,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
-    // Default route, unchanged.
+    // Default route: one ordinary Core file path for every registered
+    // frontend plus the exact shared catalog/runtime services.
     let runtime = vm::cli::CliRuntime {
         binary_name: "pd-vm-compat-run",
         default_source: "examples/example.ts",

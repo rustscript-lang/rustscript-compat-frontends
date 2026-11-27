@@ -27,6 +27,7 @@ pub(crate) struct HeapHelpers {
     pub decode_u32: u16,
     pub root_enter: u16,
     pub root_write: u16,
+    pub root_clear: u16,
     pub root_write_node: u16,
     pub root_leave: u16,
     pub checked_base: u16,
@@ -38,6 +39,11 @@ pub(crate) struct HeapHelpers {
     pub heap_collect: u16,
     pub heap_observe: u16,
     pub set_prototype: u16,
+    pub array_get: u16,
+    pub array_put: u16,
+    pub array_expand: u16,
+    pub array_length: u16,
+    pub array_set_length: u16,
 }
 
 /// Read one raw backing cell through the B1 read helper. The address is an
@@ -126,11 +132,26 @@ pub(crate) fn fresh_index(
     ir: &FrontendIr,
     span: swc_common::Span,
 ) -> Result<u16, ParseError> {
+    fresh_index_above(lower, ir, span, 0)
+}
+
+/// Fresh flat function index above every declared helper and above the last
+/// index a caller has already reserved but not declared yet. A block owner
+/// (intrinsics reserves `start..=ascii_init` before declaring any of them)
+/// passes its reserved high-water mark so a lazy `fresh_index` call inside the
+/// block can never hand out a slot another reservation still owns.
+pub(crate) fn fresh_index_above(
+    lower: &Lowerer<'_>,
+    ir: &FrontendIr,
+    span: swc_common::Span,
+    reserved_high: u16,
+) -> Result<u16, ParseError> {
     ir.functions
         .iter()
         .map(|function| function.index)
         .max()
         .unwrap_or(0)
+        .max(reserved_high)
         .checked_add(1)
         .ok_or_else(|| lower.error(span, "JS heap helper function index space exhausted"))
 }
@@ -152,6 +173,15 @@ pub(crate) fn declare_helper(
     body_expr: Expr,
     line: u32,
 ) {
+    // Every declaration must win a slot that is neither declared nor a
+    // pending reservation. A collision here would otherwise surface much
+    // later as a UTF16 bridge `duplicate helper/index`, after the reserved
+    // site silently emitted a call to the wrong body.
+    assert!(
+        !ir.functions.iter().any(|function| function.index == index)
+            && !ir.function_impls.contains_key(&index),
+        "helper declaration reuses function index {index} ({name})"
+    );
     ir.functions.push(FunctionDecl {
         name: name.to_owned(),
         arity,
@@ -207,6 +237,44 @@ fn emit_row_lookup(
     page_ptr: u16,
     require: bool,
 ) {
+    emit_row_lookup_cached(
+        helper_read,
+        decode,
+        carrier,
+        slot,
+        line,
+        body,
+        declare,
+        page_out,
+        row_out,
+        addr_out,
+        page_ptr_num,
+        page_ptr,
+        require,
+        None,
+    );
+}
+
+/// `page0_cache` is a collection-local decoded page-0 directory pointer.
+/// Only the gray lookup inside one collection passes it. Every other site
+/// keeps the uncached table read. Page numbers above 0 always re-read.
+#[allow(clippy::too_many_arguments)]
+fn emit_row_lookup_cached(
+    helper_read: u16,
+    decode: u16,
+    carrier: u16,
+    slot: u16,
+    line: u32,
+    body: &mut Vec<Stmt>,
+    declare: bool,
+    page_out: u16,
+    row_out: u16,
+    addr_out: u16,
+    page_ptr_num: u16,
+    page_ptr: u16,
+    require: bool,
+    page0_cache: Option<(u16, u16)>,
+) {
     body.push(bind_slot(
         page_out,
         Some(TypeSchema::Int),
@@ -251,27 +319,80 @@ fn emit_row_lookup(
         ],
         line,
     });
-    body.push(bind_slot(
-        page_ptr_num,
-        Some(TypeSchema::Number),
-        read_cell(
-            helper_read,
-            carrier,
-            Expr::Add(
-                Box::new(Expr::Int(layout::HEADER_CELLS)),
-                Box::new(Expr::Var(page_out)),
-            ),
-        ),
-        line,
-        declare,
-    ));
-    body.push(bind_slot(
-        page_ptr,
-        Some(TypeSchema::Int),
-        decode_int_call(decode, Expr::Var(page_ptr_num)),
-        line,
-        declare,
-    ));
+    match page0_cache {
+        Some((cached_num, cached_ptr)) => {
+            // Page 0's directory pointer does not change during this collection:
+            // the collector allocates no directory page, does not move or free
+            // one, and does not rewrite the header page-pointer table. Page > 0
+            // keeps the exact table read and decode. A cached zero is legal for
+            // an empty heap; the require below still rejects it on a real row.
+            debug_assert!(!declare);
+            body.push(Stmt::IfElse {
+                condition: Expr::Eq(Box::new(Expr::Var(page_out)), Box::new(Expr::Int(0))),
+                then_branch: vec![
+                    Stmt::Assign {
+                        kind: vm::AssignmentKind::Set,
+                        index: page_ptr_num,
+                        expr: Expr::Var(cached_num),
+                        line,
+                    },
+                    Stmt::Assign {
+                        kind: vm::AssignmentKind::Set,
+                        index: page_ptr,
+                        expr: Expr::Var(cached_ptr),
+                        line,
+                    },
+                ],
+                else_branch: vec![
+                    bind_slot(
+                        page_ptr_num,
+                        Some(TypeSchema::Number),
+                        read_cell(
+                            helper_read,
+                            carrier,
+                            Expr::Add(
+                                Box::new(Expr::Int(layout::HEADER_CELLS)),
+                                Box::new(Expr::Var(page_out)),
+                            ),
+                        ),
+                        line,
+                        false,
+                    ),
+                    bind_slot(
+                        page_ptr,
+                        Some(TypeSchema::Int),
+                        decode_int_call(decode, Expr::Var(page_ptr_num)),
+                        line,
+                        false,
+                    ),
+                ],
+                line,
+            });
+        }
+        None => {
+            body.push(bind_slot(
+                page_ptr_num,
+                Some(TypeSchema::Number),
+                read_cell(
+                    helper_read,
+                    carrier,
+                    Expr::Add(
+                        Box::new(Expr::Int(layout::HEADER_CELLS)),
+                        Box::new(Expr::Var(page_out)),
+                    ),
+                ),
+                line,
+                declare,
+            ));
+            body.push(bind_slot(
+                page_ptr,
+                Some(TypeSchema::Int),
+                decode_int_call(decode, Expr::Var(page_ptr_num)),
+                line,
+                declare,
+            ));
+        }
+    }
     if require {
         body.push(assert_stmt(
             Expr::Not(Box::new(Expr::Eq(
@@ -373,10 +494,11 @@ pub(crate) fn emit_bootstrap(
     Ok(carrier)
 }
 
-/// Append the exact UInt32 generation decoder `(Number) -> Int`: bounded
-/// binary decomposition over 2^31 down to 2^0 with Float remainder
-/// subtraction plus Int accumulation, then a zero-remainder guard. Separate
-/// from the 17-bit slot decoder; generations never ride the slot domain.
+/// Append the exact UInt32 generation decoder `(Number) -> Int`: the original
+/// closed bounds, then exactly one guarded Core `CheckedIntFromNumber`
+/// conversion of the original parameter. The existing exact conversion rejects
+/// fractions. Separate from the 17-bit slot decoder; generations never ride
+/// the slot domain.
 pub(crate) fn append_decode_u32(
     lower: &mut Lowerer<'_>,
     ir: &mut FrontendIr,
@@ -388,7 +510,11 @@ pub(crate) fn append_decode_u32(
     let param_x = lower.slot(span)?;
     let remaining = lower.slot(span)?;
     let decoded = lower.slot(span)?;
-    let mut body = vec![
+    // The accepted Core builtin owns the numeric conversion; the wrapper keeps
+    // the full UInt32 domain on this same assertion layer. The closed upper
+    // guard already rejects NaN. Fractions fail at the existing exact
+    // conversion of the original parameter.
+    let body = vec![
         Stmt::Let {
             index: remaining,
             declared_schema: Some(TypeSchema::Number),
@@ -418,49 +544,16 @@ pub(crate) fn append_decode_u32(
         Stmt::Let {
             index: decoded,
             declared_schema: Some(TypeSchema::Int),
-            expr: Expr::Int(0),
+            expr: Expr::Call(
+                BuiltinFunction::CheckedIntFromNumber.call_index(),
+                Vec::new(),
+                vec![Expr::Var(param_x)],
+                None,
+                None,
+            ),
             line,
         },
     ];
-    for bit in (0..=31u32).rev() {
-        let threshold = f64::from(1u32 << bit);
-        let bit_value = 1i64 << bit;
-        body.push(Stmt::IfElse {
-            condition: Expr::Or(
-                Box::new(Expr::Gt(
-                    Box::new(Expr::Var(remaining)),
-                    Box::new(Expr::Float(threshold)),
-                )),
-                Box::new(Expr::Eq(
-                    Box::new(Expr::Var(remaining)),
-                    Box::new(Expr::Float(threshold)),
-                )),
-            ),
-            then_branch: vec![
-                Stmt::Assign {
-                    kind: vm::AssignmentKind::Set,
-                    index: remaining,
-                    expr: Expr::Sub(
-                        Box::new(Expr::Var(remaining)),
-                        Box::new(Expr::Float(threshold)),
-                    ),
-                    line,
-                },
-                Stmt::Assign {
-                    kind: vm::AssignmentKind::Set,
-                    index: decoded,
-                    expr: Expr::Add(Box::new(Expr::Var(decoded)), Box::new(Expr::Int(bit_value))),
-                    line,
-                },
-            ],
-            else_branch: Vec::new(),
-            line,
-        });
-    }
-    body.push(assert_stmt(
-        Expr::Eq(Box::new(Expr::Var(remaining)), Box::new(Expr::Float(0.0))),
-        line,
-    ));
     declare_helper(
         ir,
         statements,
@@ -797,31 +890,53 @@ pub(crate) fn append_root_enter(
 #[allow(clippy::too_many_arguments)]
 fn emit_frame_check(
     helper_read: u16,
-    decode: u16,
     param_carrier: u16,
     frame: u16,
     entry: u16,
     line: u32,
     body: &mut Vec<Stmt>,
-    class_num: u16,
     class: u16,
-    cap_num: u16,
     cap: u16,
-    end_num: u16,
     end: u16,
 ) {
-    body.push(Stmt::Let {
-        index: end_num,
-        declared_schema: Some(TypeSchema::Number),
-        expr: header_cell(helper_read, param_carrier, layout::HDR_HEAP_END),
-        line,
-    });
+    // These cells are only compared, never answered with an address, so every
+    // raw cell is normalized in the Number domain instead of being routed
+    // through the Int decoder. The accepted value domain stays exactly the
+    // decoder's: finite, integral and inside 0..=the realm cell budget.
+    let bounded = |value: Expr| {
+        Expr::And(
+            Box::new(Expr::Not(Box::new(Expr::Lt(
+                Box::new(value.clone()),
+                Box::new(Expr::Float(0.0)),
+            )))),
+            Box::new(Expr::And(
+                // Same closed upper guard shape the Int decoder uses: a plain
+                // `<=` rewrite would admit NaN through this arm.
+                Box::new(Expr::Or(
+                    Box::new(Expr::Lt(
+                        Box::new(value.clone()),
+                        Box::new(Expr::Float(layout::PHYSICAL_CEILING as f64)),
+                    )),
+                    Box::new(Expr::Eq(
+                        Box::new(value.clone()),
+                        Box::new(Expr::Float(layout::PHYSICAL_CEILING as f64)),
+                    )),
+                )),
+                // The decoder rejected any fraction at its zero-remainder gate.
+                Box::new(Expr::Eq(
+                    Box::new(Expr::Mod(Box::new(value), Box::new(Expr::Float(1.0)))),
+                    Box::new(Expr::Float(0.0)),
+                )),
+            )),
+        )
+    };
     body.push(Stmt::Let {
         index: end,
-        declared_schema: Some(TypeSchema::Int),
-        expr: decode_int_call(decode, Expr::Var(end_num)),
+        declared_schema: Some(TypeSchema::Number),
+        expr: Lowerer::as_number(header_cell(helper_read, param_carrier, layout::HDR_HEAP_END)),
         line,
     });
+    body.push(assert_stmt(bounded(Expr::Var(end)), line));
     body.push(assert_stmt(
         Expr::And(
             Box::new(Expr::Or(
@@ -835,65 +950,56 @@ fn emit_frame_check(
                 )),
             )),
             Box::new(Expr::Lt(
-                Box::new(Expr::Var(frame)),
+                Box::new(Lowerer::as_number(Expr::Var(frame))),
                 Box::new(Expr::Var(end)),
             )),
         ),
         line,
     ));
     body.push(Stmt::Let {
-        index: class_num,
+        index: class,
         declared_schema: Some(TypeSchema::Number),
-        expr: read_cell(
+        expr: Lowerer::as_number(read_cell(
             helper_read,
             param_carrier,
             Expr::Add(
                 Box::new(Expr::Var(frame)),
                 Box::new(Expr::Int(layout::RAW_CLASS)),
             ),
-        ),
+        )),
         line,
     });
-    body.push(Stmt::Let {
-        index: class,
-        declared_schema: Some(TypeSchema::Int),
-        expr: decode_int_call(decode, Expr::Var(class_num)),
-        line,
-    });
+    // Equality with the one root-frame class is already finite, integral and
+    // in range, so no second bound check is owed on this cell.
     body.push(assert_stmt(
         Expr::Eq(
             Box::new(Expr::Var(class)),
-            Box::new(Expr::Int(layout::RAW_CLASS_ROOT_FRAME)),
+            Box::new(Expr::Float(layout::RAW_CLASS_ROOT_FRAME as f64)),
         ),
         line,
     ));
     body.push(Stmt::Let {
-        index: cap_num,
+        index: cap,
         declared_schema: Some(TypeSchema::Number),
-        expr: read_cell(
+        expr: Lowerer::as_number(read_cell(
             helper_read,
             param_carrier,
             Expr::Add(
                 Box::new(Expr::Var(frame)),
                 Box::new(Expr::Int(layout::RAW_HEADER_CELLS)),
             ),
-        ),
+        )),
         line,
     });
-    body.push(Stmt::Let {
-        index: cap,
-        declared_schema: Some(TypeSchema::Int),
-        expr: decode_int_call(decode, Expr::Var(cap_num)),
-        line,
-    });
+    body.push(assert_stmt(bounded(Expr::Var(cap)), line));
     body.push(assert_stmt(
         Expr::And(
             Box::new(Expr::Not(Box::new(Expr::Lt(
-                Box::new(Expr::Var(entry)),
-                Box::new(Expr::Int(0)),
+                Box::new(Lowerer::as_number(Expr::Var(entry))),
+                Box::new(Expr::Float(0.0)),
             )))),
             Box::new(Expr::Lt(
-                Box::new(Expr::Var(entry)),
+                Box::new(Lowerer::as_number(Expr::Var(entry))),
                 Box::new(Expr::Var(cap)),
             )),
         ),
@@ -914,7 +1020,6 @@ pub(crate) fn append_root_write(
     carrier_schema: &TypeSchema,
     helper_read: u16,
     helper_write: u16,
-    decode: u16,
     span: swc_common::Span,
     statements: &mut Vec<Stmt>,
 ) -> Result<u16, ParseError> {
@@ -924,11 +1029,8 @@ pub(crate) fn append_root_write(
     let param_frame = lower.slot(span)?;
     let param_entry = lower.slot(span)?;
     let param_value = lower.slot(span)?;
-    let class_num = lower.slot(span)?;
     let class = lower.slot(span)?;
-    let cap_num = lower.slot(span)?;
     let cap = lower.slot(span)?;
-    let end_num = lower.slot(span)?;
     let end = lower.slot(span)?;
     let tag = lower.slot(span)?;
     let ref_slot = lower.slot(span)?;
@@ -946,17 +1048,13 @@ pub(crate) fn append_root_write(
     }];
     emit_frame_check(
         helper_read,
-        decode,
         param_carrier,
         param_frame,
         param_entry,
         line,
         &mut body,
-        class_num,
         class,
-        cap_num,
         cap,
-        end_num,
         end,
     );
     body.push(Stmt::Let {
@@ -1075,6 +1173,98 @@ pub(crate) fn append_root_write(
     Ok(index)
 }
 
+/// Append the canonical root clear helper
+/// `(Carrier, frame: Int, entry: Int) -> Int ack`. It validates the same
+/// frame/entry prefix the generic write uses and then publishes the three
+/// cells of one already-proven empty entry: the `ROOT_EMPTY` category and the
+/// zeroed slot/generation pair, each through the existing native cell writer
+/// with a Number payload. Never allocates, collects or loads a boxed record.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn append_root_clear(
+    lower: &mut Lowerer<'_>,
+    ir: &mut FrontendIr,
+    carrier_schema: &TypeSchema,
+    helper_read: u16,
+    helper_write: u16,
+    span: swc_common::Span,
+    statements: &mut Vec<Stmt>,
+) -> Result<u16, ParseError> {
+    let index = fresh_index(lower, ir, span)?;
+    let line = lower.line(span);
+    let param_carrier = lower.slot(span)?;
+    let param_frame = lower.slot(span)?;
+    let param_entry = lower.slot(span)?;
+    let class = lower.slot(span)?;
+    let cap = lower.slot(span)?;
+    let end = lower.slot(span)?;
+    let sink = lower.slot(span)?;
+    let mut body = vec![Stmt::Let {
+        index: sink,
+        declared_schema: Some(TypeSchema::Number),
+        expr: Expr::Float(0.0),
+        line,
+    }];
+    emit_frame_check(
+        helper_read,
+        param_carrier,
+        param_frame,
+        param_entry,
+        line,
+        &mut body,
+        class,
+        cap,
+        end,
+    );
+    let entry_base = Expr::Add(
+        Box::new(Expr::Add(
+            Box::new(Expr::Var(param_frame)),
+            Box::new(Expr::Int(layout::FRAME_FIXED_CELLS)),
+        )),
+        Box::new(Expr::Mul(
+            Box::new(Expr::Var(param_entry)),
+            Box::new(Expr::Int(layout::FRAME_CELLS_PER_ENTRY)),
+        )),
+    );
+    for (cell, payload) in [
+        (0, Expr::Int(layout::ROOT_EMPTY)),
+        (1, Expr::Int(0)),
+        (2, Expr::Int(0)),
+    ] {
+        body.push(Stmt::Assign {
+            kind: vm::AssignmentKind::Set,
+            index: sink,
+            expr: write_call(
+                helper_write,
+                param_carrier,
+                Expr::Add(Box::new(entry_base.clone()), Box::new(Expr::Int(cell))),
+                Lowerer::as_number(payload),
+            ),
+            line,
+        });
+    }
+
+    declare_helper(
+        ir,
+        statements,
+        layout::ROOT_CLEAR_HELPER,
+        index,
+        3,
+        vec!["carrier".to_owned(), "frame".to_owned(), "entry".to_owned()],
+        vec![
+            Some(carrier_schema.clone()),
+            Some(TypeSchema::Int),
+            Some(TypeSchema::Int),
+        ],
+        Some(TypeSchema::Int),
+        ValueType::Int,
+        vec![param_carrier, param_frame, param_entry],
+        body,
+        Expr::Int(1),
+        line,
+    );
+    Ok(index)
+}
+
 /// Append the explicit edge root helper
 /// `(Carrier, frame, entry, category, slot, gen: Int) -> Int ack` for
 /// internal graph edges (environment nodes) that never become user JS
@@ -1086,7 +1276,6 @@ pub(crate) fn append_root_write_node(
     carrier_schema: &TypeSchema,
     helper_read: u16,
     helper_write: u16,
-    decode: u16,
     checked_base: u16,
     span: swc_common::Span,
     statements: &mut Vec<Stmt>,
@@ -1099,11 +1288,8 @@ pub(crate) fn append_root_write_node(
     let param_cat = lower.slot(span)?;
     let param_slot = lower.slot(span)?;
     let param_gen = lower.slot(span)?;
-    let class_num = lower.slot(span)?;
     let class = lower.slot(span)?;
-    let cap_num = lower.slot(span)?;
     let cap = lower.slot(span)?;
-    let end_num = lower.slot(span)?;
     let end = lower.slot(span)?;
     let sink = lower.slot(span)?;
     let mut body = vec![Stmt::Let {
@@ -1114,17 +1300,13 @@ pub(crate) fn append_root_write_node(
     }];
     emit_frame_check(
         helper_read,
-        decode,
         param_carrier,
         param_frame,
         param_entry,
         line,
         &mut body,
-        class_num,
         class,
-        cap_num,
         cap,
-        end_num,
         end,
     );
     // Explicit edges name object-like (string 4, object 5) or internal (6)
@@ -1280,7 +1462,18 @@ pub(crate) fn append_root_leave(
             expr: decode_int_call(decode, Expr::Var(top_num)),
             line,
         },
-        // Frames leave in strict LIFO order.
+        // Frames leave in strict LIFO order; the permanent bottom frame
+        // belongs to the carrier and is released only by owner teardown.
+        assert_stmt(
+            Expr::Not(Box::new(Expr::Eq(
+                Box::new(Expr::Var(param_frame)),
+                Box::new(decode_int_call(
+                    decode,
+                    header_cell(helper_read, param_carrier, layout::HDR_INTRINSIC_FRAME),
+                )),
+            ))),
+            line,
+        ),
         assert_stmt(
             Expr::Eq(Box::new(Expr::Var(top)), Box::new(Expr::Var(param_frame))),
             line,
@@ -1746,6 +1939,17 @@ pub(crate) fn append_checked_base(
         ),
         line,
     ));
+    if lower.array_buffer_used.get() || lower.typed_array_used() {
+        let kind = lower.slot(span)?;
+        body.push(Stmt::Let {
+            index: kind,
+            declared_schema: Some(TypeSchema::Int),
+            expr: decode_int_call(decode, read_cell(helper_read, param_carrier, Expr::Var(base))),
+            line,
+        });
+        use super::object::{and, int, lt, not, var};
+        body.push(assert_stmt(and(not(lt(var(kind), int(layout::KIND_ARRAY))), not(lt(int(layout::KIND_MAX), var(kind)))), line));
+    }
     declare_helper(
         ir,
         statements,
@@ -1773,7 +1977,7 @@ pub(crate) fn append_checked_base(
 }
 
 /// Append the intrusive gray marker
-/// `(Carrier, slot: Int, generation: Int, expect: Int) -> Int ack`.
+/// `(Carrier, slot: Int, generation: Int, expect: Int, next: Int) -> Int ack`.
 /// Validates the edge exactly (bound, page, active state, current
 /// generation, node class) and asserts the node kind matches `expect`
 /// (0 any node, 2 string, 3 object-like array/object/function, 5 internal
@@ -1797,8 +2001,7 @@ pub(crate) fn append_mark(
     let param_slot = lower.slot(span)?;
     let param_gen = lower.slot(span)?;
     let param_expect = lower.slot(span)?;
-    let next_num = lower.slot(span)?;
-    let next = lower.slot(span)?;
+    let param_next = lower.slot(span)?;
     let page = lower.slot(span)?;
     let row = lower.slot(span)?;
     let addr = lower.slot(span)?;
@@ -1822,18 +2025,6 @@ pub(crate) fn append_mark(
             expr: Expr::Float(0.0),
             line,
         },
-        Stmt::Let {
-            index: next_num,
-            declared_schema: Some(TypeSchema::Number),
-            expr: header_cell(helper_read, param_carrier, layout::HDR_NEXT_SLOT),
-            line,
-        },
-        Stmt::Let {
-            index: next,
-            declared_schema: Some(TypeSchema::Int),
-            expr: decode_int_call(decode, Expr::Var(next_num)),
-            line,
-        },
         assert_stmt(
             Expr::And(
                 Box::new(Expr::Not(Box::new(Expr::Lt(
@@ -1842,7 +2033,7 @@ pub(crate) fn append_mark(
                 )))),
                 Box::new(Expr::Lt(
                     Box::new(Expr::Var(param_slot)),
-                    Box::new(Expr::Var(next)),
+                    Box::new(Expr::Var(param_next)),
                 )),
             ),
             line,
@@ -1883,7 +2074,14 @@ pub(crate) fn append_mark(
             expr: if is_gen {
                 decode_gen_call(decode_u32, Expr::Var(field_num))
             } else {
-                decode_int_call(decode, Expr::Var(field_num))
+                Expr::IfElse {
+                    condition: Box::new(Expr::Eq(
+                        Box::new(Expr::Var(field_num)),
+                        Box::new(Expr::Float(layout::STATE_ACTIVE as f64)),
+                    )),
+                    then_expr: Box::new(Expr::Int(layout::STATE_ACTIVE)),
+                    else_expr: Box::new(decode_int_call(decode, Expr::Var(field_num))),
+                }
             },
             line,
         });
@@ -1940,28 +2138,17 @@ pub(crate) fn append_mark(
         Box::new(Expr::Var(kind)),
         Box::new(Expr::Int(layout::KIND_STRING)),
     );
-    let is_object_like = Expr::Or(
-        Box::new(Expr::Eq(
-            Box::new(Expr::Var(kind)),
-            Box::new(Expr::Int(layout::KIND_ARRAY)),
-        )),
-        Box::new(Expr::Or(
-            Box::new(Expr::Eq(
-                Box::new(Expr::Var(kind)),
-                Box::new(Expr::Int(layout::KIND_OBJECT)),
-            )),
-            Box::new(Expr::Eq(
-                Box::new(Expr::Var(kind)),
-                Box::new(Expr::Int(layout::KIND_FUNCTION)),
-            )),
-        )),
-    );
+    let is_object_like = super::object::object_like(Expr::Var(kind));
     let is_env_kind = Expr::Eq(
         Box::new(Expr::Var(kind)),
         Box::new(Expr::Int(layout::KIND_ENVIRONMENT)),
     );
     let wanted_string = Expr::Eq(Box::new(Expr::Var(param_expect)), Box::new(Expr::Int(2)));
     let wanted_object_like = Expr::Eq(Box::new(Expr::Var(param_expect)), Box::new(Expr::Int(3)));
+    let backing = super::object::and(
+        super::object::eq(Expr::Var(param_expect), Expr::Int(layout::KIND_BYTES)),
+        super::object::eq(Expr::Var(kind), Expr::Int(layout::KIND_BYTES)),
+    );
     let wanted_env = Expr::Eq(Box::new(Expr::Var(param_expect)), Box::new(Expr::Int(5)));
     body.push(assert_stmt(
         Expr::Or(
@@ -1976,7 +2163,7 @@ pub(crate) fn append_mark(
                         Box::new(wanted_object_like),
                         Box::new(is_object_like),
                     )),
-                    Box::new(Expr::And(Box::new(wanted_env), Box::new(is_env_kind))),
+                    Box::new(super::object::or(backing, Expr::And(Box::new(wanted_env), Box::new(is_env_kind)))),
                 )),
             )),
         ),
@@ -2070,22 +2257,30 @@ pub(crate) fn append_mark(
         statements,
         layout::MARK_HELPER,
         index,
-        4,
+        5,
         vec![
             "carrier".to_owned(),
             "slot".to_owned(),
             "generation".to_owned(),
             "expect".to_owned(),
+            "next".to_owned(),
         ],
         vec![
             Some(carrier_schema.clone()),
             Some(TypeSchema::Int),
             Some(TypeSchema::Int),
             Some(TypeSchema::Int),
+            Some(TypeSchema::Int),
         ],
         Some(TypeSchema::Int),
         ValueType::Int,
-        vec![param_carrier, param_slot, param_gen, param_expect],
+        vec![
+            param_carrier,
+            param_slot,
+            param_gen,
+            param_expect,
+            param_next,
+        ],
         body,
         Expr::Int(1),
         line,
@@ -2998,29 +3193,34 @@ pub(crate) fn append_node_begin(
         ),
         assert_stmt(
             Expr::And(
-                Box::new(Expr::Or(
-                    Box::new(Expr::Gt(
-                        Box::new(Expr::Var(param_kind)),
-                        Box::new(Expr::Int(0)),
-                    )),
-                    Box::new(Expr::Eq(
-                        Box::new(Expr::Var(param_kind)),
-                        Box::new(Expr::Int(layout::KIND_ARRAY)),
-                    )),
-                )),
-                Box::new(Expr::Or(
-                    Box::new(Expr::Lt(
-                        Box::new(Expr::Var(param_kind)),
-                        Box::new(Expr::Int(layout::KIND_ENVIRONMENT)),
-                    )),
-                    Box::new(Expr::Eq(
-                        Box::new(Expr::Var(param_kind)),
-                        Box::new(Expr::Int(layout::KIND_ENVIRONMENT)),
-                    )),
-                )),
+                Box::new(Expr::Not(Box::new(Expr::Lt(
+                    Box::new(Expr::Var(param_kind)),
+                    Box::new(Expr::Int(layout::KIND_ARRAY)),
+                )))),
+                Box::new(Expr::Not(Box::new(Expr::Gt(
+                    Box::new(Expr::Var(param_kind)),
+                    Box::new(Expr::Int(layout::KIND_MAX)),
+                )))),
             ),
             line,
         ),
+        Stmt::IfElse {
+            condition: super::object::eq(Expr::Var(param_kind), Expr::Int(layout::KIND_VIEW)),
+            then_branch: vec![assert_stmt(super::object::eq(
+                Expr::Var(param_count), Expr::Int(layout::VIEW_CELLS),
+            ), line)],
+            else_branch: Vec::new(),
+            line,
+        },
+        Stmt::IfElse {
+            condition: super::object::eq(Expr::Var(param_kind), Expr::Int(layout::KIND_BYTES)),
+            then_branch: vec![assert_stmt(super::object::and(
+                super::object::not(super::object::lt(Expr::Var(param_count), Expr::Int(layout::BYTES_HEADER_CELLS))),
+                super::object::not(super::object::lt(Expr::Int(layout::BYTES_HEADER_CELLS + layout::BYTES_MAX_LENGTH), Expr::Var(param_count))),
+            ), line)],
+            else_branch: Vec::new(),
+            line,
+        },
         Stmt::Let {
             index: pending_num,
             declared_schema: Some(TypeSchema::Number),
@@ -3833,6 +4033,43 @@ pub(crate) fn append_node_begin(
             line,
         });
     }
+    body.push(Stmt::IfElse {
+        condition: Expr::Or(
+            Box::new(Expr::Eq(
+                Box::new(Expr::Var(param_kind)),
+                Box::new(Expr::Int(layout::KIND_ARRAY)),
+            )),
+            Box::new(Expr::Eq(
+                Box::new(Expr::Var(param_kind)),
+                Box::new(Expr::Int(layout::KIND_TAGGED_ARRAY)),
+            )),
+        ),
+        then_branch: vec![
+            assert_stmt(
+                Expr::Not(Box::new(Expr::Lt(
+                    Box::new(Expr::Var(param_count)),
+                    Box::new(Expr::Int(layout::ARRAY_HEADER_CELLS)),
+                ))),
+                line,
+            ),
+            Stmt::Assign {
+                kind: vm::AssignmentKind::Set,
+                index: sink,
+                expr: write_call(
+                    helper_write,
+                    param_carrier,
+                    Expr::Add(
+                        Box::new(Expr::Var(data)),
+                        Box::new(Expr::Int(layout::ARRAY_PRESENT_OFFSET)),
+                    ),
+                    Expr::Float(1.0),
+                ),
+                line,
+            },
+        ],
+        else_branch: Vec::new(),
+        line,
+    });
     let allocation_schema = value::allocation_schema();
 
     declare_helper(
@@ -3889,11 +4126,8 @@ fn emit_publish_preamble(
     kind_num: u16,
     kind: u16,
     headgen: u16,
-    class_num: u16,
     class: u16,
-    cap_num: u16,
     cap: u16,
-    end_num: u16,
     end: u16,
 ) -> Result<(), ParseError> {
     let page_ptr_num = lower.slot(span)?;
@@ -4007,17 +4241,13 @@ fn emit_publish_preamble(
     ));
     emit_frame_check(
         helper_read,
-        decode,
         param_carrier,
         param_frame,
         param_entry,
         line,
         body,
-        class_num,
         class,
-        cap_num,
         cap,
-        end_num,
         end,
     );
     let _ = helper_write;
@@ -4166,6 +4396,7 @@ pub(crate) fn append_node_publish(
     helper_write: u16,
     decode: u16,
     decode_u32: u16,
+    checked_base: u16,
     span: swc_common::Span,
     statements: &mut Vec<Stmt>,
 ) -> Result<u16, ParseError> {
@@ -4189,11 +4420,8 @@ pub(crate) fn append_node_publish(
     let kind_num = lower.slot(span)?;
     let kind = lower.slot(span)?;
     let headgen = lower.slot(span)?;
-    let class_num = lower.slot(span)?;
     let class = lower.slot(span)?;
-    let cap_num = lower.slot(span)?;
     let cap = lower.slot(span)?;
-    let end_num = lower.slot(span)?;
     let end = lower.slot(span)?;
     let category = lower.slot(span)?;
     let tag = lower.slot(span)?;
@@ -4236,35 +4464,36 @@ pub(crate) fn append_node_publish(
         kind_num,
         kind,
         headgen,
-        class_num,
         class,
-        cap_num,
         cap,
-        end_num,
         end,
     )?;
+    if lower.typed_array_used() {
+        use super::object::{Emit, branch, eq, int, var};
+        let mut e = Emit {
+            lower, span, line, declarations: Vec::new(), carrier: param_carrier,
+            read: helper_read, write: helper_write, decode, checked_base, decode_u32,
+            number_write_sink: None, bootstrap_row_suffix: None, bootstrap_ascii_init: None,
+        };
+        let mut check = Vec::new();
+        super::typed_array::check_window(&mut e, param_base, &mut check)?;
+        body.extend(e.finish(vec![branch(
+            eq(var(kind), int(layout::KIND_VIEW)), check, Vec::new(), line,
+        )]));
+    }
     // User nodes only: arrays, strings, plain objects and functions get
     // the object-like or string root category (environment nodes publish
     // through the internal edge variant).
     body.push(assert_stmt(
         Expr::And(
-            Box::new(Expr::Or(
-                Box::new(Expr::Gt(Box::new(Expr::Var(kind)), Box::new(Expr::Int(0)))),
-                Box::new(Expr::Eq(
-                    Box::new(Expr::Var(kind)),
-                    Box::new(Expr::Int(layout::KIND_ARRAY)),
-                )),
-            )),
-            Box::new(Expr::Or(
-                Box::new(Expr::Lt(
-                    Box::new(Expr::Var(kind)),
-                    Box::new(Expr::Int(layout::KIND_ENVIRONMENT)),
-                )),
-                Box::new(Expr::Eq(
-                    Box::new(Expr::Var(kind)),
-                    Box::new(Expr::Int(layout::KIND_FUNCTION)),
-                )),
-            )),
+            Box::new(Expr::Not(Box::new(Expr::Lt(
+                Box::new(Expr::Var(kind)),
+                Box::new(Expr::Int(layout::KIND_ARRAY)),
+            )))),
+            Box::new(Expr::Not(Box::new(Expr::Gt(
+                Box::new(Expr::Var(kind)),
+                Box::new(Expr::Int(layout::KIND_MAX)),
+            )))),
         ),
         line,
     ));
@@ -4399,11 +4628,8 @@ pub(crate) fn append_node_publish_edge(
     let kind_num = lower.slot(span)?;
     let kind = lower.slot(span)?;
     let headgen = lower.slot(span)?;
-    let class_num = lower.slot(span)?;
     let class = lower.slot(span)?;
-    let cap_num = lower.slot(span)?;
     let cap = lower.slot(span)?;
-    let end_num = lower.slot(span)?;
     let end = lower.slot(span)?;
     let sink = lower.slot(span)?;
     let live_num = lower.slot(span)?;
@@ -4443,11 +4669,8 @@ pub(crate) fn append_node_publish_edge(
         kind_num,
         kind,
         headgen,
-        class_num,
         class,
-        cap_num,
         cap,
-        end_num,
         end,
     )?;
     body.push(assert_stmt(
@@ -4537,6 +4760,7 @@ fn emit_trace_pair(
     decode: u16,
     decode_u32: u16,
     mark: u16,
+    next: u16,
     param_carrier: u16,
     sink: u16,
     ps: u16,
@@ -4588,6 +4812,7 @@ fn emit_trace_pair(
                     Expr::Var(ps),
                     Expr::Var(pg),
                     Expr::Int(expect),
+                    Expr::Var(next),
                 ],
             )),
             line,
@@ -4595,6 +4820,179 @@ fn emit_trace_pair(
         else_branch: Vec::new(),
         line,
     });
+}
+
+/// Trace every reference-capable element of a tagged dense array. The node
+/// kind (6) is already established by the caller's per-kind dispatch; only
+/// String and Object tags carry heap edges, and only a nonzero generation
+/// links a live node. Packed arrays never call this helper. Every temp is
+/// pre-declared by the caller outside the collector loop; the returned
+/// statements are assignment-only so loop SSA edges stay balanced.
+#[allow(clippy::too_many_arguments)]
+fn tagged_array_elements(
+    helper_read: u16,
+    decode: u16,
+    decode_u32: u16,
+    mark: u16,
+    next: u16,
+    param_carrier: u16,
+    sink: u16,
+    ps: u16,
+    pg: u16,
+    base: u16,
+    line: u32,
+    count: u16,
+    cursor: u16,
+    address: u16,
+    tag: u16,
+) -> Vec<Stmt> {
+    let read = |addr: Expr| read_cell(helper_read, param_carrier, addr);
+    vec![
+        Stmt::Assign {
+            kind: vm::AssignmentKind::Set,
+            index: count,
+            expr: decode_gen_call(
+                decode_u32,
+                read(Expr::Add(Box::new(Expr::Var(base)), Box::new(Expr::Int(2)))),
+            ),
+            line,
+        },
+        Stmt::Assign {
+            kind: vm::AssignmentKind::Set,
+            index: tag,
+            expr: decode_gen_call(
+                decode_u32,
+                read(Expr::Add(
+                    Box::new(Expr::Var(base)),
+                    Box::new(Expr::Int(layout::ARRAY_PRESENT_OFFSET)),
+                )),
+            ),
+            line,
+        },
+        // Cell 5 stores physical present + 1. A raw 0 is not a present of -1.
+        assert_stmt(
+            Expr::Not(Box::new(Expr::Lt(
+                Box::new(Expr::Var(tag)),
+                Box::new(Expr::Int(1)),
+            ))),
+            line,
+        ),
+        Stmt::Assign {
+            kind: vm::AssignmentKind::Set,
+            index: count,
+            expr: physical_present(Expr::Var(tag), Expr::Var(count)),
+            line,
+        },
+        Stmt::Assign {
+            kind: vm::AssignmentKind::Set,
+            index: cursor,
+            expr: Expr::Int(0),
+            line,
+        },
+        Stmt::While {
+            condition: Expr::Lt(Box::new(Expr::Var(cursor)), Box::new(Expr::Var(count))),
+            body: vec![
+                Stmt::Assign {
+                    kind: vm::AssignmentKind::Set,
+                    index: address,
+                    expr: Expr::Add(
+                        Box::new(Expr::Add(
+                            Box::new(Expr::Var(base)),
+                            Box::new(Expr::Int(layout::ARRAY_HEADER_CELLS)),
+                        )),
+                        Box::new(Expr::Mul(
+                            Box::new(Expr::Var(cursor)),
+                            Box::new(Expr::Int(layout::ARRAY_TAGGED_CELLS_PER_ENTRY)),
+                        )),
+                    ),
+                    line,
+                },
+                Stmt::Assign {
+                    kind: vm::AssignmentKind::Set,
+                    index: tag,
+                    expr: decode_int_call(decode, read(Expr::Var(address))),
+                    line,
+                },
+                Stmt::IfElse {
+                    condition: Expr::Or(
+                        Box::new(Expr::Eq(
+                            Box::new(Expr::Var(tag)),
+                            Box::new(Expr::Int(value::STRING)),
+                        )),
+                        Box::new(Expr::Eq(
+                            Box::new(Expr::Var(tag)),
+                            Box::new(Expr::Int(value::OBJECT)),
+                        )),
+                    ),
+                    then_branch: vec![
+                        Stmt::Assign {
+                            kind: vm::AssignmentKind::Set,
+                            index: ps,
+                            expr: decode_int_call(
+                                decode,
+                                read(Expr::Add(
+                                    Box::new(Expr::Var(address)),
+                                    Box::new(Expr::Int(3)),
+                                )),
+                            ),
+                            line,
+                        },
+                        Stmt::Assign {
+                            kind: vm::AssignmentKind::Set,
+                            index: pg,
+                            expr: decode_gen_call(
+                                decode_u32,
+                                read(Expr::Add(
+                                    Box::new(Expr::Var(address)),
+                                    Box::new(Expr::Int(4)),
+                                )),
+                            ),
+                            line,
+                        },
+                        Stmt::IfElse {
+                            condition: Expr::Not(Box::new(Expr::Eq(
+                                Box::new(Expr::Var(pg)),
+                                Box::new(Expr::Int(0)),
+                            ))),
+                            then_branch: vec![Stmt::Assign {
+                                kind: vm::AssignmentKind::Set,
+                                index: sink,
+                                expr: Lowerer::as_number(Lowerer::guest_call(
+                                    mark,
+                                    vec![
+                                        Expr::Var(param_carrier),
+                                        Expr::Var(ps),
+                                        Expr::Var(pg),
+                                        Expr::IfElse {
+                                            condition: Box::new(Expr::Eq(
+                                                Box::new(Expr::Var(tag)),
+                                                Box::new(Expr::Int(value::STRING)),
+                                            )),
+                                            then_expr: Box::new(Expr::Int(2)),
+                                            else_expr: Box::new(Expr::Int(3)),
+                                        },
+                                        Expr::Var(next),
+                                    ],
+                                )),
+                                line,
+                            }],
+                            else_branch: Vec::new(),
+                            line,
+                        },
+                    ],
+                    else_branch: Vec::new(),
+                    line,
+                },
+                Stmt::Assign {
+                    kind: vm::AssignmentKind::Set,
+                    index: cursor,
+                    expr: Expr::Add(Box::new(Expr::Var(cursor)), Box::new(Expr::Int(1))),
+                    line,
+                },
+            ],
+            line,
+        },
+    ]
 }
 /// Append the iterative mark/sweep collector `(Carrier) -> Int`.
 /// Requires no pending node. Clears active marks and gray links, marks
@@ -4615,6 +5013,7 @@ pub(crate) fn append_heap_collect(
     decode: u16,
     decode_u32: u16,
     mark: u16,
+    checked_base: u16,
     span: swc_common::Span,
     statements: &mut Vec<Stmt>,
 ) -> Result<u16, ParseError> {
@@ -4662,6 +5061,8 @@ pub(crate) fn append_heap_collect(
     let g_addr = lower.slot(span)?;
     let g_ppn = lower.slot(span)?;
     let g_pp = lower.slot(span)?;
+    let page0_num = lower.slot(span)?;
+    let page0_ptr = lower.slot(span)?;
     let g_next = lower.slot(span)?;
     let reclaimed = lower.slot(span)?;
     let live = lower.slot(span)?;
@@ -4678,6 +5079,11 @@ pub(crate) fn append_heap_collect(
     let end = lower.slot(span)?;
     let sz = lower.slot(span)?;
     let coll = lower.slot(span)?;
+    let ta_count = lower.slot(span)?;
+    let ta_cursor = lower.slot(span)?;
+    let ta_addr = lower.slot(span)?;
+    let ta_tag = lower.slot(span)?;
+    let prev_link = lower.slot(span)?;
     let mut body = vec![
         Stmt::Let {
             index: sink,
@@ -4717,6 +5123,18 @@ pub(crate) fn append_heap_collect(
             index: next,
             declared_schema: Some(TypeSchema::Int),
             expr: decode_int_call(decode, Expr::Var(next_num)),
+            line,
+        },
+        Stmt::Let {
+            index: page0_num,
+            declared_schema: Some(TypeSchema::Number),
+            expr: header_cell(helper_read, param_carrier, layout::HEADER_CELLS),
+            line,
+        },
+        Stmt::Let {
+            index: page0_ptr,
+            declared_schema: Some(TypeSchema::Int),
+            expr: decode_int_call(decode, Expr::Var(page0_num)),
             line,
         },
     ];
@@ -4771,6 +5189,7 @@ pub(crate) fn append_heap_collect(
         (end, TypeSchema::Int, Expr::Int(0)),
         (sz, TypeSchema::Int, Expr::Int(0)),
         (coll, TypeSchema::Int, Expr::Int(0)),
+        (prev_link, TypeSchema::Int, Expr::Int(0)),
     ] {
         body.push(Stmt::Let {
             index: temp,
@@ -4862,7 +5281,14 @@ pub(crate) fn append_heap_collect(
                     Stmt::Assign {
                         kind: vm::AssignmentKind::Set,
                         index: st,
-                        expr: decode_int_call(decode, Expr::Var(rdn)),
+                        expr: Expr::IfElse {
+                            condition: Box::new(Expr::Eq(
+                                Box::new(Expr::Var(rdn)),
+                                Box::new(Expr::Float(layout::STATE_ACTIVE as f64)),
+                            )),
+                            then_expr: Box::new(Expr::Int(layout::STATE_ACTIVE)),
+                            else_expr: Box::new(decode_int_call(decode, Expr::Var(rdn))),
+                        },
                         line,
                     },
                     assert_stmt(
@@ -4960,6 +5386,41 @@ pub(crate) fn append_heap_collect(
     let _ = read;
     // Phase 2: scan every active frame and mark each checked live root.
     // A stale edge is corruption and fails closed inside the marker.
+    let bottom_check = {
+        use super::object::{add, and, eq, int, lt, not, or, var};
+        let previous = var(prev_link);
+        let permanent = decode_int_call(
+            decode,
+            header_cell(helper_read, param_carrier, layout::HDR_INTRINSIC_FRAME),
+        );
+        let size = decode_int_call(decode, read_cell(helper_read, param_carrier, var(f)));
+        let end = decode_int_call(
+            decode,
+            header_cell(helper_read, param_carrier, layout::HDR_HEAP_END),
+        );
+        let valid = and(
+            eq(var(f), permanent.clone()),
+            and(
+                eq(
+                    var(cap),
+                    int(super::intrinsics::selected_root_capacity(lower)),
+                ),
+                and(
+                    not(lt(
+                        size.clone(),
+                        int(layout::FRAME_FIXED_CELLS
+                            + layout::FRAME_CELLS_PER_ENTRY
+                                * super::intrinsics::selected_root_capacity(lower)),
+                    )),
+                    not(lt(end, add(var(f), size))),
+                ),
+            ),
+        );
+        assert_stmt(
+            or(not(eq(previous, int(0))), or(eq(permanent, int(0)), valid)),
+            line,
+        )
+    };
     body.push(Stmt::Assign {
         kind: vm::AssignmentKind::Set,
         index: rdn,
@@ -5028,24 +5489,38 @@ pub(crate) fn append_heap_collect(
                 body: vec![
                     Stmt::Assign {
                         kind: vm::AssignmentKind::Set,
-                        index: cat,
-                        expr: decode_int_call(
-                            decode,
-                            read_cell(
-                                helper_read,
-                                param_carrier,
-                                Expr::Add(
-                                    Box::new(Expr::Add(
-                                        Box::new(Expr::Var(f)),
-                                        Box::new(Expr::Int(layout::FRAME_FIXED_CELLS)),
-                                    )),
-                                    Box::new(Expr::Mul(
-                                        Box::new(Expr::Var(e)),
-                                        Box::new(Expr::Int(layout::FRAME_CELLS_PER_ENTRY)),
-                                    )),
-                                ),
+                        index: rdn,
+                        expr: read_cell(
+                            helper_read,
+                            param_carrier,
+                            Expr::Add(
+                                Box::new(Expr::Add(
+                                    Box::new(Expr::Var(f)),
+                                    Box::new(Expr::Int(layout::FRAME_FIXED_CELLS)),
+                                )),
+                                Box::new(Expr::Mul(
+                                    Box::new(Expr::Var(e)),
+                                    Box::new(Expr::Int(layout::FRAME_CELLS_PER_ENTRY)),
+                                )),
                             ),
                         ),
+                        line,
+                    },
+                    // Reuse the single category-cell read in the Number scratch.
+                    // The existing scalar boundary normalizes the comparison: Float ±0
+                    // and raw Int 0 select the empty category. All other Numbers retain
+                    // the unchanged exact decoder and its errors.
+                    Stmt::Assign {
+                        kind: vm::AssignmentKind::Set,
+                        index: cat,
+                        expr: Expr::IfElse {
+                            condition: Box::new(Expr::Eq(
+                                Box::new(Expr::Var(rdn)),
+                                Box::new(Expr::Float(0.0)),
+                            )),
+                            then_expr: Box::new(Expr::Int(0)),
+                            else_expr: Box::new(decode_int_call(decode, Expr::Var(rdn))),
+                        },
                         line,
                     },
                     Stmt::IfElse {
@@ -5138,6 +5613,7 @@ pub(crate) fn append_heap_collect(
                                         Expr::Var(eslot),
                                         Expr::Var(egen),
                                         Expr::Var(expect),
+                                        Expr::Var(next),
                                     ],
                                 )),
                                 line,
@@ -5157,7 +5633,7 @@ pub(crate) fn append_heap_collect(
             },
             Stmt::Assign {
                 kind: vm::AssignmentKind::Set,
-                index: f,
+                index: prev_link,
                 expr: decode_int_call(
                     decode,
                     read_cell(
@@ -5171,6 +5647,13 @@ pub(crate) fn append_heap_collect(
                 ),
                 line,
             },
+            bottom_check,
+            Stmt::Assign {
+                kind: vm::AssignmentKind::Set,
+                index: f,
+                expr: Expr::Var(prev_link),
+                line,
+            },
         ],
         line,
     });
@@ -5180,222 +5663,163 @@ pub(crate) fn append_heap_collect(
     // elements stay Float numbers with no edges.
     // Object property-row scan shared by the object arm below.
     let object_rows = {
-        let mut rows = vec![
-            Stmt::Assign {
-                kind: vm::AssignmentKind::Set,
-                index: rdn,
-                expr: read_cell(
-                    helper_read,
-                    param_carrier,
-                    Expr::Add(Box::new(Expr::Var(base)), Box::new(Expr::Int(2))),
-                ),
-                line,
-            },
-            Stmt::Assign {
-                kind: vm::AssignmentKind::Set,
-                index: count,
-                expr: decode_int_call(decode, Expr::Var(rdn)),
-                line,
-            },
-            Stmt::Assign {
-                kind: vm::AssignmentKind::Set,
-                index: rc,
-                expr: Expr::Int(0),
-                line,
-            },
-        ];
-        rows.push(Stmt::While {
-            condition: Expr::Lt(
-                Box::new(Lowerer::as_number(Expr::Var(rc))),
-                Box::new(Lowerer::as_number(Expr::Var(count))),
+        use super::object::*;
+        let mut e = Emit {
+            lower,
+            span,
+            line,
+            declarations: Vec::new(),
+            carrier: param_carrier,
+            read: helper_read,
+            write: helper_write,
+            decode,
+            decode_u32,
+            checked_base,
+            number_write_sink: None,
+            bootstrap_row_suffix: None,
+            bootstrap_ascii_init: None,
+        };
+        let mut rows = Vec::new();
+        // The gray drain decoded and range-checked this node's kind for the
+        // current queue entry; hand that Int to the header emitter so the
+        // object/function row scan does not read and exact-decode it again.
+        let header = decode_header_known_kind(&mut e, base, &mut rows, kind)?;
+        let mut message = Vec::new();
+        emit_trace_pair(
+            helper_read,
+            decode,
+            decode_u32,
+            mark,
+            next,
+            param_carrier,
+            sink,
+            ps,
+            pg,
+            line,
+            &mut message,
+            base,
+            layout::ERROR_MESSAGE_OFFSET,
+            2, // Collector selector for a checked String edge.
+        );
+        message.push(assert_stmt(or(not(eq(var(pg), int(0))), eq(var(ps), int(0))), line));
+        rows.push(branch(var(header.error_instance), message, Vec::new(), line));
+        rows.push(assign(rc, int(0), line));
+        let mut scan = vec![assign(
+            rb,
+            add(
+                add(var(base), var(header.header)),
+                mul(int(layout::OBJECT_CELLS_PER_PROPERTY), var(rc)),
             ),
-            body: vec![
-                Stmt::Assign {
-                    kind: vm::AssignmentKind::Set,
-                    index: rb,
-                    expr: Expr::Add(
-                        Box::new(Expr::Add(
-                            Box::new(Expr::Var(base)),
-                            Box::new(Expr::Int(layout::OBJECT_HEADER_CELLS)),
-                        )),
-                        Box::new(Expr::Mul(
-                            Box::new(Expr::Var(rc)),
-                            Box::new(Expr::Int(layout::OBJECT_CELLS_PER_PROPERTY)),
-                        )),
-                    ),
-                    line,
-                },
-                Stmt::Assign {
-                    kind: vm::AssignmentKind::Set,
-                    index: ks,
-                    expr: decode_int_call(
-                        decode,
-                        read_cell(helper_read, param_carrier, Expr::Var(rb)),
-                    ),
-                    line,
-                },
-                Stmt::Assign {
-                    kind: vm::AssignmentKind::Set,
-                    index: kg,
-                    expr: decode_gen_call(
-                        decode_u32,
-                        read_cell(
-                            helper_read,
-                            param_carrier,
-                            Expr::Add(Box::new(Expr::Var(rb)), Box::new(Expr::Int(1))),
-                        ),
-                    ),
-                    line,
-                },
-                Stmt::Assign {
-                    kind: vm::AssignmentKind::Set,
-                    index: sink,
-                    expr: Lowerer::as_number(Lowerer::guest_call(
-                        mark,
-                        vec![
-                            Expr::Var(param_carrier),
-                            Expr::Var(ks),
-                            Expr::Var(kg),
-                            Expr::Int(2),
-                        ],
-                    )),
-                    line,
-                },
-                Stmt::Assign {
-                    kind: vm::AssignmentKind::Set,
-                    index: tag,
-                    expr: decode_int_call(
-                        decode,
-                        read_cell(
-                            helper_read,
-                            param_carrier,
-                            Expr::Add(Box::new(Expr::Var(rb)), Box::new(Expr::Int(2))),
-                        ),
-                    ),
-                    line,
-                },
-                assert_stmt(
-                    Expr::Or(
-                        Box::new(Expr::Lt(
-                            Box::new(Expr::Var(tag)),
-                            Box::new(Expr::Int(value::OBJECT)),
-                        )),
-                        Box::new(Expr::Eq(
-                            Box::new(Expr::Var(tag)),
-                            Box::new(Expr::Int(value::OBJECT)),
-                        )),
-                    ),
-                    line,
-                ),
-                Stmt::IfElse {
-                    condition: Expr::Eq(
-                        Box::new(Expr::Var(tag)),
-                        Box::new(Expr::Int(value::STRING)),
-                    ),
-                    then_branch: vec![
-                        Stmt::Assign {
-                            kind: vm::AssignmentKind::Set,
-                            index: vs,
-                            expr: decode_int_call(
-                                decode,
-                                read_cell(
-                                    helper_read,
-                                    param_carrier,
-                                    Expr::Add(Box::new(Expr::Var(rb)), Box::new(Expr::Int(5))),
-                                ),
-                            ),
-                            line,
-                        },
-                        Stmt::Assign {
-                            kind: vm::AssignmentKind::Set,
-                            index: vg,
-                            expr: decode_gen_call(
-                                decode_u32,
-                                read_cell(
-                                    helper_read,
-                                    param_carrier,
-                                    Expr::Add(Box::new(Expr::Var(rb)), Box::new(Expr::Int(6))),
-                                ),
-                            ),
-                            line,
-                        },
-                        Stmt::Assign {
-                            kind: vm::AssignmentKind::Set,
-                            index: sink,
-                            expr: Lowerer::as_number(Lowerer::guest_call(
+            line,
+        )];
+        // One shared validation for this row: the emitter checks the key, the
+        // metadata/tag/accessor legality and the matching payload cells with
+        // full live-state, generation and brand validation. The dedicated key
+        // snapshot temps below preserve the validated pair before any union
+        // scratch reuse, so the key edge needs no second read or decode.
+        let key_slot = e.integer()?;
+        let key_gen = e.integer()?;
+        // One last-key cache for this collection: the four temporaries are
+        // declared once at helper entry, so every new collection starts with
+        // `valid` false and the pair/base cells cannot carry a previous
+        // collection's proof. The key pair is only recorded after the row's
+        // own numeric decoders, checked_base and String-brand check succeed.
+        let key_cache = CheckedKeyCache {
+            valid: e.boolean()?,
+            slot: e.integer()?,
+            generation: e.integer()?,
+            base: e.integer()?,
+        };
+        // The key edge is marked once per row — only the matching arm below
+        // runs — spliced first in each arm so validated scalars are consumed
+        // in key-then-payload order.
+        let key_mark = || {
+            assign(
+                sink,
+                num(call(
+                    mark,
+                    vec![
+                        var(param_carrier),
+                        var(key_slot),
+                        var(key_gen),
+                        int(2),
+                        var(next),
+                    ],
+                )),
+                line,
+            )
+        };
+        // Payload edges: data rows carry the payload only for STRING/OBJECT
+        // tags with a live pair; accessor rows carry the present getter/setter
+        // pairs (an absent side stays 0/0 and marks nothing, exactly as the
+        // validated generation gate requires). Every mark here runs after the
+        // validation above and only inside the arm that defines its scratch.
+        emit_checked_row(
+            &mut e,
+            rb,
+            &mut scan,
+            Some((key_slot, key_gen)),
+            Some(key_cache),
+            |r| {
+                let mut trace = vec![key_mark()];
+                for (slot, generation) in [(r.get_slot, r.get_gen), (r.slot, r.generation)] {
+                    trace.push(branch(
+                        not(eq(var(generation), int(0))),
+                        vec![assign(
+                            sink,
+                            num(call(
                                 mark,
                                 vec![
-                                    Expr::Var(param_carrier),
-                                    Expr::Var(vs),
-                                    Expr::Var(vg),
-                                    Expr::Int(2),
+                                    var(param_carrier),
+                                    var(slot),
+                                    var(generation),
+                                    int(3),
+                                    var(next),
                                 ],
                             )),
                             line,
-                        },
-                    ],
-                    else_branch: Vec::new(),
-                    line,
-                },
-                Stmt::IfElse {
-                    condition: Expr::Eq(
-                        Box::new(Expr::Var(tag)),
-                        Box::new(Expr::Int(value::OBJECT)),
-                    ),
-                    then_branch: vec![
-                        Stmt::Assign {
-                            kind: vm::AssignmentKind::Set,
-                            index: vs,
-                            expr: decode_int_call(
-                                decode,
-                                read_cell(
-                                    helper_read,
-                                    param_carrier,
-                                    Expr::Add(Box::new(Expr::Var(rb)), Box::new(Expr::Int(5))),
-                                ),
-                            ),
-                            line,
-                        },
-                        Stmt::Assign {
-                            kind: vm::AssignmentKind::Set,
-                            index: vg,
-                            expr: decode_gen_call(
-                                decode_u32,
-                                read_cell(
-                                    helper_read,
-                                    param_carrier,
-                                    Expr::Add(Box::new(Expr::Var(rb)), Box::new(Expr::Int(6))),
-                                ),
-                            ),
-                            line,
-                        },
-                        Stmt::Assign {
-                            kind: vm::AssignmentKind::Set,
-                            index: sink,
-                            expr: Lowerer::as_number(Lowerer::guest_call(
+                        )],
+                        Vec::new(),
+                        line,
+                    ));
+                }
+                trace
+            },
+            |r| {
+                vec![
+                    key_mark(),
+                    branch(
+                        or(
+                            eq(var(r.tag), int(value::STRING)),
+                            eq(var(r.tag), int(value::OBJECT)),
+                        ),
+                        vec![assign(
+                            sink,
+                            num(call(
                                 mark,
                                 vec![
-                                    Expr::Var(param_carrier),
-                                    Expr::Var(vs),
-                                    Expr::Var(vg),
-                                    Expr::Int(3),
+                                    var(param_carrier),
+                                    var(r.slot),
+                                    var(r.generation),
+                                    choose(eq(var(r.tag), int(value::STRING)), int(2), int(3)),
+                                    var(next),
                                 ],
                             )),
                             line,
-                        },
-                    ],
-                    else_branch: Vec::new(),
-                    line,
-                },
-                Stmt::Assign {
-                    kind: vm::AssignmentKind::Set,
-                    index: rc,
-                    expr: Expr::Add(Box::new(Expr::Var(rc)), Box::new(Expr::Int(1))),
-                    line,
-                },
-            ],
+                        )],
+                        Vec::new(),
+                        line,
+                    ),
+                ]
+            },
+        )?;
+        scan.push(assign(rc, add(var(rc), int(1)), line));
+        rows.push(Stmt::While {
+            condition: lt(var(rc), var(header.count)),
+            body: scan,
             line,
         });
+        body.extend(e.declarations);
         rows
     };
     // Environment boxed-entry scan (5 scalar cells per entry, no key pair).
@@ -5522,6 +5946,7 @@ pub(crate) fn append_heap_collect(
                                         then_expr: Box::new(Expr::Int(2)),
                                         else_expr: Box::new(Expr::Int(3)),
                                     },
+                                    Expr::Var(next),
                                 ],
                             )),
                             line,
@@ -5547,7 +5972,7 @@ pub(crate) fn append_heap_collect(
         expr: Expr::Sub(Box::new(Expr::Var(gray)), Box::new(Expr::Int(1))),
         line,
     }];
-    emit_row_lookup(
+    emit_row_lookup_cached(
         helper_read,
         decode,
         param_carrier,
@@ -5561,6 +5986,7 @@ pub(crate) fn append_heap_collect(
         g_ppn,
         g_pp,
         true,
+        Some((page0_num, page0_ptr)),
     );
     gray_body.push(Stmt::Assign {
         kind: vm::AssignmentKind::Set,
@@ -5622,33 +6048,27 @@ pub(crate) fn append_heap_collect(
     });
     gray_body.push(assert_stmt(
         Expr::And(
-            Box::new(Expr::Or(
-                Box::new(Expr::Gt(Box::new(Expr::Var(kind)), Box::new(Expr::Int(0)))),
-                Box::new(Expr::Eq(
-                    Box::new(Expr::Var(kind)),
-                    Box::new(Expr::Int(layout::KIND_ARRAY)),
-                )),
-            )),
-            Box::new(Expr::Or(
-                Box::new(Expr::Lt(
-                    Box::new(Expr::Var(kind)),
-                    Box::new(Expr::Int(layout::KIND_ENVIRONMENT)),
-                )),
-                Box::new(Expr::Eq(
-                    Box::new(Expr::Var(kind)),
-                    Box::new(Expr::Int(layout::KIND_ENVIRONMENT)),
-                )),
-            )),
+            Box::new(Expr::Not(Box::new(Expr::Lt(
+                Box::new(Expr::Var(kind)),
+                Box::new(Expr::Int(layout::KIND_ARRAY)),
+            )))),
+            Box::new(Expr::Not(Box::new(Expr::Gt(
+                Box::new(Expr::Var(kind)),
+                Box::new(Expr::Int(layout::KIND_MAX)),
+            )))),
         ),
         line,
     ));
-    // Per-kind child tracing. Strings carry no edges.
+    // Per-kind child tracing. Strings carry no edges. Tagged arrays trace
+    // their prototype pair AND every reference-capable five-cell element;
+    // packed numeric arrays keep tracing the prototype only.
     let mut array_arm = Vec::new();
     emit_trace_pair(
         helper_read,
         decode,
         decode_u32,
         mark,
+        next,
         param_carrier,
         sink,
         ps,
@@ -5656,15 +6076,50 @@ pub(crate) fn append_heap_collect(
         line,
         &mut array_arm,
         base,
-        layout::ARRAY_HEADER_CELLS - 2,
+        layout::ARRAY_PROTO_OFFSET,
         3,
     );
+    let mut tagged_array_arm = Vec::new();
+    emit_trace_pair(
+        helper_read,
+        decode,
+        decode_u32,
+        mark,
+        next,
+        param_carrier,
+        sink,
+        ps,
+        pg,
+        line,
+        &mut tagged_array_arm,
+        base,
+        layout::ARRAY_PROTO_OFFSET,
+        3,
+    );
+    tagged_array_arm.extend(tagged_array_elements(
+        helper_read,
+        decode,
+        decode_u32,
+        mark,
+        next,
+        param_carrier,
+        sink,
+        ps,
+        pg,
+        base,
+        line,
+        ta_count,
+        ta_cursor,
+        ta_addr,
+        ta_tag,
+    ));
     let mut object_arm = Vec::new();
     emit_trace_pair(
         helper_read,
         decode,
         decode_u32,
         mark,
+        next,
         param_carrier,
         sink,
         ps,
@@ -5675,13 +6130,14 @@ pub(crate) fn append_heap_collect(
         layout::OBJECT_HEADER_CELLS - 2,
         3,
     );
-    object_arm.extend(object_rows);
+    object_arm.extend(object_rows.clone());
     let mut function_arm = Vec::new();
     emit_trace_pair(
         helper_read,
         decode,
         decode_u32,
         mark,
+        next,
         param_carrier,
         sink,
         ps,
@@ -5739,6 +6195,7 @@ pub(crate) fn append_heap_collect(
                     Expr::Var(ps),
                     Expr::Var(pg),
                     Expr::Int(5),
+                    Expr::Var(next),
                 ],
             )),
             line,
@@ -5746,6 +6203,24 @@ pub(crate) fn append_heap_collect(
         else_branch: Vec::new(),
         line,
     });
+    function_arm.extend(object_rows);
+    let mut bytes_arm = Vec::new();
+    emit_trace_pair(
+        helper_read, decode, decode_u32, mark, next, param_carrier, sink,
+        ps, pg, line, &mut bytes_arm, base, 3, 3,
+    );
+    let mut view_arm = bytes_arm.clone();
+    {
+        use super::object::{add, eq, int, not, var};
+        view_arm.push(assert_stmt(not(eq(
+            decode_gen_call(decode_u32, read_cell(helper_read, param_carrier,
+                add(var(base), int(layout::VIEW_BUFFER + 1)))), int(0),
+        )), line));
+    }
+    emit_trace_pair(
+        helper_read, decode, decode_u32, mark, next, param_carrier, sink,
+        ps, pg, line, &mut view_arm, base, layout::VIEW_BUFFER, layout::KIND_BYTES,
+    );
     let mut env_arm = vec![assert_stmt(
         Expr::Eq(
             Box::new(Expr::Var(kind)),
@@ -5758,6 +6233,7 @@ pub(crate) fn append_heap_collect(
         decode,
         decode_u32,
         mark,
+        next,
         param_carrier,
         sink,
         ps,
@@ -5783,9 +6259,15 @@ pub(crate) fn append_heap_collect(
             ),
             then_branch: array_arm,
             else_branch: vec![Stmt::IfElse {
-                condition: Expr::Eq(
-                    Box::new(Expr::Var(kind)),
-                    Box::new(Expr::Int(layout::KIND_OBJECT)),
+                condition: Expr::Or(
+                    Box::new(Expr::Eq(
+                        Box::new(Expr::Var(kind)),
+                        Box::new(Expr::Int(layout::KIND_OBJECT)),
+                    )),
+                    Box::new(Expr::Eq(
+                        Box::new(Expr::Var(kind)),
+                        Box::new(Expr::Int(layout::KIND_REGEXP)),
+                    )),
                 ),
                 then_branch: object_arm,
                 else_branch: vec![Stmt::IfElse {
@@ -5794,7 +6276,26 @@ pub(crate) fn append_heap_collect(
                         Box::new(Expr::Int(layout::KIND_FUNCTION)),
                     ),
                     then_branch: function_arm,
-                    else_branch: env_arm,
+                    // Tagged arrays are rare relative to the ordinary
+                    // object/function shapes, so their extra dispatch step
+                    // costs nothing on the common path.
+                    else_branch: vec![Stmt::IfElse {
+                        condition: Expr::Eq(
+                            Box::new(Expr::Var(kind)),
+                            Box::new(Expr::Int(layout::KIND_TAGGED_ARRAY)),
+                        ),
+                        then_branch: tagged_array_arm,
+                        else_branch: vec![Stmt::IfElse {
+                            condition: super::object::eq(Expr::Var(kind), Expr::Int(layout::KIND_BYTES)),
+                            then_branch: bytes_arm,
+                            else_branch: vec![super::object::branch(
+                                super::object::eq(Expr::Var(kind), Expr::Int(layout::KIND_VIEW)),
+                                view_arm, env_arm, line,
+                            )],
+                            line,
+                        }],
+                        line,
+                    }],
                     line,
                 }],
                 line,
@@ -5804,20 +6305,43 @@ pub(crate) fn append_heap_collect(
         line,
     });
     // Refresh the head: tracing may have pushed newly discovered nodes.
-    gray_body.push(Stmt::Assign {
-        kind: vm::AssignmentKind::Set,
-        index: rdn,
-        expr: header_cell(helper_read, param_carrier, layout::HDR_GRAY_HEAD_PLUS_ONE),
-        line,
-    });
-    gray_body.push(Stmt::Assign {
-        kind: vm::AssignmentKind::Set,
-        index: gray,
-        expr: decode_int_call(decode, Expr::Var(rdn)),
+    gray_body.push(Stmt::IfElse {
+        condition: Expr::Eq(
+            Box::new(Expr::Var(kind)),
+            Box::new(Expr::Int(layout::KIND_STRING)),
+        ),
+        then_branch: vec![Stmt::Assign {
+            kind: vm::AssignmentKind::Set,
+            index: gray,
+            expr: Expr::Var(g_next),
+            line,
+        }],
+        else_branch: vec![
+            Stmt::Assign {
+                kind: vm::AssignmentKind::Set,
+                index: rdn,
+                expr: header_cell(helper_read, param_carrier, layout::HDR_GRAY_HEAD_PLUS_ONE),
+                line,
+            },
+            Stmt::Assign {
+                kind: vm::AssignmentKind::Set,
+                index: gray,
+                expr: decode_int_call(decode, Expr::Var(rdn)),
+                line,
+            },
+        ],
         line,
     });
     // Root marking populated the backing's worklist. Seed the drain local
     // from that actual head before its first condition is evaluated.
+    for slot in [ta_count, ta_cursor, ta_addr, ta_tag] {
+        body.push(Stmt::Let {
+            index: slot,
+            declared_schema: Some(TypeSchema::Int),
+            expr: Expr::Int(0),
+            line,
+        });
+    }
     body.push(Stmt::Assign {
         kind: vm::AssignmentKind::Set,
         index: rdn,
@@ -5929,7 +6453,14 @@ pub(crate) fn append_heap_collect(
                     Stmt::Assign {
                         kind: vm::AssignmentKind::Set,
                         index: st,
-                        expr: decode_int_call(decode, Expr::Var(rdn)),
+                        expr: Expr::IfElse {
+                            condition: Box::new(Expr::Eq(
+                                Box::new(Expr::Var(rdn)),
+                                Box::new(Expr::Float(layout::STATE_ACTIVE as f64)),
+                            )),
+                            then_expr: Box::new(Expr::Int(layout::STATE_ACTIVE)),
+                            else_expr: Box::new(decode_int_call(decode, Expr::Var(rdn))),
+                        },
                         line,
                     },
                     Stmt::Assign {
@@ -7107,6 +7638,1793 @@ pub(crate) fn append_heap_observe(
     Ok(index)
 }
 
+/// Append the dense-array element reader
+/// `(Carrier, base: Int, index: Int) -> JsValue`.
+/// Dispatches on the real node kind (packed one-cell vs tagged five-cell
+/// entry), validates kind/length/extent and, for tagged reference elements,
+/// the referenced node brand through `checked_base`. A non-negative
+/// out-of-range index returns Undefined, exactly like an absent element.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn append_array_get(
+    lower: &mut Lowerer<'_>,
+    ir: &mut FrontendIr,
+    carrier_schema: &TypeSchema,
+    helper_read: u16,
+    decode: u16,
+    decode_u32: u16,
+    checked_base: u16,
+    span: swc_common::Span,
+    statements: &mut Vec<Stmt>,
+) -> Result<u16, ParseError> {
+    let index = fresh_index(lower, ir, span)?;
+    let line = lower.line(span);
+    let param_carrier = lower.slot(span)?;
+    let param_base = lower.slot(span)?;
+    let param_index = lower.slot(span)?;
+    let kind_num = lower.slot(span)?;
+    let kind = lower.slot(span)?;
+    let len_num = lower.slot(span)?;
+    let len = lower.slot(span)?;
+    let present_cell = lower.slot(span)?;
+    let present = lower.slot(span)?;
+    let stride = lower.slot(span)?;
+    let offset = lower.slot(span)?;
+    let raw_num = lower.slot(span)?;
+    let raw_size = lower.slot(span)?;
+    let extent = lower.slot(span)?;
+    let in_range = lower.slot(span)?;
+    let address = lower.slot(span)?;
+    let out = lower.slot(span)?;
+    let tag_num = lower.slot(span)?;
+    let tag = lower.slot(span)?;
+    let flag_num = lower.slot(span)?;
+    let flag = lower.slot(span)?;
+    let vs = lower.slot(span)?;
+    let vg = lower.slot(span)?;
+    let managed = lower.slot(span)?;
+    let managed_kind = lower.slot(span)?;
+    let read = |carrier: u16, addr: Expr| read_cell(helper_read, carrier, addr);
+    let decode_int = |expr: Expr| decode_int_call(decode, expr);
+    let number_at = |carrier: u16, base: u16, delta: i64| {
+        read(
+            carrier,
+            Expr::Add(Box::new(Expr::Var(base)), Box::new(Expr::Int(delta))),
+        )
+    };
+    let mut body = vec![
+        Stmt::Let {
+            index: out,
+            declared_schema: Some(value::schema()),
+            expr: value::undefined(),
+            line,
+        },
+        Stmt::Let {
+            index: kind_num,
+            declared_schema: Some(TypeSchema::Number),
+            expr: number_at(param_carrier, param_base, 0),
+            line,
+        },
+        Stmt::Let {
+            index: kind,
+            declared_schema: Some(TypeSchema::Int),
+            expr: decode_int(Expr::Var(kind_num)),
+            line,
+        },
+        assert_stmt(
+            Expr::Or(
+                Box::new(Expr::Eq(
+                    Box::new(Expr::Var(kind)),
+                    Box::new(Expr::Int(layout::KIND_ARRAY)),
+                )),
+                Box::new(Expr::Eq(
+                    Box::new(Expr::Var(kind)),
+                    Box::new(Expr::Int(layout::KIND_TAGGED_ARRAY)),
+                )),
+            ),
+            line,
+        ),
+        Stmt::Let {
+            index: len_num,
+            declared_schema: Some(TypeSchema::Number),
+            expr: number_at(param_carrier, param_base, 2),
+            line,
+        },
+        Stmt::Let {
+            index: len,
+            declared_schema: Some(TypeSchema::Int),
+            expr: decode_gen_call(decode_u32, Expr::Var(len_num)),
+            line,
+        },
+        Stmt::Let {
+            index: present_cell,
+            declared_schema: Some(TypeSchema::Number),
+            expr: number_at(param_carrier, param_base, layout::ARRAY_PRESENT_OFFSET),
+            line,
+        },
+        Stmt::Let {
+            index: present,
+            declared_schema: Some(TypeSchema::Int),
+            expr: physical_present(
+                decode_gen_call(decode_u32, Expr::Var(present_cell)),
+                Expr::Var(len),
+            ),
+            line,
+        },
+        assert_stmt(
+            Expr::Not(Box::new(Expr::Lt(
+                Box::new(Expr::Var(present)),
+                Box::new(Expr::Int(0)),
+            ))),
+            line,
+        ),
+        Stmt::Let {
+            index: stride,
+            declared_schema: Some(TypeSchema::Int),
+            expr: Expr::IfElse {
+                condition: Box::new(Expr::Eq(
+                    Box::new(Expr::Var(kind)),
+                    Box::new(Expr::Int(layout::KIND_ARRAY)),
+                )),
+                then_expr: Box::new(Expr::Int(1)),
+                else_expr: Box::new(Expr::Int(layout::ARRAY_TAGGED_CELLS_PER_ENTRY)),
+            },
+            line,
+        },
+        Stmt::Let {
+            index: offset,
+            declared_schema: Some(TypeSchema::Int),
+            expr: Expr::Add(
+                Box::new(Expr::Int(layout::ARRAY_HEADER_CELLS)),
+                Box::new(Expr::Mul(
+                    Box::new(Expr::Var(stride)),
+                    Box::new(Expr::Var(param_index)),
+                )),
+            ),
+            line,
+        },
+        Stmt::Let {
+            index: raw_num,
+            declared_schema: Some(TypeSchema::Number),
+            expr: read(
+                param_carrier,
+                Expr::Sub(
+                    Box::new(Expr::Var(param_base)),
+                    Box::new(Expr::Int(layout::RAW_HEADER_CELLS)),
+                ),
+            ),
+            line,
+        },
+        Stmt::Let {
+            index: raw_size,
+            declared_schema: Some(TypeSchema::Int),
+            expr: decode_int(Expr::Var(raw_num)),
+            line,
+        },
+        Stmt::Let {
+            index: extent,
+            declared_schema: Some(TypeSchema::Int),
+            expr: Expr::Sub(
+                Box::new(Expr::Var(raw_size)),
+                Box::new(Expr::Int(layout::RAW_HEADER_CELLS)),
+            ),
+            line,
+        },
+        Stmt::Let {
+            index: in_range,
+            declared_schema: Some(TypeSchema::Bool),
+            expr: Expr::And(
+                Box::new(Expr::Not(Box::new(Expr::Lt(
+                    Box::new(Expr::Var(param_index)),
+                    Box::new(Expr::Int(0)),
+                )))),
+                Box::new(Expr::And(
+                    Box::new(Expr::And(
+                        Box::new(Expr::Lt(
+                            Box::new(Expr::Var(param_index)),
+                            Box::new(Expr::Var(len)),
+                        )),
+                        Box::new(Expr::Lt(
+                            Box::new(Expr::Var(param_index)),
+                            Box::new(Expr::Var(present)),
+                        )),
+                    )),
+                    Box::new(Expr::Not(Box::new(Expr::Gt(
+                        Box::new(Expr::Add(
+                            Box::new(Expr::Var(offset)),
+                            Box::new(Expr::Var(stride)),
+                        )),
+                        Box::new(Expr::Var(extent)),
+                    )))),
+                )),
+            ),
+            line,
+        },
+    ];
+    // address is shared by both shape arms.
+    body.push(Stmt::Let {
+        index: address,
+        declared_schema: Some(TypeSchema::Int),
+        expr: Expr::Add(Box::new(Expr::Var(param_base)), Box::new(Expr::Var(offset))),
+        line,
+    });
+    let packed = vec![Stmt::Assign {
+        kind: vm::AssignmentKind::Set,
+        index: out,
+        expr: value::number(Lowerer::as_number(read(param_carrier, Expr::Var(address)))),
+        line,
+    }];
+    let mut tagged = vec![
+        Stmt::Let {
+            index: tag_num,
+            declared_schema: Some(TypeSchema::Number),
+            expr: read(param_carrier, Expr::Var(address)),
+            line,
+        },
+        Stmt::Let {
+            index: tag,
+            declared_schema: Some(TypeSchema::Int),
+            expr: decode_int(Expr::Var(tag_num)),
+            line,
+        },
+        assert_stmt(
+            Expr::Not(Box::new(Expr::Gt(
+                Box::new(Expr::Var(tag)),
+                Box::new(Expr::Int(value::OBJECT)),
+            ))),
+            line,
+        ),
+        Stmt::Let {
+            index: flag_num,
+            declared_schema: Some(TypeSchema::Number),
+            expr: read(
+                param_carrier,
+                Expr::Add(Box::new(Expr::Var(address)), Box::new(Expr::Int(2))),
+            ),
+            line,
+        },
+        Stmt::Let {
+            index: flag,
+            declared_schema: Some(TypeSchema::Int),
+            expr: decode_int(Expr::Var(flag_num)),
+            line,
+        },
+        assert_stmt(
+            Expr::Not(Box::new(Expr::Gt(
+                Box::new(Expr::Var(flag)),
+                Box::new(Expr::Int(1)),
+            ))),
+            line,
+        ),
+    ];
+    for (target, delta) in [(vs, 3i64), (vg, 4i64)] {
+        tagged.push(Stmt::Let {
+            index: target,
+            declared_schema: Some(TypeSchema::Int),
+            expr: if target == vg {
+                decode_gen_call(
+                    decode_u32,
+                    read(
+                        param_carrier,
+                        Expr::Add(Box::new(Expr::Var(address)), Box::new(Expr::Int(delta))),
+                    ),
+                )
+            } else {
+                decode_int(read(
+                    param_carrier,
+                    Expr::Add(Box::new(Expr::Var(address)), Box::new(Expr::Int(delta))),
+                ))
+            },
+            line,
+        });
+    }
+    // Reference elements must name a live, correctly branded node.
+    tagged.push(Stmt::IfElse {
+        condition: Expr::Or(
+            Box::new(Expr::Eq(
+                Box::new(Expr::Var(tag)),
+                Box::new(Expr::Int(value::STRING)),
+            )),
+            Box::new(Expr::Eq(
+                Box::new(Expr::Var(tag)),
+                Box::new(Expr::Int(value::OBJECT)),
+            )),
+        ),
+        then_branch: vec![
+            Stmt::Let {
+                index: managed,
+                declared_schema: Some(TypeSchema::Int),
+                expr: Lowerer::guest_call(
+                    checked_base,
+                    vec![Expr::Var(param_carrier), Expr::Var(vs), Expr::Var(vg)],
+                ),
+                line,
+            },
+            Stmt::Let {
+                index: managed_kind,
+                declared_schema: Some(TypeSchema::Int),
+                expr: decode_int(read(param_carrier, Expr::Var(managed))),
+                line,
+            },
+            assert_stmt(
+                Expr::IfElse {
+                    condition: Box::new(Expr::Eq(
+                        Box::new(Expr::Var(tag)),
+                        Box::new(Expr::Int(value::STRING)),
+                    )),
+                    then_expr: Box::new(Expr::Eq(
+                        Box::new(Expr::Var(managed_kind)),
+                        Box::new(Expr::Int(layout::KIND_STRING)),
+                    )),
+                    else_expr: Box::new(super::object::object_like(Expr::Var(managed_kind))),
+                },
+                line,
+            ),
+        ],
+        else_branch: vec![assert_stmt(
+            Expr::And(
+                Box::new(Expr::Eq(Box::new(Expr::Var(vs)), Box::new(Expr::Int(0)))),
+                Box::new(Expr::Eq(Box::new(Expr::Var(vg)), Box::new(Expr::Int(0)))),
+            ),
+            line,
+        )],
+        line,
+    });
+    tagged.push(Stmt::Assign {
+        kind: vm::AssignmentKind::Set,
+        index: out,
+        expr: value::dynamic_value(
+            Expr::Var(tag),
+            Lowerer::as_number(read(
+                param_carrier,
+                Expr::Add(Box::new(Expr::Var(address)), Box::new(Expr::Int(1))),
+            )),
+            Expr::Eq(Box::new(Expr::Var(flag)), Box::new(Expr::Int(1))),
+            Expr::Var(vs),
+            Expr::Var(vg),
+        ),
+        line,
+    });
+    let shape_branch = Stmt::IfElse {
+        condition: Expr::Eq(
+            Box::new(Expr::Var(kind)),
+            Box::new(Expr::Int(layout::KIND_ARRAY)),
+        ),
+        then_branch: packed,
+        else_branch: tagged,
+        line,
+    };
+    body.push(Stmt::IfElse {
+        condition: Expr::Var(in_range),
+        then_branch: vec![shape_branch],
+        else_branch: Vec::new(),
+        line,
+    });
+    declare_helper(
+        ir,
+        statements,
+        layout::ARRAY_GET_HELPER,
+        index,
+        3,
+        vec!["carrier".to_owned(), "base".to_owned(), "index".to_owned()],
+        vec![
+            Some(carrier_schema.clone()),
+            Some(TypeSchema::Int),
+            Some(TypeSchema::Int),
+        ],
+        Some(value::schema()),
+        ValueType::Map,
+        vec![param_carrier, param_base, param_index],
+        body,
+        Expr::Var(out),
+        line,
+    );
+    Ok(index)
+}
+
+/// Relocate one dense array so index is physically present, then return the
+/// new data base. Slot, generation and mark state stay put: the directory row
+/// swings to the fresh extent, matching object row growth. Gaps become tagged
+/// undefined. A moving collector or an oversized index fails closed.
+fn append_array_expand(
+    lower: &mut Lowerer<'_>,
+    ir: &mut FrontendIr,
+    carrier_schema: &TypeSchema,
+    helper_read: u16,
+    helper_write: u16,
+    decode: u16,
+    decode_u32: u16,
+    checked_base: u16,
+    raw_reserve: u16,
+    span: swc_common::Span,
+    statements: &mut Vec<Stmt>,
+) -> Result<u16, ParseError> {
+    let index = fresh_index(lower, ir, span)?;
+    let line = lower.line(span);
+    let param_carrier = lower.slot(span)?;
+    let param_slot = lower.slot(span)?;
+    let param_generation = lower.slot(span)?;
+    let param_index = lower.slot(span)?;
+    let base = lower.slot(span)?;
+    let old_base = lower.slot(span)?;
+    let kind = lower.slot(span)?;
+    let len = lower.slot(span)?;
+    let present = lower.slot(span)?;
+    let new_present = lower.slot(span)?;
+    let needed = lower.slot(span)?;
+    let fresh = lower.slot(span)?;
+    let old_size = lower.slot(span)?;
+    let fresh_size = lower.slot(span)?;
+    let cursor = lower.slot(span)?;
+    let number = lower.slot(span)?;
+    let dest = lower.slot(span)?;
+    let limit = lower.slot(span)?;
+    let page = lower.slot(span)?;
+    let ordinal = lower.slot(span)?;
+    let directory = lower.slot(span)?;
+    let next = lower.slot(span)?;
+    let cells = lower.slot(span)?;
+    let page_ptr = lower.slot(span)?;
+    let row_state = lower.slot(span)?;
+    let row_gen = lower.slot(span)?;
+    let sink = lower.slot(span)?;
+    let num = Lowerer::as_number;
+    let write_at = |addr: Expr, payload: Expr| Stmt::Assign {
+        kind: vm::AssignmentKind::Set,
+        index: sink,
+        expr: write_call(helper_write, param_carrier, addr, payload),
+        line,
+    };
+    let read_at = |addr: Expr| read_cell(helper_read, param_carrier, addr);
+    let decoded = |addr: Expr| decode_int_call(decode, read_at(addr));
+    let mut body = vec![
+        Stmt::Let {
+            index: sink,
+            declared_schema: Some(TypeSchema::Number),
+            expr: Expr::Float(0.0),
+            line,
+        },
+        Stmt::Let {
+            index: base,
+            declared_schema: Some(TypeSchema::Int),
+            expr: Lowerer::guest_call(
+                checked_base,
+                vec![
+                    Expr::Var(param_carrier),
+                    Expr::Var(param_slot),
+                    Expr::Var(param_generation),
+                ],
+            ),
+            line,
+        },
+        Stmt::Let {
+            index: kind,
+            declared_schema: Some(TypeSchema::Int),
+            expr: decoded(Expr::Var(base)),
+            line,
+        },
+        assert_stmt(
+            Expr::Or(
+                Box::new(Expr::Eq(
+                    Box::new(Expr::Var(kind)),
+                    Box::new(Expr::Int(layout::KIND_ARRAY)),
+                )),
+                Box::new(Expr::Eq(
+                    Box::new(Expr::Var(kind)),
+                    Box::new(Expr::Int(layout::KIND_TAGGED_ARRAY)),
+                )),
+            ),
+            line,
+        ),
+        Stmt::Let {
+            index: len,
+            declared_schema: Some(TypeSchema::Int),
+            expr: decode_gen_call(decode_u32, read_at(Expr::Add(
+                Box::new(Expr::Var(base)),
+                Box::new(Expr::Int(2)),
+            ))),
+            line,
+        },
+        Stmt::Let {
+            index: present,
+            declared_schema: Some(TypeSchema::Int),
+            expr: physical_present(
+                decode_gen_call(decode_u32, read_at(Expr::Add(
+                    Box::new(Expr::Var(base)),
+                    Box::new(Expr::Int(layout::ARRAY_PRESENT_OFFSET)),
+                ))),
+                Expr::Var(len),
+            ),
+            line,
+        },
+        assert_stmt(
+            Expr::Not(Box::new(Expr::Lt(
+                Box::new(Expr::Var(present)),
+                Box::new(Expr::Int(0)),
+            ))),
+            line,
+        ),
+        // An in-prefix write can request widening only for a packed array.
+        // Preserve that prefix, and bound the tagged size before multiplying.
+        assert_stmt(
+            Expr::And(
+                Box::new(Expr::Not(Box::new(Expr::Lt(
+                    Box::new(Expr::Var(param_index)),
+                    Box::new(Expr::Int(0)),
+                )))),
+                Box::new(Expr::And(
+                    Box::new(Expr::Lt(
+                        Box::new(Expr::Var(param_index)),
+                        Box::new(Expr::Var(len)),
+                    )),
+                    Box::new(Expr::Or(
+                        Box::new(Expr::Eq(
+                            Box::new(Expr::Var(kind)),
+                            Box::new(Expr::Int(layout::KIND_ARRAY)),
+                        )),
+                        Box::new(Expr::Not(Box::new(Expr::Lt(
+                            Box::new(Expr::Var(param_index)),
+                            Box::new(Expr::Var(present)),
+                        )))),
+                    )),
+                )),
+            ),
+            line,
+        ),
+        Stmt::Let {
+            index: new_present,
+            declared_schema: Some(TypeSchema::Int),
+            expr: Expr::IfElse {
+                condition: Box::new(Expr::Lt(
+                    Box::new(Expr::Var(param_index)),
+                    Box::new(Expr::Var(present)),
+                )),
+                then_expr: Box::new(Expr::Var(present)),
+                else_expr: Box::new(Expr::Add(Box::new(Expr::Var(param_index)), Box::new(Expr::Int(1)))),
+            },
+            line,
+        },
+        assert_stmt(
+            Expr::Not(Box::new(Expr::Lt(
+                Box::new(Expr::Int(13105)),
+                Box::new(Expr::Var(new_present)),
+            ))),
+            line,
+        ),
+        Stmt::Let {
+            index: needed,
+            declared_schema: Some(TypeSchema::Int),
+            expr: Expr::Add(
+                Box::new(Expr::Int(layout::RAW_HEADER_CELLS + layout::ARRAY_HEADER_CELLS)),
+                Box::new(Expr::Mul(
+                    Box::new(Expr::Int(layout::ARRAY_TAGGED_CELLS_PER_ENTRY)),
+                    Box::new(Expr::Var(new_present)),
+                )),
+            ),
+            line,
+        },
+        Stmt::Let {
+            index: old_base,
+            declared_schema: Some(TypeSchema::Int),
+            expr: Expr::Var(base),
+            line,
+        },
+        Stmt::Let {
+            index: fresh,
+            declared_schema: Some(TypeSchema::Int),
+            expr: Lowerer::guest_call(
+                raw_reserve,
+                vec![
+                    Expr::Var(param_carrier),
+                    Expr::Var(needed),
+                    Expr::Int(layout::RAW_CLASS_NODE),
+                ],
+            ),
+            line,
+        },
+        Stmt::Assign {
+            kind: vm::AssignmentKind::Set,
+            index: base,
+            expr: Lowerer::guest_call(
+                checked_base,
+                vec![
+                    Expr::Var(param_carrier),
+                    Expr::Var(param_slot),
+                    Expr::Var(param_generation),
+                ],
+            ),
+            line,
+        },
+        // NODE reservation does not collect today. A future moving collector
+        // must not copy from a stale base.
+        assert_stmt(
+            Expr::Eq(Box::new(Expr::Var(base)), Box::new(Expr::Var(old_base))),
+            line,
+        ),
+        Stmt::Let {
+            index: old_size,
+            declared_schema: Some(TypeSchema::Int),
+            expr: decoded(Expr::Sub(
+                Box::new(Expr::Var(old_base)),
+                Box::new(Expr::Int(layout::RAW_HEADER_CELLS)),
+            )),
+            line,
+        },
+        Stmt::Let {
+            index: fresh_size,
+            declared_schema: Some(TypeSchema::Int),
+            expr: decoded(Expr::Sub(
+                Box::new(Expr::Var(fresh)),
+                Box::new(Expr::Int(layout::RAW_HEADER_CELLS)),
+            )),
+            line,
+        },
+        assert_stmt(
+            Expr::Not(Box::new(Expr::Lt(
+                Box::new(Expr::Var(fresh_size)),
+                Box::new(Expr::Var(needed)),
+            ))),
+            line,
+        ),
+        Stmt::Let {
+            index: number,
+            declared_schema: Some(TypeSchema::Number),
+            expr: Expr::Float(0.0),
+            line,
+        },
+        Stmt::Let {
+            index: dest,
+            declared_schema: Some(TypeSchema::Int),
+            expr: Expr::Int(0),
+            line,
+        },
+        Stmt::Let {
+            index: cursor,
+            declared_schema: Some(TypeSchema::Int),
+            expr: Expr::Int(0),
+            line,
+        },
+        Stmt::Let {
+            index: limit,
+            declared_schema: Some(TypeSchema::Int),
+            expr: Expr::Int(0),
+            line,
+        },
+    ];
+    for offset in 0..layout::ARRAY_HEADER_CELLS {
+        body.push(write_at(
+            Expr::Add(Box::new(Expr::Var(fresh)), Box::new(Expr::Int(offset))),
+            read_at(Expr::Add(Box::new(Expr::Var(old_base)), Box::new(Expr::Int(offset)))),
+        ));
+    }
+    body.push(write_at(
+        Expr::Var(fresh),
+        num(Expr::Int(layout::KIND_TAGGED_ARRAY)),
+    ));
+    body.push(write_at(
+        Expr::Add(
+            Box::new(Expr::Var(fresh)),
+            Box::new(Expr::Int(layout::ARRAY_PRESENT_OFFSET)),
+        ),
+        num(Expr::Add(Box::new(Expr::Var(new_present)), Box::new(Expr::Int(1)))),
+    ));
+    let mut packed_copy = vec![Stmt::Assign {
+        kind: vm::AssignmentKind::Set,
+        index: cursor,
+        expr: Expr::Int(0),
+        line,
+    }];
+    packed_copy.push(Stmt::While {
+        condition: Expr::Lt(Box::new(Expr::Var(cursor)), Box::new(Expr::Var(present))),
+        body: vec![
+            Stmt::Assign {
+                kind: vm::AssignmentKind::Set,
+                index: number,
+                expr: read_at(Expr::Add(
+                    Box::new(Expr::Add(
+                        Box::new(Expr::Var(old_base)),
+                        Box::new(Expr::Int(layout::ARRAY_HEADER_CELLS)),
+                    )),
+                    Box::new(Expr::Var(cursor)),
+                )),
+                line,
+            },
+            Stmt::Assign {
+                kind: vm::AssignmentKind::Set,
+                index: dest,
+                expr: Expr::Add(
+                    Box::new(Expr::Add(
+                        Box::new(Expr::Var(fresh)),
+                        Box::new(Expr::Int(layout::ARRAY_HEADER_CELLS)),
+                    )),
+                    Box::new(Expr::Mul(
+                        Box::new(Expr::Int(layout::ARRAY_TAGGED_CELLS_PER_ENTRY)),
+                        Box::new(Expr::Var(cursor)),
+                    )),
+                ),
+                line,
+            },
+            write_at(Expr::Var(dest), num(Expr::Int(value::NUMBER))),
+            write_at(
+                Expr::Add(Box::new(Expr::Var(dest)), Box::new(Expr::Int(1))),
+                Expr::Var(number),
+            ),
+            write_at(
+                Expr::Add(Box::new(Expr::Var(dest)), Box::new(Expr::Int(2))),
+                num(Expr::Int(0)),
+            ),
+            write_at(
+                Expr::Add(Box::new(Expr::Var(dest)), Box::new(Expr::Int(3))),
+                num(Expr::Int(0)),
+            ),
+            write_at(
+                Expr::Add(Box::new(Expr::Var(dest)), Box::new(Expr::Int(4))),
+                num(Expr::Int(0)),
+            ),
+            Stmt::Assign {
+                kind: vm::AssignmentKind::Set,
+                index: cursor,
+                expr: Expr::Add(Box::new(Expr::Var(cursor)), Box::new(Expr::Int(1))),
+                line,
+            },
+        ],
+        line,
+    });
+    let mut tagged_copy = vec![Stmt::Assign {
+        kind: vm::AssignmentKind::Set,
+        index: cursor,
+        expr: Expr::Int(0),
+        line,
+    }];
+    tagged_copy.push(Stmt::While {
+        condition: Expr::Lt(
+            Box::new(Expr::Var(cursor)),
+            Box::new(Expr::Mul(
+                Box::new(Expr::Int(layout::ARRAY_TAGGED_CELLS_PER_ENTRY)),
+                Box::new(Expr::Var(present)),
+            )),
+        ),
+        body: vec![
+            write_at(
+                Expr::Add(
+                    Box::new(Expr::Add(
+                        Box::new(Expr::Var(fresh)),
+                        Box::new(Expr::Int(layout::ARRAY_HEADER_CELLS)),
+                    )),
+                    Box::new(Expr::Var(cursor)),
+                ),
+                read_at(Expr::Add(
+                    Box::new(Expr::Add(
+                        Box::new(Expr::Var(old_base)),
+                        Box::new(Expr::Int(layout::ARRAY_HEADER_CELLS)),
+                    )),
+                    Box::new(Expr::Var(cursor)),
+                )),
+            ),
+            Stmt::Assign {
+                kind: vm::AssignmentKind::Set,
+                index: cursor,
+                expr: Expr::Add(Box::new(Expr::Var(cursor)), Box::new(Expr::Int(1))),
+                line,
+            },
+        ],
+        line,
+    });
+    body.push(Stmt::IfElse {
+        condition: Expr::Eq(
+            Box::new(Expr::Var(kind)),
+            Box::new(Expr::Int(layout::KIND_ARRAY)),
+        ),
+        then_branch: packed_copy,
+        else_branch: tagged_copy,
+        line,
+    });
+    body.push(Stmt::Assign {
+        kind: vm::AssignmentKind::Set,
+        index: cursor,
+        expr: Expr::Mul(
+            Box::new(Expr::Int(layout::ARRAY_TAGGED_CELLS_PER_ENTRY)),
+            Box::new(Expr::Var(present)),
+        ),
+        line,
+    });
+    body.push(Stmt::Assign {
+        kind: vm::AssignmentKind::Set,
+        index: limit,
+        expr: Expr::Sub(
+            Box::new(Expr::Sub(
+                Box::new(Expr::Var(fresh_size)),
+                Box::new(Expr::Int(layout::RAW_HEADER_CELLS)),
+            )),
+            Box::new(Expr::Int(layout::ARRAY_HEADER_CELLS)),
+        ),
+        line,
+    });
+    body.push(Stmt::While {
+        condition: Expr::Lt(Box::new(Expr::Var(cursor)), Box::new(Expr::Var(limit))),
+        body: vec![
+            write_at(
+                Expr::Add(
+                    Box::new(Expr::Add(
+                        Box::new(Expr::Var(fresh)),
+                        Box::new(Expr::Int(layout::ARRAY_HEADER_CELLS)),
+                    )),
+                    Box::new(Expr::Var(cursor)),
+                ),
+                num(Expr::Int(0)),
+            ),
+            Stmt::Assign {
+                kind: vm::AssignmentKind::Set,
+                index: cursor,
+                expr: Expr::Add(Box::new(Expr::Var(cursor)), Box::new(Expr::Int(1))),
+                line,
+            },
+        ],
+        line,
+    });
+    body.extend([
+        Stmt::Let {
+            index: page,
+            declared_schema: Some(TypeSchema::Int),
+            expr: Expr::Int(0),
+            line,
+        },
+        Stmt::Let {
+            index: ordinal,
+            declared_schema: Some(TypeSchema::Int),
+            expr: Expr::Var(param_slot),
+            line,
+        },
+        Stmt::While {
+            condition: Expr::Not(Box::new(Expr::Lt(
+                Box::new(Expr::Var(ordinal)),
+                Box::new(Expr::Int(layout::PAGE_ROWS)),
+            ))),
+            body: vec![
+                Stmt::Assign {
+                    kind: vm::AssignmentKind::Set,
+                    index: ordinal,
+                    expr: Expr::Sub(
+                        Box::new(Expr::Var(ordinal)),
+                        Box::new(Expr::Int(layout::PAGE_ROWS)),
+                    ),
+                    line,
+                },
+                Stmt::Assign {
+                    kind: vm::AssignmentKind::Set,
+                    index: page,
+                    expr: Expr::Add(Box::new(Expr::Var(page)), Box::new(Expr::Int(1))),
+                    line,
+                },
+            ],
+            line,
+        },
+        assert_stmt(
+            Expr::Lt(Box::new(Expr::Var(page)), Box::new(Expr::Int(layout::DIRECTORY_PAGES))),
+            line,
+        ),
+        Stmt::Let {
+            index: page_ptr,
+            declared_schema: Some(TypeSchema::Int),
+            expr: decoded(Expr::Add(
+                Box::new(Expr::Int(layout::HEADER_CELLS)),
+                Box::new(Expr::Var(page)),
+            )),
+            line,
+        },
+        assert_stmt(
+            Expr::Not(Box::new(Expr::Eq(
+                Box::new(Expr::Var(page_ptr)),
+                Box::new(Expr::Int(0)),
+            ))),
+            line,
+        ),
+        Stmt::Let {
+            index: directory,
+            declared_schema: Some(TypeSchema::Int),
+            expr: Expr::Add(
+                Box::new(Expr::Add(
+                    Box::new(Expr::Var(page_ptr)),
+                    Box::new(Expr::Int(layout::RAW_HEADER_CELLS)),
+                )),
+                Box::new(Expr::Mul(
+                    Box::new(Expr::Int(layout::ROW_CELLS)),
+                    Box::new(Expr::Var(ordinal)),
+                )),
+            ),
+            line,
+        },
+        Stmt::Let {
+            index: row_state,
+            declared_schema: Some(TypeSchema::Int),
+            expr: decoded(Expr::Add(
+                Box::new(Expr::Var(directory)),
+                Box::new(Expr::Int(layout::ROW_STATE)),
+            )),
+            line,
+        },
+        assert_stmt(
+            Expr::Eq(
+                Box::new(Expr::Var(row_state)),
+                Box::new(Expr::Int(layout::STATE_ACTIVE)),
+            ),
+            line,
+        ),
+        Stmt::Let {
+            index: row_gen,
+            declared_schema: Some(TypeSchema::Int),
+            expr: decode_gen_call(
+                decode_u32,
+                read_at(Expr::Add(
+                    Box::new(Expr::Var(directory)),
+                    Box::new(Expr::Int(layout::ROW_GENERATION)),
+                )),
+            ),
+            line,
+        },
+        assert_stmt(
+            Expr::Eq(
+                Box::new(Expr::Var(row_gen)),
+                Box::new(Expr::Var(param_generation)),
+            ),
+            line,
+        ),
+        Stmt::Let {
+            index: next,
+            declared_schema: Some(TypeSchema::Int),
+            expr: decoded(Expr::Int(layout::HDR_RAW_FREE_HEAD)),
+            line,
+        },
+        Stmt::Let {
+            index: cells,
+            declared_schema: Some(TypeSchema::Int),
+            expr: decoded(Expr::Int(layout::HDR_NODE_CELLS)),
+            line,
+        },
+    ]);
+    body.push(write_at(
+        Expr::Add(
+            Box::new(Expr::Var(directory)),
+            Box::new(Expr::Int(layout::ROW_PHYSICAL_BASE)),
+        ),
+        num(Expr::Var(fresh)),
+    ));
+    body.push(write_at(
+        Expr::Add(
+            Box::new(Expr::Var(directory)),
+            Box::new(Expr::Int(layout::ROW_DATA_CELLS)),
+        ),
+        num(Expr::Sub(
+            Box::new(Expr::Var(fresh_size)),
+            Box::new(Expr::Int(layout::RAW_HEADER_CELLS)),
+        )),
+    ));
+    body.push(write_at(
+        Expr::Int(layout::HDR_NODE_CELLS),
+        num(Expr::Add(
+            Box::new(Expr::Var(cells)),
+            Box::new(Expr::Sub(
+                Box::new(Expr::Var(fresh_size)),
+                Box::new(Expr::Var(old_size)),
+            )),
+        )),
+    ));
+    body.push(write_at(
+        Expr::Sub(Box::new(Expr::Var(old_base)), Box::new(Expr::Int(2))),
+        num(Expr::Int(layout::RAW_CLASS_FREE)),
+    ));
+    body.push(write_at(
+        Expr::Sub(Box::new(Expr::Var(old_base)), Box::new(Expr::Int(1))),
+        num(Expr::Var(next)),
+    ));
+    body.push(write_at(
+        Expr::Int(layout::HDR_RAW_FREE_HEAD),
+        num(Expr::Sub(
+            Box::new(Expr::Var(old_base)),
+            Box::new(Expr::Int(layout::RAW_HEADER_CELLS)),
+        )),
+    ));
+    body.push(Stmt::Assign {
+        kind: vm::AssignmentKind::Set,
+        index: base,
+        expr: Expr::Var(fresh),
+        line,
+    });
+    declare_helper(
+        ir,
+        statements,
+        "__compat_es5_array_expand_present",
+        index,
+        4,
+        vec![
+            "carrier".to_owned(),
+            "slot".to_owned(),
+            "generation".to_owned(),
+            "index".to_owned(),
+        ],
+        vec![
+            Some(carrier_schema.clone()),
+            Some(TypeSchema::Int),
+            Some(TypeSchema::Int),
+            Some(TypeSchema::Int),
+        ],
+        Some(TypeSchema::Int),
+        ValueType::Int,
+        vec![param_carrier, param_slot, param_generation, param_index],
+        body,
+        Expr::Var(base),
+        line,
+    );
+    Ok(index)
+}
+
+/// Append the dense-array element writer
+/// `(Carrier, base: Int, index: Int, value: JsValue, slot: Int, generation: Int) -> Null`.
+/// An index in `[present, length)` relocates storage and then stores. An index
+/// at or past length still halts. Packed in-range number writes stay number-only.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn append_array_put(
+    lower: &mut Lowerer<'_>,
+    ir: &mut FrontendIr,
+    carrier_schema: &TypeSchema,
+    helper_read: u16,
+    helper_write: u16,
+    decode: u16,
+    decode_u32: u16,
+    expand: u16,
+    span: swc_common::Span,
+    statements: &mut Vec<Stmt>,
+) -> Result<u16, ParseError> {
+    let index = fresh_index(lower, ir, span)?;
+    let line = lower.line(span);
+    let param_carrier = lower.slot(span)?;
+    let param_base = lower.slot(span)?;
+    let param_index = lower.slot(span)?;
+    let param_value = lower.slot(span)?;
+    let param_slot = lower.slot(span)?;
+    let param_generation = lower.slot(span)?;
+    let base = lower.slot(span)?;
+    let kind_num = lower.slot(span)?;
+    let kind = lower.slot(span)?;
+    let len_num = lower.slot(span)?;
+    let len = lower.slot(span)?;
+    let present_cell = lower.slot(span)?;
+    let present = lower.slot(span)?;
+    let stride = lower.slot(span)?;
+    let offset = lower.slot(span)?;
+    let raw_num = lower.slot(span)?;
+    let raw_size = lower.slot(span)?;
+    let extent = lower.slot(span)?;
+    let address = lower.slot(span)?;
+    let tag_num = lower.slot(span)?;
+    let tag = lower.slot(span)?;
+    let flag = lower.slot(span)?;
+    let sink = lower.slot(span)?;
+    let mut body = vec![
+        Stmt::Let {
+            index: base,
+            declared_schema: Some(TypeSchema::Int),
+            expr: Expr::Var(param_base),
+            line,
+        },
+        Stmt::Let {
+            index: sink,
+            declared_schema: Some(TypeSchema::Number),
+            expr: Expr::Float(0.0),
+            line,
+        },
+        Stmt::Let {
+            index: kind_num,
+            declared_schema: Some(TypeSchema::Number),
+            expr: read_cell(helper_read, param_carrier, Expr::Var(param_base)),
+            line,
+        },
+        Stmt::Let {
+            index: kind,
+            declared_schema: Some(TypeSchema::Int),
+            expr: decode_int_call(decode, Expr::Var(kind_num)),
+            line,
+        },
+        assert_stmt(
+            Expr::Or(
+                Box::new(Expr::Eq(
+                    Box::new(Expr::Var(kind)),
+                    Box::new(Expr::Int(layout::KIND_ARRAY)),
+                )),
+                Box::new(Expr::Eq(
+                    Box::new(Expr::Var(kind)),
+                    Box::new(Expr::Int(layout::KIND_TAGGED_ARRAY)),
+                )),
+            ),
+            line,
+        ),
+        Stmt::Let {
+            index: len_num,
+            declared_schema: Some(TypeSchema::Number),
+            expr: read_cell(
+                helper_read,
+                param_carrier,
+                Expr::Add(Box::new(Expr::Var(param_base)), Box::new(Expr::Int(2))),
+            ),
+            line,
+        },
+        Stmt::Let {
+            index: len,
+            declared_schema: Some(TypeSchema::Int),
+            expr: decode_gen_call(decode_u32, Expr::Var(len_num)),
+            line,
+        },
+        Stmt::Let {
+            index: present_cell,
+            declared_schema: Some(TypeSchema::Number),
+            expr: read_cell(
+                helper_read,
+                param_carrier,
+                Expr::Add(
+                    Box::new(Expr::Var(param_base)),
+                    Box::new(Expr::Int(layout::ARRAY_PRESENT_OFFSET)),
+                ),
+            ),
+            line,
+        },
+        Stmt::Let {
+            index: present,
+            declared_schema: Some(TypeSchema::Int),
+            expr: physical_present(
+                decode_gen_call(decode_u32, Expr::Var(present_cell)),
+                Expr::Var(len),
+            ),
+            line,
+        },
+        assert_stmt(
+            Expr::Not(Box::new(Expr::Lt(
+                Box::new(Expr::Var(present)),
+                Box::new(Expr::Int(0)),
+            ))),
+            line,
+        ),
+        // A hole in [present, length) is storage after relocation. Past length
+        // still fails the present assert below.
+        Stmt::IfElse {
+            condition: Expr::And(
+                Box::new(Expr::Not(Box::new(Expr::Lt(
+                    Box::new(Expr::Var(param_index)),
+                    Box::new(Expr::Int(0)),
+                )))),
+                Box::new(Expr::And(
+                    Box::new(Expr::Not(Box::new(Expr::Lt(
+                        Box::new(Expr::Var(param_index)),
+                        Box::new(Expr::Var(present)),
+                    )))),
+                    Box::new(Expr::Lt(
+                        Box::new(Expr::Var(param_index)),
+                        Box::new(Expr::Var(len)),
+                    )),
+                )),
+            ),
+            then_branch: vec![
+                Stmt::Assign {
+                    kind: vm::AssignmentKind::Set,
+                    index: base,
+                    expr: Lowerer::guest_call(
+                        expand,
+                        vec![
+                            Expr::Var(param_carrier),
+                            Expr::Var(param_slot),
+                            Expr::Var(param_generation),
+                            Expr::Var(param_index),
+                        ],
+                    ),
+                    line,
+                },
+                Stmt::Assign {
+                    kind: vm::AssignmentKind::Set,
+                    index: kind_num,
+                    expr: read_cell(helper_read, param_carrier, Expr::Var(base)),
+                    line,
+                },
+                Stmt::Assign {
+                    kind: vm::AssignmentKind::Set,
+                    index: kind,
+                    expr: decode_int_call(decode, Expr::Var(kind_num)),
+                    line,
+                },
+                Stmt::Assign {
+                    kind: vm::AssignmentKind::Set,
+                    index: present_cell,
+                    expr: read_cell(
+                        helper_read,
+                        param_carrier,
+                        Expr::Add(
+                            Box::new(Expr::Var(base)),
+                            Box::new(Expr::Int(layout::ARRAY_PRESENT_OFFSET)),
+                        ),
+                    ),
+                    line,
+                },
+                Stmt::Assign {
+                    kind: vm::AssignmentKind::Set,
+                    index: present,
+                    expr: physical_present(
+                        decode_gen_call(decode_u32, Expr::Var(present_cell)),
+                        Expr::Var(len),
+                    ),
+                    line,
+                },
+            ],
+            else_branch: Vec::new(),
+            line,
+        },
+        assert_stmt(
+            Expr::And(
+                Box::new(Expr::Not(Box::new(Expr::Lt(
+                    Box::new(Expr::Var(param_index)),
+                    Box::new(Expr::Int(0)),
+                )))),
+                Box::new(Expr::Lt(
+                    Box::new(Expr::Var(param_index)),
+                    Box::new(Expr::Var(present)),
+                )),
+            ),
+            line,
+        ),
+        Stmt::Let {
+            index: stride,
+            declared_schema: Some(TypeSchema::Int),
+            expr: Expr::IfElse {
+                condition: Box::new(Expr::Eq(
+                    Box::new(Expr::Var(kind)),
+                    Box::new(Expr::Int(layout::KIND_ARRAY)),
+                )),
+                then_expr: Box::new(Expr::Int(1)),
+                else_expr: Box::new(Expr::Int(layout::ARRAY_TAGGED_CELLS_PER_ENTRY)),
+            },
+            line,
+        },
+        Stmt::Let {
+            index: offset,
+            declared_schema: Some(TypeSchema::Int),
+            expr: Expr::Add(
+                Box::new(Expr::Int(layout::ARRAY_HEADER_CELLS)),
+                Box::new(Expr::Mul(
+                    Box::new(Expr::Var(stride)),
+                    Box::new(Expr::Var(param_index)),
+                )),
+            ),
+            line,
+        },
+        Stmt::Let {
+            index: raw_num,
+            declared_schema: Some(TypeSchema::Number),
+            expr: read_cell(
+                helper_read,
+                param_carrier,
+                Expr::Sub(
+                    Box::new(Expr::Var(base)),
+                    Box::new(Expr::Int(layout::RAW_HEADER_CELLS)),
+                ),
+            ),
+            line,
+        },
+        Stmt::Let {
+            index: raw_size,
+            declared_schema: Some(TypeSchema::Int),
+            expr: decode_int_call(decode, Expr::Var(raw_num)),
+            line,
+        },
+        Stmt::Let {
+            index: extent,
+            declared_schema: Some(TypeSchema::Int),
+            expr: Expr::Sub(
+                Box::new(Expr::Var(raw_size)),
+                Box::new(Expr::Int(layout::RAW_HEADER_CELLS)),
+            ),
+            line,
+        },
+        assert_stmt(
+            Expr::Not(Box::new(Expr::Gt(
+                Box::new(Expr::Add(
+                    Box::new(Expr::Var(offset)),
+                    Box::new(Expr::Var(stride)),
+                )),
+                Box::new(Expr::Var(extent)),
+            ))),
+            line,
+        ),
+        Stmt::Let {
+            index: address,
+            declared_schema: Some(TypeSchema::Int),
+            expr: Expr::Add(Box::new(Expr::Var(base)), Box::new(Expr::Var(offset))),
+            line,
+        },
+    ];
+    // Packed arrays keep the old static refusal: a Number tag is required.
+    let packed = vec![
+        assert_stmt(
+            Expr::Eq(
+                Box::new(Lowerer::as_number(value::field(param_value, "tag"))),
+                Box::new(Lowerer::as_number(Expr::Int(value::NUMBER))),
+            ),
+            line,
+        ),
+        Stmt::Assign {
+            kind: vm::AssignmentKind::Set,
+            index: sink,
+            expr: write_call(
+                helper_write,
+                param_carrier,
+                Expr::Var(address),
+                value::field(param_value, "number"),
+            ),
+            line,
+        },
+    ];
+    let mut tagged = vec![
+        Stmt::Let {
+            index: tag_num,
+            declared_schema: Some(TypeSchema::Number),
+            expr: Lowerer::as_number(value::field(param_value, "tag")),
+            line,
+        },
+        Stmt::Let {
+            index: tag,
+            declared_schema: Some(TypeSchema::Int),
+            expr: decode_int_call(decode, Expr::Var(tag_num)),
+            line,
+        },
+        assert_stmt(
+            Expr::Not(Box::new(Expr::Gt(
+                Box::new(Expr::Var(tag)),
+                Box::new(Expr::Int(value::OBJECT)),
+            ))),
+            line,
+        ),
+        Stmt::Let {
+            index: flag,
+            declared_schema: Some(TypeSchema::Int),
+            expr: Expr::IfElse {
+                condition: Box::new(value::field(param_value, "flag")),
+                then_expr: Box::new(Expr::Int(1)),
+                else_expr: Box::new(Expr::Int(0)),
+            },
+            line,
+        },
+    ];
+    let entries: [(i64, Expr); 5] = [
+        (0, Lowerer::as_number(Expr::Var(tag))),
+        (1, value::field(param_value, "number")),
+        (2, Lowerer::as_number(Expr::Var(flag))),
+        (3, Lowerer::as_number(value::field(param_value, "ref_slot"))),
+        (
+            4,
+            Lowerer::as_number(value::field(param_value, "generation")),
+        ),
+    ];
+    for (delta, payload) in entries {
+        tagged.push(Stmt::Assign {
+            kind: vm::AssignmentKind::Set,
+            index: sink,
+            expr: write_call(
+                helper_write,
+                param_carrier,
+                Expr::Add(Box::new(Expr::Var(address)), Box::new(Expr::Int(delta))),
+                payload,
+            ),
+            line,
+        });
+    }
+    body.push(Stmt::IfElse {
+        condition: Expr::Eq(
+            Box::new(Expr::Var(kind)),
+            Box::new(Expr::Int(layout::KIND_ARRAY)),
+        ),
+        then_branch: packed,
+        else_branch: tagged,
+        line,
+    });
+    declare_helper(
+        ir,
+        statements,
+        layout::ARRAY_PUT_HELPER,
+        index,
+        6,
+        vec![
+            "carrier".to_owned(),
+            "base".to_owned(),
+            "index".to_owned(),
+            "value".to_owned(),
+            "slot".to_owned(),
+            "generation".to_owned(),
+        ],
+        vec![
+            Some(carrier_schema.clone()),
+            Some(TypeSchema::Int),
+            Some(TypeSchema::Int),
+            Some(value::schema()),
+            Some(TypeSchema::Int),
+            Some(TypeSchema::Int),
+        ],
+        Some(TypeSchema::Null),
+        ValueType::Null,
+        vec![
+            param_carrier,
+            param_base,
+            param_index,
+            param_value,
+            param_slot,
+            param_generation,
+        ],
+        body,
+        Expr::Null,
+        line,
+    );
+    Ok(index)
+}
+
+/// Append the dense-array length reader `(Carrier, base: Int) -> Number`.
+/// Checks the node kind is a packed or tagged array, then decodes the public
+/// length at cell base+2. It does not re-check element extent; a short node
+/// is not rejected here.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn append_array_length(
+    lower: &mut Lowerer<'_>,
+    ir: &mut FrontendIr,
+    carrier_schema: &TypeSchema,
+    helper_read: u16,
+    decode: u16,
+    decode_u32: u16,
+    span: swc_common::Span,
+    statements: &mut Vec<Stmt>,
+) -> Result<u16, ParseError> {
+    let index = fresh_index(lower, ir, span)?;
+    let line = lower.line(span);
+    let param_carrier = lower.slot(span)?;
+    let param_base = lower.slot(span)?;
+    let kind_num = lower.slot(span)?;
+    let kind = lower.slot(span)?;
+    let len_num = lower.slot(span)?;
+    let len = lower.slot(span)?;
+    let body = vec![
+        Stmt::Let {
+            index: kind_num,
+            declared_schema: Some(TypeSchema::Number),
+            expr: read_cell(helper_read, param_carrier, Expr::Var(param_base)),
+            line,
+        },
+        Stmt::Let {
+            index: kind,
+            declared_schema: Some(TypeSchema::Int),
+            expr: decode_int_call(decode, Expr::Var(kind_num)),
+            line,
+        },
+        assert_stmt(
+            Expr::Or(
+                Box::new(Expr::Eq(
+                    Box::new(Expr::Var(kind)),
+                    Box::new(Expr::Int(layout::KIND_ARRAY)),
+                )),
+                Box::new(Expr::Eq(
+                    Box::new(Expr::Var(kind)),
+                    Box::new(Expr::Int(layout::KIND_TAGGED_ARRAY)),
+                )),
+            ),
+            line,
+        ),
+        Stmt::Let {
+            index: len_num,
+            declared_schema: Some(TypeSchema::Number),
+            expr: read_cell(
+                helper_read,
+                param_carrier,
+                Expr::Add(Box::new(Expr::Var(param_base)), Box::new(Expr::Int(2))),
+            ),
+            line,
+        },
+        Stmt::Let {
+            index: len,
+            declared_schema: Some(TypeSchema::Int),
+            expr: decode_gen_call(decode_u32, Expr::Var(len_num)),
+            line,
+        },
+    ];
+    declare_helper(
+        ir,
+        statements,
+        layout::ARRAY_LENGTH_HELPER,
+        index,
+        2,
+        vec!["carrier".to_owned(), "base".to_owned()],
+        vec![Some(carrier_schema.clone()), Some(TypeSchema::Int)],
+        Some(TypeSchema::Number),
+        ValueType::Float,
+        vec![param_carrier, param_base],
+        body,
+        Lowerer::as_number(Expr::Var(len)),
+        line,
+    );
+    Ok(index)
+}
+
+/// Cell 5 is `physical present + 1`. Cell 2 is the plain public length.
+/// Cell 1 is the node generation publish checks; it is not a present cell.
+/// A zero present cell is not a sentinel: the decoder rejects a raw 0.
+fn physical_present(cell1: Expr, _public_length: Expr) -> Expr {
+    Expr::Sub(Box::new(cell1), Box::new(Expr::Int(1)))
+}
+
+/// Resize an array length. Cell 2 stays a plain integer in `0 .. 2^30`.
+/// Growth does not allocate: indexes in `[present, length)` read as undefined
+/// and are own, without a stored cell. Shrink clears only the physical tail,
+/// so a later grow cannot revive it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn append_array_set_length(
+    lower: &mut Lowerer<'_>,
+    ir: &mut FrontendIr,
+    carrier_schema: &TypeSchema,
+    helper_read: u16,
+    helper_write: u16,
+    decode: u16,
+    decode_u32: u16,
+    span: swc_common::Span,
+    statements: &mut Vec<Stmt>,
+) -> Result<u16, ParseError> {
+    let index = fresh_index(lower, ir, span)?;
+    let line = lower.line(span);
+    let param_carrier = lower.slot(span)?;
+    let param_base = lower.slot(span)?;
+    let param_new = lower.slot(span)?;
+    let kind_num = lower.slot(span)?;
+    let kind = lower.slot(span)?;
+    let old_num = lower.slot(span)?;
+    let old = lower.slot(span)?;
+    let cell1 = lower.slot(span)?;
+    let present = lower.slot(span)?;
+    let stride = lower.slot(span)?;
+    let cursor = lower.slot(span)?;
+    let delta = lower.slot(span)?;
+    let address = lower.slot(span)?;
+    let ack = lower.slot(span)?;
+    let read_at = |base: u16, delta: i64| {
+        read_cell(
+            helper_read,
+            param_carrier,
+            Expr::Add(Box::new(Expr::Var(base)), Box::new(Expr::Int(delta))),
+        )
+    };
+    let mut body = vec![
+        Stmt::Let {
+            index: kind_num,
+            declared_schema: Some(TypeSchema::Number),
+            expr: read_cell(helper_read, param_carrier, Expr::Var(param_base)),
+            line,
+        },
+        Stmt::Let {
+            index: kind,
+            declared_schema: Some(TypeSchema::Int),
+            expr: decode_int_call(decode, Expr::Var(kind_num)),
+            line,
+        },
+        assert_stmt(
+            Expr::Or(
+                Box::new(Expr::Eq(
+                    Box::new(Expr::Var(kind)),
+                    Box::new(Expr::Int(layout::KIND_ARRAY)),
+                )),
+                Box::new(Expr::Eq(
+                    Box::new(Expr::Var(kind)),
+                    Box::new(Expr::Int(layout::KIND_TAGGED_ARRAY)),
+                )),
+            ),
+            line,
+        ),
+        assert_stmt(
+            Expr::And(
+                Box::new(Expr::Not(Box::new(Expr::Lt(
+                    Box::new(Expr::Var(param_new)),
+                    Box::new(Expr::Int(0)),
+                )))),
+                Box::new(Expr::Not(Box::new(Expr::Gt(
+                    Box::new(Expr::Var(param_new)),
+                    Box::new(Expr::Int((1 << 30) - 1)),
+                )))),
+            ),
+            line,
+        ),
+        Stmt::Let {
+            index: old_num,
+            declared_schema: Some(TypeSchema::Number),
+            expr: read_at(param_base, 2),
+            line,
+        },
+        Stmt::Let {
+            index: old,
+            declared_schema: Some(TypeSchema::Int),
+            expr: decode_gen_call(decode_u32, Expr::Var(old_num)),
+            line,
+        },
+        Stmt::Let {
+            index: cell1,
+            declared_schema: Some(TypeSchema::Number),
+            expr: read_at(param_base, layout::ARRAY_PRESENT_OFFSET),
+            line,
+        },
+        Stmt::Let {
+            index: present,
+            declared_schema: Some(TypeSchema::Int),
+            expr: physical_present(
+                decode_gen_call(decode_u32, Expr::Var(cell1)),
+                Expr::Var(old),
+            ),
+            line,
+        },
+        assert_stmt(
+            Expr::Not(Box::new(Expr::Lt(
+                Box::new(Expr::Var(present)),
+                Box::new(Expr::Int(0)),
+            ))),
+            line,
+        ),
+        Stmt::Let {
+            index: stride,
+            declared_schema: Some(TypeSchema::Int),
+            expr: Expr::IfElse {
+                condition: Box::new(Expr::Eq(
+                    Box::new(Expr::Var(kind)),
+                    Box::new(Expr::Int(layout::KIND_ARRAY)),
+                )),
+                then_expr: Box::new(Expr::Int(1)),
+                else_expr: Box::new(Expr::Int(layout::ARRAY_TAGGED_CELLS_PER_ENTRY)),
+            },
+            line,
+        },
+        Stmt::Let {
+            index: cursor,
+            declared_schema: Some(TypeSchema::Int),
+            expr: Expr::Var(param_new),
+            line,
+        },
+        Stmt::Let {
+            index: delta,
+            declared_schema: Some(TypeSchema::Int),
+            expr: Expr::Int(0),
+            line,
+        },
+        Stmt::Let {
+            index: address,
+            declared_schema: Some(TypeSchema::Int),
+            expr: Expr::Int(0),
+            line,
+        },
+        Stmt::Let {
+            index: ack,
+            declared_schema: Some(TypeSchema::Number),
+            expr: Expr::Float(0.0),
+            line,
+        },
+    ];
+    let clear_one = vec![
+        Stmt::Assign {
+            kind: vm::AssignmentKind::Set,
+            index: address,
+            expr: Expr::Add(
+                Box::new(Expr::Add(
+                    Box::new(Expr::Var(param_base)),
+                    Box::new(Expr::Int(layout::ARRAY_HEADER_CELLS)),
+                )),
+                Box::new(Expr::Mul(
+                    Box::new(Expr::Var(cursor)),
+                    Box::new(Expr::Var(stride)),
+                )),
+            ),
+            line,
+        },
+        Stmt::Assign {
+            kind: vm::AssignmentKind::Set,
+            index: delta,
+            expr: Expr::Int(0),
+            line,
+        },
+        Stmt::While {
+            condition: Expr::Lt(Box::new(Expr::Var(delta)), Box::new(Expr::Var(stride))),
+            body: vec![
+                Stmt::Assign {
+                    kind: vm::AssignmentKind::Set,
+                    index: ack,
+                    expr: write_call(
+                        helper_write,
+                        param_carrier,
+                        Expr::Add(
+                            Box::new(Expr::Var(address)),
+                            Box::new(Expr::Var(delta)),
+                        ),
+                        Expr::Float(0.0),
+                    ),
+                    line,
+                },
+                Stmt::Assign {
+                    kind: vm::AssignmentKind::Set,
+                    index: delta,
+                    expr: Expr::Add(Box::new(Expr::Var(delta)), Box::new(Expr::Int(1))),
+                    line,
+                },
+            ],
+            line,
+        },
+        Stmt::Assign {
+            kind: vm::AssignmentKind::Set,
+            index: cursor,
+            expr: Expr::Add(Box::new(Expr::Var(cursor)), Box::new(Expr::Int(1))),
+            line,
+        },
+    ];
+    let write_len = Stmt::Assign {
+        kind: vm::AssignmentKind::Set,
+        index: ack,
+        expr: write_call(
+            helper_write,
+            param_carrier,
+            Expr::Add(Box::new(Expr::Var(param_base)), Box::new(Expr::Int(2))),
+            Expr::Var(param_new),
+        ),
+        line,
+    };
+    let write_present = Stmt::Assign {
+        kind: vm::AssignmentKind::Set,
+        index: ack,
+        expr: write_call(
+            helper_write,
+            param_carrier,
+            Expr::Add(
+                Box::new(Expr::Var(param_base)),
+                Box::new(Expr::Int(layout::ARRAY_PRESENT_OFFSET)),
+            ),
+            Expr::Add(Box::new(Expr::Var(present)), Box::new(Expr::Int(1))),
+        ),
+        line,
+    };
+    body.push(Stmt::While {
+        condition: Expr::Lt(Box::new(Expr::Var(cursor)), Box::new(Expr::Var(present))),
+        body: clear_one,
+        line,
+    });
+    body.push(Stmt::IfElse {
+        condition: Expr::Lt(Box::new(Expr::Var(param_new)), Box::new(Expr::Var(present))),
+        then_branch: vec![Stmt::Assign {
+            kind: vm::AssignmentKind::Set,
+            index: present,
+            expr: Expr::Var(param_new),
+            line,
+        }],
+        else_branch: Vec::new(),
+        line,
+    });
+    body.push(write_len);
+    body.push(write_present);
+    declare_helper(
+        ir,
+        statements,
+        layout::ARRAY_SET_LENGTH_HELPER,
+        index,
+        3,
+        vec![
+            "carrier".to_owned(),
+            "base".to_owned(),
+            "new_length".to_owned(),
+        ],
+        vec![
+            Some(carrier_schema.clone()),
+            Some(TypeSchema::Int),
+            Some(TypeSchema::Int),
+        ],
+        Some(TypeSchema::Null),
+        ValueType::Null,
+        vec![param_carrier, param_base, param_new],
+        body,
+        Expr::Null,
+        line,
+    );
+    Ok(index)
+}
+
 /// Append the prototype setter `(Carrier, obj: JsValue, proto: JsValue)`.
 /// Resolves and kind-checks both object-like nodes, walks the prototype
 /// chain from the candidate (bounded by the directory high-water, failing
@@ -7222,22 +9540,7 @@ pub(crate) fn append_set_prototype(
             line,
         });
         body.push(assert_stmt(
-            Expr::Or(
-                Box::new(Expr::Eq(
-                    Box::new(Expr::Var(kind)),
-                    Box::new(Expr::Int(layout::KIND_ARRAY)),
-                )),
-                Box::new(Expr::Or(
-                    Box::new(Expr::Eq(
-                        Box::new(Expr::Var(kind)),
-                        Box::new(Expr::Int(layout::KIND_OBJECT)),
-                    )),
-                    Box::new(Expr::Eq(
-                        Box::new(Expr::Var(kind)),
-                        Box::new(Expr::Int(layout::KIND_FUNCTION)),
-                    )),
-                )),
-            ),
+            super::object::object_like(Expr::Var(kind)),
             line,
         ));
     }
@@ -7337,22 +9640,7 @@ pub(crate) fn append_set_prototype(
                     line,
                 },
                 assert_stmt(
-                    Expr::Or(
-                        Box::new(Expr::Eq(
-                            Box::new(Expr::Var(kind)),
-                            Box::new(Expr::Int(layout::KIND_ARRAY)),
-                        )),
-                        Box::new(Expr::Or(
-                            Box::new(Expr::Eq(
-                                Box::new(Expr::Var(kind)),
-                                Box::new(Expr::Int(layout::KIND_OBJECT)),
-                            )),
-                            Box::new(Expr::Eq(
-                                Box::new(Expr::Var(kind)),
-                                Box::new(Expr::Int(layout::KIND_FUNCTION)),
-                            )),
-                        )),
-                    ),
+                    super::object::object_like(Expr::Var(kind)),
                     line,
                 ),
                 Stmt::Assign {
@@ -7524,6 +9812,7 @@ pub(crate) fn append_heap_core(
         decode_int,
         decode_u32,
         mark,
+        checked_base,
         span,
         statements,
     )?;
@@ -7557,7 +9846,15 @@ pub(crate) fn append_heap_core(
         &carrier_schema,
         helper_read,
         helper_write,
-        decode_int,
+        span,
+        statements,
+    )?;
+    let root_clear = append_root_clear(
+        lower,
+        ir,
+        &carrier_schema,
+        helper_read,
+        helper_write,
         span,
         statements,
     )?;
@@ -7567,7 +9864,6 @@ pub(crate) fn append_heap_core(
         &carrier_schema,
         helper_read,
         helper_write,
-        decode_int,
         checked_base,
         span,
         statements,
@@ -7604,6 +9900,7 @@ pub(crate) fn append_heap_core(
         helper_write,
         decode_int,
         decode_u32,
+        checked_base,
         span,
         statements,
     )?;
@@ -7641,10 +9938,68 @@ pub(crate) fn append_heap_core(
         span,
         statements,
     )?;
+    let array_get = append_array_get(
+        lower,
+        ir,
+        &carrier_schema,
+        helper_read,
+        decode_int,
+        decode_u32,
+        checked_base,
+        span,
+        statements,
+    )?;
+    let array_expand = append_array_expand(
+        lower,
+        ir,
+        &carrier_schema,
+        helper_read,
+        helper_write,
+        decode_int,
+        decode_u32,
+        checked_base,
+        raw_reserve,
+        span,
+        statements,
+    )?;
+    let array_put = append_array_put(
+        lower,
+        ir,
+        &carrier_schema,
+        helper_read,
+        helper_write,
+        decode_int,
+        decode_u32,
+        array_expand,
+        span,
+        statements,
+    )?;
+    let array_length = append_array_length(
+        lower,
+        ir,
+        &carrier_schema,
+        helper_read,
+        decode_int,
+        decode_u32,
+        span,
+        statements,
+    )?;
+    let array_set_length = append_array_set_length(
+        lower,
+        ir,
+        &carrier_schema,
+        helper_read,
+        helper_write,
+        decode_int,
+        decode_u32,
+        span,
+        statements,
+    )?;
     Ok(HeapHelpers {
         decode_u32,
         root_enter,
         root_write,
+        root_clear,
         root_write_node,
         root_leave,
         checked_base,
@@ -7656,5 +10011,10 @@ pub(crate) fn append_heap_core(
         heap_collect: collect,
         heap_observe,
         set_prototype,
+        array_get,
+        array_put,
+        array_expand,
+        array_length,
+        array_set_length,
     })
 }

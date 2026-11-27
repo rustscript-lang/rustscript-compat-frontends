@@ -21,7 +21,7 @@ use vm::{HostApiCatalog, HostFunctionRegistry, Value, Vm, VmStatus};
 // ---- Narrow test-owned realm recipe (helper, not a business proof) ----
 
 fn lifecycle_catalog() -> Arc<HostApiCatalog> {
-    pd_vm_compat_frontends::reference_array_effective_catalog()
+    pd_vm_compat_frontends::runtime::cli::reference_array_cli_effective_catalog()
 }
 
 fn lifecycle_file_options(catalog: &Arc<HostApiCatalog>) -> vm::CompileSourceFileOptions {
@@ -74,6 +74,9 @@ fn install_lifecycle_production(registry: &mut HostFunctionRegistry, catalog: &H
     pd_vm_compat_frontends::runtime::scalar_math::typescript_scalar_math_host_module()
         .install_from_catalog(registry, catalog)
         .expect("scalar-math adapter should match the effective catalog");
+    pd_vm_compat_frontends::runtime::scalar_error::typescript_error_host_module()
+        .install_from_catalog(registry, catalog)
+        .expect("scalar-error adapter should match the effective catalog");
     registry
         .allow_builtin("math::floor")
         .expect("math::floor should be allow-listable");
@@ -95,6 +98,15 @@ fn lifecycle_vm_with_plugin(
     let mut machine = compilation
         .into_vm()
         .expect("certified compilation should create a source-certified VM");
+    if !native {
+        machine.set_jit_config(vm::JitConfig {
+            enabled: false,
+            ..vm::JitConfig::default()
+        });
+    }
+    if !native {
+        machine.set_fuel(10_000_000);
+    }
     pd_vm_compat_frontends::runtime::array::initialize_typescript_owned_arrays(
         &mut machine,
         pd_vm_compat_frontends::runtime::array::OwnedArrayLimits::default(),
@@ -429,6 +441,9 @@ fn js_reset_clears_heap_after_successful_run() {
         machine.run().expect("heap program should succeed"),
         VmStatus::Halted
     );
+    assert!(!machine.jit_config().enabled);
+    assert_eq!(machine.aot_exec_count(), 0);
+    assert_eq!(machine.jit_native_exec_count(), 0);
     assert_eq!(
         boxed_float_at(&machine, machine.stack().len() - 1),
         Value::Float(7.0)
@@ -469,6 +484,12 @@ fn js_two_vms_keep_independent_state_across_reset() {
     let (mut second, _) = lifecycle_vm("var a=[3,4];var b=a;b[0]=9;a[0];", false);
     assert_eq!(first.run().expect("first VM runs"), VmStatus::Halted);
     assert_eq!(second.run().expect("second VM runs"), VmStatus::Halted);
+    assert!(!first.jit_config().enabled);
+    assert_eq!(first.aot_exec_count(), 0);
+    assert_eq!(first.jit_native_exec_count(), 0);
+    assert!(!second.jit_config().enabled);
+    assert_eq!(second.aot_exec_count(), 0);
+    assert_eq!(second.jit_native_exec_count(), 0);
     assert_eq!(
         boxed_float_at(&first, first.stack().len() - 1),
         Value::Float(7.0)
@@ -565,6 +586,9 @@ fn js_abort_keeps_payload_open_until_reset() {
         false,
     );
     let error = machine.run().expect_err("zero-count allocation must abort");
+    assert!(!machine.jit_config().enabled);
+    assert_eq!(machine.aot_exec_count(), 0);
+    assert_eq!(machine.jit_native_exec_count(), 0);
     let text = format!("{error:?}");
     eprintln!("ABORT refusal: {text}");
     assert!(
@@ -658,6 +682,110 @@ impl vm::SourcePlugin for LifecycleQuotaPlugin {
     }
 }
 
+// Read only the real script-prefix root-enter declaration, never runtime
+// length/capacity or function bodies. Ambiguous or changed IR fails closed.
+fn quota_script_root_capacity(source: &str) -> Result<usize, vm::ParseError> {
+    use vm::SourcePlugin;
+    let catalog = lifecycle_catalog();
+    let context = vm::SourceFrontendContext {
+        source_id: 0,
+        original_path: None,
+        phase: vm::compiler::ParsePhase::Standalone,
+        host_api_catalog: Some(&catalog),
+        imports: &[],
+    };
+    let ir = JAVASCRIPT_ES5_PLUGIN.parse_source(source, &context)?;
+    let unique_helper = |name: &str| -> Result<u16, vm::ParseError> {
+        let mut matches = ir.functions.iter().filter(|function| function.name == name);
+        let function = matches
+            .next()
+            .ok_or_else(|| lifecycle_rejection(format!("quota layout requires helper '{name}'")))?;
+        if matches.next().is_some() {
+            return Err(lifecycle_rejection(format!(
+                "quota layout requires a unique helper '{name}'"
+            )));
+        }
+        Ok(function.index)
+    };
+    let make = unique_helper(LIFECYCLE_MAKE_NAME)?;
+    let root_enter = unique_helper("__compat_es5_root_enter")?;
+    let mut carriers = ir.stmts.iter().filter_map(|stmt| match stmt {
+        vm::Stmt::Let {
+            index,
+            declared_schema: None,
+            expr: vm::Expr::Call(target, _, args, _, _),
+            ..
+        } if *target == make && args.len() == 1 => Some(*index),
+        _ => None,
+    });
+    let carrier = carriers
+        .next()
+        .ok_or_else(|| lifecycle_rejection("quota layout requires a realm carrier".to_owned()))?;
+    if carriers.next().is_some() {
+        return Err(lifecycle_rejection(
+            "quota layout requires a unique realm carrier".to_owned(),
+        ));
+    }
+    let mut frames = ir.stmts.iter().filter(|stmt| {
+        matches!(stmt, vm::Stmt::Let { expr: vm::Expr::Call(target, _, _, _, _), .. } if *target == root_enter)
+    });
+    let frame = frames
+        .next()
+        .ok_or_else(|| lifecycle_rejection("quota layout requires a script frame".to_owned()))?;
+    if frames.next().is_some() {
+        return Err(lifecycle_rejection(
+            "quota layout requires a unique top-level script frame".to_owned(),
+        ));
+    }
+    let vm::Stmt::Let {
+        declared_schema: Some(vm::TypeSchema::Int),
+        expr: vm::Expr::Call(_, type_args, args, None, None),
+        ..
+    } = frame
+    else {
+        return Err(lifecycle_rejection(
+            "quota layout requires the typed script root-enter call".to_owned(),
+        ));
+    };
+    let [vm::Expr::Var(actual_carrier), vm::Expr::Int(capacity)] = args.as_slice() else {
+        return Err(lifecycle_rejection(
+            "quota layout requires root-enter(carrier, Int(capacity))".to_owned(),
+        ));
+    };
+    if *actual_carrier != carrier || !type_args.is_empty() {
+        return Err(lifecycle_rejection(
+            "quota layout requires the actual realm carrier and no type arguments".to_owned(),
+        ));
+    }
+    usize::try_from(*capacity)
+        .map_err(|_| lifecycle_rejection("quota layout requires a nonnegative capacity".to_owned()))
+}
+
+#[test]
+fn quota_layout_includes_pending_payload_root() {
+    // Pure host parsing: lowerer prefixes the final RootScope::next_entry.
+    // Array-only publication roots the source binding directly. Member
+    // access adds a rooted receiver copy (lower_member_read/bind_temp) and
+    // SourceScan::member -> init_script_pending -> refresh_root(payload).
+    // Each added entry costs three cells; only one is the pending payload.
+    let without_member = quota_script_root_capacity("var a=[1];").expect("array-only script frame");
+    let with_member = quota_script_root_capacity("var a=[1];a[0];").expect("member script frame");
+    let member_receiver_roots = 1;
+    let pending_payload_roots = 1;
+    eprintln!(
+        "QUOTA_LAYOUT without_member_capacity={without_member} with_member_capacity={with_member} member_receiver_roots={member_receiver_roots} pending_payload_roots={pending_payload_roots}"
+    );
+    assert_eq!(without_member, 1, "directly published source binding root");
+    assert_eq!(
+        with_member, 3,
+        "source binding, member receiver and mandatory pending-payload root"
+    );
+    assert_eq!(
+        with_member,
+        without_member + member_receiver_roots + pending_payload_roots
+    );
+}
+
 #[test]
 fn js_tight_quota_refuses_resize_transactionally() {
     // Independent completed-source control supplies the actual pre-resize
@@ -686,6 +814,11 @@ fn js_tight_quota_refuses_resize_transactionally() {
     let mut machine = compilation
         .into_vm()
         .expect("certified probe compilation should create a VM");
+    machine.set_jit_config(vm::JitConfig {
+        enabled: false,
+        ..vm::JitConfig::default()
+    });
+    machine.set_fuel(10_000_000);
     let tight = pd_vm_compat_frontends::runtime::array::OwnedArrayLimits::new(8, 64, 1 << 16)
         .expect("tight but positive quotas");
     pd_vm_compat_frontends::runtime::array::initialize_typescript_owned_arrays(&mut machine, tight)
@@ -696,6 +829,12 @@ fn js_tight_quota_refuses_resize_transactionally() {
         .bind_vm_cached(&mut machine)
         .expect("production adapters should bind");
     let error = machine.run().expect_err("over-quota resize must refuse");
+    assert!(!machine.jit_config().enabled);
+    assert_eq!(machine.aot_exec_count(), 0);
+    assert_eq!(machine.jit_native_exec_count(), 0);
+    assert!(!control.jit_config().enabled);
+    assert_eq!(control.aot_exec_count(), 0);
+    assert_eq!(control.jit_native_exec_count(), 0);
     let text = format!("{error:?}");
     eprintln!("QUOTA refusal: {text}");
     assert!(
@@ -720,11 +859,16 @@ fn js_tight_quota_refuses_resize_transactionally() {
             panic!("quota phase must contain the actual numeric backing length, got {other:?}")
         }
     };
-    // Initial layout, derived independently of the failing request:
-    // prefix80 + script frame(4+2*3) + page(3+64*7) + array(3+5+1).
-    const INITIAL_CELLS: usize = 80 + (4 + 2 * 3) + (3 + 64 * 7) + (3 + 5 + 1);
-    assert_eq!(length, INITIAL_CELLS as f64);
-    assert!(before.reserved_bytes >= INITIAL_CELLS * std::mem::size_of::<Value>());
+    // Initial occupied layout, independent of the failing request and its
+    // observed length. Member access adds the pending-payload root to the
+    // member receiver copy and source binding in this script activation frame.
+    let script_root_capacity =
+        quota_script_root_capacity("var a=[1];a[0];").expect("original source script frame");
+    assert_eq!(script_root_capacity, 3, "mandatory pending-payload root");
+    // Preserve prefix80, frame header4/entry3, page and array accounting.
+    let expected_initial_cells = 80 + (4 + script_root_capacity * 3) + (3 + 64 * 7) + (3 + 5 + 1);
+    assert_eq!(length, expected_initial_cells as f64);
+    assert!(before.reserved_bytes >= expected_initial_cells * std::mem::size_of::<Value>());
     assert!(before.reserved_bytes <= 1 << 16);
     // The pre-existing owner survives with old accounting intact.
     assert_eq!(machine.host_context().resource_count(), 1);
@@ -1998,6 +2142,7 @@ fn install_cost_registry(registry: &mut HostFunctionRegistry) -> CostInstall {
         pd_vm_compat_frontends::runtime::array::typescript_owned_array_host_module(),
         pd_vm_compat_frontends::runtime::array::typescript_array_snapshot_host_module(),
         pd_vm_compat_frontends::runtime::scalar_math::typescript_scalar_math_host_module(),
+        pd_vm_compat_frontends::runtime::scalar_error::typescript_error_host_module(),
     ];
     let mut descriptors = Vec::new();
     for module in modules {

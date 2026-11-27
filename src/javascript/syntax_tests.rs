@@ -15,6 +15,28 @@ use vm::ParseError;
 
 const SOURCE_ID: u32 = 7;
 
+#[test]
+fn p7_general_call_provisions_implicit_error_channel() {
+    // Callability failures are possible without any explicit Throw producer.
+    // The unchanged source also matches the existing control-flow consumer.
+    let source = "function f(){'use strict';return false;}var r=0;if(f()){r=1;}else{r=2;}";
+    let (script, _) = parse_script(source, SOURCE_ID).expect("ES5 Script");
+    assert!(super::reference::script_can_receive_callee_throw(
+        None,
+        &script.body
+    ));
+}
+
+#[test]
+fn p7_uninvoked_function_call_does_not_provision_script_error_channel() {
+    let source = "function f(){'use strict';unknown();}";
+    let (script, _) = parse_script(source, SOURCE_ID).expect("ES5 Script");
+    assert!(!super::reference::script_can_receive_callee_throw(
+        None,
+        &script.body
+    ));
+}
+
 fn admitted(source: &str) {
     if let Err(error) = parse_script(source, SOURCE_ID) {
         panic!("ES5 source must be admitted at the parser stage: {source:?}\n{error:?}");
@@ -166,12 +188,13 @@ fn strict_accessor_duplicate_rules() {
     }
 }
 
-/// Sloppy code admits every accessor combination.
+/// Sloppy object literals allow a get/set pair; all other accessor
+/// conflicts remain early errors under ES5.1 11.1.5.
 #[test]
 fn sloppy_accessor_combinations_are_admitted() {
-    admitted("({get a(){return 1;},get a(){return 2;}});");
-    admitted("({set a(v){},set a(w){}});");
-    admitted("({a:1,get a(){return 2;}});");
+    refused_syntax("({get a(){return 1;},get a(){return 2;}});");
+    refused_syntax("({set a(v){},set a(w){}});");
+    refused_syntax("({a:1,get a(){return 2;}});");
     admitted("({get a(){return 1;},set a(v){}});");
 }
 
@@ -383,6 +406,16 @@ fn modern_forms_are_rejected() {
         "function* g(){ yield 1; }",
         "async function f(){}",
         "var f = async function(){};",
+    ] {
+        refused_unsupported(source);
+    }
+}
+
+/// Continued post-ES5 refusals: template literals, destructuring patterns and
+/// the function-parameter extensions.
+#[test]
+fn modern_forms_are_rejected_group_2() {
+    for source in [
         "`hi`;",
         "tag`hi`;",
         "var {a} = b;",
@@ -391,17 +424,34 @@ fn modern_forms_are_rejected() {
         "function f(...a){ return a; }",
         "function f([a]){ return a; }",
         "f(...a);",
+    ] {
+        refused_unsupported(source);
+    }
+}
+
+/// Continued post-ES5 refusals: spread/object-literal extensions and the
+/// remaining post-ES5 operators. Exponentiation, binary and compound, is
+/// admitted separately below.
+#[test]
+fn modern_forms_are_rejected_group_3() {
+    for source in [
         "[...a];",
         "var o = {...a};",
-        "for (var x of y) {}",
-        "for (x of y) {}",
-        "2 ** 3;",
-        "x **= 2;",
         "x ?? y;",
         "x &&= y; x ||= y; x ??= y;",
         "a?.b; a?.[b]; a?.();",
         "5n;",
         "var o = {a};",
+    ] {
+        refused_unsupported(source);
+    }
+}
+
+/// Continued post-ES5 refusals: object-literal members, optional catch
+/// bindings, dynamic import and block-nested declarations.
+#[test]
+fn modern_forms_are_rejected_group_4() {
+    for source in [
         "var o = {m(){ return 1; }};",
         "var o = {[\"k\"]: 1};",
         "var o = {\"k\": 1, ...rest};",
@@ -410,13 +460,41 @@ fn modern_forms_are_rejected() {
         "import(x);",
         "[...[]];",
         "function f(){ let x = 1; }",
-        "if (a) { class C {} }",
     ] {
         refused_unsupported(source);
     }
-    // The locked parser already rejects `new.target` and `super` outside
-    // methods in scripts; those diagnostics stay rejections without an
-    // admission category.
+}
+
+/// Continued post-ES5 refusal: a class declaration nested in a block.
+#[test]
+fn modern_forms_are_rejected_group_5() {
+    for source in ["if (a) { class C {} }"] {
+        refused_unsupported(source);
+    }
+}
+
+/// Binary exponentiation is admitted through the Micro extension surface.
+/// Its compound `**=` form has its own admission selector below.
+#[test]
+fn binary_exponentiation_source_is_admitted() {
+    admitted("2 ** 3;");
+}
+
+/// Compound exponentiation entered the same Micro extension surface, so the
+/// exact byte-for-byte source formerly refused by group 3 is now admitted.
+#[test]
+fn micro_compound_exponentiation_source_is_admitted() {
+    admitted("x **= 2;");
+}
+
+/// Numeric dense-Array `for-of` is admitted. Unbound names stay a later
+/// lowering error, not an unsupported-syntax refusal. The locked parser
+/// already rejects `new.target` and `super` outside methods in scripts; those
+/// diagnostics stay rejections without an admission category.
+#[test]
+fn for_of_and_parser_controls_are_unchanged() {
+    admitted("for (var x of y) {}");
+    admitted("for (x of y) {}");
     refused("new.target;");
     refused("super.x;");
     refused("super();");
@@ -529,8 +607,8 @@ fn statement_position_functions_track_enclosing_strictness() {
 }
 
 /// Post-ES5 braced Unicode escapes are rejected in every actual identifier
-/// lexeme before the cooked SWC symbol loses the spelling. Fixed four-hex
-/// escapes stay legal wherever the decoded identifier is valid.
+/// lexeme before the cooked SWC symbol loses the spelling: binding and
+/// reference positions stay outside the accepted quoted-string extension.
 #[test]
 fn braced_unicode_identifier_lexemes_are_rejected() {
     for source in [
@@ -541,6 +619,18 @@ fn braced_unicode_identifier_lexemes_are_rejected() {
         "\\u{41}++;",
         "for (\\u{41} in obj) {}",
         "function \\u{41}(){}",
+    ] {
+        let error = refused_unsupported(source);
+        check_span(source, &error);
+    }
+}
+
+/// The same refusal for parameter, catch, member, property-name and label
+/// identifier lexemes. These are identifiers, never quoted strings, so the
+/// Micro braced string escape does not admit them.
+#[test]
+fn braced_unicode_identifier_lexemes_are_rejected_in_member_positions() {
+    for source in [
         "function f(\\u{41}){}",
         "try{}catch(\\u{41}){}",
         "x.\\u{41};",
@@ -552,7 +642,12 @@ fn braced_unicode_identifier_lexemes_are_rejected() {
         let error = refused_unsupported(source);
         check_span(source, &error);
     }
-    // Fixed ES5 escapes remain allowed, including reserved property names.
+}
+
+/// Fixed four-hex escapes stay legal wherever the decoded identifier is
+/// valid, including reserved property names.
+#[test]
+fn fixed_unicode_identifier_escapes_stay_admitted() {
     admitted("var \\u0041=1;");
     admitted("var A=1; var x=A; x;");
     admitted("x.\\u0041; x.\\u006c\\u0065\\u0074;");
@@ -827,8 +922,8 @@ fn codec_invalid_octal_lookaheads_rejected() {
     }
 }
 
-/// Hex and Unicode escapes consume exactly 2/4 hex digits and emit the u16
-/// directly, preserving lone surrogates; braced escapes are post-ES5.
+/// Hex and fixed Unicode escapes consume exactly 2/4 hex digits and emit the
+/// u16 directly, preserving lone surrogates; an escaped backslash is text.
 #[test]
 fn codec_hex_and_unicode_escapes() {
     assert_eq!(decoded_ok("\"\\x41\"", false), vec![0x41]);
@@ -841,6 +936,16 @@ fn codec_hex_and_unicode_escapes() {
         decoded_ok("\"\\uD834\\uDD1E\"", false),
         vec![0xD834, 0xDD1E]
     );
+    // An escaped backslash stays ordinary text: `\\u{...}` is six text units.
+    assert_eq!(
+        decoded_ok("\"\\\\u{41}\"", false),
+        vec![0x5C, 0x75, 0x7B, 0x34, 0x31, 0x7D]
+    );
+}
+
+/// Truncated and non-hex fixed hex/Unicode escapes stay lexical errors.
+#[test]
+fn codec_hex_and_unicode_malformed() {
     for raw in [
         "\"\\x4\"",
         "\"\\xZZ\"",
@@ -852,20 +957,70 @@ fn codec_hex_and_unicode_escapes() {
         let (kind, _, _) = decoded_err_kind(raw, false);
         assert_eq!(kind, StringCodecErrorKind::Lexical, "for {raw:?}");
     }
-    for strict in [false, true] {
-        let (kind, offset, message) = decoded_err_kind("\"\\u{41}\"", strict);
-        assert_eq!(kind, StringCodecErrorKind::PostEs5, "braced is post-ES5");
-        assert_eq!(offset, 1);
-        assert!(
-            message.contains("braced"),
-            "braced guard wording, got: {message}"
-        );
-    }
-    // An escaped backslash stays ordinary text: `\\u{...}` is six text units.
+}
+
+/// Micro braced Unicode escapes in sloppy code: one unit at or below
+/// U+FFFF (lone surrogates kept raw) and a surrogate pair above it,
+/// including the fixed-quickjs-upstream `\u{101234}` spelling.
+#[test]
+fn codec_braced_unicode_escapes_sloppy() {
+    assert_eq!(decoded_ok("\"\\u{0}\"", false), vec![0x0000]);
+    assert_eq!(decoded_ok("\"\\u{61}\"", false), vec![0x0061]);
+    assert_eq!(decoded_ok("\"\\u{20ac}\"", false), vec![0x20AC]);
+    assert_eq!(decoded_ok("\"\\u{10000}\"", false), vec![0xD800, 0xDC00]);
+    assert_eq!(decoded_ok("\"\\u{10ffff}\"", false), vec![0xDBFF, 0xDFFF]);
+    assert_eq!(decoded_ok("\"\\u{d800}\"", false), vec![0xD800]);
+    assert_eq!(decoded_ok("\"\\u{dfff}\"", false), vec![0xDFFF]);
+    assert_eq!(decoded_ok("\"\\u{101234}\"", false), vec![0xDBC4, 0xDE34]);
+}
+
+/// The same braced spellings decode identically in strict code: the Micro
+/// extension is a spelling rule, not a strictness mode.
+#[test]
+fn codec_braced_unicode_escapes_strict() {
+    assert_eq!(decoded_ok("\"\\u{0}\"", true), vec![0x0000]);
+    assert_eq!(decoded_ok("\"\\u{61}\"", true), vec![0x0061]);
+    assert_eq!(decoded_ok("\"\\u{20ac}\"", true), vec![0x20AC]);
+    assert_eq!(decoded_ok("\"\\u{10000}\"", true), vec![0xD800, 0xDC00]);
+    assert_eq!(decoded_ok("\"\\u{10ffff}\"", true), vec![0xDBFF, 0xDFFF]);
+    assert_eq!(decoded_ok("\"\\u{d800}\"", true), vec![0xD800]);
+    assert_eq!(decoded_ok("\"\\u{dfff}\"", true), vec![0xDFFF]);
+    assert_eq!(decoded_ok("\"\\u{101234}\"", true), vec![0xDBC4, 0xDE34]);
+}
+
+/// Braced spellings share the ordinary token loop: leading zeros are plain
+/// digits (no digit-count cap), uppercase hex is accepted, content after the
+/// closing brace continues normally, and escaped backslashes/separators are
+/// never reinterpreted.
+#[test]
+fn codec_braced_unicode_escape_spellings() {
+    assert_eq!(decoded_ok("\"\\u{000061}\"", false), vec![0x61]);
+    assert_eq!(decoded_ok("\"\\u{20AC}\"", true), vec![0x20AC]);
+    assert_eq!(decoded_ok("\"\\u{61}x\"", false), vec![0x61, 0x78]);
     assert_eq!(
-        decoded_ok("\"\\\\u{41}\"", false),
-        vec![0x5C, 0x75, 0x7B, 0x34, 0x31, 0x7D]
+        decoded_ok("\"\\\\u{61}\"", false),
+        vec![0x5C, 0x75, 0x7B, 0x36, 0x31, 0x7D]
     );
+    assert_eq!(decoded_ok("\"\\u{2028}\"", false), vec![0x2028]);
+    assert_eq!(decoded_ok("\"\\u{2029}\"", true), vec![0x2029]);
+}
+
+/// Malformed braced escapes are lexical errors at the escape's own backslash
+/// (the raw token includes the opening quote, so the offset is 1).
+#[test]
+fn codec_braced_unicode_malformed_rejected() {
+    for raw in [
+        "\"\\u{}\"",
+        "\"\\u{gg}\"",
+        "\"\\u{110000}\"",
+        "\"\\u{61\"",
+        "\"\\u{00_61}\"",
+        "\"\\u{-1}\"",
+    ] {
+        let (kind, offset, _) = decoded_err_kind(raw, false);
+        assert_eq!(kind, StringCodecErrorKind::Lexical, "for {raw:?}");
+        assert_eq!(offset, 1, "escape backslash offset for {raw:?}");
+    }
 }
 
 /// Line continuations contribute nothing; unescaped line terminators and
@@ -925,6 +1080,22 @@ fn codec_unit_bound_is_a_resource_error() {
     assert!(message.contains("16384"), "bound wording, got: {message}");
 }
 
+/// Braced astral escapes count two units each against the unchanged
+/// 16384-unit literal bound: 8192 fit exactly, 8193 are the same resource
+/// refusal as any other oversized literal.
+#[test]
+fn codec_braced_astral_bound_is_the_existing_16384_units() {
+    let astral = "\\u{10000}".repeat(8192);
+    assert_eq!(
+        decoded_ok(&format!("\"{astral}\""), false).len(),
+        super::string_literal::MAX_LITERAL_UTF16_UNITS
+    );
+    let over = "\\u{10000}".repeat(8193);
+    let (kind, _, message) = decoded_err_kind(&format!("\"{over}\""), false);
+    assert_eq!(kind, StringCodecErrorKind::Oversize);
+    assert!(message.contains("16384"), "bound wording, got: {message}");
+}
+
 /// Codec offsets narrow to the offending escape inside the token span.
 #[test]
 fn codec_span_narrowing_stays_inside_the_token() {
@@ -936,27 +1107,33 @@ fn codec_span_narrowing_stays_inside_the_token() {
     assert!(clamped.lo.0 < clamped.hi.0 && clamped.hi.0 <= 110);
 }
 
-/// Post-ES5 braced escapes are rejected in every string token position the
-/// admission walk visits, with the grammar-stage unsupported category.
+/// Micro braced escapes are accepted in every quoted string token position
+/// the admission walk visits (values, directives and unlowered bodies).
 #[test]
-fn braced_escapes_rejected_in_all_string_positions() {
+fn braced_escapes_admitted_in_value_positions() {
     for source in [
         "var s = \"\\u{41}\";",
         "\"\\u{41}\";",
         "function f(){ \"\\u{41}\"; }",
         "if (1) { \"\\u{41}\"; }",
+    ] {
+        admitted(source);
+    }
+}
+
+/// The same accepted spelling in loop, property-key and member-key
+/// positions (grammar admission only; the infinite `while (1)` is never
+/// executed here).
+#[test]
+fn braced_escapes_admitted_in_key_and_loop_positions() {
+    for source in [
         "while (1) { \"\\u{41}\"; }",
         "({\"\\u{41}\":1});",
         "var o = {a:1}; o[\"\\u{41}\"];",
         "var o = {a:1}; o[\"\\u{41}\"] = 2;",
         "switch (1) { case \"\\u{41}\": 2; }",
     ] {
-        let error = refused_unsupported(source);
-        assert!(
-            error.message.contains("braced"),
-            "braced guard wording for {source:?}, got: {error:?}"
-        );
-        check_span(source, &error);
+        admitted(source);
     }
 }
 
@@ -1022,4 +1199,72 @@ fn string_strictness_follows_resolved_code() {
     admitted("(\"use strict\"); var s = \"\\01\";");
     admitted("1; \"use strict\"; var s = \"\\01\";");
     admitted("function f(){ \"use strict\"; } var s = \"\\01\";");
+}
+
+#[test]
+fn p7_ceq_has_property_projects_only_numeric_tag() {
+    use vm::{BuiltinFunction, Expr, SourcePlugin, Stmt, TypeSchema};
+    let catalog = crate::runtime::cli::reference_array_cli_effective_catalog();
+    let context = vm::SourceFrontendContext {
+        source_id: SOURCE_ID,
+        original_path: None,
+        phase: vm::compiler::ParsePhase::Standalone,
+        host_api_catalog: Some(&catalog),
+        imports: &[],
+    };
+    let ir = super::JAVASCRIPT_ES5_PLUGIN.parse_source(
+        "var p={x:1};var o=Object.create(p);var a=o.x===1;var b=\"x\" in o;var c=Object.getOwnPropertyDescriptor(o,\"x\")===undefined;a&&b&&c;",
+        &context,
+    ).unwrap();
+    let declaration = ir
+        .functions
+        .iter()
+        .find(|f| f.name == "__compat_es5_has_property")
+        .unwrap();
+    assert_eq!(declaration.return_schema, Some(TypeSchema::Bool));
+    assert_eq!(declaration.arity, 3);
+    let body = &ir.function_impls[&declaration.index];
+    let condition = body
+        .body_stmts
+        .iter()
+        .find_map(|s| match s {
+            Stmt::While { condition, .. } => Some(condition),
+            _ => None,
+        })
+        .expect("actual prototype traversal");
+    let Expr::And(found, tag_test) = condition else {
+        panic!("short-circuit loop condition")
+    };
+    assert!(
+        matches!(found.as_ref(), Expr::IfElse { condition, then_expr, else_expr }
+        if matches!(condition.as_ref(), Expr::Var(_))
+        && matches!(then_expr.as_ref(), Expr::Bool(false))
+        && matches!(else_expr.as_ref(), Expr::Bool(true)))
+    );
+    let Expr::Eq(left, right) = tag_test.as_ref() else {
+        panic!("tag comparison")
+    };
+    let Expr::Div(tag, one) = left.as_ref() else {
+        panic!("numeric Get projection")
+    };
+    assert!(matches!(one.as_ref(), Expr::Float(n) if *n == 1.0));
+    let Expr::Call(get, _, args, _, _) = tag.as_ref() else {
+        panic!("actual tag producer")
+    };
+    assert_eq!(*get, BuiltinFunction::Get.call_index());
+    assert!(matches!(&args[0], Expr::Borrow(_)));
+    assert!(matches!(&args[1], Expr::String(name) if name == "tag"));
+    assert!(matches!(right.as_ref(), Expr::Div(code, one)
+        if matches!(code.as_ref(), Expr::Int(5)) && matches!(one.as_ref(), Expr::Float(n) if *n == 1.0)));
+    // Do not manufacture a boxed-true Get comparison for a Bool metadata flag.
+    let Stmt::While { body: step, .. } = body
+        .body_stmts
+        .iter()
+        .find(|s| matches!(s, Stmt::While { .. }))
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    assert!(step.iter().any(|s| matches!(s, Stmt::Assign { expr: Expr::Call(get, _, args, _, _), .. }
+        if *get == BuiltinFunction::Get.call_index() && matches!(&args[1], Expr::String(name) if name == "found"))));
 }

@@ -5,6 +5,13 @@ pub mod runtime;
 mod source_loader;
 mod typescript;
 
+pub use javascript::analysis::{
+    JavaScriptEs5Analysis, JavaScriptEs5ProjectionUnavailable, analyze_javascript_es5_at_path,
+};
+pub use javascript::cli::{
+    compile_javascript_es5_source, javascript_es5_cli_compile_options,
+    javascript_es5_cli_host_services,
+};
 pub use javascript::{
     JAVASCRIPT_ES5_PLUGIN, JavaScriptEs5Plugin, javascript_es5_compile_options,
     javascript_es5_flavor,

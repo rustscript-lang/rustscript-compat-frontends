@@ -92,10 +92,23 @@ fn validate_expression(
                 for (index, (argument, parameter)) in
                     args.iter().zip(resolution.params.iter()).enumerate()
                 {
-                    if expression_schema(argument, typed).is_some_and(|actual| {
-                        schema_requires_numeric_narrowing(&actual, &parameter.schema, typed, 0)
+                    let actual = expression_schema(argument, typed);
+                    if actual.as_ref().is_some_and(|actual| {
+                        schema_requires_numeric_narrowing(actual, &parameter.schema, typed, 0)
                     }) {
                         return Err(numeric_abi_error(
+                            typed,
+                            source_id,
+                            *semantic_id,
+                            &resolution.name,
+                            index,
+                            &parameter.schema,
+                        ));
+                    }
+                    if host_parameter_requires_proof(&parameter.schema)
+                        && !host_argument_proven(actual.as_ref(), typed, 0)
+                    {
+                        return Err(host_argument_proof_error(
                             typed,
                             source_id,
                             *semantic_id,
@@ -208,6 +221,34 @@ fn validate_expression(
         Expr::ResultQuery { value, .. } | Expr::ResultTry { value, .. } => {
             validate_expression(value, typed, source_id)?;
         }
+        Expr::ResultConvert { value, .. } => {
+            validate_expression(value, typed, source_id)?;
+        }
+        Expr::ResultMethod {
+            receiver, argument, ..
+        }
+        | Expr::OptionMethod {
+            receiver, argument, ..
+        } => {
+            validate_expression(receiver, typed, source_id)?;
+            validate_expression(argument, typed, source_id)?;
+        }
+        Expr::OptionConstruct { payload, .. } => {
+            if let Some(payload) = payload {
+                validate_expression(payload, typed, source_id)?;
+            }
+        }
+        Expr::OptionMatch {
+            value,
+            some_expr,
+            none_expr,
+            ..
+        } => {
+            validate_expression(value, typed, source_id)?;
+            validate_expression(some_expr, typed, source_id)?;
+            validate_expression(none_expr, typed, source_id)?;
+        }
+        Expr::Unit => {}
     }
     Ok(())
 }
@@ -233,6 +274,86 @@ fn numeric_abi_error(
     parameter_index: usize,
     expected: &TypeSchema,
 ) -> CompileError {
+    call_site_error(
+        typed,
+        source_id,
+        semantic_id,
+        format!(
+            "TypeScript numeric ABI: argument {} of host function '{name}' has no concrete proof for {expected:?}",
+            parameter_index + 1
+        ),
+    )
+}
+
+/// Fail-closed companion to [`numeric_abi_error`]: a resolved host call whose
+/// argument has no frontend type proof at all (`None`), resolves to
+/// [`TypeSchema::Unknown`], or is still an unbound generic parameter cannot
+/// cross a concrete host scalar boundary. The raw catalog callback receives
+/// the carrier value unchanged, so the frontend has to state the argument type
+/// before the call can be imported.
+fn host_argument_proof_error(
+    typed: &FrontendTypedIr<'_>,
+    source_id: u32,
+    semantic_id: Option<vm::compiler::ir::SemanticNodeId>,
+    name: &str,
+    parameter_index: usize,
+    expected: &TypeSchema,
+) -> CompileError {
+    call_site_error(
+        typed,
+        source_id,
+        semantic_id,
+        format!(
+            "TypeScript host ABI: argument {} of host function '{name}' has no frontend type proof for concrete host parameter type {expected:?}",
+            parameter_index + 1
+        ),
+    )
+}
+
+/// Host parameters whose catalog contract is a concrete scalar value. Only
+/// resolved host call sites are classified here, and structural contracts
+/// (named structs, objects, arrays, maps, callables, results, optionals and
+/// resources) keep their existing handling instead of being collapsed onto a
+/// scalar check.
+fn host_parameter_requires_proof(schema: &TypeSchema) -> bool {
+    matches!(
+        schema,
+        TypeSchema::Int
+            | TypeSchema::Float
+            | TypeSchema::Number
+            | TypeSchema::Bool
+            | TypeSchema::String
+            | TypeSchema::Bytes
+    )
+}
+
+/// A concrete host scalar argument is proven only when the frontend carries a
+/// concrete schema for the expression. Missing schemas and `Unknown` are
+/// refused rather than admitted, and named aliases are expanded (bounded)
+/// first so an alias of `Unknown` cannot launder an unproven value.
+fn host_argument_proven(
+    actual: Option<&TypeSchema>,
+    typed: &FrontendTypedIr<'_>,
+    depth: usize,
+) -> bool {
+    if depth >= 48 {
+        return false;
+    }
+    match actual {
+        None | Some(TypeSchema::Unknown | TypeSchema::GenericParam(_)) => false,
+        Some(schema @ TypeSchema::Named(_, _)) => expand_named(schema, typed)
+            .is_some_and(|expanded| host_argument_proven(Some(&expanded), typed, depth + 1)),
+        Some(TypeSchema::Optional(inner)) => host_argument_proven(Some(&**inner), typed, depth + 1),
+        Some(_) => true,
+    }
+}
+
+fn call_site_error(
+    typed: &FrontendTypedIr<'_>,
+    source_id: u32,
+    semantic_id: Option<vm::compiler::ir::SemanticNodeId>,
+    detail: String,
+) -> CompileError {
     let site = semantic_id
         .and_then(|id| call_site(typed, id))
         .filter(|site| site.expr_span.source_id == source_id);
@@ -249,10 +370,7 @@ fn numeric_abi_error(
             .source_map
             .and_then(|map| map.file_name(source_id))
             .map(str::to_owned),
-        detail: format!(
-            "TypeScript numeric ABI: argument {} of host function '{name}' has no concrete proof for {expected:?}",
-            parameter_index + 1
-        ),
+        detail,
         span,
     }
 }
@@ -532,6 +650,10 @@ fn host_type_schema(schema: &vm::HostTypeSchema) -> TypeSchema {
             ok: Box::new(host_type_schema(ok)),
             err: Box::new(host_type_schema(err)),
         },
+        vm::HostTypeSchema::Unit => TypeSchema::Unit,
+        vm::HostTypeSchema::Option(inner) => {
+            TypeSchema::Option(Box::new(host_type_schema(inner)))
+        }
     }
 }
 
@@ -584,8 +706,10 @@ fn substitute(
             ok: Box::new(substitute(ok, bindings)),
             err: Box::new(substitute(err, bindings)),
         },
+        TypeSchema::Option(inner) => TypeSchema::Option(Box::new(substitute(inner, bindings))),
         TypeSchema::Unknown
         | TypeSchema::Null
+        | TypeSchema::Unit
         | TypeSchema::Int
         | TypeSchema::Float
         | TypeSchema::Number

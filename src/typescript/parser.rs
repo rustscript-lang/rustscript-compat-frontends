@@ -351,7 +351,10 @@ fn generic_params_in_schema(schema: &TypeSchema) -> Vec<String> {
                     ordered.push(name.clone());
                 }
             }
-            TypeSchema::Optional(inner) | TypeSchema::Array(inner) | TypeSchema::Map(inner) => {
+            TypeSchema::Optional(inner)
+            | TypeSchema::Option(inner)
+            | TypeSchema::Array(inner)
+            | TypeSchema::Map(inner) => {
                 visit(inner, seen, ordered);
             }
             TypeSchema::Named(_, arguments) | TypeSchema::ArrayTuple(arguments) => {
@@ -384,6 +387,7 @@ fn generic_params_in_schema(schema: &TypeSchema) -> Vec<String> {
             }
             TypeSchema::Unknown
             | TypeSchema::Null
+            | TypeSchema::Unit
             | TypeSchema::Int
             | TypeSchema::Float
             | TypeSchema::Number
@@ -411,6 +415,9 @@ fn substitute_type_schema(
             .unwrap_or_else(|| schema.clone()),
         TypeSchema::Optional(inner) => {
             TypeSchema::Optional(Box::new(substitute_type_schema(inner, bindings)))
+        }
+        TypeSchema::Option(inner) => {
+            TypeSchema::Option(Box::new(substitute_type_schema(inner, bindings)))
         }
         TypeSchema::Named(name, args) => TypeSchema::Named(
             name.clone(),
@@ -456,6 +463,7 @@ fn substitute_type_schema(
         },
         TypeSchema::Unknown
         | TypeSchema::Null
+        | TypeSchema::Unit
         | TypeSchema::Int
         | TypeSchema::Float
         | TypeSchema::Number
@@ -469,6 +477,9 @@ fn substitute_type_schema(
 pub(crate) fn schema_value_type(schema: &TypeSchema) -> vm::ValueType {
     match schema {
         TypeSchema::Null => vm::ValueType::Null,
+        // Unit's physical carrier is the internal Null value. The logical
+        // type stays TypeSchema::Unit everywhere a schema is preserved.
+        TypeSchema::Unit => vm::ValueType::Null,
         TypeSchema::Int => vm::ValueType::Int,
         TypeSchema::Float => vm::ValueType::Float,
         TypeSchema::Bool => vm::ValueType::Bool,
@@ -479,6 +490,7 @@ pub(crate) fn schema_value_type(schema: &TypeSchema) -> vm::ValueType {
         }
         TypeSchema::Map(_) | TypeSchema::Object(_) | TypeSchema::Named(_, _) => vm::ValueType::Map,
         TypeSchema::Result { .. } => vm::ValueType::Map,
+        TypeSchema::Option(_) => vm::ValueType::Map,
         TypeSchema::Callable { .. } => vm::ValueType::Callable,
         TypeSchema::Number
         | TypeSchema::Unknown
@@ -694,7 +706,8 @@ fn collect_host_named_type_names(schema: &vm::HostTypeSchema, names: &mut HashSe
     match schema {
         vm::HostTypeSchema::Array(inner)
         | vm::HostTypeSchema::Map(inner)
-        | vm::HostTypeSchema::Optional(inner) => collect_host_named_type_names(inner, names),
+        | vm::HostTypeSchema::Optional(inner)
+        | vm::HostTypeSchema::Option(inner) => collect_host_named_type_names(inner, names),
         vm::HostTypeSchema::Callable { params, result } => {
             for param in params {
                 collect_host_named_type_names(param, names);
@@ -713,6 +726,7 @@ fn collect_host_named_type_names(schema: &vm::HostTypeSchema, names: &mut HashSe
         }
         vm::HostTypeSchema::Unknown
         | vm::HostTypeSchema::Null
+        | vm::HostTypeSchema::Unit
         | vm::HostTypeSchema::Int
         | vm::HostTypeSchema::Float
         | vm::HostTypeSchema::Number
@@ -1348,6 +1362,12 @@ pub(crate) struct Lowerer<'a> {
     /// result-typed values resolve to their exact representation without
     /// name-based privileges for user shapes.
     pub(crate) gen_results: HashMap<String, String>,
+    /// Private numeric-record carriers minted by this unit, keyed by their
+    /// hygienic nominal. Membership is proof of generation: a user
+    /// declaration racing a hygienic name fails as a duplicate instead of
+    /// inheriting carrier privileges.
+    pub(crate) record_carriers:
+        HashMap<String, super::record_lowering::RowCarrier>,
     /// Module-level `const` initializers lowered so far (name to initializer
     /// AST plus declared/inferred schema), in source order. Powers
     /// pure-constant capture for isolated function bodies; shadowing, order
@@ -1439,10 +1459,21 @@ impl<'a> Lowerer<'a> {
         &self,
         annotation: &ast::TsType,
         span: swc_common::Span,
+        carrier_eligible: bool,
     ) -> Option<TypeSchema> {
-        self.lower_type(annotation)
-            .ok()
-            .map(|schema| self.ref_map_number_array(schema, span))
+        let schema = self.lower_type(annotation).ok()?;
+        let schema = self.ref_map_number_array(schema, span);
+        // A homogeneous required-numeric row is declared as the private
+        // carrier before its body lowers, so recursive and forward calls
+        // observe the same identity later calls do. Exported signatures keep
+        // the logical row: a carrier never crosses a module or export
+        // boundary, so their geometry must not depend on it.
+        if carrier_eligible
+            && let Some(row) = super::record_lowering::qualify(self, &schema)
+        {
+            return Some(row.schema());
+        }
+        Some(schema)
     }
 
     /// Module function schemas by name: the lowered `FunctionDecl` once its
@@ -1702,6 +1733,7 @@ impl<'a> Lowerer<'a> {
             TypeSchema::Optional(inner) | TypeSchema::Array(inner) | TypeSchema::Map(inner) => {
                 Self::schema_contains_named_type(inner, names)
             }
+            TypeSchema::Option(inner) => Self::schema_contains_named_type(inner, names),
             TypeSchema::Named(name, arguments) => {
                 names.contains(name)
                     || arguments
@@ -1732,6 +1764,7 @@ impl<'a> Lowerer<'a> {
             }
             TypeSchema::Unknown
             | TypeSchema::Null
+            | TypeSchema::Unit
             | TypeSchema::Int
             | TypeSchema::Float
             | TypeSchema::Number
@@ -1945,7 +1978,11 @@ impl<'a> Lowerer<'a> {
                 for param in &function.function.params {
                     arg_schemas.push(parameter_binding(&param.pat).and_then(|(ident, _)| {
                         ident.type_ann.as_ref().and_then(|annotation| {
-                            self.predeclared_annotation(&annotation.type_ann, ident.id.span)
+                            self.predeclared_annotation(
+                                &annotation.type_ann,
+                                ident.id.span,
+                                !exported,
+                            )
                         })
                     }));
                 }
@@ -1954,7 +1991,7 @@ impl<'a> Lowerer<'a> {
                     .return_type
                     .as_ref()
                     .and_then(|annotation| {
-                        self.predeclared_annotation(&annotation.type_ann, annotation.span)
+                        self.predeclared_annotation(&annotation.type_ann, annotation.span, !exported)
                     });
                 self.predeclared_signatures
                     .insert(name.clone(), (arg_schemas, return_schema));
@@ -2026,12 +2063,16 @@ impl<'a> Lowerer<'a> {
                     for pat in &arrow.params {
                         arg_schemas.push(parameter_binding(pat).and_then(|(ident, _)| {
                             ident.type_ann.as_ref().and_then(|annotation| {
-                                self.predeclared_annotation(&annotation.type_ann, ident.id.span)
+                                self.predeclared_annotation(
+                                    &annotation.type_ann,
+                                    ident.id.span,
+                                    !exported,
+                                )
                             })
                         }));
                     }
                     let return_schema = arrow.return_type.as_ref().and_then(|annotation| {
-                        self.predeclared_annotation(&annotation.type_ann, annotation.span)
+                        self.predeclared_annotation(&annotation.type_ann, annotation.span, !exported)
                     });
                     self.predeclared_signatures
                         .insert(name.clone(), (arg_schemas, return_schema));
@@ -2238,6 +2279,23 @@ impl<'a> Lowerer<'a> {
         body_span: swc_common::Span,
         declared_return: Option<TypeSchema>,
     ) -> Result<(Vec<Stmt>, Expr, u32), ParseError> {
+        // A carrier return under a declaration that is not the carrier (the
+        // exported logical row, or no declaration at all) cannot be staged
+        // in the hidden result cell: this transform has no carrier-return
+        // path, so refuse exactly like the straight-line return lowering
+        // instead of emitting a carrier behind a logical declaration.
+        if !declared_return
+            .as_ref()
+            .is_some_and(super::record_lowering::is_carrier_schema)
+            && let Some(span) = self.carrier_return_span(&stmts)
+        {
+            return Err(unsupported(
+                span,
+                self.base,
+                self.source_id,
+                "record carrier return value",
+            ));
+        }
         let mut valued_schemas: Vec<Option<TypeSchema>> = Vec::new();
         let mut bare_count = 0usize;
         let mut last_return_span: Option<swc_common::Span> = None;
@@ -3127,6 +3185,15 @@ impl<'a> Lowerer<'a> {
             }
             let schema = self.lower_type(&annotation.type_ann)?;
             let schema = self.ref_map_number_array(schema, binding.id.span);
+            // Homogeneous required-numeric row formals are the private
+            // carrier, so a guest call passes carrier identity and never
+            // copies. Exported signatures keep the logical row: a carrier
+            // never crosses an export or module boundary.
+            let schema = if exported {
+                schema
+            } else {
+                self.record_carrier_schema(schema, binding.id.span)?
+            };
             let slot = self.next_slot;
             self.next_slot = self.next_slot.checked_add(1).ok_or_else(|| {
                 unsupported(
@@ -3165,6 +3232,14 @@ impl<'a> Lowerer<'a> {
                     .map(|schema| self.ref_map_number_array(schema, annotation.span))
             })
             .transpose()?;
+        // The same carrier identity for returns: an un-exported function
+        // that declares a qualifying row returns the carrier, so its callers
+        // share the row instead of copying it.
+        if !exported
+            && let Some(schema) = return_schema.take()
+        {
+            return_schema = Some(self.record_carrier_schema(schema, function.ident.span)?);
+        }
         // Reference-array mode: an un-annotated function whose body
         // returns a carrier (like the upstream QuickSort shape) records
         // the physical carrier as its return schema so callers alias the
@@ -3230,7 +3305,9 @@ impl<'a> Lowerer<'a> {
                         byte_span(ret.span, self.base, self.source_id).lo,
                     );
                     body_expr = match ret.arg.as_ref() {
-                        Some(value) => self.lower_expr((**value).clone())?,
+                        Some(value) => {
+                            self.record_return_value(value, return_schema.as_ref())?
+                        }
                         None => Expr::Null,
                     };
                     returned = true;
@@ -4218,6 +4295,29 @@ impl<'a> Lowerer<'a> {
                     ));
                 }
             }
+            // A concrete scalar annotation states the runtime value domain of
+            // the slot, so it may only be published when the initializer
+            // itself proves a compatible value type: its own statically known
+            // schema, or the element proof a computed read carries. An
+            // annotation is not a value proof. An unknown alias has no schema
+            // of its own, and a dynamic element read over a structurally typed
+            // record yields the union of that record's field types. Publishing
+            // either as the annotated scalar would let the unchecked value
+            // cross a typed host boundary while the slot advertises a domain
+            // it never entered. Literals, typed calls, ordinary fields,
+            // homogeneous container reads and literal field names carry a
+            // proof and stay admitted.
+            if let Some(declared) = declared_schema.as_ref()
+                && Self::is_concrete_scalar_schema(declared)
+                && !self.scalar_value_proof(&init, declared)
+            {
+                return Err(ParseError::at_span(
+                    byte_span(binding.id.span, self.base, self.source_id),
+                    format!(
+                        "TypeScript type proof: binding '{name}' declares {declared:?} but its initializer proves no compatible value type"
+                    ),
+                ));
+            }
             let local_type = declared_schema.clone().or(inferred_schema.clone());
             let callable_origin = (!mutable)
                 .then(|| self.immutable_guest_callable_origin(&init))
@@ -4238,8 +4338,18 @@ impl<'a> Lowerer<'a> {
             } else {
                 None
             };
-            let local_type =
+            let mut local_type =
                 local_type.map(|schema| self.ref_map_number_array(schema, binding.id.span));
+            // A homogeneous required-numeric row binding takes the private
+            // carrier: the slot schema is the carrier, and the initializer is
+            // converted at the boundary, so every alias shares one row.
+            let record_row = match local_type.as_ref() {
+                Some(schema) => super::record_lowering::qualify(self, schema),
+                None => None,
+            };
+            if let Some(row) = &record_row {
+                local_type = Some(self.ensure_record_carrier(row, binding.id.span)?);
+            }
             // Reserve the binding while lowering an arrow so recursive references resolve.
             let is_arrow_initializer = matches!(init.as_ref(), ast::Expr::Arrow(_));
             // Module-level `const` initializers are recorded for pure-constant
@@ -4271,12 +4381,39 @@ impl<'a> Lowerer<'a> {
             } else {
                 None
             };
+            let record_init_span = init.span();
+            let record_init_is_carrier = self
+                .expression_schema(&init)
+                .as_ref()
+                .is_some_and(super::record_lowering::is_carrier_schema);
+            let record_init_literal = record_row
+                .as_ref()
+                .is_some_and(|row| self.record_row_literal(&init, row));
             let expr = self.lower_expr(*init)?;
             let expr = match ref_wrap_span {
                 Some(span) => {
                     self.syn_call(super::array_lowering::HELPER_MAKE, vec![expr], span)?
                 }
                 None => expr,
+            };
+            // The carrier boundary: an already-carrier initializer is a plain
+            // alias share, a plain row literal converts, and any other value
+            // claiming the row is refused instead of being stored under a
+            // carrier schema it does not satisfy.
+            let expr = match &record_row {
+                Some(row) if !record_init_is_carrier => {
+                    if record_init_literal {
+                        self.carrier_from_value(expr, row, record_init_span)?
+                    } else {
+                        return Err(unsupported(
+                            record_init_span,
+                            self.base,
+                            self.source_id,
+                            "record carrier initializer",
+                        ));
+                    }
+                }
+                _ => expr,
             };
             let slot = match slot {
                 Some(slot) => slot,
@@ -4323,9 +4460,22 @@ impl<'a> Lowerer<'a> {
                 scope_id: self.scope_id,
                 decl_order,
             });
+            // An unannotated mutable integer starts with an inferred value,
+            // not an explicit Int declaration. Preserve that initial inference
+            // while allowing Core to infer later stores without a false lock.
+            // Explicit annotations and physical carrier schemas stay declared.
+            let slot_schema = if !self.ref_mode
+                && mutable
+                && declared_schema.is_none()
+                && matches!(local_type.as_ref(), Some(TypeSchema::Int))
+            {
+                None
+            } else {
+                local_type
+            };
             output.push(Stmt::Let {
                 index: slot,
-                declared_schema: local_type,
+                declared_schema: slot_schema,
                 expr,
                 line,
             });
@@ -4438,6 +4588,52 @@ impl<'a> Lowerer<'a> {
                         format!("cannot assign to const binding '{name}'"),
                     ));
                 }
+                // The same publication rule applies to a later assignment: a
+                // slot whose executable type is a concrete scalar cannot store
+                // a value that has no compatible proof, because the stored
+                // value would leave the proven domain while the slot kept
+                // advertising the annotation. A plain `Set` republishes the
+                // whole slot, so every right-hand side needs its own proof,
+                // including an alias that carries none. Compound operators
+                // keep their historical rule and still only guard the direct
+                // computed element read checked before.
+                let rhs_node = Self::initializer_without_parens(&assignment.right);
+                let rhs_direct_computed = match rhs_node {
+                    ast::Expr::Member(member) => {
+                        matches!(&member.prop, ast::MemberProp::Computed(_))
+                    }
+                    _ => false,
+                };
+                if let Some(declared) = self.local_types.get(&name)
+                    && Self::is_concrete_scalar_schema(declared)
+                    && (assignment.op == ast::AssignOp::Assign || rhs_direct_computed)
+                    && !self.scalar_value_proof(&assignment.right, declared)
+                {
+                    return Err(ParseError::at_span(
+                        byte_span(binding.id.span, self.base, self.source_id),
+                        format!(
+                            "TypeScript type proof: assignment to '{name}' declares {declared:?} but its right-hand side proves no compatible value type"
+                        ),
+                    ));
+                }
+                // A carrier-typed local rebinds only through the carrier
+                // boundary: the right-hand side is the same carrier (a plain
+                // alias share) or a plain row literal (a fresh carrier).
+                // Compound operators and any other value claiming the row are
+                // refused instead of republishing the slot under a schema the
+                // stored value does not satisfy.
+                let record_row = self
+                    .local_types
+                    .get(&name)
+                    .and_then(|schema| self.record_carrier_of_schema(schema));
+                if record_row.is_some() && assignment.op != ast::AssignOp::Assign {
+                    return Err(unsupported(
+                        assignment.span,
+                        self.base,
+                        self.source_id,
+                        "compound assignment operator",
+                    ));
+                }
                 let slot = self.capture_slot(source_slot, &name, binding.id.span)?;
                 // Explicit reference-array mode: `+=` on a Number/Float local
                 // lowers to Set with the floating projection (native Float
@@ -4460,10 +4656,27 @@ impl<'a> Lowerer<'a> {
                         .expression_schema(&assignment.right)
                         .as_ref()
                         .is_some_and(Self::is_numeric_schema);
+                // Ordinary public mode: a statically proven numeric `**=` on a
+                // plain local target stores through `Set`. The old value is
+                // read first, the once-lowered right-hand side second, and both
+                // go through the shared ES5 power staging helper. The explicit
+                // reference-array mode and every non-numeric target keep the
+                // historical compound refusal below.
+                let use_numeric_power_assign = !self.ref_mode
+                    && assignment.op == ast::AssignOp::ExpAssign
+                    && self
+                        .local_types
+                        .get(&name)
+                        .is_some_and(Self::is_numeric_schema)
+                    && self
+                        .expression_schema(&assignment.right)
+                        .as_ref()
+                        .is_some_and(Self::is_numeric_schema);
                 let kind = match assignment.op {
                     ast::AssignOp::Assign => AssignmentKind::Set,
                     ast::AssignOp::AddAssign if use_float_addassign => AssignmentKind::Set,
                     ast::AssignOp::AddAssign => AssignmentKind::Add,
+                    ast::AssignOp::ExpAssign if use_numeric_power_assign => AssignmentKind::Set,
                     _ => {
                         return Err(unsupported(
                             assignment.span,
@@ -4476,7 +4689,30 @@ impl<'a> Lowerer<'a> {
                 let rhs_needs_factory = self
                     .expression_schema(&assignment.right)
                     .is_some_and(super::array_lowering::is_logical_number_array);
+                let record_rhs_span = assignment.right.span();
+                let record_rhs_is_carrier = self
+                    .expression_schema(&assignment.right)
+                    .as_ref()
+                    .is_some_and(super::record_lowering::is_carrier_schema);
+                let record_rhs_literal = record_row
+                    .as_ref()
+                    .is_some_and(|row| self.record_row_literal(&assignment.right, row));
                 let value = self.lower_expr(*assignment.right)?;
+                let value = match &record_row {
+                    Some(row) if !record_rhs_is_carrier => {
+                        if record_rhs_literal {
+                            self.carrier_from_value(value, row, record_rhs_span)?
+                        } else {
+                            return Err(unsupported(
+                                record_rhs_span,
+                                self.base,
+                                self.source_id,
+                                "record carrier assignment",
+                            ));
+                        }
+                    }
+                    _ => value,
+                };
                 // Rebinding a reference-array variable to a plain staging
                 // array converts through the owning factory; carrier to
                 // carrier assignment stays a plain rebinding share.
@@ -4496,6 +4732,19 @@ impl<'a> Lowerer<'a> {
                 // with once-only semantics (local target evaluates once).
                 let value = if use_float_addassign {
                     Self::lower_numeric_add(Expr::Var(slot), value)
+                } else if !self.ref_mode && matches!(&kind, AssignmentKind::Add) {
+                    // The kind carries admission metadata; the value must
+                    // already include the ordinary local addition.
+                    Expr::Add(Box::new(Expr::Var(slot)), Box::new(value))
+                } else {
+                    value
+                };
+                // Numeric `**=`: the shared helper binds the slot's old value
+                // before the right-hand side at runtime, so left-to-right
+                // once-only evaluation holds and the outer assignment stays a
+                // plain `Set`.
+                let value = if use_numeric_power_assign {
+                    self.lower_numeric_power(Expr::Var(slot), value, assignment.span)?
                 } else {
                     value
                 };
@@ -4578,12 +4827,30 @@ impl<'a> Lowerer<'a> {
                         )?;
                     }
                     ast::Expr::Member(_) => {
-                        return Err(unsupported(
+                        // Statement-position member update: the
+                        // expression-position path already models
+                        // record-carrier field updates (and indexed
+                        // carrier elements) once-only, so reuse that
+                        // lowering and discard the value through the
+                        // statement-value path. Members it still refuses
+                        // keep the statement-level refusal text.
+                        let base = self.base;
+                        let source_id = self.source_id;
+                        let lowered = self.lower_update_expr(update).map_err(|_| {
+                            unsupported(
+                                update_span,
+                                base,
+                                source_id,
+                                "non-local increment target",
+                            )
+                        })?;
+                        self.push_expr_stmt(
+                            lowered,
+                            Some(TypeSchema::Number),
                             update_span,
-                            self.base,
-                            self.source_id,
-                            "non-local increment target",
-                        ));
+                            line,
+                            output,
+                        )?;
                     }
                     ast::Expr::Ident(ident) => {
                         let name = ident.sym.to_string();
@@ -4659,7 +4926,279 @@ impl<'a> Lowerer<'a> {
         line: u32,
         output: &mut Vec<Stmt>,
     ) -> Result<(), ParseError> {
+        let array_schema = self.expression_schema(&member.obj);
+        // A carrier receiver stores through its `write` closure: base, then
+        // key, then the right-hand side, each evaluated exactly once in that
+        // order. No source slot is re-read and no slot is reassigned, so
+        // every alias observes the write.
+        let carrier_row = array_schema
+            .as_ref()
+            .and_then(|schema| self.record_carrier_of_schema(schema));
+        // A declared field of such a carrier is the same store as a computed
+        // key: the proven field name takes the key position. The name is
+        // staged through a hidden string local exactly like an ordinary record
+        // field read, so the key is dynamic (never a literal-key move) and the
+        // field is shared, not reaped.
+        let ident_field = match &member.prop {
+            ast::MemberProp::Ident(property) if carrier_row.is_some() => {
+                Some(property.sym.to_string())
+            }
+            _ => None,
+        };
+        if let (Some(field), Some(row)) = (ident_field, carrier_row.as_ref()) {
+            // A declared numeric field of the carrier's row is the only
+            // compound target this path knows how to finish: `+=` reads the
+            // current number through `read` and writes the sum through
+            // `write`, both against a base captured once, `-=` uses the very
+            // same staging with the difference stored instead, `*=` stores
+            // the product of the value just read and the lowered right-hand
+            // side in the same slot, `/=` stores the quotient of those same
+            // two numbers, `%=` stores their remainder, and ordinary `**=`
+            // stores the guarded power of those same two numbers. Every
+            // other compound operator, a non-numeric field, a non-numeric
+            // right-hand side and reference-mode `**=` keep the refusal.
+            let field_schema = row.fields.get(&field).cloned();
+            let rhs_schema = self.expression_schema(&right);
+            let numeric_field = field_schema.as_ref().is_some_and(Self::is_numeric_schema);
+            let numeric_rhs = rhs_schema.as_ref().is_some_and(Self::is_numeric_schema);
+            let is_add = op == ast::AssignOp::AddAssign;
+            let is_sub = op == ast::AssignOp::SubAssign;
+            let is_mul = op == ast::AssignOp::MulAssign;
+            let is_div = op == ast::AssignOp::DivAssign;
+            let is_mod = op == ast::AssignOp::ModAssign;
+            let is_exp = op == ast::AssignOp::ExpAssign;
+            let field_is_int = matches!(field_schema, Some(TypeSchema::Int));
+            let rhs_is_int = matches!(rhs_schema, Some(TypeSchema::Int));
+            // `-=`, `*=` and `/=` are lowered only in the plain
+            // representation, where the stored value is an `Expr::Sub` resp.
+            // `Expr::Mul` resp. `Expr::Div` of two numbers. `ref_mode` would
+            // need a float-aware shape that does not exist yet, so a non-Int
+            // field or right-hand side falls through to the refusal below
+            // rather than inventing one.
+            let sub_is_representable = is_sub && (!self.ref_mode || (field_is_int && rhs_is_int));
+            let mul_is_representable = is_mul && (!self.ref_mode || (field_is_int && rhs_is_int));
+            let div_is_representable = is_div && (!self.ref_mode || (field_is_int && rhs_is_int));
+            // A carrier's row is homogeneous and required-numeric by
+            // construction; the check is restated here so `%=` can only ever
+            // land on exactly that shape. Its stored value is the existing
+            // `Expr::Mod` of the value read before the right-hand side and
+            // that side, so no numeric remainder helper is introduced — and
+            // in reference mode a field or right-hand side that is not Int
+            // keeps the refusal rather than inventing a float remainder.
+            let row_is_numeric = row.fields.values().all(Self::is_numeric_schema);
+            let mod_is_representable =
+                is_mod && row_is_numeric && (!self.ref_mode || (field_is_int && rhs_is_int));
+            let exp_is_representable = is_exp && !self.ref_mode;
+            if (is_add
+                || sub_is_representable
+                || mul_is_representable
+                || div_is_representable
+                || mod_is_representable
+                || exp_is_representable)
+                && numeric_field
+                && numeric_rhs
+            {
+                let container = self.lower_expr(*member.obj)?;
+                // The base is captured exactly once: the read and the write
+                // below both address this staged value, and the source
+                // binding is never re-read: the staged slot holds the carrier.
+                let container = match container {
+                    Expr::Borrow(inner) => match *inner {
+                        Expr::Var(slot) => Expr::Var(slot),
+                        other => other,
+                    },
+                    other => other,
+                };
+                let base_slot = self.alloc_hidden_local(member.span)?;
+                let key_slot = self.alloc_hidden_local(member.span)?;
+                // The two closure names are staged in hidden string locals for
+                // the same reason as the field name: the keys stay dynamic, so
+                // no literal-key move reaps the carrier's closures.
+                let read_name_slot = self.alloc_hidden_local(member.span)?;
+                let write_name_slot = self.alloc_hidden_local(member.span)?;
+                let read_slot = self.alloc_hidden_local(member.span)?;
+                let write_slot = self.alloc_hidden_local(member.span)?;
+                let current_slot = self.alloc_hidden_local(member.span)?;
+                let value_slot = self.alloc_hidden_local(member.span)?;
+                let written_slot = self.alloc_hidden_local(member.span)?;
+                // The field name is staged in a hidden string local, exactly
+                // like the plain ident store: the key stays dynamic, so no
+                // literal-key move reaps the carrier field.
+                //
+                // Both closure lookups read the one staged carrier through a
+                // borrow of its slot, the shape `record_cell_read` uses for
+                // its cell, so the first `Get` never moves the local the
+                // second `Get` still needs.
+                let mut stmts = vec![
+                    Stmt::Let {
+                        index: base_slot,
+                        declared_schema: Some(row.schema()),
+                        expr: container,
+                        line,
+                    },
+                    Stmt::Let {
+                        index: key_slot,
+                        declared_schema: Some(TypeSchema::String),
+                        expr: Expr::String(field),
+                        line,
+                    },
+                    Stmt::Let {
+                        index: read_name_slot,
+                        declared_schema: Some(TypeSchema::String),
+                        expr: Expr::String("read".to_owned()),
+                        line,
+                    },
+                    Stmt::Let {
+                        index: write_name_slot,
+                        declared_schema: Some(TypeSchema::String),
+                        expr: Expr::String("write".to_owned()),
+                        line,
+                    },
+                    Stmt::Let {
+                        index: read_slot,
+                        declared_schema: Some(row.read_schema()),
+                        expr: Self::builtin_call(
+                            vm::BuiltinFunction::Get,
+                            vec![
+                                Expr::Borrow(Box::new(Expr::Var(base_slot))),
+                                Expr::Var(read_name_slot),
+                            ],
+                        ),
+                        line,
+                    },
+                    Stmt::Let {
+                        index: write_slot,
+                        declared_schema: Some(row.write_schema()),
+                        expr: Self::builtin_call(
+                            vm::BuiltinFunction::Get,
+                            vec![
+                                Expr::Borrow(Box::new(Expr::Var(base_slot))),
+                                Expr::Var(write_name_slot),
+                            ],
+                        ),
+                        line,
+                    },
+                    Stmt::Let {
+                        index: current_slot,
+                        declared_schema: Some(TypeSchema::Number),
+                        expr: Expr::LocalCall(
+                            read_slot,
+                            Vec::new(),
+                            vec![Expr::Var(key_slot)],
+                            None,
+                        ),
+                        line,
+                    },
+                ];
+                // The right-hand side is evaluated after the read and before
+                // the arithmetic, so the read always observes the pre-update
+                // value.
+                let increment = self.lower_expr(right)?;
+                let updated = if exp_is_representable {
+                    // Ordinary `**=` reuses that staging through the shared
+                    // guarded power helper: the pre-read value is its base.
+                    self.lower_numeric_power(Expr::Var(current_slot), increment, member.span)?
+                } else if is_sub {
+                    // The stored value is the previous value minus the lowered
+                    // right-hand side; no numeric helper is involved.
+                    Expr::Sub(
+                        Box::new(Expr::Var(current_slot)),
+                        Box::new(increment),
+                    )
+                } else if is_mul {
+                    // Multiplication is the plain `Expr::Mul` of the value
+                    // read before the right-hand side and that side, stored
+                    // back through `write`: `+=` and `-=` above are untouched.
+                    Expr::Mul(
+                        Box::new(Expr::Var(current_slot)),
+                        Box::new(increment),
+                    )
+                } else if is_div {
+                    // Division reuses the identical staging: the stored value
+                    // is the plain `Expr::Div` of the value read before the
+                    // right-hand side and that lowered side, written back
+                    // through `write`. No numeric helper is involved and the
+                    // other operators keep their own arithmetic.
+                    Expr::Div(
+                        Box::new(Expr::Var(current_slot)),
+                        Box::new(increment),
+                    )
+                } else if is_mod {
+                    // Remainder reuses that same staging unchanged: the stored
+                    // value is the existing `Expr::Mod` of the value read
+                    // before the right-hand side and that lowered side,
+                    // written back through `write`. `+=`, `-=`, `*=` and `/=`
+                    // keep their own arithmetic.
+                    Expr::Mod(
+                        Box::new(Expr::Var(current_slot)),
+                        Box::new(increment),
+                    )
+                } else if self.ref_mode && !(field_is_int && rhs_is_int) {
+                    Self::lower_numeric_add(Expr::Var(current_slot), increment)
+                } else {
+                    Expr::Add(
+                        Box::new(Expr::Var(current_slot)),
+                        Box::new(increment),
+                    )
+                };
+                stmts.push(Stmt::Let {
+                    index: value_slot,
+                    declared_schema: Some(TypeSchema::Number),
+                    expr: updated,
+                    line,
+                });
+                stmts.push(Stmt::Let {
+                    index: written_slot,
+                    declared_schema: Some(TypeSchema::Number),
+                    expr: Expr::LocalCall(
+                        write_slot,
+                        Vec::new(),
+                        vec![Expr::Var(key_slot), Expr::Var(value_slot)],
+                        None,
+                    ),
+                    line,
+                });
+                let written = Expr::Block {
+                    stmts,
+                    expr: Box::new(Expr::Var(written_slot)),
+                };
+                self.push_expr_stmt(
+                    written,
+                    Some(TypeSchema::Number),
+                    member.span,
+                    line,
+                    output,
+                )?;
+                return Ok(());
+            }
+            if op != ast::AssignOp::Assign {
+                return Err(unsupported(
+                    member.span,
+                    self.base,
+                    self.source_id,
+                    "compound indexed assignment operator",
+                ));
+            }
+            let container = self.lower_expr(*member.obj)?;
+            let key_slot = self.alloc_hidden_local(member.span)?;
+            let key = Expr::Block {
+                stmts: vec![Stmt::Let {
+                    index: key_slot,
+                    declared_schema: Some(TypeSchema::String),
+                    expr: Expr::String(field),
+                    line,
+                }],
+                expr: Box::new(Expr::Var(key_slot)),
+            };
+            let value = self.lower_expr(right)?;
+            let written = self.carrier_write(container, key, value, row, member.span)?;
+            self.push_expr_stmt(written, Some(TypeSchema::Number), member.span, line, output)?;
+            return Ok(());
+        }
         let ast::MemberProp::Computed(property) = member.prop else {
+            // Everything that is not a computed key keeps the refusal below,
+            // except a declared-field write on a record carrier, which is
+            // handled above before the key is destructured.
             return Err(unsupported(
                 member.span,
                 self.base,
@@ -4667,7 +5206,269 @@ impl<'a> Lowerer<'a> {
                 "non-indexed assignment target",
             ));
         };
-        let array_schema = self.expression_schema(&member.obj);
+        if let Some(row) = carrier_row.as_ref() {
+            // Computed `+=`/`-=`/`*=`/`/=`/`%=`/`**=` on a carrier: the key names a
+            // field the compiler cannot resolve statically, so no field lookup
+            // is required — a String-typed key is the only proof available that
+            // the row's read path can see the entry the write creates. Every
+            // other compound operator, and a non-string key, keep the
+            // refusals.
+            let key_is_string = self
+                .expression_schema(&property.expr)
+                .is_some_and(|schema| matches!(schema, TypeSchema::String));
+            let rhs_schema = self.expression_schema(&right);
+            let rhs_is_int = matches!(rhs_schema, Some(TypeSchema::Int));
+            let rhs_is_numeric = rhs_schema.as_ref().is_some_and(Self::is_numeric_schema);
+            let is_sub = op == ast::AssignOp::SubAssign;
+            let is_mul = op == ast::AssignOp::MulAssign;
+            let is_div = op == ast::AssignOp::DivAssign;
+            // A qualified row is already a homogeneous object of required
+            // numeric fields; the check is restated here so `*=` can only
+            // ever land on exactly that carrier shape.
+            let row_is_numeric = row.fields.values().all(Self::is_numeric_schema);
+            // Every field of a qualified carrier is numeric, but only an
+            // all-Int row has a subtraction or multiplication shape in
+            // reference mode: a mixed or Float row, or a non-Int right-hand
+            // side, keeps the refusal rather than inventing a float
+            // subtraction or product.
+            let row_is_int = row
+                .fields
+                .values()
+                .all(|schema| matches!(schema, TypeSchema::Int));
+            let compound_is_representable = !self.ref_mode || (row_is_int && rhs_is_int);
+            let admits_sub = is_sub && compound_is_representable;
+            // `*=` reuses the very same staging: the field is unknown
+            // statically, so the homogeneous numeric row is the whole proof,
+            // and the stored value is the plain `Expr::Mul` of the value read
+            // before the right-hand side and that side.
+            let admits_mul = is_mul && row_is_numeric && compound_is_representable;
+            // `/=` reuses that staging unchanged: a String key plus the
+            // homogeneous numeric row is the whole proof, and a reference-mode
+            // row or right-hand side that is not Int keeps the refusal rather
+            // than inventing a float division shape.
+            let admits_div = is_div && row_is_numeric && compound_is_representable;
+            // `%=` reuses that same staging unchanged. The stored value is the
+            // existing `Expr::Mod` of the value read before the right-hand side
+            // and that lowered side, so no numeric remainder helper is
+            // introduced, and in reference mode a row or right-hand side that
+            // is not Int keeps the refusal rather than inventing a float
+            // remainder shape.
+            let admits_mod =
+                op == ast::AssignOp::ModAssign && row_is_numeric && compound_is_representable;
+            // `**=` reuses that staging unchanged: the existing ordinary
+            // guarded power helper binds the pre-read value and the once-lowered
+            // right-hand side before the write. A numeric right-hand side plus
+            // the homogeneous numeric row is the whole proof, and reference
+            // mode keeps the refusal rather than inventing a float power shape.
+            let admits_exp = op == ast::AssignOp::ExpAssign
+                && !self.ref_mode
+                && row_is_numeric
+                && rhs_is_numeric;
+            if key_is_string
+                && (op == ast::AssignOp::AddAssign
+                    || admits_sub
+                    || admits_mul
+                    || admits_div
+                    || admits_mod
+                    || admits_exp)
+            {
+                // Exactly the declared-field `+=` shape above: the base is
+                // captured once, the key is staged once, both closure names
+                // are staged in hidden string locals, and the read happens
+                // before the right-hand side so the sum starts from the
+                // pre-update value. The source binding is never re-read and
+                // the carrier is never cloned: the write lands in the one
+                // shared cell every alias observes.
+                let container = self.lower_expr(*member.obj)?;
+                let container = match container {
+                    Expr::Borrow(inner) => match *inner {
+                        Expr::Var(slot) => Expr::Var(slot),
+                        other => other,
+                    },
+                    other => other,
+                };
+                let key = self.lower_expr(*property.expr)?;
+                let base_slot = self.alloc_hidden_local(member.span)?;
+                let key_slot = self.alloc_hidden_local(member.span)?;
+                let read_name_slot = self.alloc_hidden_local(member.span)?;
+                let write_name_slot = self.alloc_hidden_local(member.span)?;
+                let read_slot = self.alloc_hidden_local(member.span)?;
+                let write_slot = self.alloc_hidden_local(member.span)?;
+                let current_slot = self.alloc_hidden_local(member.span)?;
+                let value_slot = self.alloc_hidden_local(member.span)?;
+                let written_slot = self.alloc_hidden_local(member.span)?;
+                let mut stmts = vec![
+                    Stmt::Let {
+                        index: base_slot,
+                        declared_schema: Some(row.schema()),
+                        expr: container,
+                        line,
+                    },
+                    Stmt::Let {
+                        index: key_slot,
+                        declared_schema: Some(TypeSchema::String),
+                        expr: key,
+                        line,
+                    },
+                    Stmt::Let {
+                        index: read_name_slot,
+                        declared_schema: Some(TypeSchema::String),
+                        expr: Expr::String("read".to_owned()),
+                        line,
+                    },
+                    Stmt::Let {
+                        index: write_name_slot,
+                        declared_schema: Some(TypeSchema::String),
+                        expr: Expr::String("write".to_owned()),
+                        line,
+                    },
+                    Stmt::Let {
+                        index: read_slot,
+                        declared_schema: Some(row.read_schema()),
+                        expr: Self::builtin_call(
+                            vm::BuiltinFunction::Get,
+                            vec![
+                                Expr::Borrow(Box::new(Expr::Var(base_slot))),
+                                Expr::Var(read_name_slot),
+                            ],
+                        ),
+                        line,
+                    },
+                    Stmt::Let {
+                        index: write_slot,
+                        declared_schema: Some(row.write_schema()),
+                        expr: Self::builtin_call(
+                            vm::BuiltinFunction::Get,
+                            vec![
+                                Expr::Borrow(Box::new(Expr::Var(base_slot))),
+                                Expr::Var(write_name_slot),
+                            ],
+                        ),
+                        line,
+                    },
+                    Stmt::Let {
+                        index: current_slot,
+                        declared_schema: Some(TypeSchema::Number),
+                        expr: Expr::LocalCall(
+                            read_slot,
+                            Vec::new(),
+                            vec![Expr::Var(key_slot)],
+                            None,
+                        ),
+                        line,
+                    },
+                ];
+                let increment = self.lower_expr(right)?;
+                // `-=` stores the previous value minus the lowered right-hand
+                // side and `*=` stores their product, both with the existing
+                // Core arithmetic and no numeric helper involved; `+=`/`-=`
+                // are never turned into a multiplication here. For `+=` the
+                // field type is not statically known, so only an integer
+                // right-hand side keeps the exact integer add; everything
+                // else takes the floating projection in reference-array mode.
+                let updated = if admits_exp {
+                    // Ordinary numeric `**=`: the shared guarded power helper
+                    // stages the pre-read value and the once-lowered right-hand
+                    // side exactly like the plain-local shape; the write below
+                    // still lands in the one shared carrier cell.
+                    self.lower_numeric_power(Expr::Var(current_slot), increment, member.span)?
+                } else if is_sub {
+                    Expr::Sub(
+                        Box::new(Expr::Var(current_slot)),
+                        Box::new(increment),
+                    )
+                } else if is_mul {
+                    Expr::Mul(
+                        Box::new(Expr::Var(current_slot)),
+                        Box::new(increment),
+                    )
+                } else if is_div {
+                    // The stored value is the plain `Expr::Div` of the value
+                    // read before the right-hand side and that lowered side,
+                    // written back through `write`: no numeric division helper
+                    // exists or is invented, and `+=`, `-=`, `*=` keep their
+                    // own arithmetic.
+                    Expr::Div(
+                        Box::new(Expr::Var(current_slot)),
+                        Box::new(increment),
+                    )
+                } else if admits_mod {
+                    // `%=` stores the plain `Expr::Mod` of that same pre-read
+                    // value and the lowered right-hand side: the existing Core
+                    // remainder, evaluated after the right-hand side and
+                    // written back through `write`. The other compound
+                    // operators keep their own arithmetic.
+                    Expr::Mod(
+                        Box::new(Expr::Var(current_slot)),
+                        Box::new(increment),
+                    )
+                } else if self.ref_mode && !rhs_is_int {
+                    Self::lower_numeric_add(Expr::Var(current_slot), increment)
+                } else {
+                    Expr::Add(
+                        Box::new(Expr::Var(current_slot)),
+                        Box::new(increment),
+                    )
+                };
+                stmts.push(Stmt::Let {
+                    index: value_slot,
+                    declared_schema: Some(TypeSchema::Number),
+                    expr: updated,
+                    line,
+                });
+                stmts.push(Stmt::Let {
+                    index: written_slot,
+                    declared_schema: Some(TypeSchema::Number),
+                    expr: Expr::LocalCall(
+                        write_slot,
+                        Vec::new(),
+                        vec![Expr::Var(key_slot), Expr::Var(value_slot)],
+                        None,
+                    ),
+                    line,
+                });
+                let written = Expr::Block {
+                    stmts,
+                    expr: Box::new(Expr::Var(written_slot)),
+                };
+                self.push_expr_stmt(
+                    written,
+                    Some(TypeSchema::Number),
+                    member.span,
+                    line,
+                    output,
+                )?;
+                return Ok(());
+            }
+            if op != ast::AssignOp::Assign {
+                return Err(unsupported(
+                    member.span,
+                    self.base,
+                    self.source_id,
+                    "compound indexed assignment operator",
+                ));
+            }
+            // The row's read path is keyed by field name: a non-string key
+            // would be stored where no read can see it. Keep the precise
+            // refusal instead of writing an unreachable entry.
+            if !self
+                .expression_schema(&property.expr)
+                .is_some_and(|schema| matches!(schema, TypeSchema::String))
+            {
+                return Err(unsupported(
+                    property.expr.span(),
+                    self.base,
+                    self.source_id,
+                    "computed record key",
+                ));
+            }
+            let container = self.lower_expr(*member.obj)?;
+            let key = self.lower_expr(*property.expr)?;
+            let value = self.lower_expr(right)?;
+            let written = self.carrier_write(container, key, value, row, member.span)?;
+            self.push_expr_stmt(written, Some(TypeSchema::Number), member.span, line, output)?;
+            return Ok(());
+        }
         // Reference-array carriers lower indexed writes through the owning
         // dispatcher; the plain Core-array path below never sees one.
         if array_schema
@@ -4724,6 +5525,71 @@ impl<'a> Lowerer<'a> {
             ));
         };
         let slot = self.capture_slot(source_slot, &name, binding.span)?;
+        // Ordinary native `**=` on an indexed element of a plain immutable
+        // `number[]` local. The receiver must be a const binding: a mutable
+        // source slot could be rebound by the right-hand side after the old
+        // element is read, so a staged old base would no longer describe the
+        // slot the store lands in. The item schema is exactly `Number`, the
+        // right side is proven numeric by the existing expression schema,
+        // and reference mode keeps its carrier path above untouched.
+        if op == ast::AssignOp::ExpAssign
+            && !self.ref_mode
+            && !self.mutable_locals.contains(&source_slot)
+            && array_schema.as_ref().is_some_and(|schema| match schema {
+                TypeSchema::Array(item) => matches!(item.as_ref(), TypeSchema::Number),
+                _ => false,
+            })
+            && self
+                .expression_schema(&right)
+                .as_ref()
+                .is_some_and(Self::is_numeric_schema)
+        {
+            // The key is lowered once and bound without a declared schema so
+            // Core keeps its integer inference for the index. The old element
+            // is read through the canonical indexed `Get` callsite before the
+            // right side runs, and the shared power helper binds both operands
+            // and projects them onto the existing float kernel. The final
+            // store consumes the array through the original slot variable and
+            // the lowered result, preserving the alias guard.
+            let key_slot = self.alloc_hidden_local(property.span)?;
+            let key = self.lower_expr(*property.expr)?;
+            let previous = self.canonical_indexed_get(
+                Expr::Var(slot),
+                Expr::Var(key_slot),
+                property.span,
+                member.span,
+            );
+            let increment = self.lower_expr(right)?;
+            let power = self.lower_numeric_power(previous, increment, member.span)?;
+            let result_slot = self.alloc_hidden_local(member.span)?;
+            let updated = Expr::Block {
+                stmts: vec![
+                    Stmt::Let {
+                        index: key_slot,
+                        declared_schema: None,
+                        expr: key,
+                        line,
+                    },
+                    Stmt::Let {
+                        index: result_slot,
+                        declared_schema: Some(TypeSchema::Number),
+                        expr: power,
+                        line,
+                    },
+                ],
+                expr: Box::new(Self::builtin_call(
+                    vm::BuiltinFunction::Set,
+                    vec![Expr::Var(slot), Expr::Var(key_slot), Expr::Var(result_slot)],
+                )),
+            };
+            output.push(Stmt::Assign {
+                kind: AssignmentKind::Set,
+                index: slot,
+                expr: updated,
+                line,
+            });
+            return Ok(());
+        }
         if op != ast::AssignOp::Assign {
             return Err(unsupported(
                 member.span,
@@ -5304,6 +6170,21 @@ impl<'a> Lowerer<'a> {
                 TypeSchema::Object(fields) => fields.get(property).cloned(),
                 TypeSchema::Optional(_) => None,
                 TypeSchema::Named(name, arguments) => {
+                    // A private numeric-record carrier carries its logical row
+                    // as its single type argument: field lookup delegates to
+                    // that row, so a carrier never exposes its physical
+                    // closure fields as guest fields.
+                    if super::record_lowering::is_carrier_name(name) && arguments.len() == 1 {
+                        return find_field(
+                            &arguments[0],
+                            property,
+                            struct_schemas,
+                            named_type_declarations,
+                            named_types,
+                            aliases,
+                            depth + 1,
+                        );
+                    }
                     let declaration = struct_schemas
                         .get(name)
                         .or_else(|| named_type_declarations.get(name))
@@ -5385,6 +6266,166 @@ impl<'a> Lowerer<'a> {
             &self.type_alias_schemas,
             0,
         )
+    }
+
+    /// True when `schema` statically denotes an ordinary typed record: the
+    /// same nominal/alias resolution `schema_field` performs must land on
+    /// `TypeSchema::Object`. Optional, primitive, callable, resource, array
+    /// and generator-protocol nominals stay out, so computed reads keep
+    /// their existing refusals instead of widening the admitted domain.
+    fn is_ordinary_record_schema(&self, schema: &TypeSchema, depth: usize) -> bool {
+        if depth > 32 {
+            return false;
+        }
+        match schema {
+            TypeSchema::Object(_) => true,
+            TypeSchema::Named(name, arguments) => {
+                // A private numeric-record carrier is a physical record of
+                // closures, not a guest record: computed admission must stay
+                // with the carrier's own read closure.
+                if super::record_lowering::is_carrier_name(name) {
+                    return false;
+                }
+                // Generator protocol nominals expose exactly their protocol
+                // fields; a computed read must not bypass that static
+                // restriction, including through a type alias.
+                if self.gen_iterators.contains_key(name) || self.gen_results.contains_key(name) {
+                    return false;
+                }
+                let declaration = self
+                    .struct_schemas
+                    .get(name)
+                    .or_else(|| self.named_type_declarations.get(name))
+                    .or_else(|| {
+                        self.named_types
+                            .iter()
+                            .find_map(|(source_name, alias)| match alias {
+                                TypeSchema::Named(canonical, _) if canonical == name => {
+                                    self.named_type_declarations.get(source_name)
+                                }
+                                _ => None,
+                            })
+                    });
+                if let Some(declaration) = declaration {
+                    if declaration.type_params.len() != arguments.len() {
+                        return false;
+                    }
+                    let bindings = declaration
+                        .type_params
+                        .iter()
+                        .cloned()
+                        .zip(arguments.iter().cloned())
+                        .collect::<HashMap<_, _>>();
+                    let body = substitute_type_schema(&declaration.body_schema, &bindings);
+                    return self.is_ordinary_record_schema(&body, depth + 1);
+                }
+                if let Some((parameters, body)) = self.type_alias_schemas.get(name) {
+                    if parameters.len() != arguments.len() {
+                        return false;
+                    }
+                    let bindings = parameters
+                        .iter()
+                        .cloned()
+                        .zip(arguments.iter().cloned())
+                        .collect::<HashMap<_, _>>();
+                    let body = substitute_type_schema(body, &bindings);
+                    return self.is_ordinary_record_schema(&body, depth + 1);
+                }
+                match self.named_types.get(name) {
+                    Some(expanded) if expanded != schema => {
+                        self.is_ordinary_record_schema(expanded, depth + 1)
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Concrete scalar schemas name exactly one runtime value variant.
+    /// Structural schemas (records, arrays, maps, callables, results,
+    /// optionals and resources) are never collapsed onto this check.
+    fn is_concrete_scalar_schema(schema: &TypeSchema) -> bool {
+        matches!(
+            schema,
+            TypeSchema::Int
+                | TypeSchema::Float
+                | TypeSchema::Number
+                | TypeSchema::Bool
+                | TypeSchema::String
+                | TypeSchema::Bytes
+        )
+    }
+
+    /// A proven initializer type supports a concrete scalar annotation when
+    /// it is the same schema, or when both stay inside the numeric domain
+    /// (`Int`, `Float` and `Number` share one runtime numeric carrier).
+    fn proof_supports_annotation(proof: &TypeSchema, declared: &TypeSchema) -> bool {
+        proof == declared || (Self::is_numeric_schema(proof) && Self::is_numeric_schema(declared))
+    }
+
+    /// Strips redundant parentheses so binding-publication checks see the
+    /// expression the stored value actually comes from.
+    fn initializer_without_parens(expression: &ast::Expr) -> &ast::Expr {
+        let mut expression = expression;
+        while let ast::Expr::Paren(paren) = expression {
+            expression = paren.expr.as_ref();
+        }
+        expression
+    }
+
+    /// Element schema of a computed read, when the frontend can state one.
+    /// Reference-array carriers read checked numbers through their owning
+    /// dispatcher, homogeneous arrays and maps have a single element schema,
+    /// and a literal field name resolves an ordinary record field. A dynamic
+    /// key into a structurally typed record has the union of every field type
+    /// and therefore no concrete element schema.
+    fn computed_element_proof(&self, object: &ast::Expr, key: &ast::Expr) -> Option<TypeSchema> {
+        if self.ref_carrier_of(object) {
+            return Some(TypeSchema::Number);
+        }
+        match self.expression_schema(object)? {
+            TypeSchema::Array(inner) | TypeSchema::Map(inner) => Some(*inner),
+            receiver => {
+                let name = Self::literal_string_property(key)?;
+                self.schema_field(&receiver, &name)
+            }
+        }
+    }
+
+    /// Actual value proof for a concrete scalar publication target. The
+    /// expression's own statically known schema is preferred; a computed
+    /// element read whose receiver has no record schema may still carry an
+    /// element proof (reference-array carriers, homogeneous arrays and maps,
+    /// literal field names). An unknown value proves nothing: neither an
+    /// annotation nor a binding name is a value proof, so a failed proof must
+    /// refuse publication rather than assume the declared domain.
+    fn scalar_value_proof(&self, expression: &ast::Expr, declared: &TypeSchema) -> bool {
+        if self
+            .expression_schema(expression)
+            .is_some_and(|schema| Self::proof_supports_annotation(&schema, declared))
+        {
+            return true;
+        }
+        let ast::Expr::Member(member) = Self::initializer_without_parens(expression) else {
+            return false;
+        };
+        let ast::MemberProp::Computed(key) = &member.prop else {
+            return false;
+        };
+        self.computed_element_proof(&member.obj, key.expr.as_ref())
+            .is_some_and(|proof| Self::proof_supports_annotation(&proof, declared))
+    }
+
+    /// Statically written property name of a computed key, when the key is a
+    /// string literal.
+    fn literal_string_property(key: &ast::Expr) -> Option<String> {
+        match key {
+            ast::Expr::Lit(ast::Lit::Str(value)) => {
+                Some(value.value.to_string_lossy().into_owned())
+            }
+            _ => None,
+        }
     }
 
     pub(crate) fn expression_schema(&self, expression: &ast::Expr) -> Option<TypeSchema> {
@@ -5525,11 +6566,22 @@ impl<'a> Lowerer<'a> {
                     {
                         Some(TypeSchema::Number)
                     }
-                    // Explicit reference-array mode only: statically proven
-                    // numeric `**` (the lowered Core power builtin returns a
-                    // float, a numeric). Ordinary mode keeps `None`.
+                    // Explicit reference-array mode: statically proven numeric
+                    // `**` lowers to the existing Core floating power builtin,
+                    // a numeric. Ordinary mode proves the numeric case in its
+                    // own arm below; non-numeric operands stay `None`.
                     ast::BinaryOp::Exp
                         if self.ref_mode
+                            && left.as_ref().is_some_and(Self::is_numeric_schema)
+                            && right.as_ref().is_some_and(Self::is_numeric_schema) =>
+                    {
+                        Some(TypeSchema::Number)
+                    }
+                    // Ordinary public mode: statically proven numeric `**`
+                    // stages both operands and reuses the shared ES5 power
+                    // kernel, so the result stays a plain number.
+                    ast::BinaryOp::Exp
+                        if !self.ref_mode
                             && left.as_ref().is_some_and(Self::is_numeric_schema)
                             && right.as_ref().is_some_and(Self::is_numeric_schema) =>
                     {
@@ -5674,6 +6726,10 @@ impl<'a> Lowerer<'a> {
                 ok: Box::new(Self::host_type_schema(ok)),
                 err: Box::new(Self::host_type_schema(err)),
             },
+            vm::HostTypeSchema::Unit => TypeSchema::Unit,
+            vm::HostTypeSchema::Option(inner) => {
+                TypeSchema::Option(Box::new(Self::host_type_schema(inner)))
+            }
         }
     }
 
@@ -6279,6 +7335,240 @@ impl<'a> Lowerer<'a> {
                     }),
                 })
             }
+            // `++`/`--` on a declared field of a homogeneous required-numeric
+            // record carrier lowers exactly like the
+            // declared-field `+=` in `lower_array_index_assignment`: the base
+            // is captured once, the field name and the two closure names are
+            // staged in hidden locals, and the read/write closures are both
+            // fetched off a borrow of that one staged base, so the write lands
+            // in the shared cell every alias observes. Postfix yields the
+            // previous value; prefix yields the value it stores (prefix `--`
+            // the integer Sub it wrote, prefix `++` the incremented one).
+            // A computed `++` on the same carrier takes the same shape: the
+            // key names a field the compiler cannot resolve statically, so no
+            // field-name lookup is required and a String-typed key is the only
+            // proof available that the row's read path can see the entry the
+            // write lands in. Postfix `--` joins it: the store is the integer
+            // Sub down by one, again against the captured previous value, so
+            // the expression yields the value read before the store, exactly
+            // as the ident `--` path does. All three share this arm and
+            // therefore the same once-only base/key staging; only the result
+            // differs, so prefix yields the value stored to that shared cell
+            // while postfix yields the value captured before it. Non-string
+            // keys, non-carrier receivers and non-numeric fields keep the
+            // non-local refusal below.
+            ast::Expr::Member(member) => {
+                let field = match &member.prop {
+                    ast::MemberProp::Ident(property) => Some(property.sym.to_string()),
+                    ast::MemberProp::Computed(property) => {
+                        let string_key = self
+                            .expression_schema(&property.expr)
+                            .is_some_and(|schema| matches!(schema, TypeSchema::String));
+                        // A String key reaches the same shared cell the write
+                        // lands in, so prefix `--` is lowered here too: the
+                        // Sub store below and the prefix result selection
+                        // already yield the decremented value, and postfix
+                        // still yields the captured previous one.
+                        if !string_key {
+                            return Err(unsupported(
+                                span,
+                                self.base,
+                                self.source_id,
+                                "non-local update target",
+                            ));
+                        }
+                        None
+                    }
+                    _ => {
+                        return Err(unsupported(
+                            span,
+                            self.base,
+                            self.source_id,
+                            "non-local update target",
+                        ));
+                    }
+                };
+                let Some(row) = self
+                    .expression_schema(&member.obj)
+                    .as_ref()
+                    .and_then(|schema| self.record_carrier_of_schema(schema))
+                else {
+                    return Err(unsupported(
+                        span,
+                        self.base,
+                        self.source_id,
+                        "non-local update target",
+                    ));
+                };
+                let field_schema = match field.as_ref() {
+                    Some(field) => {
+                        let Some(field_schema) = row
+                            .fields
+                            .get(field)
+                            .cloned()
+                            .filter(Self::is_numeric_schema)
+                        else {
+                            return Err(unsupported(
+                                span,
+                                self.base,
+                                self.source_id,
+                                "non-local update target",
+                            ));
+                        };
+                        field_schema
+                    }
+                    // Nothing pins a computed key to one declared field, so
+                    // the row's own homogeneity decides the increment domain:
+                    // a pure Int row keeps the exact integer path, anything
+                    // else takes the Number projection.
+                    None => {
+                        if row
+                            .fields
+                            .values()
+                            .all(|schema| matches!(schema, TypeSchema::Int))
+                        {
+                            TypeSchema::Int
+                        } else {
+                            TypeSchema::Number
+                        }
+                    }
+                };
+                let container = self.lower_expr(*member.obj)?;
+                // The staged slot holds the carrier itself, and the source
+                // binding is never re-read.
+                let container = match container {
+                    Expr::Borrow(inner) => match *inner {
+                        Expr::Var(slot) => Expr::Var(slot),
+                        other => other,
+                    },
+                    other => other,
+                };
+                // The staged key is the declared field name, or the single
+                // evaluation of the computed key expression. It is never
+                // passed as an `Expr::String` Get key: it reaches the read
+                // and write closures as one staged local slot.
+                let key = match &member.prop {
+                    ast::MemberProp::Computed(property) => {
+                        self.lower_expr((*property.expr).clone())?
+                    }
+                    ast::MemberProp::Ident(property) => Expr::String(property.sym.to_string()),
+                    _ => {
+                        return Err(unsupported(
+                            span,
+                            self.base,
+                            self.source_id,
+                            "non-local update target",
+                        ));
+                    }
+                };
+                let base_slot = self.alloc_hidden_local(member.span)?;
+                let key_slot = self.alloc_hidden_local(member.span)?;
+                let read_name_slot = self.alloc_hidden_local(member.span)?;
+                let write_name_slot = self.alloc_hidden_local(member.span)?;
+                let read_slot = self.alloc_hidden_local(member.span)?;
+                let write_slot = self.alloc_hidden_local(member.span)?;
+                let current_slot = self.alloc_hidden_local(member.span)?;
+                let next_slot = self.alloc_hidden_local(member.span)?;
+                let mut stmts = vec![
+                    Stmt::Let {
+                        index: base_slot,
+                        declared_schema: Some(row.schema()),
+                        expr: container,
+                        line,
+                    },
+                    Stmt::Let {
+                        index: key_slot,
+                        declared_schema: Some(TypeSchema::String),
+                        expr: key,
+                        line,
+                    },
+                    Stmt::Let {
+                        index: read_name_slot,
+                        declared_schema: Some(TypeSchema::String),
+                        expr: Expr::String("read".to_owned()),
+                        line,
+                    },
+                    Stmt::Let {
+                        index: write_name_slot,
+                        declared_schema: Some(TypeSchema::String),
+                        expr: Expr::String("write".to_owned()),
+                        line,
+                    },
+                    Stmt::Let {
+                        index: read_slot,
+                        declared_schema: Some(row.read_schema()),
+                        expr: Self::builtin_call(
+                            vm::BuiltinFunction::Get,
+                            vec![
+                                Expr::Borrow(Box::new(Expr::Var(base_slot))),
+                                Expr::Var(read_name_slot),
+                            ],
+                        ),
+                        line,
+                    },
+                    Stmt::Let {
+                        index: write_slot,
+                        declared_schema: Some(row.write_schema()),
+                        expr: Self::builtin_call(
+                            vm::BuiltinFunction::Get,
+                            vec![
+                                Expr::Borrow(Box::new(Expr::Var(base_slot))),
+                                Expr::Var(write_name_slot),
+                            ],
+                        ),
+                        line,
+                    },
+                    Stmt::Let {
+                        index: current_slot,
+                        declared_schema: Some(TypeSchema::Number),
+                        expr: Expr::LocalCall(
+                            read_slot,
+                            Vec::new(),
+                            vec![Expr::Var(key_slot)],
+                            None,
+                        ),
+                        line,
+                    },
+                ];
+                // `--` is always the integer Sub down by one, so the stored
+                // value and either result stay exact; only `++` needs the
+                // reference-array floating projection, and only when the
+                // field itself is not Int.
+                let updated = if decrement {
+                    Expr::Sub(Box::new(Expr::Var(current_slot)), Box::new(Expr::Int(1)))
+                } else if self.ref_mode && !matches!(field_schema, TypeSchema::Int) {
+                    Self::lower_numeric_add(Expr::Var(current_slot), Expr::Int(1))
+                } else {
+                    Expr::Add(Box::new(Expr::Var(current_slot)), Box::new(Expr::Int(1)))
+                };
+                stmts.push(Stmt::Let {
+                    index: next_slot,
+                    declared_schema: Some(TypeSchema::Number),
+                    expr: updated,
+                    line,
+                });
+                let written = Expr::LocalCall(
+                    write_slot,
+                    Vec::new(),
+                    vec![Expr::Var(key_slot), Expr::Var(next_slot)],
+                    None,
+                );
+                stmts.push(Stmt::Expr {
+                    expr: written,
+                    line,
+                });
+                // Postfix reads as the value captured before the store; prefix
+                // reads as the value that was just stored.
+                let result = if update.prefix {
+                    Expr::Var(next_slot)
+                } else {
+                    Expr::Var(current_slot)
+                };
+                Ok(Expr::Block {
+                    stmts,
+                    expr: Box::new(result),
+                })
+            }
             _ => Err(unsupported(
                 span,
                 self.base,
@@ -6393,6 +7683,34 @@ impl<'a> Lowerer<'a> {
             expr: Box::new(negative_zero),
         })
     }
+    /// Ordinary-mode strict-equality operand proof: the operand's own schema
+    /// stays the primary test. A computed read over a plain `number[]` binding
+    /// has no schema of its own, but its element schema is exactly `Number`,
+    /// so the existing numeric projection is sound for it; every other
+    /// element type (including `Int[]`, whose wide integers must stay exact),
+    /// maps, records and reference carriers stay outside this proof, and
+    /// reference-array mode keeps its existing numeric paths untouched.
+    fn numeric_strict_equality_operand(&self, expression: &ast::Expr) -> bool {
+        if self
+            .expression_schema(expression)
+            .is_some_and(|schema| Self::is_numeric_schema(&schema))
+        {
+            return true;
+        }
+        if self.ref_mode {
+            return false;
+        }
+        let ast::Expr::Member(member) = Self::initializer_without_parens(expression) else {
+            return false;
+        };
+        if !matches!(member.prop, ast::MemberProp::Computed(_)) {
+            return false;
+        }
+        matches!(
+            self.expression_schema(&member.obj),
+            Some(TypeSchema::Array(item)) if matches!(item.as_ref(), TypeSchema::Number)
+        )
+    }
 
     fn lower_numeric_strict_equality(left: Expr, right: Expr) -> Expr {
         let as_number = |value| Expr::Div(Box::new(value), Box::new(Expr::Float(1.0)));
@@ -6420,12 +7738,123 @@ impl<'a> Lowerer<'a> {
         Expr::Div(Box::new(expr), Box::new(Expr::Float(1.0)))
     }
 
+    /// Ordinary public mode: statically proven numeric `**`. The already
+    /// lowered left value is bound first and only then the right, so
+    /// JavaScript's left-to-right evaluation order holds and neither operand
+    /// is lowered or evaluated twice. Both bound values are then projected
+    /// exactly once onto `Float` slots (the existing `Div(_, Float(1.0))`
+    /// coercion the other numeric boundaries use) and handed to the shared
+    /// ES5 power kernel `ecmascript_number_power`, so the operator keeps the
+    /// existing guards (zero exponent, NaN exponent, unit base with an
+    /// infinite exponent) instead of a second implementation.
+    fn lower_numeric_power(
+        &mut self,
+        left: Expr,
+        right: Expr,
+        span: swc_common::Span,
+    ) -> Result<Expr, ParseError> {
+        let source_span = byte_span(span, self.base, self.source_id);
+        let line = line_at(self.source, source_span.lo);
+        let left_slot = self.alloc_hidden_local(span)?;
+        let right_slot = self.alloc_hidden_local(span)?;
+        let left_float_slot = self.alloc_hidden_local(span)?;
+        let right_float_slot = self.alloc_hidden_local(span)?;
+        Ok(Expr::Block {
+            stmts: vec![
+                Stmt::Let {
+                    index: left_slot,
+                    declared_schema: Some(TypeSchema::Number),
+                    expr: left,
+                    line,
+                },
+                Stmt::Let {
+                    index: right_slot,
+                    declared_schema: Some(TypeSchema::Number),
+                    expr: right,
+                    line,
+                },
+                Stmt::Let {
+                    index: left_float_slot,
+                    declared_schema: Some(TypeSchema::Float),
+                    expr: Self::project_numeric_call_arg(Expr::Var(left_slot)),
+                    line,
+                },
+                Stmt::Let {
+                    index: right_float_slot,
+                    declared_schema: Some(TypeSchema::Float),
+                    expr: Self::project_numeric_call_arg(Expr::Var(right_slot)),
+                    line,
+                },
+            ],
+            expr: Box::new(crate::javascript::ecmascript_number_power(
+                left_float_slot,
+                right_float_slot,
+            )),
+        })
+    }
+
+    /// Emits the canonical indexed `Get` callsite: one semantic node id,
+    /// the computed property span as the callee span and the member span as
+    /// the expression span, the empty function name `[]`, and no namespace
+    /// flag. Container and index are already lowered exactly once by the
+    /// caller and are passed through unchanged, so each caller keeps its own
+    /// staging and evaluation order.
+    fn canonical_indexed_get(
+        &mut self,
+        container: Expr,
+        index: Expr,
+        property_span: swc_common::Span,
+        member_span: swc_common::Span,
+    ) -> Expr {
+        let id = self.alloc_node_id();
+        self.call_sites.push(ParsedCallSite {
+            id,
+            callee_span: byte_span(property_span, self.base, self.source_id),
+            expr_span: byte_span(member_span, self.base, self.source_id),
+            target: ParsedCallTarget::Function(vm::BuiltinFunction::Get.call_index()),
+            name: "[]".to_owned(),
+            scope_id: self.scope_id,
+            is_namespace_call: false,
+        });
+        Expr::Call(
+            vm::BuiltinFunction::Get.call_index(),
+            Vec::new(),
+            vec![container, index],
+            None,
+            Some(id),
+        )
+    }
+
     fn lower_member_get(&mut self, member: ast::MemberExpr) -> Result<Expr, ParseError> {
         let member_span = member.span;
         let object = member.obj;
         let property = match member.prop {
             ast::MemberProp::Ident(property) => property,
             ast::MemberProp::Computed(property) => {
+                // A carrier receiver reads through its own `read_any`
+                // closure: the key is dynamic, so no declared-field proof
+                // exists and the result stays schema-free. A non-string key
+                // keeps the precise refusal below.
+                if let Some(row) = self
+                    .expression_schema(&object)
+                    .as_ref()
+                    .and_then(|schema| self.record_carrier_of_schema(schema))
+                {
+                    if !self
+                        .expression_schema(&property.expr)
+                        .is_some_and(|schema| matches!(schema, TypeSchema::String))
+                    {
+                        return Err(unsupported(
+                            member_span,
+                            self.base,
+                            self.source_id,
+                            "computed property access",
+                        ));
+                    }
+                    let base = self.lower_expr(*object)?;
+                    let key = self.lower_expr(*property.expr)?;
+                    return self.carrier_read(base, key, false, &row, member_span);
+                }
                 // Reference-array carriers lower indexed reads through the
                 // owning dispatcher; the plain Core-array path below never
                 // sees a carrier value.
@@ -6438,15 +7867,29 @@ impl<'a> Lowerer<'a> {
                         member_span,
                     );
                 }
-                let array_schema = self.expression_schema(&object);
-                if !array_schema.as_ref().is_some_and(|schema| {
+                let receiver_schema = self.expression_schema(&object);
+                let is_array_receiver = receiver_schema.as_ref().is_some_and(|schema| {
                     matches!(
                         schema,
                         TypeSchema::Array(_)
                             | TypeSchema::ArrayTuple(_)
                             | TypeSchema::ArrayTupleRest { .. }
                     )
-                }) {
+                });
+                // Ordinary typed records admit computed reads only for a
+                // statically `string` key; the shared `Get` emitter below
+                // then reads the field exactly once. Arrays keep their
+                // historical admission, and every other receiver/key form
+                // keeps the precise unsupported refusal.
+                let is_string_key = self
+                    .expression_schema(&property.expr)
+                    .is_some_and(|schema| matches!(schema, TypeSchema::String));
+                if !(is_array_receiver
+                    || (is_string_key
+                        && receiver_schema
+                            .as_ref()
+                            .is_some_and(|schema| self.is_ordinary_record_schema(schema, 0))))
+                {
                     return Err(unsupported(
                         member_span,
                         self.base,
@@ -6456,22 +7899,11 @@ impl<'a> Lowerer<'a> {
                 }
                 let container = self.lower_expr(*object)?;
                 let index = self.lower_expr(*property.expr)?;
-                let id = self.alloc_node_id();
-                self.call_sites.push(ParsedCallSite {
-                    id,
-                    callee_span: byte_span(property.span, self.base, self.source_id),
-                    expr_span: byte_span(member_span, self.base, self.source_id),
-                    target: ParsedCallTarget::Function(vm::BuiltinFunction::Get.call_index()),
-                    name: "[]".to_owned(),
-                    scope_id: self.scope_id,
-                    is_namespace_call: false,
-                });
-                return Ok(Expr::Call(
-                    vm::BuiltinFunction::Get.call_index(),
-                    Vec::new(),
-                    vec![container, index],
-                    None,
-                    Some(id),
+                return Ok(self.canonical_indexed_get(
+                    container,
+                    index,
+                    property.span,
+                    member_span,
                 ));
             }
             _ => {
@@ -6485,6 +7917,24 @@ impl<'a> Lowerer<'a> {
         };
         let property_name = property.sym.to_string();
         let receiver_schema = self.expression_schema(&object);
+        // A carrier receiver reads a declared numeric field through its
+        // `read` closure. The field name is proven, so the result carries the
+        // numeric domain; an undeclared field is refused precisely instead of
+        // being projected out of the physical closure record.
+        if let Some(row) = receiver_schema
+            .as_ref()
+            .and_then(|schema| self.record_carrier_of_schema(schema))
+        {
+            if !row.fields.contains_key(&property_name) {
+                return Err(ParseError::at_span(
+                    byte_span(member_span, self.base, self.source_id),
+                    format!("record row has no field '{property_name}'"),
+                ));
+            }
+            let base = self.lower_expr(*object)?;
+            let key = Expr::String(property_name.clone());
+            return self.carrier_read(base, key, true, &row, member_span);
+        }
         // Generator nominals expose exactly their protocol fields. Any other
         // field access fails precisely instead of projecting a conflicting
         // record protocol; ordinary receivers are untouched.
@@ -6580,6 +8030,11 @@ impl<'a> Lowerer<'a> {
             });
             return Ok(Expr::OptionalGet {
                 field_projection,
+                // JS/TS optional fields stay nullable values. Logical Option
+                // projection belongs to the RustScript dialect.
+                logical_projection: false,
+                option_receiver: false,
+                logical_unit_field: false,
                 container: Box::new(container),
                 key: Box::new(Expr::String(property.sym.to_string())),
                 container_slot,
@@ -6587,6 +8042,34 @@ impl<'a> Lowerer<'a> {
                 semantic_id: Some(id),
             });
         }
+        // An ordinary record field read must stay a copying `Get`. Core's
+        // availability rules rewrite a literal-key read of a field outside the
+        // copyable set into a moving `MoveField`, which reaps the key with a
+        // `null` write and so loses the field for a second read. Passing the
+        // key through a hidden local makes it dynamic, so the same `Get` is
+        // left in place, the container is still evaluated exactly once, and
+        // nothing is reaped. Every other receiver keeps the literal key.
+        let key = if receiver_schema
+            .as_ref()
+            .is_some_and(|schema| self.is_ordinary_record_schema(schema, 0))
+        {
+            let key_slot = self.alloc_hidden_local(member_span)?;
+            let line = line_at(
+                self.source,
+                byte_span(member_span, self.base, self.source_id).lo,
+            );
+            Expr::Block {
+                stmts: vec![Stmt::Let {
+                    index: key_slot,
+                    declared_schema: Some(TypeSchema::String),
+                    expr: Expr::String(property_name.clone()),
+                    line,
+                }],
+                expr: Box::new(Expr::Var(key_slot)),
+            }
+        } else {
+            Expr::String(property_name.clone())
+        };
         self.call_sites.push(ParsedCallSite {
             id,
             callee_span: byte_span(property.span, self.base, self.source_id),
@@ -6599,7 +8082,7 @@ impl<'a> Lowerer<'a> {
         Ok(Expr::Call(
             vm::BuiltinFunction::Get.call_index(),
             Vec::new(),
-            vec![container, Expr::String(property.sym.to_string())],
+            vec![container, key],
             None,
             Some(id),
         ))
@@ -7002,6 +8485,31 @@ impl<'a> Lowerer<'a> {
                 } else {
                     Vec::new()
                 };
+                // Guest row boundary: where the callee's declared formal is a
+                // homogeneous numeric row it is declared as the private
+                // carrier, so a plain row literal argument converts here
+                // (once, in order) and an already-carrier argument passes
+                // through untouched. Host calls, imported functions and
+                // exported signatures keep the logical row, so a carrier
+                // argument there is refused precisely instead.
+                let record_carrier_formals: Vec<Option<TypeSchema>> = if host_index.is_none() {
+                    if let Some((index, _)) = local_function {
+                        self.module_function_arg_schemas(&callee, index)
+                    } else if let Some((_, declaration)) = imported_function.as_ref() {
+                        declaration.arg_schemas.clone()
+                    } else if local_slot.is_some() {
+                        match self.local_types.get(&callee).cloned() {
+                            Some(TypeSchema::Callable { params, .. }) => {
+                                params.into_iter().map(Some).collect()
+                            }
+                            _ => Vec::new(),
+                        }
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                };
                 // Reference-array numeric call boundary: where the declared
                 // formal is exactly `number` and the actual is statically
                 // proven numeric, project the already-once-lowered argument
@@ -7233,6 +8741,15 @@ impl<'a> Lowerer<'a> {
                             .expression_schema(&argument.expr)
                             .as_ref()
                             .is_some_and(Self::is_numeric_schema);
+                    // Guest row conversion is decided on the AST, before
+                    // lowering, so the boundary check sees the declared value
+                    // domain and the wrap applies to the once-only lowered
+                    // argument.
+                    let record_row = self.record_argument_carrier(
+                        &argument.expr,
+                        record_carrier_formals.get(index).and_then(|schema| schema.as_ref()),
+                        argument_span,
+                    )?;
                     let expression = self.lower_expr(*argument.expr)?;
                     // Reference-array call boundary conversion: a plain
                     // staging array (including an empty literal) becomes
@@ -7248,6 +8765,8 @@ impl<'a> Lowerer<'a> {
                             vec![expression],
                             argument_span,
                         )?
+                    } else if let Some(row) = &record_row {
+                        self.carrier_from_value(expression, row, argument_span)?
                     } else {
                         expression
                     };
@@ -7682,12 +9201,8 @@ impl<'a> Lowerer<'a> {
                 }
                 let numeric_strict_equality =
                     matches!(value.op, ast::BinaryOp::EqEqEq | ast::BinaryOp::NotEqEq)
-                        && self
-                            .expression_schema(&value.left)
-                            .is_some_and(|schema| Self::is_numeric_schema(&schema))
-                        && self
-                            .expression_schema(&value.right)
-                            .is_some_and(|schema| Self::is_numeric_schema(&schema));
+                        && self.numeric_strict_equality_operand(&value.left)
+                        && self.numeric_strict_equality_operand(&value.right);
                 // Presence-aware relational comparisons over reference-array
                 // elements evaluate false on a missing integral index
                 // instead of fabricating an element value.
@@ -7740,9 +9255,11 @@ impl<'a> Lowerer<'a> {
                     ast::BinaryOp::Mul => Ok(Expr::Mul(left, right)),
                     ast::BinaryOp::Div => Ok(Expr::Div(left, right)),
                     ast::BinaryOp::Mod => Ok(Expr::Mod(left, right)),
-                    // Explicit reference-array mode only: numeric `**`
-                    // lowers to the existing Core floating power builtin.
-                    // Ordinary mode keeps the historical rejection.
+                    // Explicit reference-array mode: numeric `**` lowers to
+                    // the existing Core floating power builtin. Ordinary mode
+                    // handles proven numeric operands in the guarded arm below
+                    // through the shared staged helper; non-numeric operands
+                    // stay refused there.
                     ast::BinaryOp::Exp
                         if self.ref_mode
                             && left_schema_for_add
@@ -7760,6 +9277,20 @@ impl<'a> Lowerer<'a> {
                             None,
                         ))
                     }
+                    // Ordinary public mode: statically proven numeric `**`
+                    // stages the left value, then the right, projects both
+                    // onto Float slots and calls the shared ES5 power kernel.
+                    ast::BinaryOp::Exp
+                        if !self.ref_mode
+                            && left_schema_for_add
+                                .as_ref()
+                                .is_some_and(Self::is_numeric_schema)
+                            && right_schema_for_add
+                                .as_ref()
+                                .is_some_and(Self::is_numeric_schema) =>
+                    {
+                        self.lower_numeric_power(*left, *right, value.span)
+                    }
                     ast::BinaryOp::EqEq | ast::BinaryOp::EqEqEq => Ok(Expr::Eq(left, right)),
                     ast::BinaryOp::NotEq | ast::BinaryOp::NotEqEq => {
                         Ok(Expr::Not(Box::new(Expr::Eq(left, right))))
@@ -7775,6 +9306,1242 @@ impl<'a> Lowerer<'a> {
                         "binary operator",
                     )),
                 }
+            }
+            // An expression-position plain assignment to a declared ident
+            // field of a homogeneous numeric-record carrier stores through
+            // the carrier's own `write` closure and yields the written
+            // number, so a comparison observes the value every alias sees.
+            // Compound operators, computed keys, non-carrier receivers and
+            // every other target keep the refusal below.
+            ast::Expr::Assign(assignment) => {
+                // Local power expressions reuse the statement producer's checks
+                // and once-only store, then read that same binding as the value.
+                if assignment.op == ast::AssignOp::ExpAssign
+                    && !self.ref_mode
+                    && let ast::AssignTarget::Simple(ast::SimpleAssignTarget::Ident(binding)) =
+                        &assignment.left
+                {
+                    let result_read = ast::Expr::Ident(binding.id.clone());
+                    let mut stmts = Vec::new();
+                    self.lower_assignment_statement(ast::Expr::Assign(assignment), &mut stmts)?;
+                    let result = self.lower_expr(result_read)?;
+                    return Ok(Expr::Block {
+                        stmts,
+                        expr: Box::new(result),
+                    });
+                }
+                if assignment.op != ast::AssignOp::Assign
+                    && assignment.op != ast::AssignOp::AddAssign
+                    && assignment.op != ast::AssignOp::SubAssign
+                    && assignment.op != ast::AssignOp::MulAssign
+                    && assignment.op != ast::AssignOp::DivAssign
+                    && assignment.op != ast::AssignOp::ModAssign
+                    && !(assignment.op == ast::AssignOp::ExpAssign
+                        && !self.ref_mode
+                        && matches!(
+                            &assignment.left,
+                            ast::AssignTarget::Simple(ast::SimpleAssignTarget::Member(member))
+                                if matches!(&member.prop, ast::MemberProp::Ident(_) | ast::MemberProp::Computed(_))
+                        ))
+                {
+                    return Err(unsupported(
+                        assignment.span,
+                        self.base,
+                        self.source_id,
+                        "expression",
+                    ));
+                }
+                let ast::AssignTarget::Simple(ast::SimpleAssignTarget::Member(member)) =
+                    assignment.left
+                else {
+                    return Err(unsupported(
+                        assignment.span,
+                        self.base,
+                        self.source_id,
+                        "expression",
+                    ));
+                };
+                if matches!(member.prop, ast::MemberProp::Computed(_)) {
+                    if assignment.op == ast::AssignOp::AddAssign {
+                        let member_span = member.span;
+                        let key_is_string = match &member.prop {
+                            ast::MemberProp::Computed(property) => self
+                                .expression_schema(&property.expr)
+                                .is_some_and(|schema| matches!(schema, TypeSchema::String)),
+                            _ => false,
+                        };
+                        if !key_is_string {
+                            return Err(unsupported(
+                                member_span,
+                                self.base,
+                                self.source_id,
+                                "expression",
+                            ));
+                        }
+                        let carrier = self
+                            .expression_schema(&member.obj)
+                            .and_then(|schema| self.record_carrier_of_schema(&schema));
+                        let Some(row) = carrier else {
+                            return Err(unsupported(
+                                member_span,
+                                self.base,
+                                self.source_id,
+                                "expression",
+                            ));
+                        };
+                        if !row.fields.values().all(Self::is_numeric_schema) {
+                            return Err(unsupported(
+                                member_span,
+                                self.base,
+                                self.source_id,
+                                "expression",
+                            ));
+                        }
+                        if !self
+                            .expression_schema(&assignment.right)
+                            .is_some_and(|schema| Self::is_numeric_schema(&schema))
+                        {
+                            return Err(unsupported(
+                                member_span,
+                                self.base,
+                                self.source_id,
+                                "expression",
+                            ));
+                        }
+                        let rhs_is_int = self
+                            .expression_schema(&assignment.right)
+                            .is_some_and(|schema| matches!(schema, TypeSchema::Int));
+                        let row_is_int = row
+                            .fields
+                            .values()
+                            .all(|schema| matches!(schema, TypeSchema::Int));
+                        let obj = member.obj;
+                        let ast::MemberProp::Computed(property) = member.prop else {
+                            return Err(unsupported(
+                                member_span,
+                                self.base,
+                                self.source_id,
+                                "expression",
+                            ));
+                        };
+                        let line = line_at(
+                            self.source,
+                            byte_span(member_span, self.base, self.source_id).lo,
+                        );
+                        let container = self.lower_expr(*obj)?;
+                        let container = match container {
+                            Expr::Borrow(inner) => match *inner {
+                                Expr::Var(slot) => Expr::Var(slot),
+                                other => other,
+                            },
+                            other => other,
+                        };
+                        let key = self.lower_expr(*property.expr)?;
+                        let base_slot = self.alloc_hidden_local(member_span)?;
+                        let key_slot = self.alloc_hidden_local(member_span)?;
+                        let read_name_slot = self.alloc_hidden_local(member_span)?;
+                        let write_name_slot = self.alloc_hidden_local(member_span)?;
+                        let read_slot = self.alloc_hidden_local(member_span)?;
+                        let write_slot = self.alloc_hidden_local(member_span)?;
+                        let current_slot = self.alloc_hidden_local(member_span)?;
+                        let value_slot = self.alloc_hidden_local(member_span)?;
+                        let written_slot = self.alloc_hidden_local(member_span)?;
+                        let mut stmts = vec![
+                            Stmt::Let {
+                                index: base_slot,
+                                declared_schema: Some(row.schema()),
+                                expr: container,
+                                line,
+                            },
+                            Stmt::Let {
+                                index: key_slot,
+                                declared_schema: Some(TypeSchema::String),
+                                expr: key,
+                                line,
+                            },
+                            Stmt::Let {
+                                index: read_name_slot,
+                                declared_schema: Some(TypeSchema::String),
+                                expr: Expr::String("read".to_owned()),
+                                line,
+                            },
+                            Stmt::Let {
+                                index: write_name_slot,
+                                declared_schema: Some(TypeSchema::String),
+                                expr: Expr::String("write".to_owned()),
+                                line,
+                            },
+                            Stmt::Let {
+                                index: read_slot,
+                                declared_schema: Some(row.read_schema()),
+                                expr: Self::builtin_call(
+                                    vm::BuiltinFunction::Get,
+                                    vec![
+                                        Expr::Borrow(Box::new(Expr::Var(base_slot))),
+                                        Expr::Var(read_name_slot),
+                                    ],
+                                ),
+                                line,
+                            },
+                            Stmt::Let {
+                                index: write_slot,
+                                declared_schema: Some(row.write_schema()),
+                                expr: Self::builtin_call(
+                                    vm::BuiltinFunction::Get,
+                                    vec![
+                                        Expr::Borrow(Box::new(Expr::Var(base_slot))),
+                                        Expr::Var(write_name_slot),
+                                    ],
+                                ),
+                                line,
+                            },
+                            Stmt::Let {
+                                index: current_slot,
+                                declared_schema: Some(TypeSchema::Number),
+                                expr: Expr::LocalCall(
+                                    read_slot,
+                                    Vec::new(),
+                                    vec![Expr::Var(key_slot)],
+                                    None,
+                                ),
+                                line,
+                            },
+                        ];
+                        let increment = self.lower_expr(*assignment.right)?;
+                        let updated = if self.ref_mode && !(row_is_int && rhs_is_int) {
+                            Self::lower_numeric_add(Expr::Var(current_slot), increment)
+                        } else {
+                            Expr::Add(
+                                Box::new(Expr::Var(current_slot)),
+                                Box::new(increment),
+                            )
+                        };
+                        stmts.push(Stmt::Let {
+                            index: value_slot,
+                            declared_schema: Some(TypeSchema::Number),
+                            expr: updated,
+                            line,
+                        });
+                        stmts.push(Stmt::Let {
+                            index: written_slot,
+                            declared_schema: Some(TypeSchema::Number),
+                            expr: Expr::LocalCall(
+                                write_slot,
+                                Vec::new(),
+                                vec![Expr::Var(key_slot), Expr::Var(value_slot)],
+                                None,
+                            ),
+                            line,
+                        });
+                        return Ok(Expr::Block {
+                            stmts,
+                            expr: Box::new(Expr::Var(written_slot)),
+                        });
+                    }
+                    if assignment.op == ast::AssignOp::SubAssign {
+                        let member_span = member.span;
+                        let key_is_string = match &member.prop {
+                            ast::MemberProp::Computed(property) => self
+                                .expression_schema(&property.expr)
+                                .is_some_and(|schema| matches!(schema, TypeSchema::String)),
+                            _ => false,
+                        };
+                        if !key_is_string {
+                            return Err(unsupported(
+                                member_span,
+                                self.base,
+                                self.source_id,
+                                "expression",
+                            ));
+                        }
+                        let carrier = self
+                            .expression_schema(&member.obj)
+                            .and_then(|schema| self.record_carrier_of_schema(&schema));
+                        let Some(row) = carrier else {
+                            return Err(unsupported(
+                                member_span,
+                                self.base,
+                                self.source_id,
+                                "expression",
+                            ));
+                        };
+                        if !row.fields.values().all(Self::is_numeric_schema) {
+                            return Err(unsupported(
+                                member_span,
+                                self.base,
+                                self.source_id,
+                                "expression",
+                            ));
+                        }
+                        if !self
+                            .expression_schema(&assignment.right)
+                            .is_some_and(|schema| Self::is_numeric_schema(&schema))
+                        {
+                            return Err(unsupported(
+                                member_span,
+                                self.base,
+                                self.source_id,
+                                "expression",
+                            ));
+                        }
+                        let rhs_is_int = self
+                            .expression_schema(&assignment.right)
+                            .is_some_and(|schema| matches!(schema, TypeSchema::Int));
+                        let row_is_int = row
+                            .fields
+                            .values()
+                            .all(|schema| matches!(schema, TypeSchema::Int));
+                        if self.ref_mode && !(row_is_int && rhs_is_int) {
+                            return Err(unsupported(
+                                member_span,
+                                self.base,
+                                self.source_id,
+                                "expression",
+                            ));
+                        }
+                        let obj = member.obj;
+                        let ast::MemberProp::Computed(property) = member.prop else {
+                            return Err(unsupported(
+                                member_span,
+                                self.base,
+                                self.source_id,
+                                "expression",
+                            ));
+                        };
+                        let line = line_at(
+                            self.source,
+                            byte_span(member_span, self.base, self.source_id).lo,
+                        );
+                        let container = self.lower_expr(*obj)?;
+                        let container = match container {
+                            Expr::Borrow(inner) => match *inner {
+                                Expr::Var(slot) => Expr::Var(slot),
+                                other => other,
+                            },
+                            other => other,
+                        };
+                        let key = self.lower_expr(*property.expr)?;
+                        let base_slot = self.alloc_hidden_local(member_span)?;
+                        let key_slot = self.alloc_hidden_local(member_span)?;
+                        let read_name_slot = self.alloc_hidden_local(member_span)?;
+                        let write_name_slot = self.alloc_hidden_local(member_span)?;
+                        let read_slot = self.alloc_hidden_local(member_span)?;
+                        let write_slot = self.alloc_hidden_local(member_span)?;
+                        let current_slot = self.alloc_hidden_local(member_span)?;
+                        let value_slot = self.alloc_hidden_local(member_span)?;
+                        let written_slot = self.alloc_hidden_local(member_span)?;
+                        let mut stmts = vec![
+                            Stmt::Let {
+                                index: base_slot,
+                                declared_schema: Some(row.schema()),
+                                expr: container,
+                                line,
+                            },
+                            Stmt::Let {
+                                index: key_slot,
+                                declared_schema: Some(TypeSchema::String),
+                                expr: key,
+                                line,
+                            },
+                            Stmt::Let {
+                                index: read_name_slot,
+                                declared_schema: Some(TypeSchema::String),
+                                expr: Expr::String("read".to_owned()),
+                                line,
+                            },
+                            Stmt::Let {
+                                index: write_name_slot,
+                                declared_schema: Some(TypeSchema::String),
+                                expr: Expr::String("write".to_owned()),
+                                line,
+                            },
+                            Stmt::Let {
+                                index: read_slot,
+                                declared_schema: Some(row.read_schema()),
+                                expr: Self::builtin_call(
+                                    vm::BuiltinFunction::Get,
+                                    vec![
+                                        Expr::Borrow(Box::new(Expr::Var(base_slot))),
+                                        Expr::Var(read_name_slot),
+                                    ],
+                                ),
+                                line,
+                            },
+                            Stmt::Let {
+                                index: write_slot,
+                                declared_schema: Some(row.write_schema()),
+                                expr: Self::builtin_call(
+                                    vm::BuiltinFunction::Get,
+                                    vec![
+                                        Expr::Borrow(Box::new(Expr::Var(base_slot))),
+                                        Expr::Var(write_name_slot),
+                                    ],
+                                ),
+                                line,
+                            },
+                            Stmt::Let {
+                                index: current_slot,
+                                declared_schema: Some(TypeSchema::Number),
+                                expr: Expr::LocalCall(
+                                    read_slot,
+                                    Vec::new(),
+                                    vec![Expr::Var(key_slot)],
+                                    None,
+                                ),
+                                line,
+                            },
+                        ];
+                        let decrement = self.lower_expr(*assignment.right)?;
+                        let updated = Expr::Sub(
+                            Box::new(Expr::Var(current_slot)),
+                            Box::new(decrement),
+                        );
+                        stmts.push(Stmt::Let {
+                            index: value_slot,
+                            declared_schema: Some(TypeSchema::Number),
+                            expr: updated,
+                            line,
+                        });
+                        stmts.push(Stmt::Let {
+                            index: written_slot,
+                            declared_schema: Some(TypeSchema::Number),
+                            expr: Expr::LocalCall(
+                                write_slot,
+                                Vec::new(),
+                                vec![Expr::Var(key_slot), Expr::Var(value_slot)],
+                                None,
+                            ),
+                            line,
+                        });
+                        return Ok(Expr::Block {
+                            stmts,
+                            expr: Box::new(Expr::Var(written_slot)),
+                        });
+                    }
+                    if assignment.op == ast::AssignOp::MulAssign
+                        || assignment.op == ast::AssignOp::ExpAssign
+                    {
+                        let member_span = member.span;
+                        let key_is_string = match &member.prop {
+                            ast::MemberProp::Computed(property) => self
+                                .expression_schema(&property.expr)
+                                .is_some_and(|schema| matches!(schema, TypeSchema::String)),
+                            _ => false,
+                        };
+                        if !key_is_string {
+                            return Err(unsupported(
+                                member_span,
+                                self.base,
+                                self.source_id,
+                                "expression",
+                            ));
+                        }
+                        let carrier = self
+                            .expression_schema(&member.obj)
+                            .and_then(|schema| self.record_carrier_of_schema(&schema));
+                        let Some(row) = carrier else {
+                            return Err(unsupported(
+                                member_span,
+                                self.base,
+                                self.source_id,
+                                "expression",
+                            ));
+                        };
+                        if !row.fields.values().all(Self::is_numeric_schema) {
+                            return Err(unsupported(
+                                member_span,
+                                self.base,
+                                self.source_id,
+                                "expression",
+                            ));
+                        }
+                        if !self
+                            .expression_schema(&assignment.right)
+                            .is_some_and(|schema| Self::is_numeric_schema(&schema))
+                        {
+                            return Err(unsupported(
+                                member_span,
+                                self.base,
+                                self.source_id,
+                                "expression",
+                            ));
+                        }
+                        let rhs_is_int = self
+                            .expression_schema(&assignment.right)
+                            .is_some_and(|schema| matches!(schema, TypeSchema::Int));
+                        let row_is_int = row
+                            .fields
+                            .values()
+                            .all(|schema| matches!(schema, TypeSchema::Int));
+                        if self.ref_mode && !(row_is_int && rhs_is_int) {
+                            return Err(unsupported(
+                                member_span,
+                                self.base,
+                                self.source_id,
+                                "expression",
+                            ));
+                        }
+                        let obj = member.obj;
+                        let ast::MemberProp::Computed(property) = member.prop else {
+                            return Err(unsupported(
+                                member_span,
+                                self.base,
+                                self.source_id,
+                                "expression",
+                            ));
+                        };
+                        let line = line_at(
+                            self.source,
+                            byte_span(member_span, self.base, self.source_id).lo,
+                        );
+                        let container = self.lower_expr(*obj)?;
+                        let container = match container {
+                            Expr::Borrow(inner) => match *inner {
+                                Expr::Var(slot) => Expr::Var(slot),
+                                other => other,
+                            },
+                            other => other,
+                        };
+                        let key = self.lower_expr(*property.expr)?;
+                        let base_slot = self.alloc_hidden_local(member_span)?;
+                        let key_slot = self.alloc_hidden_local(member_span)?;
+                        let read_name_slot = self.alloc_hidden_local(member_span)?;
+                        let write_name_slot = self.alloc_hidden_local(member_span)?;
+                        let read_slot = self.alloc_hidden_local(member_span)?;
+                        let write_slot = self.alloc_hidden_local(member_span)?;
+                        let current_slot = self.alloc_hidden_local(member_span)?;
+                        let value_slot = self.alloc_hidden_local(member_span)?;
+                        let written_slot = self.alloc_hidden_local(member_span)?;
+                        let mut stmts = vec![
+                            Stmt::Let {
+                                index: base_slot,
+                                declared_schema: Some(row.schema()),
+                                expr: container,
+                                line,
+                            },
+                            Stmt::Let {
+                                index: key_slot,
+                                declared_schema: Some(TypeSchema::String),
+                                expr: key,
+                                line,
+                            },
+                            Stmt::Let {
+                                index: read_name_slot,
+                                declared_schema: Some(TypeSchema::String),
+                                expr: Expr::String("read".to_owned()),
+                                line,
+                            },
+                            Stmt::Let {
+                                index: write_name_slot,
+                                declared_schema: Some(TypeSchema::String),
+                                expr: Expr::String("write".to_owned()),
+                                line,
+                            },
+                            Stmt::Let {
+                                index: read_slot,
+                                declared_schema: Some(row.read_schema()),
+                                expr: Self::builtin_call(
+                                    vm::BuiltinFunction::Get,
+                                    vec![
+                                        Expr::Borrow(Box::new(Expr::Var(base_slot))),
+                                        Expr::Var(read_name_slot),
+                                    ],
+                                ),
+                                line,
+                            },
+                            Stmt::Let {
+                                index: write_slot,
+                                declared_schema: Some(row.write_schema()),
+                                expr: Self::builtin_call(
+                                    vm::BuiltinFunction::Get,
+                                    vec![
+                                        Expr::Borrow(Box::new(Expr::Var(base_slot))),
+                                        Expr::Var(write_name_slot),
+                                    ],
+                                ),
+                                line,
+                            },
+                            Stmt::Let {
+                                index: current_slot,
+                                declared_schema: Some(TypeSchema::Number),
+                                expr: Expr::LocalCall(
+                                    read_slot,
+                                    Vec::new(),
+                                    vec![Expr::Var(key_slot)],
+                                    None,
+                                ),
+                                line,
+                            },
+                        ];
+                        let factor = self.lower_expr(*assignment.right)?;
+                        let updated = if assignment.op == ast::AssignOp::ExpAssign {
+                            self.lower_numeric_power(Expr::Var(current_slot), factor, member_span)?
+                        } else {
+                            Expr::Mul(Box::new(Expr::Var(current_slot)), Box::new(factor))
+                        };
+                        stmts.push(Stmt::Let {
+                            index: value_slot,
+                            declared_schema: Some(TypeSchema::Number),
+                            expr: updated,
+                            line,
+                        });
+                        stmts.push(Stmt::Let {
+                            index: written_slot,
+                            declared_schema: Some(TypeSchema::Number),
+                            expr: Expr::LocalCall(
+                                write_slot,
+                                Vec::new(),
+                                vec![Expr::Var(key_slot), Expr::Var(value_slot)],
+                                None,
+                            ),
+                            line,
+                        });
+                        return Ok(Expr::Block {
+                            stmts,
+                            expr: Box::new(Expr::Var(written_slot)),
+                        });
+                    }
+                    if assignment.op == ast::AssignOp::DivAssign {
+                        let member_span = member.span;
+                        let key_is_string = match &member.prop {
+                            ast::MemberProp::Computed(property) => self
+                                .expression_schema(&property.expr)
+                                .is_some_and(|schema| matches!(schema, TypeSchema::String)),
+                            _ => false,
+                        };
+                        if !key_is_string {
+                            return Err(unsupported(
+                                member_span,
+                                self.base,
+                                self.source_id,
+                                "expression",
+                            ));
+                        }
+                        let carrier = self
+                            .expression_schema(&member.obj)
+                            .and_then(|schema| self.record_carrier_of_schema(&schema));
+                        let Some(row) = carrier else {
+                            return Err(unsupported(
+                                member_span,
+                                self.base,
+                                self.source_id,
+                                "expression",
+                            ));
+                        };
+                        if !row.fields.values().all(Self::is_numeric_schema) {
+                            return Err(unsupported(
+                                member_span,
+                                self.base,
+                                self.source_id,
+                                "expression",
+                            ));
+                        }
+                        if !self
+                            .expression_schema(&assignment.right)
+                            .is_some_and(|schema| Self::is_numeric_schema(&schema))
+                        {
+                            return Err(unsupported(
+                                member_span,
+                                self.base,
+                                self.source_id,
+                                "expression",
+                            ));
+                        }
+                        let rhs_is_int = self
+                            .expression_schema(&assignment.right)
+                            .is_some_and(|schema| matches!(schema, TypeSchema::Int));
+                        let row_is_int = row
+                            .fields
+                            .values()
+                            .all(|schema| matches!(schema, TypeSchema::Int));
+                        if self.ref_mode && !(row_is_int && rhs_is_int) {
+                            return Err(unsupported(
+                                member_span,
+                                self.base,
+                                self.source_id,
+                                "expression",
+                            ));
+                        }
+                        let obj = member.obj;
+                        let ast::MemberProp::Computed(property) = member.prop else {
+                            return Err(unsupported(
+                                member_span,
+                                self.base,
+                                self.source_id,
+                                "expression",
+                            ));
+                        };
+                        let line = line_at(
+                            self.source,
+                            byte_span(member_span, self.base, self.source_id).lo,
+                        );
+                        let container = self.lower_expr(*obj)?;
+                        let container = match container {
+                            Expr::Borrow(inner) => match *inner {
+                                Expr::Var(slot) => Expr::Var(slot),
+                                other => other,
+                            },
+                            other => other,
+                        };
+                        let key = self.lower_expr(*property.expr)?;
+                        let base_slot = self.alloc_hidden_local(member_span)?;
+                        let key_slot = self.alloc_hidden_local(member_span)?;
+                        let read_name_slot = self.alloc_hidden_local(member_span)?;
+                        let write_name_slot = self.alloc_hidden_local(member_span)?;
+                        let read_slot = self.alloc_hidden_local(member_span)?;
+                        let write_slot = self.alloc_hidden_local(member_span)?;
+                        let current_slot = self.alloc_hidden_local(member_span)?;
+                        let value_slot = self.alloc_hidden_local(member_span)?;
+                        let written_slot = self.alloc_hidden_local(member_span)?;
+                        let mut stmts = vec![
+                            Stmt::Let {
+                                index: base_slot,
+                                declared_schema: Some(row.schema()),
+                                expr: container,
+                                line,
+                            },
+                            Stmt::Let {
+                                index: key_slot,
+                                declared_schema: Some(TypeSchema::String),
+                                expr: key,
+                                line,
+                            },
+                            Stmt::Let {
+                                index: read_name_slot,
+                                declared_schema: Some(TypeSchema::String),
+                                expr: Expr::String("read".to_owned()),
+                                line,
+                            },
+                            Stmt::Let {
+                                index: write_name_slot,
+                                declared_schema: Some(TypeSchema::String),
+                                expr: Expr::String("write".to_owned()),
+                                line,
+                            },
+                            Stmt::Let {
+                                index: read_slot,
+                                declared_schema: Some(row.read_schema()),
+                                expr: Self::builtin_call(
+                                    vm::BuiltinFunction::Get,
+                                    vec![
+                                        Expr::Borrow(Box::new(Expr::Var(base_slot))),
+                                        Expr::Var(read_name_slot),
+                                    ],
+                                ),
+                                line,
+                            },
+                            Stmt::Let {
+                                index: write_slot,
+                                declared_schema: Some(row.write_schema()),
+                                expr: Self::builtin_call(
+                                    vm::BuiltinFunction::Get,
+                                    vec![
+                                        Expr::Borrow(Box::new(Expr::Var(base_slot))),
+                                        Expr::Var(write_name_slot),
+                                    ],
+                                ),
+                                line,
+                            },
+                            Stmt::Let {
+                                index: current_slot,
+                                declared_schema: Some(TypeSchema::Number),
+                                expr: Expr::LocalCall(
+                                    read_slot,
+                                    Vec::new(),
+                                    vec![Expr::Var(key_slot)],
+                                    None,
+                                ),
+                                line,
+                            },
+                        ];
+                        let divisor = self.lower_expr(*assignment.right)?;
+                        let updated = Expr::Div(
+                            Box::new(Expr::Var(current_slot)),
+                            Box::new(divisor),
+                        );
+                        stmts.push(Stmt::Let {
+                            index: value_slot,
+                            declared_schema: Some(TypeSchema::Number),
+                            expr: updated,
+                            line,
+                        });
+                        stmts.push(Stmt::Let {
+                            index: written_slot,
+                            declared_schema: Some(TypeSchema::Number),
+                            expr: Expr::LocalCall(
+                                write_slot,
+                                Vec::new(),
+                                vec![Expr::Var(key_slot), Expr::Var(value_slot)],
+                                None,
+                            ),
+                            line,
+                        });
+                        return Ok(Expr::Block {
+                            stmts,
+                            expr: Box::new(Expr::Var(written_slot)),
+                        });
+                    }
+                    if assignment.op == ast::AssignOp::ModAssign {
+                        let member_span = member.span;
+                        let key_is_string = match &member.prop {
+                            ast::MemberProp::Computed(property) => self
+                                .expression_schema(&property.expr)
+                                .is_some_and(|schema| matches!(schema, TypeSchema::String)),
+                            _ => false,
+                        };
+                        if !key_is_string {
+                            return Err(unsupported(
+                                member_span,
+                                self.base,
+                                self.source_id,
+                                "expression",
+                            ));
+                        }
+                        let carrier = self
+                            .expression_schema(&member.obj)
+                            .and_then(|schema| self.record_carrier_of_schema(&schema));
+                        let Some(row) = carrier else {
+                            return Err(unsupported(
+                                member_span,
+                                self.base,
+                                self.source_id,
+                                "expression",
+                            ));
+                        };
+                        if !row.fields.values().all(Self::is_numeric_schema) {
+                            return Err(unsupported(
+                                member_span,
+                                self.base,
+                                self.source_id,
+                                "expression",
+                            ));
+                        }
+                        if !self
+                            .expression_schema(&assignment.right)
+                            .is_some_and(|schema| Self::is_numeric_schema(&schema))
+                        {
+                            return Err(unsupported(
+                                member_span,
+                                self.base,
+                                self.source_id,
+                                "expression",
+                            ));
+                        }
+                        let rhs_is_int = self
+                            .expression_schema(&assignment.right)
+                            .is_some_and(|schema| matches!(schema, TypeSchema::Int));
+                        let row_is_int = row
+                            .fields
+                            .values()
+                            .all(|schema| matches!(schema, TypeSchema::Int));
+                        if self.ref_mode && !(row_is_int && rhs_is_int) {
+                            return Err(unsupported(
+                                member_span,
+                                self.base,
+                                self.source_id,
+                                "expression",
+                            ));
+                        }
+                        let obj = member.obj;
+                        let ast::MemberProp::Computed(property) = member.prop else {
+                            return Err(unsupported(
+                                member_span,
+                                self.base,
+                                self.source_id,
+                                "expression",
+                            ));
+                        };
+                        let line = line_at(
+                            self.source,
+                            byte_span(member_span, self.base, self.source_id).lo,
+                        );
+                        let container = self.lower_expr(*obj)?;
+                        let container = match container {
+                            Expr::Borrow(inner) => match *inner {
+                                Expr::Var(slot) => Expr::Var(slot),
+                                other => other,
+                            },
+                            other => other,
+                        };
+                        let key = self.lower_expr(*property.expr)?;
+                        let base_slot = self.alloc_hidden_local(member_span)?;
+                        let key_slot = self.alloc_hidden_local(member_span)?;
+                        let read_name_slot = self.alloc_hidden_local(member_span)?;
+                        let write_name_slot = self.alloc_hidden_local(member_span)?;
+                        let read_slot = self.alloc_hidden_local(member_span)?;
+                        let write_slot = self.alloc_hidden_local(member_span)?;
+                        let current_slot = self.alloc_hidden_local(member_span)?;
+                        let value_slot = self.alloc_hidden_local(member_span)?;
+                        let written_slot = self.alloc_hidden_local(member_span)?;
+                        let mut stmts = vec![
+                            Stmt::Let {
+                                index: base_slot,
+                                declared_schema: Some(row.schema()),
+                                expr: container,
+                                line,
+                            },
+                            Stmt::Let {
+                                index: key_slot,
+                                declared_schema: Some(TypeSchema::String),
+                                expr: key,
+                                line,
+                            },
+                            Stmt::Let {
+                                index: read_name_slot,
+                                declared_schema: Some(TypeSchema::String),
+                                expr: Expr::String("read".to_owned()),
+                                line,
+                            },
+                            Stmt::Let {
+                                index: write_name_slot,
+                                declared_schema: Some(TypeSchema::String),
+                                expr: Expr::String("write".to_owned()),
+                                line,
+                            },
+                            Stmt::Let {
+                                index: read_slot,
+                                declared_schema: Some(row.read_schema()),
+                                expr: Self::builtin_call(
+                                    vm::BuiltinFunction::Get,
+                                    vec![
+                                        Expr::Borrow(Box::new(Expr::Var(base_slot))),
+                                        Expr::Var(read_name_slot),
+                                    ],
+                                ),
+                                line,
+                            },
+                            Stmt::Let {
+                                index: write_slot,
+                                declared_schema: Some(row.write_schema()),
+                                expr: Self::builtin_call(
+                                    vm::BuiltinFunction::Get,
+                                    vec![
+                                        Expr::Borrow(Box::new(Expr::Var(base_slot))),
+                                        Expr::Var(write_name_slot),
+                                    ],
+                                ),
+                                line,
+                            },
+                            Stmt::Let {
+                                index: current_slot,
+                                declared_schema: Some(TypeSchema::Number),
+                                expr: Expr::LocalCall(
+                                    read_slot,
+                                    Vec::new(),
+                                    vec![Expr::Var(key_slot)],
+                                    None,
+                                ),
+                                line,
+                            },
+                        ];
+                        let divisor = self.lower_expr(*assignment.right)?;
+                        let updated = Expr::Mod(
+                            Box::new(Expr::Var(current_slot)),
+                            Box::new(divisor),
+                        );
+                        stmts.push(Stmt::Let {
+                            index: value_slot,
+                            declared_schema: Some(TypeSchema::Number),
+                            expr: updated,
+                            line,
+                        });
+                        stmts.push(Stmt::Let {
+                            index: written_slot,
+                            declared_schema: Some(TypeSchema::Number),
+                            expr: Expr::LocalCall(
+                                write_slot,
+                                Vec::new(),
+                                vec![Expr::Var(key_slot), Expr::Var(value_slot)],
+                                None,
+                            ),
+                            line,
+                        });
+                        return Ok(Expr::Block {
+                            stmts,
+                            expr: Box::new(Expr::Var(written_slot)),
+                        });
+                    }
+                    if assignment.op != ast::AssignOp::Assign {
+                        return Err(unsupported(
+                            member.span,
+                            self.base,
+                            self.source_id,
+                            "expression",
+                        ));
+                    }
+                    let member_span = member.span;
+                    let key_is_string = match &member.prop {
+                        ast::MemberProp::Computed(property) => self
+                            .expression_schema(&property.expr)
+                            .is_some_and(|schema| matches!(schema, TypeSchema::String)),
+                        _ => false,
+                    };
+                    if !key_is_string {
+                        return Err(unsupported(
+                            member_span,
+                            self.base,
+                            self.source_id,
+                            "expression",
+                        ));
+                    }
+                    let carrier = self
+                        .expression_schema(&member.obj)
+                        .and_then(|schema| self.record_carrier_of_schema(&schema));
+                    let Some(row) = carrier else {
+                        return Err(unsupported(
+                            member_span,
+                            self.base,
+                            self.source_id,
+                            "expression",
+                        ));
+                    };
+                    if !row.fields.values().all(Self::is_numeric_schema) {
+                        return Err(unsupported(
+                            member_span,
+                            self.base,
+                            self.source_id,
+                            "expression",
+                        ));
+                    }
+                    let obj = member.obj;
+                    let ast::MemberProp::Computed(property) = member.prop else {
+                        return Err(unsupported(
+                            member_span,
+                            self.base,
+                            self.source_id,
+                            "expression",
+                        ));
+                    };
+                    let container = self.lower_expr(*obj)?;
+                    let key = self.lower_expr(*property.expr)?;
+                    let value = self.lower_expr(*assignment.right)?;
+                    return self.carrier_write(container, key, value, &row, member_span);
+                }
+                let ast::MemberProp::Ident(property) = &member.prop else {
+                    return Err(unsupported(
+                        member.span,
+                        self.base,
+                        self.source_id,
+                        "expression",
+                    ));
+                };
+                let field = property.sym.to_string();
+                let carrier_row = self
+                    .expression_schema(&member.obj)
+                    .and_then(|schema| self.record_carrier_of_schema(&schema));
+                let Some(row) = carrier_row else {
+                    return Err(unsupported(
+                        member.span,
+                        self.base,
+                        self.source_id,
+                        "expression",
+                    ));
+                };
+                if !row.fields.contains_key(&field)
+                    || !row.fields.values().all(Self::is_numeric_schema)
+                {
+                    return Err(unsupported(
+                        member.span,
+                        self.base,
+                        self.source_id,
+                        "expression",
+                    ));
+                }
+                if assignment.op == ast::AssignOp::AddAssign
+                    || assignment.op == ast::AssignOp::SubAssign
+                    || assignment.op == ast::AssignOp::MulAssign
+                    || assignment.op == ast::AssignOp::DivAssign
+                    || assignment.op == ast::AssignOp::ModAssign
+                    || assignment.op == ast::AssignOp::ExpAssign
+                {
+                    let field_schema = row.fields.get(&field).cloned();
+                    let rhs_schema = self.expression_schema(&assignment.right);
+                    let numeric_field =
+                        field_schema.as_ref().is_some_and(Self::is_numeric_schema);
+                    let numeric_rhs =
+                        rhs_schema.as_ref().is_some_and(Self::is_numeric_schema);
+                    if !numeric_field || !numeric_rhs {
+                        return Err(unsupported(
+                            member.span,
+                            self.base,
+                            self.source_id,
+                            "expression",
+                        ));
+                    }
+                    let field_is_int = matches!(field_schema, Some(TypeSchema::Int));
+                    let rhs_is_int = matches!(rhs_schema, Some(TypeSchema::Int));
+                    let is_sub = assignment.op == ast::AssignOp::SubAssign;
+                    let is_mul = assignment.op == ast::AssignOp::MulAssign;
+                    let is_div = assignment.op == ast::AssignOp::DivAssign;
+                    let is_mod = assignment.op == ast::AssignOp::ModAssign;
+                    if (is_sub || is_mul || is_div || is_mod) && self.ref_mode && !(field_is_int && rhs_is_int) {
+                        return Err(unsupported(
+                            member.span,
+                            self.base,
+                            self.source_id,
+                            "expression",
+                        ));
+                    }
+                    let member_span = member.span;
+                    let line = line_at(
+                        self.source,
+                        byte_span(member_span, self.base, self.source_id).lo,
+                    );
+                    let container = self.lower_expr(*member.obj)?;
+                    let container = match container {
+                        Expr::Borrow(inner) => match *inner {
+                            Expr::Var(slot) => Expr::Var(slot),
+                            other => other,
+                        },
+                        other => other,
+                    };
+                    let base_slot = self.alloc_hidden_local(member_span)?;
+                    let key_slot = self.alloc_hidden_local(member_span)?;
+                    let read_name_slot = self.alloc_hidden_local(member_span)?;
+                    let write_name_slot = self.alloc_hidden_local(member_span)?;
+                    let read_slot = self.alloc_hidden_local(member_span)?;
+                    let write_slot = self.alloc_hidden_local(member_span)?;
+                    let current_slot = self.alloc_hidden_local(member_span)?;
+                    let value_slot = self.alloc_hidden_local(member_span)?;
+                    let written_slot = self.alloc_hidden_local(member_span)?;
+                    let mut stmts = vec![
+                        Stmt::Let {
+                            index: base_slot,
+                            declared_schema: Some(row.schema()),
+                            expr: container,
+                            line,
+                        },
+                        Stmt::Let {
+                            index: key_slot,
+                            declared_schema: Some(TypeSchema::String),
+                            expr: Expr::String(field),
+                            line,
+                        },
+                        Stmt::Let {
+                            index: read_name_slot,
+                            declared_schema: Some(TypeSchema::String),
+                            expr: Expr::String("read".to_owned()),
+                            line,
+                        },
+                        Stmt::Let {
+                            index: write_name_slot,
+                            declared_schema: Some(TypeSchema::String),
+                            expr: Expr::String("write".to_owned()),
+                            line,
+                        },
+                        Stmt::Let {
+                            index: read_slot,
+                            declared_schema: Some(row.read_schema()),
+                            expr: Self::builtin_call(
+                                vm::BuiltinFunction::Get,
+                                vec![
+                                    Expr::Borrow(Box::new(Expr::Var(base_slot))),
+                                    Expr::Var(read_name_slot),
+                                ],
+                            ),
+                            line,
+                        },
+                        Stmt::Let {
+                            index: write_slot,
+                            declared_schema: Some(row.write_schema()),
+                            expr: Self::builtin_call(
+                                vm::BuiltinFunction::Get,
+                                vec![
+                                    Expr::Borrow(Box::new(Expr::Var(base_slot))),
+                                    Expr::Var(write_name_slot),
+                                ],
+                            ),
+                            line,
+                        },
+                        Stmt::Let {
+                            index: current_slot,
+                            declared_schema: Some(TypeSchema::Number),
+                            expr: Expr::LocalCall(
+                                read_slot,
+                                Vec::new(),
+                                vec![Expr::Var(key_slot)],
+                                None,
+                            ),
+                            line,
+                        },
+                    ];
+                    let increment = self.lower_expr(*assignment.right)?;
+                    let updated = if assignment.op == ast::AssignOp::ExpAssign {
+                        self.lower_numeric_power(Expr::Var(current_slot), increment, member_span)?
+                    } else if is_sub {
+                        Expr::Sub(
+                            Box::new(Expr::Var(current_slot)),
+                            Box::new(increment),
+                        )
+                    } else if is_mul {
+                        Expr::Mul(
+                            Box::new(Expr::Var(current_slot)),
+                            Box::new(increment),
+                        )
+                    } else if is_div {
+                        Expr::Div(
+                            Box::new(Expr::Var(current_slot)),
+                            Box::new(increment),
+                        )
+                    } else if is_mod {
+                        Expr::Mod(
+                            Box::new(Expr::Var(current_slot)),
+                            Box::new(increment),
+                        )
+                    } else if self.ref_mode && !(field_is_int && rhs_is_int) {
+                        Self::lower_numeric_add(Expr::Var(current_slot), increment)
+                    } else {
+                        Expr::Add(
+                            Box::new(Expr::Var(current_slot)),
+                            Box::new(increment),
+                        )
+                    };
+                    stmts.push(Stmt::Let {
+                        index: value_slot,
+                        declared_schema: Some(TypeSchema::Number),
+                        expr: updated,
+                        line,
+                    });
+                    stmts.push(Stmt::Let {
+                        index: written_slot,
+                        declared_schema: Some(TypeSchema::Number),
+                        expr: Expr::LocalCall(
+                            write_slot,
+                            Vec::new(),
+                            vec![Expr::Var(key_slot), Expr::Var(value_slot)],
+                            None,
+                        ),
+                        line,
+                    });
+                    return Ok(Expr::Block {
+                        stmts,
+                        expr: Box::new(Expr::Var(written_slot)),
+                    });
+                }
+                // The statement path's ident-field store, restated as a
+                // value: the base is lowered once, the declared field name
+                // is staged in a hidden string local (never a literal-key
+                // `Get` move), and the right-hand side is lowered before
+                // `carrier_write` stages base, key and value in that order
+                // and returns the written number.
+                let member_span = member.span;
+                let line = line_at(
+                    self.source,
+                    byte_span(member_span, self.base, self.source_id).lo,
+                );
+                let container = self.lower_expr(*member.obj)?;
+                let key_slot = self.alloc_hidden_local(member_span)?;
+                let key = Expr::Block {
+                    stmts: vec![Stmt::Let {
+                        index: key_slot,
+                        declared_schema: Some(TypeSchema::String),
+                        expr: Expr::String(field),
+                        line,
+                    }],
+                    expr: Box::new(Expr::Var(key_slot)),
+                };
+                let value = self.lower_expr(*assignment.right)?;
+                self.carrier_write(container, key, value, &row, member_span)
             }
             other => Err(unsupported(
                 other.span(),
@@ -8095,6 +10862,94 @@ pub(crate) fn lower_reference_array(
     lower_impl_merged(user, Some(prelude), source, context, true)
 }
 
+/// Owned-prelude wrapper declarations with no JavaScript-realm consumer.
+///
+/// These six helpers are legacy TypeScript reference-array surface: ordinary
+/// TypeScript source lowers guarded element comparisons and `Math.random`
+/// through them. The JavaScript frontend lowers its own operators, so the JS
+/// realm has no caller for any of them. `snapshot_values`, `close` and
+/// `collect` are deliberately absent from this list: the heap acceptance,
+/// directory/extents and lifecycle proofs call them through the real
+/// generated carrier.
+const JS_REALM_UNUSED_OWNED_PRELUDE: [&str; 6] = [
+    super::array_lowering::HELPER_HAS,
+    super::array_lowering::HELPER_RAND,
+    super::array_lowering::HELPER_LT,
+    super::array_lowering::HELPER_GT,
+    super::array_lowering::HELPER_LT2,
+    super::array_lowering::HELPER_GT2,
+];
+
+/// Drops exactly the known unused owned wrapper `FunctionDecl` items from a
+/// parsed prelude module. Type aliases, interfaces, the owning dispatcher
+/// closure, every other function (including unknown future names) and all
+/// user items are retained untouched; the one host binding that only these
+/// wrappers served is handled by [`drop_unused_owned_prelude_imports`].
+fn drop_unused_owned_prelude_wrappers(module: &mut ast::Module) {
+    module.body.retain(|item| {
+        let ast::ModuleItem::Stmt(ast::Stmt::Decl(ast::Decl::Fn(decl))) = item else {
+            return true;
+        };
+        !JS_REALM_UNUSED_OWNED_PRELUDE
+            .iter()
+            .any(|name| decl.ident.sym.as_ref() == *name)
+    });
+}
+
+/// Host import bindings that exist *only* to serve an omitted owned wrapper:
+/// (module, imported local). `__compat_ref_rand` is the sole caller of
+/// `compat_math::random`, and the pinned VM refuses to bind a program import
+/// that has no resolved full schema while the catalog has candidates for it
+/// (`host import '...' has N catalog overloads; full schema and fingerprint
+/// are required`). Keeping the binding without its caller would make every
+/// JS realm run unbindable, so the exact dead declaration is removed with
+/// the wrapper it served. Nothing else is pruned: unknown or future imports
+/// stay declared even when currently unused.
+const JS_REALM_UNUSED_OWNED_PRELUDE_IMPORTS: [(&str, &str); 1] =
+    [("compat_math", "__compat_ref_random")];
+
+/// Drops a whole `ImportDecl` only when it is a single named specifier whose
+/// module and local name match [`JS_REALM_UNUSED_OWNED_PRELUDE_IMPORTS`]
+/// exactly. Multi-specifier imports, default/namespace imports and every
+/// other module stay untouched.
+fn drop_unused_owned_prelude_imports(module: &mut ast::Module) {
+    module.body.retain(|item| {
+        let ast::ModuleItem::ModuleDecl(ast::ModuleDecl::Import(import)) = item else {
+            return true;
+        };
+        let [ast::ImportSpecifier::Named(named)] = import.specifiers.as_slice() else {
+            return true;
+        };
+        let module_name = import.src.value.to_string_lossy();
+        !JS_REALM_UNUSED_OWNED_PRELUDE_IMPORTS
+            .iter()
+            .any(|(dead_module, dead_local)| {
+                *dead_module == module_name.as_ref() && named.local.sym.as_ref() == *dead_local
+            })
+    });
+}
+
+/// Private JavaScript-realm prelude entry.
+///
+/// Parses the same fixed trusted prelude (plus empty generated user input)
+/// as reference-array mode and removes only [`JS_REALM_UNUSED_OWNED_PRELUDE`]
+/// (plus the exact host binding in
+/// [`JS_REALM_UNUSED_OWNED_PRELUDE_IMPORTS`] that only they served) from the
+/// prelude AST *before* merge, predeclare and IR metadata production.
+/// Declarations, implementations, call sites and semantic sidecars are
+/// therefore produced by the existing parser from the filtered AST — never
+/// by editing emitted IR. Raw user JS never enters the TypeScript parser,
+/// and the ordinary TypeScript path above is untouched.
+pub(crate) fn lower_js_realm_prelude(
+    context: &SourceFrontendContext<'_>,
+) -> Result<FrontendIr, ParseError> {
+    let user = parse_module("")?;
+    let mut prelude = parse_module(super::array_lowering::REFERENCE_ARRAY_PRELUDE)?;
+    drop_unused_owned_prelude_wrappers(&mut prelude.module);
+    drop_unused_owned_prelude_imports(&mut prelude.module);
+    lower_impl_merged(user, Some(prelude), "", context, true)
+}
+
 fn lower_impl(
     source: &str,
     context: &SourceFrontendContext<'_>,
@@ -8244,6 +11099,7 @@ fn lower_impl_merged(
         stmt_spans: Vec::new(),
         gen_iterators: HashMap::new(),
         gen_results: HashMap::new(),
+        record_carriers: HashMap::new(),
         module_const_inits: HashMap::new(),
         in_gen_body: false,
     }

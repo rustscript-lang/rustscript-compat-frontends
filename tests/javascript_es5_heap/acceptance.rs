@@ -58,6 +58,7 @@ fn transaction_registry() -> vm::HostFunctionRegistry {
         pd_vm_compat_frontends::runtime::array::typescript_owned_array_host_module(),
         pd_vm_compat_frontends::runtime::array::typescript_array_snapshot_host_module(),
         pd_vm_compat_frontends::runtime::scalar_math::typescript_scalar_math_host_module(),
+        pd_vm_compat_frontends::runtime::scalar_error::typescript_error_host_module(),
     ] {
         descriptors.extend(module.descriptors());
     }
@@ -93,6 +94,12 @@ fn transaction_registry() -> vm::HostFunctionRegistry {
     registry
         .allow_builtin("math::floor")
         .expect("numeric builtin");
+    // The realm bootstrap publishes its fixed ASCII strings through the Core
+    // bytes initializer; the accepted Object.keys harness allows the same
+    // builtin for the same reason.
+    registry
+        .allow_builtin("bytes::from_utf8")
+        .expect("bootstrap strings");
     registry
 }
 
@@ -380,6 +387,10 @@ fn boundary_run(boundary: Boundary, refuse: bool) -> (Vec<Value>, Vec<Value>, us
     )
     .expect("real boundary compilation");
     let mut machine = compilation.into_vm().expect("certified boundary VM");
+    machine.set_jit_config(vm::JitConfig {
+        enabled: false,
+        ..vm::JitConfig::default()
+    });
     // Derived prior to execution: prefix80 + source frame14 + page451 +
     // source node9 =554 cells or less for this simple source; one extra
     // page of64 nodes and roots fits 8192 cells. Requested8197 data cells
@@ -408,8 +419,11 @@ fn boundary_run(boundary: Boundary, refuse: bool) -> (Vec<Value>, Vec<Value>, us
     transaction_registry()
         .bind_vm_cached(&mut machine)
         .expect("bind unchanged catalog");
-    machine.set_fuel(100_000_000);
+    machine.set_fuel(10_000_000);
     let outcome = machine.run();
+    assert!(!machine.jit_config().enabled);
+    assert_eq!(machine.aot_exec_count(), 0);
+    assert_eq!(machine.jit_native_exec_count(), 0);
     if refuse {
         assert!(
             outcome.is_err(),

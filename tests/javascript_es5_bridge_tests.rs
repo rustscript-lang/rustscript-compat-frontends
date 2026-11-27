@@ -157,7 +157,7 @@ fn primitive_source_executes_native_ssa() {
 }
 
 fn js_realm_catalog() -> std::sync::Arc<vm::HostApiCatalog> {
-    pd_vm_compat_frontends::reference_array_effective_catalog()
+    pd_vm_compat_frontends::runtime::cli::reference_array_cli_effective_catalog()
 }
 
 fn js_realm_options(catalog: &std::sync::Arc<vm::HostApiCatalog>) -> vm::CompileSourceFileOptions {
@@ -214,6 +214,9 @@ fn js_realm_vm(
     pd_vm_compat_frontends::runtime::scalar_math::typescript_scalar_math_host_module()
         .install_from_catalog(&mut registry, &catalog)
         .expect("scalar-math adapter should match the effective catalog");
+    pd_vm_compat_frontends::runtime::scalar_error::typescript_error_host_module()
+        .install_from_catalog(&mut registry, &catalog)
+        .expect("scalar-error adapter should match the effective catalog");
     registry
         .allow_builtin("math::floor")
         .expect("math::floor should be allow-listable");
@@ -443,6 +446,9 @@ fn js_realm_uncertified_program_fails_closed_before_allocation() {
     pd_vm_compat_frontends::runtime::scalar_math::typescript_scalar_math_host_module()
         .install_from_catalog(&mut registry, &catalog)
         .expect("scalar-math adapter should match the effective catalog");
+    pd_vm_compat_frontends::runtime::scalar_error::typescript_error_host_module()
+        .install_from_catalog(&mut registry, &catalog)
+        .expect("scalar-error adapter should match the effective catalog");
     registry
         .allow_builtin("math::floor")
         .expect("math::floor should be allow-listable");
@@ -709,19 +715,49 @@ fn utf16_near_bound_literals_still_admit() {
         pd_vm_compat_frontends::runtime::array::OwnedArrayLimits::default(),
         false,
     );
+    machine.set_jit_config(vm::JitConfig {
+        enabled: false,
+        ..*machine.jit_config()
+    });
+    assert!(!machine.jit_config().enabled);
+    machine.set_fuel(10_000_000);
+    assert_eq!(machine.get_fuel(), Some(10_000_000));
     assert_eq!(js_realm_unboxed_bool(&mut machine), Value::Bool(true));
+    assert_eq!(
+        (machine.aot_exec_count(), machine.jit_native_exec_count()),
+        (0, 0)
+    );
+    assert!(!machine.jit_config().enabled);
+    machine
+        .reset_for_reuse()
+        .expect("near-bound interpreter run must reset for reuse");
+    assert_eq!(machine.host_context().resource_count(), 0);
 }
 
+/// The old braced spelling is now the accepted Micro extension: the exact
+/// previous source compiles through the production catalog and certified
+/// compile path. A bare `s;` returns a String reference, not a Bool, so this
+/// qualification stops at compilation (source 1, Core 1, VM 0); the public
+/// length selector covers the decoded value.
 #[test]
-fn utf16_post_es5_spellings_are_rejected() {
+fn utf16_braced_escape_certified_compile_accepted() {
     let catalog = js_realm_catalog();
     let braced = "var s=\"\\u{1D11E}\";s;";
-    let text = compile_rejection(&catalog, braced, "braced Unicode escape");
-    eprintln!("UTF16_BRACED_REJECTION: {text}");
-    assert!(
-        text.contains("braced"),
-        "braced escape must hit the ES5 guard, got {text}"
+    let compilation = vm::compile_source_with_flavor_and_options_with_capture_certification(
+        braced,
+        javascript_es5_flavor(),
+        js_realm_options(&catalog),
     );
+    if let Err(error) = compilation {
+        panic!("braced Unicode escape must compile, got {error:?}");
+    }
+}
+
+/// Raw U+2028/U+2029 line separators inside a quoted string stay refused;
+/// only their escape spellings are string data.
+#[test]
+fn utf16_raw_line_separator_spelling_is_rejected() {
+    let catalog = js_realm_catalog();
     let raw = format!("var s=\"a{}b\";s;", '\u{2028}');
     let text = compile_rejection(&catalog, &raw, "raw line separator");
     eprintln!("UTF16_RAW_SEPARATOR_REJECTION: {text}");
@@ -739,7 +775,6 @@ fn utf16_es5_lookalikes_stay_admitted() {
             "escaped backslash before u-brace",
         ),
         ("var s=\"a\\\nb\";s===s;", "line continuation"),
-        ("var s=\"\\\\u2028\";s===s;", "escaped separator"),
     ] {
         let (mut machine, _) = js_realm_vm(
             source,
@@ -752,6 +787,21 @@ fn utf16_es5_lookalikes_stay_admitted() {
             "{label} must stay admitted: {source:?}"
         );
     }
+}
+
+#[test]
+fn utf16_escaped_separator_lookalike_stays_admitted() {
+    let source = "var s=\"\\\\u2028\";s===s;";
+    let (mut machine, _) = js_realm_vm(
+        source,
+        pd_vm_compat_frontends::runtime::array::OwnedArrayLimits::default(),
+        false,
+    );
+    assert_eq!(
+        js_realm_unboxed_bool(&mut machine),
+        Value::Bool(true),
+        "escaped separator must stay admitted: {source:?}"
+    );
 }
 
 // ---- Private allocator IR stress (test-only) ----
@@ -1145,6 +1195,9 @@ fn alloc_stress_vm(source: &str, native: bool) -> Vm {
     pd_vm_compat_frontends::runtime::scalar_math::typescript_scalar_math_host_module()
         .install_from_catalog(&mut registry, &catalog)
         .expect("scalar-math adapter should match the effective catalog");
+    pd_vm_compat_frontends::runtime::scalar_error::typescript_error_host_module()
+        .install_from_catalog(&mut registry, &catalog)
+        .expect("scalar-error adapter should match the effective catalog");
     registry
         .allow_builtin("math::floor")
         .expect("math::floor should be allow-listable");
@@ -1422,6 +1475,9 @@ fn alloc_probe_vm(
     pd_vm_compat_frontends::runtime::scalar_math::typescript_scalar_math_host_module()
         .install_from_catalog(&mut registry, &catalog)
         .expect("scalar-math adapter should match the effective catalog");
+    pd_vm_compat_frontends::runtime::scalar_error::typescript_error_host_module()
+        .install_from_catalog(&mut registry, &catalog)
+        .expect("scalar-error adapter should match the effective catalog");
     registry
         .allow_builtin("math::floor")
         .expect("math::floor should be allow-listable");

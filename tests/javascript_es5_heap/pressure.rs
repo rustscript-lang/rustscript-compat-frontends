@@ -183,6 +183,10 @@ fn p2_pressure_collection_precedes_slot_selection_and_preserves_payloads() {
     )
     .expect("real managed pressure fixture");
     let mut machine = compilation.into_vm().expect("certified VM");
+    machine.set_jit_config(vm::JitConfig {
+        enabled: false,
+        ..vm::JitConfig::default()
+    });
     pd_vm_compat_frontends::runtime::array::initialize_typescript_owned_arrays(
         &mut machine,
         pd_vm_compat_frontends::runtime::array::OwnedArrayLimits::default(),
@@ -191,11 +195,14 @@ fn p2_pressure_collection_precedes_slot_selection_and_preserves_payloads() {
     transaction_registry()
         .bind_vm_cached(&mut machine)
         .expect("bind");
-    machine.set_fuel(100_000_000);
+    machine.set_fuel(10_000_000);
     assert_eq!(
         machine.run().expect("pressure must collect and succeed"),
         VmStatus::Halted
     );
+    assert!(!machine.jit_config().enabled);
+    assert_eq!(machine.aot_exec_count(), 0);
+    assert_eq!(machine.jit_native_exec_count(), 0);
     let stack = machine.stack();
     let v = heap_stale_ints(&stack[stack.len() - 14..]);
     eprintln!("P2_PRESSURE_LIVE evidence={v:?}");

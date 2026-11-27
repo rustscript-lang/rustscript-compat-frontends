@@ -147,7 +147,7 @@ fn is_use_strict_raw(value: &ast::Str) -> bool {
 /// `1e+21` (so a `"1e21"` string key does not collide while `"1e+21"` does),
 /// and large finite values use the ES5 digit/threshold rules, not Rust
 /// formatting.
-fn number_to_string(value: f64) -> String {
+pub(super) fn number_to_string(value: f64) -> String {
     if value.is_nan() {
         return "NaN".to_owned();
     }
@@ -230,8 +230,8 @@ impl<'source> Checker<'source> {
     /// function, parameter and catch names). The raw-lexeme check runs in
     /// both modes, before the strictness gate below: `eval`/`arguments` and
     /// the strict reserved words are restricted only in strict code, but a
-    /// braced escape is post-ES5 everywhere; sloppy `var let` / `var yield`
-    /// stay legal.
+    /// braced escape inside an identifier lexeme is post-ES5 everywhere;
+    /// sloppy `var let` / `var yield` stay legal.
     fn check_binding(&self, name: &str, span: SwcSpan, role: &str) -> Result<(), ParseError> {
         self.check_ident_raw(span, role)?;
         if !self.strict {
@@ -271,9 +271,13 @@ impl<'source> Checker<'source> {
     /// escapes (`\u{...}`) are refused before the cooked SWC symbol loses
     /// the spelling. Only the actual token span is sliced, never a global
     /// text scan, so comments, string data, regexp patterns and
-    /// escaped-backslash lookalikes are unaffected. Fixed ES5 `\uXXXX`
-    /// escapes contain no brace and stay allowed; synthetic spans with no
-    /// source slice pass through instead of misfiring.
+    /// escaped-backslash lookalikes are unaffected. Scope is the identifier
+    /// lexeme only: quoted string literals (including quoted property and
+    /// member keys) are decoded by the shared string codec, where the Micro
+    /// braced escape is accepted, but no identifier position admits it.
+    /// Fixed ES5 `\uXXXX` escapes contain no brace and stay allowed;
+    /// synthetic spans with no source slice pass through instead of
+    /// misfiring.
     fn check_ident_raw(&self, span: SwcSpan, role: &str) -> Result<(), ParseError> {
         let lo = span.lo.0.saturating_sub(self.base) as usize;
         let hi = span.hi.0.saturating_sub(self.base) as usize;
@@ -533,10 +537,7 @@ impl<'source> Checker<'source> {
                 self.loop_depth -= 1;
                 result
             }
-            ast::Stmt::ForOf(loop_) => Err(self.unsupported(
-                loop_.span,
-                "'for-of' iteration is post-ES5; ES5.1 only has 'for-in'",
-            )),
+            ast::Stmt::ForOf(loop_) => self.admit_for_of(loop_),
             ast::Stmt::Decl(decl) => {
                 match decl {
                     ast::Decl::Fn(function) => self.admit_statement_function(function),
@@ -588,7 +589,11 @@ impl<'source> Checker<'source> {
         }
         let is_iteration = matches!(
             chain,
-            ast::Stmt::While(_) | ast::Stmt::DoWhile(_) | ast::Stmt::For(_) | ast::Stmt::ForIn(_)
+            ast::Stmt::While(_)
+                | ast::Stmt::DoWhile(_)
+                | ast::Stmt::For(_)
+                | ast::Stmt::ForIn(_)
+                | ast::Stmt::ForOf(_)
         );
         self.labels.push((label.to_owned(), is_iteration));
         // Inner chain labels are pushed by the recursive walk below.
@@ -645,6 +650,61 @@ impl<'source> Checker<'source> {
         }
     }
 
+    /// Numeric dense-Array `for-of`. `for-await`, `let`/`const`/`using`,
+    /// destructuring, multi-declarators and head initializers stay genuine
+    /// early errors. The admitted heads are a single `var` ident and the
+    /// existing for-in assignment targets.
+    fn admit_for_of(&mut self, loop_: &ast::ForOfStmt) -> Result<(), ParseError> {
+        if loop_.is_await {
+            return Err(self.unsupported(loop_.span, "'for-await' iteration is post-ES5"));
+        }
+        match &loop_.left {
+            ast::ForHead::VarDecl(decl) => {
+                if decl.kind != ast::VarDeclKind::Var {
+                    return Err(
+                        self.unsupported(decl.span, "'for-of' with 'let' or 'const' is post-ES5")
+                    );
+                }
+                if decl.decls.len() != 1 {
+                    return Err(
+                        self.syntax(decl.span, "a 'for-of' declaration binds exactly one name")
+                    );
+                }
+                let declarator = &decl.decls[0];
+                if declarator.init.is_some() {
+                    return Err(self.syntax(
+                        declarator.span,
+                        "a 'for-of' binding cannot have an initializer",
+                    ));
+                }
+                match &declarator.name {
+                    ast::Pat::Ident(binding) => {
+                        self.check_binding(
+                            binding.id.sym.as_str(),
+                            binding.id.span,
+                            "a 'for-of' binding",
+                        )?;
+                    }
+                    _ => {
+                        return Err(self.unsupported(
+                            declarator.span,
+                            "'for-of' destructuring bindings are post-ES5",
+                        ));
+                    }
+                }
+            }
+            ast::ForHead::UsingDecl(decl) => {
+                return Err(self.unsupported(decl.span, "'using' declarations are post-ES5"));
+            }
+            ast::ForHead::Pat(target) => self.admit_for_in_target(target)?,
+        }
+        self.admit_expr(&loop_.right)?;
+        self.loop_depth += 1;
+        let result = self.admit_stmt(&loop_.body);
+        self.loop_depth -= 1;
+        result
+    }
+
     /// `for-in` reference targets: identifiers bind (strict-checked) while
     /// parenthesized and member targets are walked as assignment references.
     /// Anything else is a syntax error, not an unsupported-lowering case.
@@ -680,6 +740,17 @@ impl<'source> Checker<'source> {
         for declarator in &decl.decls {
             match &declarator.name {
                 ast::Pat::Ident(binding) => {
+                    // Pinned Micro rejects `var arguments` in sloppy code too
+                    // ("invalid variable name"). Function declarations named
+                    // `arguments` stay admitted: the pinned engine allows
+                    // `function arguments(){}` and the implicit activation
+                    // binding still wins inside a function.
+                    if !self.strict && binding.id.sym == *"arguments" {
+                        return Err(self.syntax(
+                            binding.id.span,
+                            "'arguments' is an invalid variable name",
+                        ));
+                    }
                     self.check_binding(binding.id.sym.as_str(), binding.id.span, "a variable")?;
                 }
                 other => {
@@ -881,32 +952,19 @@ impl<'source> Checker<'source> {
             }
             ast::Expr::Update(update) => self.admit_assign_target_expr(&update.arg),
             ast::Expr::Bin(binary) => {
-                match binary.op {
-                    ast::BinaryOp::Exp => {
-                        return Err(self
-                            .unsupported(binary.span, "the exponentiation operator is post-ES5"));
-                    }
-                    ast::BinaryOp::NullishCoalescing => {
-                        return Err(self.unsupported(
-                            binary.span,
-                            "the nullish-coalescing operator is post-ES5",
-                        ));
-                    }
-                    _ => {}
+                if binary.op == ast::BinaryOp::NullishCoalescing {
+                    return Err(self
+                        .unsupported(binary.span, "the nullish-coalescing operator is post-ES5"));
                 }
                 self.admit_expr(&binary.left)?;
                 self.admit_expr(&binary.right)
             }
             ast::Expr::Assign(assign) => {
                 match assign.op {
-                    ast::AssignOp::ExpAssign
-                    | ast::AssignOp::AndAssign
+                    ast::AssignOp::AndAssign
                     | ast::AssignOp::OrAssign
                     | ast::AssignOp::NullishAssign => {
-                        return Err(self.unsupported(
-                            assign.span,
-                            "logical and exponentiation assignment are post-ES5",
-                        ));
+                        return Err(self.unsupported(assign.span, "logical assignment is post-ES5"));
                     }
                     _ => {}
                 }
@@ -1127,15 +1185,14 @@ impl<'source> Checker<'source> {
         }
     }
 
-    /// Map a codec failure to its truthful grammar-stage layer: ES5
-    /// violations are SyntaxErrors, post-ES5 spellings are unsupported
-    /// syntax, and the unit bound stays a resource diagnostic. The span is
-    /// narrowed to the offending escape with the caller source id kept.
+    /// Map a codec failure to its truthful grammar-stage layer: lexical
+    /// violations are SyntaxErrors and the unit bound stays a resource
+    /// diagnostic. The span is narrowed to the offending escape with the
+    /// caller source id kept.
     fn string_codec_error(&self, span: SwcSpan, codec: StringCodecError) -> ParseError {
         let span = narrowed_span(span, codec.relative_offset);
         match codec.kind {
             StringCodecErrorKind::Lexical => self.syntax(span, codec.message),
-            StringCodecErrorKind::PostEs5 => self.unsupported(span, codec.message),
             StringCodecErrorKind::Oversize => {
                 parse_error(self.source_id, self.base, span, codec.message)
             }
@@ -1361,7 +1418,7 @@ impl<'source> Checker<'source> {
             Setter => roles.setter = true,
         };
         match conflict {
-            Some(label) if self.strict => {
+            Some(label) if self.strict || label != "duplicate data property" => {
                 Err(self.syntax(span, format!("{label} is not allowed in strict mode code")))
             }
             _ => {

@@ -4,12 +4,14 @@ use vm::{HostFunctionRegistry, cli::CliHostServices};
 
 use super::array::OwnedArrayLimits;
 
-/// Exact effective catalog for the selected CLI mode: the accepted
-/// reference-array effective catalog plus the accepted scalar
-/// `typescript::throw_error` adapter the unchanged `factorial.ts` and
-/// `fibonacci.ts` modules genuinely contain. Compiler and registry share
-/// this one catalog; it never overwrites a conflicting explicit catalog
-/// (Core still refuses those).
+/// Exact effective catalog shared by the ordinary default compiler and CLI,
+/// and by the explicit reference-array mode: the accepted reference-array
+/// catalog (array, owned-array, snapshot and scalar-math descriptors) plus the
+/// accepted scalar `typescript::throw_error` adapter the unchanged
+/// `factorial.ts` and `fibonacci.ts` modules genuinely contain. The JavaScript
+/// ES5 frontend uses this same accepted boundary; no descriptor is added for a
+/// separate JavaScript mode. Compiler and registry share this one catalog; it
+/// never overwrites a conflicting explicit catalog (Core still refuses those).
 pub fn reference_array_cli_effective_catalog() -> Arc<vm::HostApiCatalog> {
     let base = crate::reference_array_effective_catalog();
     let error = crate::runtime::scalar_error::typescript_error_host_module()
@@ -38,21 +40,26 @@ pub fn reference_array_cli_compile_options() -> vm::CompileSourceFileOptions {
         .with_host_api_catalog(reference_array_cli_effective_catalog())
 }
 
-/// Builds fresh standard hosts plus the exact TypeScript scalar Error adapter for each CLI VM.
+/// Default CLI host services for one VM.
+///
+/// The ordinary default route and the explicit reference-array mode use the
+/// same exact composition: the shared compiler catalog, a fresh registry per
+/// VM installing the accepted array/owned-array/snapshot/scalar-math/Error
+/// descriptors, source capture certification, and per-VM owned-array
+/// initialization. The ordinary default route also registers the existing
+/// JavaScript ES5 source frontend, so this is the one service boundary for
+/// `.ts`, `.mts`, `.lua`, `.js` and Core-native `.rss`. Owned-array
+/// initialization installs the existing backend state and does not allocate a
+/// JavaScript realm or host resource for non-JavaScript programs.
 pub fn typescript_cli_host_services() -> CliHostServices<'static> {
-    let catalog = crate::runtime::scalar_error::typescript_error_host_catalog();
-    let registry_catalog = Arc::clone(&catalog);
-    CliHostServices::new(catalog, move || {
-        let mut registry = HostFunctionRegistry::new();
-        crate::runtime::scalar_error::typescript_error_host_module()
-            .install_from_catalog(&mut registry, &registry_catalog)?;
-        Ok(registry)
-    })
-    .with_capture_certification()
+    typescript_reference_array_cli_host_services()
 }
 
-/// Builds the exact production reference-array/generator host services for
-/// one selected-mode CLI VM: the same effective catalog the explicit
+/// Builds the exact production host services for one CLI VM.
+///
+/// The ordinary default CLI calls the default-limits variant below; the
+/// explicit reference-array mode and `typescript_cli_host_services()` share
+/// this same composition. It uses the same effective catalog the explicit
 /// reference-array compiler uses, a fresh registry per VM installing the
 /// accepted production descriptors with Core's exact `math::floor` builtin
 /// retained, source capture certification, and the accepted per-VM

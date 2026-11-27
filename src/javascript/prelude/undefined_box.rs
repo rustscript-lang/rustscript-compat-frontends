@@ -233,6 +233,31 @@ fn rewrite_expr(expr: &mut Expr, helper: u16, replaced: &mut usize) {
             rewrite_expr(err_expr, helper, replaced);
         }
         Expr::ResultTry { value, .. } => rewrite_expr(value, helper, replaced),
+        Expr::ResultConvert { value, .. } => rewrite_expr(value, helper, replaced),
+        Expr::ResultMethod {
+            receiver, argument, ..
+        }
+        | Expr::OptionMethod {
+            receiver, argument, ..
+        } => {
+            rewrite_expr(receiver, helper, replaced);
+            rewrite_expr(argument, helper, replaced);
+        }
+        Expr::OptionConstruct { payload, .. } => {
+            if let Some(payload) = payload {
+                rewrite_expr(payload, helper, replaced);
+            }
+        }
+        Expr::OptionMatch {
+            value,
+            some_expr,
+            none_expr,
+            ..
+        } => {
+            rewrite_expr(value, helper, replaced);
+            rewrite_expr(some_expr, helper, replaced);
+            rewrite_expr(none_expr, helper, replaced);
+        }
         Expr::Null
         | Expr::Int(_)
         | Expr::Float(_)
@@ -246,6 +271,7 @@ fn rewrite_expr(expr: &mut Expr, helper: u16, replaced: &mut usize) {
         | Expr::MoveVar(_)
         | Expr::MoveField { .. }
         | Expr::MoveIndex { .. } => {}
+        | Expr::Unit => {}
     }
 }
 

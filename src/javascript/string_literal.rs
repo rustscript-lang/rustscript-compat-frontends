@@ -2,14 +2,18 @@
 //!
 //! One private raw-lexeme decoder feeds both grammar admission and IR
 //! lowering, so literal values are never derived from the locked parser's
-//! cooked payload. Normative reference is ES5.1 section 7.8.4; the only
-//! additional extension is the explicitly retained sloppy Annex B.1.2 octal
-//! form, which strict code always rejects. The decoder consumes the raw
-//! token bytes including both quote delimiters, sliced by the literal's own
-//! source span, and emits exact UTF-16 units with no normalization:
-//! Unicode escapes emit their four-hex-digit value directly (lone
-//! surrogates preserved), hex escapes consume exactly two hex digits, and
-//! `\0` is NUL only when the next character is not a DecimalDigit.
+//! cooked payload. Normative reference is ES5.1 section 7.8.4; the two
+//! retained extensions are the sloppy Annex B.1.2 octal form, which strict
+//! code always rejects, and the Micro braced Unicode string escape
+//! `\u{HEX+}` (one or more ASCII hex digits, value at most U+10FFFF), which
+//! applies to quoted string literals in both strictness modes only. The
+//! decoder consumes the raw token bytes including both quote delimiters,
+//! sliced by the literal's own source span, and emits exact UTF-16 units
+//! with no normalization: fixed Unicode escapes emit their four-hex-digit
+//! value directly (lone surrogates preserved), braced escapes emit one unit
+//! at or below U+FFFF (lone surrogates preserved) and a surrogate pair above
+//! it, hex escapes consume exactly two hex digits, and `\0` is NUL only
+//! when the next character is not a DecimalDigit.
 //!
 //! The actual Annex B.1.2 productions (including DecimalDigit lookaheads)
 //! are implemented, not modern greedy-octal behavior: a lone OctalDigit
@@ -40,12 +44,11 @@ pub(super) enum StringStrictness {
     Sloppy,
 }
 
-/// Codec error category: an ES5 grammar violation, a post-ES5 spelling, or
-/// the unit-bound resource refusal.
+/// Codec error category: a lexical violation in the ES5/Micro spelling set,
+/// or the unit-bound resource refusal.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum StringCodecErrorKind {
     Lexical,
-    PostEs5,
     Oversize,
 }
 
@@ -244,35 +247,32 @@ pub(super) fn decode_string_literal(
                 }
                 b'u' => {
                     if bytes.get(index + 1) == Some(&b'{') {
-                        return Err(error(
-                            escape_at,
-                            StringCodecErrorKind::PostEs5,
-                            "JavaScript ES5 string literals reject post-ES5 braced Unicode escapes"
-                                .to_owned(),
-                        ));
-                    }
-                    let mut digits = [0u16; 4];
-                    for (position, digit) in digits.iter_mut().enumerate() {
-                        match bytes
-                            .get(index + 1 + position)
-                            .and_then(|byte| hex_value(*byte))
-                        {
-                            Some(value) => *digit = value,
-                            None => {
-                                return Err(error(
-                                    escape_at,
-                                    StringCodecErrorKind::Lexical,
-                                    "invalid ES5 Unicode escape: want exactly four hex digits"
-                                        .to_owned(),
-                                ));
+                        // Micro braced Unicode escape: `\u{HEX+}`.
+                        index = decode_braced_unicode(bytes, index + 1, escape_at, &mut units)?;
+                    } else {
+                        let mut digits = [0u16; 4];
+                        for (position, digit) in digits.iter_mut().enumerate() {
+                            match bytes
+                                .get(index + 1 + position)
+                                .and_then(|byte| hex_value(*byte))
+                            {
+                                Some(value) => *digit = value,
+                                None => {
+                                    return Err(error(
+                                        escape_at,
+                                        StringCodecErrorKind::Lexical,
+                                        "invalid ES5 Unicode escape: want exactly four hex digits"
+                                            .to_owned(),
+                                    ));
+                                }
                             }
                         }
+                        push(
+                            &mut units,
+                            4096 * digits[0] + 256 * digits[1] + 16 * digits[2] + digits[3],
+                        );
+                        index += 5;
                     }
-                    push(
-                        &mut units,
-                        4096 * digits[0] + 256 * digits[1] + 16 * digits[2] + digits[3],
-                    );
-                    index += 5;
                 }
                 b'\n' => {
                     // `\<LF>` line continuation contributes no units.
@@ -359,6 +359,82 @@ pub(super) fn decode_string_literal(
         }
     }
     Ok(units)
+}
+
+/// Decode one Micro braced Unicode escape `{HEX+}` starting at the opening
+/// brace (`brace`), returning the index just past the closing brace. The
+/// caller has already validated that this is a quoted string token, so the
+/// last byte is the closing quote: reaching it without a brace is a lexical
+/// error, never ordinary content. Digits are ASCII hex only, one or more of
+/// them, and the value is bounded at U+10FFFF with a checked accumulator; no
+/// digit-count cap, so leading zeros are ordinary digits. Values at or below
+/// U+FFFF emit one u16 (lone surrogates preserved, never a replacement);
+/// larger values emit the two surrogate units of the exact UTF-16 encoding.
+fn decode_braced_unicode(
+    bytes: &[u8],
+    brace: usize,
+    escape_at: usize,
+    units: &mut Vec<u16>,
+) -> Result<usize, StringCodecError> {
+    let mut cursor = brace + 1;
+    let mut value: u32 = 0;
+    let mut digits = 0usize;
+    loop {
+        let Some(&byte) = bytes.get(cursor) else {
+            return Err(error(
+                escape_at,
+                StringCodecErrorKind::Lexical,
+                "string literal ends inside a braced Unicode escape".to_owned(),
+            ));
+        };
+        if byte == b'}' {
+            break;
+        }
+        let Some(digit) = hex_value(byte) else {
+            return Err(error(
+                escape_at,
+                StringCodecErrorKind::Lexical,
+                "invalid braced Unicode escape: want 1+ hex digits and a closing '}'".to_owned(),
+            ));
+        };
+        let Some(accumulated) = value
+            .checked_mul(16)
+            .and_then(|accumulated| accumulated.checked_add(u32::from(digit)))
+        else {
+            return Err(error(
+                escape_at,
+                StringCodecErrorKind::Lexical,
+                "invalid braced Unicode escape: value exceeds U+10FFFF".to_owned(),
+            ));
+        };
+        value = accumulated;
+        digits += 1;
+        cursor += 1;
+    }
+    if digits == 0 {
+        return Err(error(
+            escape_at,
+            StringCodecErrorKind::Lexical,
+            "invalid braced Unicode escape: want at least one hex digit".to_owned(),
+        ));
+    }
+    if value > 0x10FFFF {
+        return Err(error(
+            escape_at,
+            StringCodecErrorKind::Lexical,
+            "invalid braced Unicode escape: value exceeds U+10FFFF".to_owned(),
+        ));
+    }
+    if value <= 0xFFFF {
+        units.push(value as u16);
+    } else {
+        // `value - 0x10000` is at most 0xFFFFF, so the high surrogate offset
+        // is at most 0x3FF and the low ten bits fit exactly.
+        let offset = value - 0x10000;
+        units.push(0xD800u16 + (offset >> 10) as u16);
+        units.push(0xDC00u16 + (offset & 0x3FF) as u16);
+    }
+    Ok(cursor + 1)
 }
 
 /// Decode one sloppy Annex B.1.2 OctalEscapeSequence starting at the first

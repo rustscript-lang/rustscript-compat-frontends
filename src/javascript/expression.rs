@@ -8,9 +8,9 @@ pub(in crate::javascript) fn join_kind(left: Kind, right: Kind) -> Kind {
 
 pub(in crate::javascript) fn join_length(
     kind: Kind,
-    left: Option<usize>,
-    right: Option<usize>,
-) -> Option<usize> {
+    left: Option<super::ArrayShape>,
+    right: Option<super::ArrayShape>,
+) -> Option<super::ArrayShape> {
     if kind == Kind::Array && left == right {
         left
     } else {
@@ -20,11 +20,13 @@ pub(in crate::javascript) fn join_length(
 
 /// Only flow facts are merged. Physical slots, root entries, static allocation
 /// charges and function identities remain monotonic across conditional emission.
+#[derive(Clone)]
 struct Flow {
     kinds: HashMap<scope::BindingId, Kind>,
     bindings: HashMap<String, (u16, Kind)>,
-    lengths: HashMap<scope::BindingId, usize>,
-    named_lengths: HashMap<String, usize>,
+    lengths: HashMap<scope::BindingId, super::ArrayShape>,
+    named_lengths: HashMap<String, super::ArrayShape>,
+    array_names: std::collections::HashSet<String>,
 }
 impl Flow {
     fn save(lower: &Lowerer<'_>) -> Self {
@@ -33,6 +35,7 @@ impl Flow {
             bindings: lower.bindings.clone(),
             lengths: lower.array_length_ids.clone(),
             named_lengths: lower.array_lengths.clone(),
+            array_names: lower.array_names.clone(),
         }
     }
     fn restore(self, lower: &mut Lowerer<'_>) {
@@ -40,6 +43,7 @@ impl Flow {
         lower.bindings = self.bindings;
         lower.array_length_ids = self.lengths;
         lower.array_lengths = self.named_lengths;
+        lower.array_names = self.array_names;
     }
     fn merge(self, lower: &mut Lowerer<'_>) {
         for (id, right) in &mut lower.binding_kinds {
@@ -62,11 +66,13 @@ impl Flow {
                 .is_some_and(|(_, k)| *k == Kind::Array)
                 && self.named_lengths.get(name) == Some(length)
         });
+        lower.array_names.retain(|name| self.array_names.contains(name));
     }
 }
 
 /// Emission facts around one runtime conditional. Slots and roots stay
 /// monotonic; only kinds and exact lengths are restored or joined.
+#[derive(Clone)]
 pub(in crate::javascript) struct BranchFacts(Flow);
 
 impl BranchFacts {
@@ -75,6 +81,65 @@ impl BranchFacts {
     }
     pub(in crate::javascript) fn restore(self, lower: &mut Lowerer<'_>) {
         self.0.restore(lower);
+    }
+    pub(in crate::javascript) fn joined(self, other: &Self) -> Self {
+        let mut kinds = self.0.kinds.clone();
+        for (id, right) in &other.0.kinds {
+            let left = kinds.get(id).copied().unwrap_or(Kind::Dynamic);
+            kinds.insert(*id, join_kind(left, *right));
+        }
+        for id in self.0.kinds.keys() {
+            if !other.0.kinds.contains_key(id) {
+                let left = kinds[id];
+                kinds.insert(*id, join_kind(left, Kind::Dynamic));
+            }
+        }
+        let mut bindings = self.0.bindings.clone();
+        for (name, (_, right)) in &other.0.bindings {
+            let left = bindings.get(name).map_or(Kind::Dynamic, |(_, kind)| *kind);
+            if let Some(slot) = bindings.get_mut(name) {
+                slot.1 = join_kind(left, *right);
+            }
+        }
+        for (name, slot) in bindings.iter_mut() {
+            if !other.0.bindings.contains_key(name) {
+                slot.1 = join_kind(slot.1, Kind::Dynamic);
+            }
+        }
+        let lengths = self
+            .0
+            .lengths
+            .iter()
+            .filter(|(id, length)| {
+                kinds.get(id) == Some(&Kind::Array) && other.0.lengths.get(id) == Some(*length)
+            })
+            .map(|(id, length)| (*id, *length))
+            .collect();
+        let named_lengths = self
+            .0
+            .named_lengths
+            .iter()
+            .filter(|(name, length)| {
+                bindings
+                    .get(*name)
+                    .is_some_and(|(_, kind)| *kind == Kind::Array)
+                    && other.0.named_lengths.get(*name) == Some(*length)
+            })
+            .map(|(name, length)| (name.clone(), *length))
+            .collect();
+        let array_names = self
+            .0
+            .array_names
+            .intersection(&other.0.array_names)
+            .cloned()
+            .collect();
+        Self(Flow {
+            kinds,
+            bindings,
+            lengths,
+            named_lengths,
+            array_names,
+        })
     }
     pub(in crate::javascript) fn merge(self, lower: &mut Lowerer<'_>) {
         self.0.merge(lower);
@@ -89,6 +154,33 @@ impl Lowerer<'_> {
     ) -> Result<(u16, Vec<Stmt>), ParseError> {
         let lowered = self.expr(test)?;
         let (slot, mut stmts) = self.bind_evaluation(lowered.expr, lowered.kind, test.span())?;
+        // P6B-ABRUPT-SIBLING-PREFIX: recheck Normal after the child prefix
+        // and before ToBoolean. A throwing test must not run truthiness or
+        // select a branch from an Undefined placeholder.
+        if let Some(normal) = self.pending_normal {
+            let line = self.line(test.span());
+            let (flag, init) = self.bind_typed(Expr::Bool(false), TypeSchema::Bool, test.span())?;
+            stmts.push(init);
+            let predicate = self.truthiness(slot, test.span())?;
+            let (tmp, tmp_stmt) = self.bind_typed(predicate, TypeSchema::Bool, test.span())?;
+            let mut then_branch = vec![tmp_stmt];
+            then_branch.push(Stmt::Assign {
+                kind: vm::AssignmentKind::Set,
+                index: flag,
+                expr: Expr::Var(tmp),
+                line,
+            });
+            stmts.push(Stmt::IfElse {
+                condition: Expr::Var(normal),
+                then_branch,
+                else_branch: Vec::new(),
+                line,
+            });
+            let mut owned = lowered.owned_roots;
+            owned.push(slot);
+            reference::release_consumed_roots(self, &owned, flag, test.span(), &mut stmts)?;
+            return Ok((flag, stmts));
+        }
         let predicate = self.truthiness(slot, test.span())?;
         let (flag, flag_stmt) = self.bind_typed(predicate, TypeSchema::Bool, test.span())?;
         stmts.push(flag_stmt);
@@ -251,12 +343,17 @@ impl Lowerer<'_> {
             .as_ref()
             .map(|s| s.entries.clone())
             .unwrap_or_default();
-        let right = self.expr(&binary.right)?;
+        let (right, rhs_definite) =
+            self.isolate_conditional_emission(|lower| lower.expr(&binary.right))?;
         self.type_names = cache;
-        flow.merge(self);
+        if rhs_definite {
+            flow.restore(self);
+        } else {
+            flow.merge(self);
+        }
         let kind = join_kind(left.kind, right.kind);
         let array_length = join_length(kind, left.array_length, right.array_length);
-        let branch = if binary.op == ast::BinaryOp::LogicalAnd {
+        let inner = if binary.op == ast::BinaryOp::LogicalAnd {
             Expr::IfElse {
                 condition: Box::new(predicate),
                 then_expr: Box::new(right.expr),
@@ -268,6 +365,19 @@ impl Lowerer<'_> {
                 then_expr: Box::new(Expr::Var(saved)),
                 else_expr: Box::new(right.expr),
             }
+        };
+        // P6B-ABRUPT-SIBLING-PREFIX: a throwing left prefix must not run the
+        // right operand's unguarded prefix (key construction/allocation).
+        // When Normal is already false, return the saved placeholder without
+        // evaluating the right expression.
+        let branch = if let Some(normal) = self.pending_normal {
+            Expr::IfElse {
+                condition: Box::new(Expr::Var(normal)),
+                then_expr: Box::new(inner),
+                else_expr: Box::new(Expr::Var(saved)),
+            }
+        } else {
+            inner
         };
         let rhs_roots: Vec<_> = self
             .root_scope

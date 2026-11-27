@@ -9,6 +9,9 @@
 use pd_vm_compat_frontends::{JAVASCRIPT_ES5_PLUGIN, javascript_es5_flavor};
 use vm::{HostFunctionRegistry, Value, Vm, VmStatus};
 
+#[path = "javascript_es5/pending_store_site.rs"]
+mod pending_store_site;
+
 const OBSERVE_ID: &str = "javascript-es5-scope-observe";
 const MAKE_NAME: &str = "__compat_ref_make";
 const READ_NAME: &str = "__compat_ref_read";
@@ -260,7 +263,7 @@ impl vm::SourcePlugin for ScopeObservePlugin {
 }
 
 fn catalog() -> std::sync::Arc<vm::HostApiCatalog> {
-    pd_vm_compat_frontends::reference_array_effective_catalog()
+    pd_vm_compat_frontends::runtime::cli::reference_array_cli_effective_catalog()
 }
 
 fn install_production(registry: &mut HostFunctionRegistry, catalog: &vm::HostApiCatalog) {
@@ -276,6 +279,9 @@ fn install_production(registry: &mut HostFunctionRegistry, catalog: &vm::HostApi
     pd_vm_compat_frontends::runtime::scalar_math::typescript_scalar_math_host_module()
         .install_from_catalog(registry, catalog)
         .expect("scalar-math adapter should match the effective catalog");
+    pd_vm_compat_frontends::runtime::scalar_error::typescript_error_host_module()
+        .install_from_catalog(registry, catalog)
+        .expect("scalar-error adapter should match the effective catalog");
     registry
         .allow_builtin("math::floor")
         .expect("math::floor should be allow-listable");
@@ -310,6 +316,10 @@ fn run_heap_free(source: &str, reads: &[&str]) -> Vec<Value> {
         )
     });
     let mut machine = Vm::new(compiled.program);
+    machine.set_jit_config(vm::JitConfig {
+        enabled: false,
+        ..vm::JitConfig::default()
+    });
     machine.set_fuel(1_000_000);
     assert_eq!(
         machine
@@ -317,6 +327,9 @@ fn run_heap_free(source: &str, reads: &[&str]) -> Vec<Value> {
             .expect("heap-free source should execute without B1"),
         VmStatus::Halted
     );
+    assert!(!machine.jit_config().enabled);
+    assert_eq!(machine.aot_exec_count(), 0);
+    assert_eq!(machine.jit_native_exec_count(), 0);
     let stack = machine.stack();
     assert!(
         stack.len() >= reads.len(),
@@ -333,6 +346,17 @@ fn run_realm(
     safepoints: bool,
     native: bool,
 ) -> (Vec<Value>, Vec<Value>, Option<(u64, String)>) {
+    run_realm_with_observer(source, reads, string_units, safepoints, native, |_| {})
+}
+
+fn run_realm_with_observer(
+    source: &str,
+    reads: &[&str],
+    string_units: Option<(&str, usize)>,
+    safepoints: bool,
+    native: bool,
+    on_readback: impl FnOnce(&mut vm::Vm),
+) -> (Vec<Value>, Vec<Value>, Option<(u64, String)>) {
     let plugin = observe_plugin(reads, string_units, safepoints);
     let catalog = catalog();
     let compiled = vm::compile_source_with_flavor_and_options_with_capture_certification(
@@ -348,6 +372,12 @@ fn run_realm(
     let mut machine = compiled
         .into_vm()
         .expect("certified compilation should create a source-certified VM");
+    if !native {
+        machine.set_jit_config(vm::JitConfig {
+            enabled: false,
+            ..vm::JitConfig::default()
+        });
+    }
     pd_vm_compat_frontends::runtime::array::initialize_typescript_owned_arrays(
         &mut machine,
         pd_vm_compat_frontends::runtime::array::OwnedArrayLimits::default(),
@@ -364,7 +394,7 @@ fn run_realm(
             .expect("native compilation should succeed");
         assert_eq!(machine.aot_exec_count(), 0, "no execution before run");
     }
-    machine.set_fuel(100_000_000);
+    machine.set_fuel(if native { 100_000_000 } else { 10_000_000 });
     match machine.run() {
         Ok(status) => assert_eq!(status, VmStatus::Halted, "scope program should halt"),
         Err(error) => panic!(
@@ -373,6 +403,11 @@ fn run_realm(
             machine.stack(),
             machine.execution_frames()
         ),
+    }
+    if !native {
+        assert!(!machine.jit_config().enabled);
+        assert_eq!(machine.aot_exec_count(), 0);
+        assert_eq!(machine.jit_native_exec_count(), 0);
     }
     let native_evidence = if native {
         let count = machine.aot_exec_count();
@@ -397,6 +432,7 @@ fn run_realm(
     let end = stack.len() - tail;
     let bindings = stack[end - reads.len()..end].to_vec();
     let extra = stack[end..].to_vec();
+    on_readback(&mut machine);
     (bindings, extra, native_evidence)
 }
 
@@ -658,6 +694,10 @@ fn typeof_unresolved_is_undefined_string_without_getvalue() {
     )
     .unwrap_or_else(|error| panic!("typeof missing must compile, got {error:?}"));
     let mut machine = compiled.into_vm().expect("vm");
+    machine.set_jit_config(vm::JitConfig {
+        enabled: false,
+        ..vm::JitConfig::default()
+    });
     pd_vm_compat_frontends::runtime::array::initialize_typescript_owned_arrays(
         &mut machine,
         pd_vm_compat_frontends::runtime::array::OwnedArrayLimits::default(),
@@ -668,6 +708,9 @@ fn typeof_unresolved_is_undefined_string_without_getvalue() {
     registry.bind_vm_cached(&mut machine).expect("bind");
     machine.set_fuel(10_000_000);
     assert_eq!(machine.run().expect("run"), VmStatus::Halted);
+    assert!(!machine.jit_config().enabled);
+    assert_eq!(machine.aot_exec_count(), 0);
+    assert_eq!(machine.jit_native_exec_count(), 0);
     let stack = machine.stack();
     assert_string_tail(&stack[stack.len() - 10..], "undefined");
 }
@@ -685,6 +728,12 @@ fn assert_typeof(source: &str, expected: &str, native: bool) {
     )
     .unwrap_or_else(|error| panic!("typeof source must compile: {source}\n{error:?}"));
     let mut machine = compiled.into_vm().expect("vm");
+    if !native {
+        machine.set_jit_config(vm::JitConfig {
+            enabled: false,
+            ..vm::JitConfig::default()
+        });
+    }
     pd_vm_compat_frontends::runtime::array::initialize_typescript_owned_arrays(
         &mut machine,
         pd_vm_compat_frontends::runtime::array::OwnedArrayLimits::default(),
@@ -705,6 +754,11 @@ fn assert_typeof(source: &str, expected: &str, native: bool) {
         eprintln!("P3_DECL_TYPEOF_NATIVE count={count}\n{info}");
         assert!(count > 0, "no native execution; {info}");
         assert!(info.contains("lowering=ssa"), "not SSA; {info}");
+    }
+    if !native {
+        assert!(!machine.jit_config().enabled);
+        assert_eq!(machine.aot_exec_count(), 0);
+        assert_eq!(machine.jit_native_exec_count(), 0);
     }
     let stack = machine.stack();
     let start = stack.len() - (units.len() + 1);
@@ -900,13 +954,22 @@ fn append_reclaim_probe(ir: &mut vm::FrontendIr, binding_name: &str) -> Result<(
     let checked = helper_index(ir, CHECKED_BASE_NAME)?;
     let decode = helper_index(ir, ADDRESS01_DECODE)?;
     let get = vm::BuiltinFunction::Get.call_index();
-    let assign_at = ir
-        .stmts
-        .iter()
-        .position(|stmt| matches!(stmt, vm::Stmt::Assign { index, .. } if *index == binding))
-        .ok_or_else(|| {
-            rejection("reclaim probe requires an assignment to the overwritten binding".into())
-        })?;
+    let root_write = helper_index(ir, "__compat_es5_root_write")?;
+    let sites = pending_store_site::sites(ir, binding, root_write)
+        .map_err(|message| rejection(message.into()))?;
+    let site = pending_store_site::first(&sites).ok_or_else(|| {
+        rejection("reclaim probe requires an assignment to the overwritten binding".into())
+    })?;
+    let snapshot_at = site.after_anchor();
+    // The real predeclared box dominates this unrooted read even if the
+    // pending-normal guard is skipped. Nothing allocates between the pair
+    // and the snapshot at the immediately following containing-list anchor.
+    if !ir.stmts[..=site.top].iter().any(|stmt| {
+        matches!(stmt,
+        vm::Stmt::Let { index, declared_schema: Some(_), .. } if *index == binding)
+    }) {
+        return Err(rejection("stale probe requires predeclared binding".into()));
+    }
     let mut take = || -> Result<u16, vm::ParseError> {
         let slot = u16::try_from(ir.locals)
             .map_err(|_| rejection("reclaim probe slot space exhausted".into()))?;
@@ -949,17 +1012,13 @@ fn append_reclaim_probe(ir: &mut vm::FrontendIr, binding_name: &str) -> Result<(
     };
     // Keep the production binding Assign/refresh contiguous. The following
     // unrooted copy and Int field extraction cannot allocate or collect.
-    let root_write = helper_index(ir, "__compat_es5_root_write")?;
-    if !matches!(ir.stmts.get(assign_at + 1), Some(vm::Stmt::Let {
-        expr: vm::Expr::Call(target, _, _, _, _), ..
-    }) if *target == root_write)
-    {
+    if pending_store_site::root_entry(&site.refresh, root_write, binding).is_none() {
         return Err(rejection(
             "stale probe requires actual binding refresh".into(),
         ));
     }
     ir.stmts.insert(
-        assign_at + 2,
+        snapshot_at,
         vm::Stmt::Let {
             index: copied,
             declared_schema: box_schema,
@@ -967,8 +1026,10 @@ fn append_reclaim_probe(ir: &mut vm::FrontendIr, binding_name: &str) -> Result<(
             line: 1,
         },
     );
-    ir.stmts.insert(assign_at + 3, stash("generation", old_gen));
-    ir.stmts.insert(assign_at + 3, stash("ref_slot", old_slot));
+    ir.stmts
+        .insert(snapshot_at + 1, stash("generation", old_gen));
+    ir.stmts
+        .insert(snapshot_at + 1, stash("ref_slot", old_slot));
     ir.stmts.push(vm::Stmt::Let {
         index: ack,
         declared_schema: Some(vm::TypeSchema::Int),
@@ -1024,6 +1085,10 @@ fn run_reclaim(source: &str, binding: &str) -> Result<(), String> {
     let mut machine = compiled
         .into_vm()
         .map_err(|error| format!("certified vm refused: {error:?}"))?;
+    machine.set_jit_config(vm::JitConfig {
+        enabled: false,
+        ..vm::JitConfig::default()
+    });
     pd_vm_compat_frontends::runtime::array::initialize_typescript_owned_arrays(
         &mut machine,
         pd_vm_compat_frontends::runtime::array::OwnedArrayLimits::default(),
@@ -1034,8 +1099,12 @@ fn run_reclaim(source: &str, binding: &str) -> Result<(), String> {
     registry
         .bind_vm_cached(&mut machine)
         .map_err(|error| format!("adapter bind refused: {error:?}"))?;
-    machine.set_fuel(100_000_000);
-    match machine.run() {
+    machine.set_fuel(10_000_000);
+    let outcome = machine.run();
+    assert!(!machine.jit_config().enabled);
+    assert_eq!(machine.aot_exec_count(), 0);
+    assert_eq!(machine.jit_native_exec_count(), 0);
+    match outcome {
         Err(error) => {
             let text = format!("{error:?}");
             let stack = format!("{:?}", machine.stack());
@@ -1377,20 +1446,19 @@ fn address01_i_nested_assignment_keeps_array_length() {
 }
 
 #[test]
-fn address01_i_dead_throw_after_return_is_refused() {
-    let text = must_refuse("function f(){\"use strict\";return 1;if(1){throw 2;}}");
-    assert!(
-        text.contains("throw") || text.contains("P0") || text.contains("unsupported"),
-        "dead throw must be a capability refusal, got {text}"
-    );
+fn address01_i_dead_throw_after_return_compiles() {
+    compile_text("function f(){\"use strict\";return 1;if(1){throw 2;}}")
+        .expect("dead throw is admitted and is not executed");
 }
 
 #[test]
-fn address01_i_dead_unary_plus_is_refused() {
-    let text = must_refuse("if(false){var x=+1;}");
+fn address01_i_dead_numeric_unary_plus_is_admitted() {
+    compile_text("if(false){var x=+1;}").expect("dead numeric unary plus is admitted");
+    compile_text("if(false){var x=+true;}").expect("dead proved Boolean unary plus is admitted");
+    let text = must_refuse("if(false){var x=+({});}");
     assert!(
-        text.contains("unary") || text.contains("P0") || text.contains("unsupported"),
-        "dead unary plus must be a capability refusal, got {text}"
+        text.contains("numeric"),
+        "dead object unary plus must retain numeric-profile refusal, got {text}"
     );
 }
 
@@ -1523,16 +1591,12 @@ impl vm::SourcePlugin for AccountPlugin {
         let observe = helper_index(&ir, OBSERVE_NAME)?;
         if self.collect_before_alias_read {
             let x = binding_slot(&ir, "x")?;
-            let overwritten = ir
-                .stmts
-                .iter()
-                .rposition(|stmt| matches!(stmt, vm::Stmt::Assign { index, .. } if *index == x))
-                .ok_or_else(|| rejection("alias probe needs the real x=null store".into()))?;
             let root_write = helper_index(&ir, "__compat_es5_root_write")?;
-            if !matches!(ir.stmts.get(overwritten + 1), Some(vm::Stmt::Let {
-                expr: vm::Expr::Call(target, _, _, _, _), ..
-            }) if *target == root_write)
-            {
+            let sites = pending_store_site::sites(&ir, x, root_write)
+                .map_err(|message| rejection(message.into()))?;
+            let site = pending_store_site::null_store(&sites)
+                .ok_or_else(|| rejection("alias probe needs the real x=null store".into()))?;
+            if pending_store_site::root_entry(&site.refresh, root_write, x).is_none() {
                 return Err(rejection(
                     "alias probe requires contiguous binding refresh".into(),
                 ));
@@ -1540,8 +1604,8 @@ impl vm::SourcePlugin for AccountPlugin {
             let collected = fresh_slot(&mut ir)?;
             // Source x=null and its actual root refresh complete first.
             // The following y.child.n is untouched production source IR.
-            ir.stmts.insert(
-                overwritten + 2,
+            site.list_mut(&mut ir).insert(
+                site.assign + 2,
                 vm::Stmt::Let {
                     index: collected,
                     declared_schema: Some(vm::TypeSchema::Int),
@@ -1633,6 +1697,10 @@ fn post_collect_accounting_with_alias(source: &str, collect_before_alias_read: b
     let mut machine = compiled
         .into_vm()
         .unwrap_or_else(|error| panic!("accounting vm refused: {error:?}"));
+    machine.set_jit_config(vm::JitConfig {
+        enabled: false,
+        ..vm::JitConfig::default()
+    });
     pd_vm_compat_frontends::runtime::array::initialize_typescript_owned_arrays(
         &mut machine,
         pd_vm_compat_frontends::runtime::array::OwnedArrayLimits::default(),
@@ -1643,7 +1711,7 @@ fn post_collect_accounting_with_alias(source: &str, collect_before_alias_read: b
     registry
         .bind_vm_cached(&mut machine)
         .unwrap_or_else(|error| panic!("adapter bind refused: {error:?}"));
-    machine.set_fuel(100_000_000);
+    machine.set_fuel(10_000_000);
     match machine.run() {
         Ok(status) => assert_eq!(
             status,
@@ -1657,6 +1725,9 @@ fn post_collect_accounting_with_alias(source: &str, collect_before_alias_read: b
             machine.execution_frames()
         ),
     }
+    assert!(!machine.jit_config().enabled);
+    assert_eq!(machine.aot_exec_count(), 0);
+    assert_eq!(machine.jit_native_exec_count(), 0);
     let stack = machine.stack();
     let marker = stack
         .iter()
@@ -1692,11 +1763,20 @@ fn expect_released_like(subject: &str, control: &str) {
 /// Primitive `null` sources have no carrier and cannot be an accounting control.
 const REALM_BASELINE: &str = "var __base=[1];__base=null;";
 
+/// Ordinary-realm bootstrap retained without any user object allocation.
+const ORDINARY_REALM_BASELINE: &str = "var __realm=Object;__realm=null;";
+
+#[test]
+fn ordinary_realm_accounting_baselines_are_independent() {
+    assert_eq!(post_collect_accounting(REALM_BASELINE), (0, 0));
+    assert_eq!(post_collect_accounting(ORDINARY_REALM_BASELINE), (27, 539));
+}
+
 #[test]
 fn address02_i_object_key_transitive_release() {
     let source = "var x={n:1};x=null;";
     expect_reclaimed(source, "x");
-    expect_released_like(source, REALM_BASELINE);
+    expect_released_like(source, ORDINARY_REALM_BASELINE);
 }
 
 #[test]
@@ -1765,16 +1845,72 @@ fn address02_i_comparison_and_method_keep_live_alias() {
 }
 
 #[test]
+fn numeric_literal_keys_live_canonical_aliases() {
+    std::thread::Builder::new()
+        .stack_size(33_554_432)
+        .spawn(|| {
+            let source = r#"var o={1000000000000000.25:7,0.000001:8,1e21:9,0x10:10,17:11};var alias=o;var r=alias["1000000000000000.3"]===7&&alias["0.000001"]===8&&alias["1e+21"]===9&&alias["16"]===10&&alias["17"]===11&&alias["1000000000000000.2"]===undefined&&alias["1e21"]===undefined;"#;
+            for source in [source, r#"var o={n:0,get 0x10(){"use strict";return this.n+7;},set 16(v){"use strict";this.n=v;}};var alias=o;alias["16"]=5;var d={16:1,0x10:2};var z={0:3,1e309:4};var r=alias["16"]===12&&o.n===5&&d["16"]===2&&z["0"]===3&&z["Infinity"]===4;"#] {
+            let plugin = observe_plugin(&["r"], None, false);
+            let catalog = catalog();
+            let issued = vm::compile_source_with_flavor_and_options_with_capture_certification(
+                source,
+                flavor(),
+                vm::CompileSourceFileOptions::new()
+                    .with_source_plugin(plugin)
+                    .with_host_api_catalog(std::sync::Arc::clone(&catalog)),
+            )
+            .expect("real numeric PropertyName and supported canonical string queries");
+            let mut machine = issued.into_vm().unwrap();
+            machine.set_jit_config(vm::JitConfig { enabled: false, ..Default::default() });
+            pd_vm_compat_frontends::runtime::array::initialize_typescript_owned_arrays(
+                &mut machine,
+                pd_vm_compat_frontends::runtime::array::OwnedArrayLimits::default(),
+            ).unwrap();
+            let mut registry = HostFunctionRegistry::restricted();
+            install_production(&mut registry, &catalog);
+            registry.bind_vm_cached(&mut machine).unwrap();
+            machine.set_fuel(10_000_000);
+            assert_eq!(machine.run().unwrap(), VmStatus::Halted);
+            assert_bool(machine.stack().last().unwrap(), true);
+            assert_eq!(machine.aot_exec_count(), 0);
+            assert_eq!(machine.jit_native_exec_count(), 0);
+            assert!(machine.capture_certification_stats().is_some_and(|stats| stats.valid));
+            machine.reset_for_reuse().unwrap();
+            assert_eq!(machine.host_context().resource_count(), 0);
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn numeric_literal_keys_dead_profiles_admitted() {
+    std::thread::Builder::new()
+        .stack_size(33_554_432)
+        .spawn(|| {
+            for source in [
+                "if(false){var o={1:2};}",
+                "var o={1:2};",
+                r#"function f(){"use strict";return 1;var o={1000000000000000.25:7,0.000001:8,1e21:9,0x10:10};var alias=o;alias["1000000000000000.3"];alias["0.000001"];alias["1e+21"];alias["16"]; }"#,
+                r#"if(false){var o={get 0x10(){"use strict";return 7;},set 16(v){"use strict";}};}"#,
+            ] {
+                compile_text(source).expect("numeric literal names remain admitted in live/dead profiles");
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
 fn address02_i_dead_and_reachable_profile_refusals() {
     for source in [
         "function f(){\"use strict\";return 1;(1)();}",
         "(1)();",
-        "function f(){\"use strict\";return 1;var o={};o.x=1;}",
-        "var o={};o.x=1;",
         "if(false){var a=[true];}",
         "var a=[true];",
-        "if(false){var o={1:2};}",
-        "var o={1:2};",
     ] {
         let text = must_refuse(source);
         assert!(
@@ -1782,12 +1918,183 @@ fn address02_i_dead_and_reachable_profile_refusals() {
             "profile refusal must name the capability guard, got {text} for {source}"
         );
     }
+    // Ordinary property writes are admitted in both reachable and dead code.
+    for source in [
+        "function f(){\"use strict\";return 1;var o={};o.x=1;}",
+        "var o={};o.x=1;",
+    ] {
+        compile_text(source).expect("ordinary property writes remain admitted");
+    }
 }
 
 #[test]
 fn p3_restart_i_expression_output_survives_collect_until_observed() {
     let (_, extra, _) = run_realm("\"alive\";", &[], Some(("#expression", 5)), false, false);
     assert_string_tail(&extra, "alive");
+}
+
+#[test]
+fn pending_store_alias_source_contract() {
+    use vm::SourcePlugin;
+    let source = "var x={child:{n:7}};var y=x;x=null;var n=y.child.n;";
+    let catalog = catalog();
+    let context = vm::SourceFrontendContext {
+        source_id: 0,
+        original_path: None,
+        phase: vm::compiler::ParsePhase::Standalone,
+        host_api_catalog: Some(&catalog),
+        imports: &[],
+    };
+    let original = JAVASCRIPT_ES5_PLUGIN
+        .parse_source(source, &context)
+        .unwrap();
+    let x = binding_slot(&original, "x").unwrap();
+    let root = helper_index(&original, "__compat_es5_root_write").unwrap();
+    // Independent witness: this exact assignment expression is a Let/Block,
+    // with one empty-else pending-normal guard and its actual refresh.
+    let witnesses: Vec<_> = original.stmts.iter().enumerate().filter_map(|(top, stmt)| {
+        let vm::Stmt::Let { expr: vm::Expr::Block { stmts, .. }, .. } = stmt else { return None; };
+        let [vm::Stmt::IfElse { condition: vm::Expr::Var(normal), then_branch, else_branch, .. }] = stmts.as_slice() else { return None; };
+        let [vm::Stmt::Assign { index, expr, .. }, vm::Stmt::Let { expr: vm::Expr::Call(target, _, args, _, _), .. }] = then_branch.as_slice() else { return None; };
+        if *index != x { return None; }
+        assert!(else_branch.is_empty());
+        assert!(original.stmts.iter().any(|s| matches!(s, vm::Stmt::Let { index, declared_schema: Some(vm::TypeSchema::Bool), expr: vm::Expr::Bool(true), .. } if index == normal)));
+        assert_eq!(*target, root);
+        assert!(matches!(args.get(3), Some(vm::Expr::Var(slot)) if *slot == x));
+        let mut canonical = vm::Expr::Call(vm::BuiltinFunction::MapNew.call_index(), vec![], vec![], None, None);
+        for (field, value) in [("tag", vm::Expr::Int(1)), ("number", vm::Expr::Float(0.0)), ("flag", vm::Expr::Bool(false)), ("ref_slot", vm::Expr::Int(0)), ("generation", vm::Expr::Int(0))] {
+            canonical = vm::Expr::Call(vm::BuiltinFunction::Set.call_index(), vec![], vec![canonical, vm::Expr::String(field.into()), value], None, None);
+        }
+        assert_eq!(format!("{expr:?}"), format!("{canonical:?}"));
+        eprintln!("ALIAS_ACTUAL_SITE top={top} normal={normal} binding={x} inner=0 refresh=1 {stmt:?}");
+        Some(top)
+    }).collect();
+    assert_eq!(
+        witnesses.len(),
+        1,
+        "actual canonical null store, not initializer"
+    );
+    let observed = AccountPlugin {
+        collect_before_alias_read: true,
+    }
+    .parse_source(source, &context)
+    .unwrap_or_else(|error| panic!("real alias store refused: {error}"));
+    assert!(observed.stmts.len() > original.stmts.len());
+    let sites = pending_store_site::sites(&original, x, root).unwrap();
+    let selected = pending_store_site::null_store(&sites).unwrap();
+    assert_eq!(selected.top, witnesses[0]);
+    assert!(!pending_store_site::canonical_null(&sites[0].assigned));
+    let mut restored = observed.clone();
+    let inserted = selected.list_mut(&mut restored).remove(selected.assign + 2);
+    let collect = helper_index(&original, ADDRESS01_COLLECT).unwrap();
+    assert!(
+        matches!(inserted, vm::Stmt::Let {expr: vm::Expr::Call(target,_,_,_,_),..} if target == collect)
+    );
+    restored.stmts.truncate(original.stmts.len());
+    assert_eq!(
+        format!("{:?}", restored.stmts),
+        format!("{:?}", original.stmts),
+        "only the inner collect changes source statements"
+    );
+    eprintln!(
+        "ALIAS_SITE_PROOF selected={selected:?} unchanged-source-prefix-after-removing-one-inner-collect"
+    );
+}
+
+#[test]
+fn pending_store_reclaim_source_contract() {
+    use vm::SourcePlugin;
+    let source = "var f=function(){\"use strict\";return {};};var x=f();f=null;x=null;";
+    let catalog = catalog();
+    let context = vm::SourceFrontendContext {
+        source_id: 0,
+        original_path: None,
+        phase: vm::compiler::ParsePhase::Standalone,
+        host_api_catalog: Some(&catalog),
+        imports: &[],
+    };
+    let original = JAVASCRIPT_ES5_PLUGIN
+        .parse_source(source, &context)
+        .unwrap();
+    let x = binding_slot(&original, "x").unwrap();
+    let root = helper_index(&original, "__compat_es5_root_write").unwrap();
+    let witnesses: Vec<_> = original.stmts.iter().enumerate().filter_map(|(top, stmt)| {
+        let vm::Stmt::IfElse { condition: vm::Expr::Var(normal), then_branch, else_branch, .. } = stmt else { return None; };
+        let [vm::Stmt::Assign { index, expr: vm::Expr::Var(result), .. }, vm::Stmt::Let { expr: vm::Expr::Call(target, _, args, _, _), .. }] = then_branch.as_slice() else { return None; };
+        if *index != x { return None; }
+        assert!(else_branch.is_empty());
+        assert!(original.stmts.iter().any(|s| matches!(s, vm::Stmt::Let { index, declared_schema: Some(vm::TypeSchema::Bool), expr: vm::Expr::Bool(true), .. } if index == normal)));
+        assert_eq!(*target, root);
+        assert!(matches!(args.get(3), Some(vm::Expr::Var(slot)) if *slot == x));
+        eprintln!("RECLAIM_ACTUAL_SITE top={top} normal={normal} binding={x} result={result} inner=0 refresh=1 {stmt:?}");
+        Some(top)
+    }).collect();
+    assert_eq!(witnesses.len(), 1, "first actual call-result store");
+    let observed = ReclaimPlugin {
+        binding: "x".into(),
+    }
+    .parse_source(source, &context)
+    .unwrap_or_else(|error| panic!("real reclaim store refused: {error}"));
+    assert!(observed.stmts.len() > original.stmts.len());
+    let sites = pending_store_site::sites(&original, x, root).unwrap();
+    let selected = pending_store_site::first(&sites).unwrap();
+    assert_eq!(selected.top, witnesses[0]);
+    assert!(selected.top < pending_store_site::null_store(&sites).unwrap().top);
+    let at = selected.after_anchor();
+    let vm::Stmt::Let {
+        index: copied,
+        declared_schema: Some(schema),
+        expr: vm::Expr::Var(slot),
+        ..
+    } = &observed.stmts[at]
+    else {
+        panic!("dominant unrooted copy");
+    };
+    assert_eq!(*slot, x);
+    assert!(original.stmts.iter().any(|s| matches!(s,vm::Stmt::Let {index,declared_schema:Some(original_schema),..} if *index==x && original_schema==schema)));
+    for (offset, field) in [(1, "ref_slot"), (2, "generation")] {
+        let vm::Stmt::Let {
+            declared_schema: Some(vm::TypeSchema::Int),
+            expr: vm::Expr::Call(decode, _, args, _, _),
+            ..
+        } = &observed.stmts[at + offset]
+        else {
+            panic!("dominant Int extraction");
+        };
+        assert_eq!(*decode, helper_index(&original, ADDRESS01_DECODE).unwrap());
+        let [vm::Expr::Div(get, one)] = args.as_slice() else {
+            panic!("unchanged extraction");
+        };
+        assert!(matches!(**one, vm::Expr::Float(1.0)));
+        assert!(
+            matches!(&**get,vm::Expr::Call(target,_,args,_,_) if *target==vm::BuiltinFunction::Get.call_index() && matches!(args.as_slice(),[vm::Expr::Var(slot),vm::Expr::String(key)] if slot==copied && key==field))
+        );
+    }
+    // Snapshot placement follows the binding store and precedes every
+    // following f=null/x=null source statement. All three declarations are
+    // top-level and dominate the unchanged trailing checked-base probe.
+    assert_eq!(
+        format!("{:?}", observed.stmts[at + 3]),
+        format!("{:?}", original.stmts[at])
+    );
+    let mut restored = observed.stmts.clone();
+    restored.drain(at..at + 3);
+    restored.truncate(original.stmts.len());
+    assert_eq!(format!("{restored:?}"), format!("{:?}", original.stmts));
+    let end = observed.stmts.len();
+    assert!(
+        matches!(&observed.stmts[end-3],vm::Stmt::Expr {expr:vm::Expr::String(marker),..} if marker==STALE_PROBE_MARKER)
+    );
+    assert!(
+        matches!(&observed.stmts[end-2],vm::Stmt::Let {expr:vm::Expr::Call(target,_,_,_,_),..} if *target==helper_index(&original,CHECKED_BASE_NAME).unwrap())
+    );
+    eprintln!(
+        "RECLAIM_DOMINANCE_PROOF anchor={} snapshots={at}..{} original-clear={} final-checked={} copy={copied}",
+        selected.top,
+        at + 3,
+        at + 3,
+        end - 2
+    );
 }
 
 #[test]
@@ -1799,14 +2106,26 @@ fn p3_restart_i_alias_only_transitive_read_after_collect() {
         counts, control,
         "only y and its real child/key edges survive"
     );
-    assert_eq!(counts.0, 4, "two object nodes and two UTF-16 key nodes");
+    let base = post_collect_accounting(ORDINARY_REALM_BASELINE);
+    assert!(
+        counts.0 >= base.0,
+        "ordinary-realm baseline must remain live"
+    );
+    assert_eq!(
+        counts
+            .0
+            .checked_sub(base.0)
+            .expect("ordinary-realm baseline"),
+        4,
+        "two object nodes and two UTF-16 key nodes above the independent bootstrap"
+    );
 }
 
 #[test]
 fn p3_restart_i_callee_snapshot_release() {
     let source = "var f=function(){\"use strict\";return {};};var x=f();f=null;x=null;";
     expect_reclaimed(source, "x");
-    expect_released_like(source, REALM_BASELINE);
+    expect_released_like(source, ORDINARY_REALM_BASELINE);
 }
 
 #[test]
@@ -1815,34 +2134,63 @@ fn p3_restart_i_numeric_consumers_release_receiver_roots() {
 }
 
 #[test]
-fn p3_restart_i_dead_binding_facts() {
+fn p3_restart_i_dead_binding_facts_refuse_calls() {
     for source in [
         "function f(){\"use strict\";var x=1;return 1;x();}",
         "function f(){\"use strict\";var x=1;x();return 1;}",
         "if(false){var x=true;var a=[x];}",
         "var x=true;var a=[x];",
-        "function f(){\"use strict\";var o={};return 1;o[0]=1;}",
-        "var o={};o[0]=1;",
         "if(false){var a=[1];var r=a[true];}",
         "var a=[1];var r=a[true];",
         "function f(){\"use strict\";return 1;var o={a:[1]};}",
         "var o={a:[1]};",
-        "if(false){var o={a:1,a:2};}",
-        "var o={a:1,a:2};",
-        "function f(){\"use strict\";return 1;var n=-true;}",
-        "var n=-true;",
+    ] {
+        must_refuse(source);
+    }
+}
+
+#[test]
+fn p3_restart_i_dead_binding_facts_refuse_stores() {
+    for source in [
         "function f(){\"use strict\";return 1;var a=[1];var x=(a[0]=2);}",
         "var a=[1];var x=(a[0]=2);",
     ] {
         must_refuse(source);
     }
+}
+
+#[test]
+fn p3_restart_i_dead_binding_facts_admit_pure() {
     for source in [
         "if(false){var n=1;var a=[n];}",
         "function f(){\"use strict\";var n=1;return 1;var a=[n];}",
         "if(true){var n=1;}else{var n=true;}var a=[n];",
         "function f(){\"use strict\";return 1;var x=g();function g(){\"use strict\";return 2;}}",
+        "function f(){\"use strict\";var o={};return 1;o[0]=1;}",
+        "var o={};o[0]=1;",
     ] {
         compile_text(source).expect("pure facts preserve admitted source");
+    }
+}
+
+#[test]
+fn p3_restart_i_dead_binding_facts_admit_duplicates() {
+    for source in ["if(false){var o={a:1,a:2};}", "var o={a:1,a:2};"] {
+        compile_text(source).expect("sloppy duplicate data properties remain admitted");
+    }
+}
+
+#[test]
+fn p3_restart_i_dead_binding_facts_admit_neg_boolean() {
+    for source in [
+        "function f(){\"use strict\";return 1;var n=-true;}",
+        "var n=-true;",
+        "function f(){\"use strict\";throw 1;var n=-true;}",
+        "function f(){\"use strict\";if(true){return 1;}else{var n=-true;}}",
+        "function f(){\"use strict\";try{return 1;}finally{var n=-true;}}",
+        "function f(){\"use strict\";return 1;var s=+'3';}",
+    ] {
+        compile_text(source).expect("admitted unary conversion in reachable or dead text");
     }
 }
 
@@ -1856,4 +2204,72 @@ fn address02_i_profile_positives_stay_admitted() {
     compile_text("var n=0;var t=typeof (n=n+1);").expect("typeof side effect");
     compile_text("var x=1;function f(){\"use strict\";var x=2;return x;}").expect("own shadow");
     compile_text("var a=[1,2];a[0]=3;var r=a[0];").expect("numeric array variable");
+}
+
+#[test]
+fn profile_current_property_writes_preserve_payload_and_return_order() {
+    // Supplemental runtime observations; the original compile predicates above stay exact.
+    let mut callbacks = 0;
+    let mut reset_zero = 0;
+    for (source, expected) in [
+        ("var o={};o.x=1;var r=o.x;", 1.0),
+        (
+            "function f(){\"use strict\";var o={};o.x=1;return o.x;}var r=f();",
+            1.0,
+        ),
+        (
+            "function f(){\"use strict\";var o={x:0};return o;o.x=1;}var o=f();var r=o.x;",
+            0.0,
+        ),
+        (
+            "function f(){\"use strict\";var o={x:0};o.x=1;return o;}var o=f();var r=o.x;",
+            1.0,
+        ),
+    ] {
+        let mut observed = false;
+        let (bindings, extra, native_evidence) = run_realm_with_observer(
+            source,
+            &["r"],
+            None,
+            false,
+            false,
+            |machine| {
+                assert!(!observed, "one callback per executed VM");
+                callbacks += 1;
+                let jit = machine.jit_config().enabled;
+                let aot = machine.aot_exec_count();
+                let jit_native = machine.jit_native_exec_count();
+                assert!(!jit);
+                assert_eq!(aot, 0);
+                assert_eq!(jit_native, 0);
+                machine
+                    .reset_for_reuse()
+                    .expect("the same executed scope VM should reset successfully");
+                let resources = machine.host_context().resource_count();
+                assert_eq!(resources, 0);
+                reset_zero += 1;
+                observed = true;
+                println!(
+                    "PROFILE70_RESET source={source:?} callback={callbacks} jit={jit} aot={aot} jit_native={jit_native} reset_resources={resources}"
+                );
+            },
+        );
+        assert!(
+            observed,
+            "callback must run before numeric readback returns"
+        );
+        assert_eq!(bindings.len(), 1);
+        assert!(extra.is_empty());
+        assert!(native_evidence.is_none());
+        assert_number(&bindings[0], expected);
+        println!(
+            "PROFILE67_NUMBER source={source:?} expected={expected} actual={:?} halted=true native=0",
+            bindings[0]
+        );
+    }
+    assert_eq!(callbacks, 4, "all four actual callbacks must run");
+    assert_eq!(
+        reset_zero, 4,
+        "all four same-VM resets must reach zero resources"
+    );
 }

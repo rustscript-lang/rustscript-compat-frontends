@@ -1,5 +1,6 @@
 //! Strict closed-source argument semantics through the production JS frontend.
-use pd_vm_compat_frontends::{javascript_es5_flavor, reference_array_effective_catalog};
+use pd_vm_compat_frontends::javascript_es5_flavor;
+use pd_vm_compat_frontends::runtime::cli::reference_array_cli_effective_catalog as reference_array_effective_catalog;
 use vm::{HostFunctionRegistry, Value, VmStatus};
 #[path = "javascript_es5/arity_observer.rs"]
 mod observer;
@@ -32,6 +33,12 @@ fn execute(source: &str, native: bool, observer: Option<observer::Observer>) -> 
     )
     .unwrap_or_else(|error| panic!("source must compile: {source}\n{error:?}"));
     let mut machine = compiled.into_vm().expect("source VM");
+    if !native {
+        machine.set_jit_config(vm::JitConfig {
+            enabled: false,
+            ..vm::JitConfig::default()
+        });
+    }
     pd_vm_compat_frontends::runtime::array::initialize_typescript_owned_arrays(
         &mut machine,
         pd_vm_compat_frontends::runtime::array::OwnedArrayLimits::default(),
@@ -50,7 +57,29 @@ fn execute(source: &str, native: bool, observer: Option<observer::Observer>) -> 
     pd_vm_compat_frontends::runtime::scalar_math::typescript_scalar_math_host_module()
         .install_from_catalog(&mut registry, &catalog)
         .expect("math adapters");
+    pd_vm_compat_frontends::runtime::scalar_error::typescript_error_host_module()
+        .install_from_catalog(&mut registry, &catalog)
+        .expect("scalar-error adapter should match the effective catalog");
     registry.allow_builtin("math::floor").expect("floor");
+    // The ordinary realm's bootstrap publishes its fixed ASCII strings through
+    // the Core bytes initializer, so this capability is part of every emitted
+    // realm program (the Object.keys harness allows the same builtin).
+    registry
+        .allow_builtin("bytes::from_utf8")
+        .expect("bootstrap strings");
+    // The `Function.prototype.prototype` accessor and the construct helper
+    // use the realm's numeric guards (finite-number checks), so the aborted
+    // construction paths below need the same scalar capability the other
+    // production harnesses allow.
+    registry
+        .allow_builtin("math::is_finite")
+        .expect("numeric guards");
+    registry
+        .allow_builtin("math::trunc")
+        .expect("numeric guards");
+    registry
+        .allow_builtin("math::powf")
+        .expect("numeric guards");
     registry.bind_vm_cached(&mut machine).expect("binding");
     machine.set_fuel(10_000_000);
     if native {
@@ -229,6 +258,11 @@ fn execute(source: &str, native: bool, observer: Option<observer::Observer>) -> 
         let info = machine.dump_aot_info();
         eprintln!("P4_ARGUMENT_NATIVE count={count}\n{info}");
         assert!(count > 0 && info.contains("lowering=ssa"), "{info}");
+    }
+    if !native {
+        assert!(!machine.jit_config().enabled);
+        assert_eq!(machine.aot_exec_count(), 0);
+        assert_eq!(machine.jit_native_exec_count(), 0);
     }
     let values = machine.stack().to_vec();
     assert_eq!(
@@ -582,14 +616,28 @@ fn pure_validation_visits_all_actuals_in_live_dead_and_post_return_code() {
 }
 
 #[test]
-fn function_property_calls_refuse_in_live_dead_and_post_return_code() {
-    for source in [
-        "function f(a){\"use strict\";return a;}f.prototype();",
-        "function f(a){\"use strict\";return a;}if(false){f.prototype();}",
-        "function g(){\"use strict\";function f(a){return a;}return 1;f.prototype();}",
-    ] {
-        refuse(source, "intrinsic length");
-    }
+fn function_prototype_reads_observe_live_dead_and_post_return_code() {
+    // `f.prototype` materializes the owned object, so the applied call keeps
+    // the unchanged guest TypeError from the ordinary callability check.
+    assert_true(
+        "function f(a){\"use strict\";return a;}var c=false;try{f.prototype();}catch(e){c=e.name==='TypeError';}c;",
+    );
+    // A dead branch and code after an unconditional return keep the shape
+    // validated but never evaluate the call.
+    assert_true("function f(a){\"use strict\";return a;}if(false){f.prototype();}true;");
+    assert_true(
+        "function g(){\"use strict\";function f(a){return a;}return 1;f.prototype();}g()===1;",
+    );
+}
+
+#[test]
+fn function_prototype_reads_and_new_are_positive_semantics() {
+    // The same two spellings that used to be refusals are now real values.
+    assert_true("function f(a){\"use strict\";return a;}f.prototype.constructor===f;");
+    assert_true("function f(a){\"use strict\";this.a=a;}new f(1).a===1;");
+    assert_true(
+        "function f(a){\"use strict\";this.a=a;}var o=new f(7);var p=f.prototype;Object.getPrototypeOf(o)===p&&p.constructor===f;",
+    );
 }
 
 #[test]
@@ -634,11 +682,6 @@ fn unknown_parameter_operations_and_later_capabilities_refuse() {
     }
     refuse("function f(a){\"use strict\";return arguments;}", "unknown");
     refuse("var x=1;function f(a){\"use strict\";return x;}", "capture");
-    refuse("function f(a){\"use strict\";}new f(1);", "unsupported");
-    refuse(
-        "function f(a){\"use strict\";}f.prototype;",
-        "intrinsic length",
-    );
 }
 
 fn field(value: &Value, key: &str) -> Value {

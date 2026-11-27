@@ -721,3 +721,432 @@ function release(handle: Resource<"io.file">): boolean { return close(handle); }
         .is_err()
     );
 }
+
+struct RecordComputedIntHostProbe(Arc<Mutex<Vec<Value>>>);
+
+impl vm::HostFunction for RecordComputedIntHostProbe {
+    fn call(&mut self, _machine: &mut Vm, args: &[Value]) -> vm::VmResult<vm::CallOutcome> {
+        assert_eq!(args.len(), 1, "raw Int probe expects exactly one argument");
+        self.0
+            .lock()
+            .expect("computed record probe lock")
+            .extend(args.iter().cloned());
+        Ok(vm::CallOutcome::Return(vm::CallReturn::one(Value::Bool(
+            true,
+        ))))
+    }
+}
+
+#[test]
+fn computed_record_string_cannot_reach_raw_int_host() {
+    std::thread::Builder::new()
+        .stack_size(33_554_432)
+        .spawn(|| {
+            let source = r#"import { takeInt } from "recordProbe"; interface Row { text: string; number: number; } const row: Row = { text: "wrong", number: 21 }; const key: string = "text"; takeInt(row[key]);"#;
+            eprintln!("TS_RECORD_HOST_SOURCE {source}");
+            let mut builder = vm::HostApiBuilder::new();
+            builder.function(vm::HostFunctionSchema::with_return(
+                "recordProbe::takeInt",
+                vec![vm::HostParamSchema::value("value", vm::HostTypeSchema::Int)],
+                vm::HostTypeSchema::Bool,
+            ));
+            let catalog = Arc::new(builder.build().expect("valid raw int host catalog"));
+            let result = compile_source_with_flavor_and_options(
+                source,
+                pd_vm_compat_frontends::typescript_flavor(),
+                pd_vm_compat_frontends::compile_options_with_catalog(Arc::clone(&catalog)),
+            );
+            let compiled = match result {
+                Ok(compiled) => compiled,
+                Err(error) => {
+                    let rendered = error.to_string();
+                    eprintln!("TS_RECORD_HOST_COMPILE_REFUSAL {error:?}");
+                    assert!(!rendered.is_empty(), "compile refusal must carry a diagnostic");
+                    assert!(
+                        !rendered.contains("computed property access"),
+                        "refusal must not restore the whole-Get computed access rejection: {rendered}"
+                    );
+                    return;
+                }
+            };
+            eprintln!("TS_RECORD_HOST_COMPILE_OK");
+            let schemas = vm::catalog_import_schemas(&catalog, "recordProbe::takeInt");
+            assert_eq!(schemas.len(), 1, "raw Int host must expose exactly one catalog schema");
+            let schema = schemas.into_iter().next().expect("takeInt catalog schema");
+            let host_schema_matches = compiled
+                .program
+                .host_import_schemas()
+                .iter()
+                .flatten()
+                .any(|actual| actual == &schema);
+            eprintln!(
+                "TS_RECORD_HOST_PROGRAM host_schema_matches_catalog={} import_count={}",
+                host_schema_matches,
+                compiled.program.imports.len()
+            );
+            assert!(
+                host_schema_matches,
+                "compiled program omitted the sole catalog schema {schema:?}"
+            );
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let factory_observed = Arc::clone(&observed);
+            let mut registry = vm::HostFunctionRegistry::new();
+            registry
+                .register_catalog(schema, move || {
+                    Box::new(RecordComputedIntHostProbe(Arc::clone(&factory_observed)))
+                })
+                .expect("raw Int probe binding matches the catalog");
+            let mut machine = Vm::new(compiled.program);
+            machine.set_jit_config(vm::JitConfig {
+                enabled: false,
+                ..*machine.jit_config()
+            });
+            machine.set_fuel(10_000_000);
+            registry
+                .bind_vm_cached(&mut machine)
+                .expect("bind the raw Int probe from the catalog");
+            eprintln!("TS_RECORD_HOST_GUEST_BEGIN");
+            let outcome = machine.run();
+            let counts = (machine.jit_native_exec_count(), machine.aot_exec_count());
+            let calls = observed.lock().expect("computed record probe lock").clone();
+            eprintln!(
+                "TS_RECORD_HOST_OBSERVED outcome={outcome:?} calls={} args={:?} stack={:?} native={} aot={}",
+                calls.len(),
+                calls,
+                machine.stack(),
+                counts.0,
+                counts.1
+            );
+            machine.reset_for_reuse().unwrap();
+            assert!(!machine.scope_reset_pending());
+            assert_eq!(machine.host_context().resource_count(), 0);
+            eprintln!("TS_RECORD_HOST_RESET resource_count=0 guest_invocations=1");
+            assert!(
+                calls.is_empty(),
+                "raw Int callback received unchecked computed record Value; args={calls:?}"
+            );
+            assert!(
+                outcome.is_err(),
+                "compiled program must deny the computed record before importing the raw Int host: {outcome:?}"
+            );
+            assert_eq!(
+                counts,
+                (0, 0),
+                "JIT/AOT native execution must stay disabled for the boundary probe"
+            );
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn ts_annotated_number_host_probe(source: &str, allow_call: bool) {
+    let owned = source.to_owned();
+    std::thread::Builder::new()
+        .stack_size(33_554_432)
+        .spawn(move || {
+            eprintln!("TS_ANNOTATED_NUMBER_HOST_SOURCE {owned}");
+            let mut builder = vm::HostApiBuilder::new();
+            builder.function(vm::HostFunctionSchema::with_return(
+                "recordProbe::takeNumber",
+                vec![vm::HostParamSchema::value(
+                    "value",
+                    vm::HostTypeSchema::Number,
+                )],
+                vm::HostTypeSchema::Bool,
+            ));
+            let catalog = Arc::new(builder.build().expect("valid raw Number host catalog"));
+            let result = compile_source_with_flavor_and_options(
+                &owned,
+                pd_vm_compat_frontends::typescript_flavor(),
+                pd_vm_compat_frontends::compile_options_with_catalog(Arc::clone(&catalog)),
+            );
+            let compiled = match result {
+                Ok(compiled) => compiled,
+                Err(error) => {
+                    let rendered = error.to_string();
+                    eprintln!("TS_ANNOTATED_NUMBER_HOST_COMPILE_REFUSAL {error:?}");
+                    assert!(
+                        !allow_call,
+                        "annotated number control source must compile: {error:?}"
+                    );
+                    assert!(
+                        !rendered.is_empty(),
+                        "compile refusal must carry a diagnostic"
+                    );
+                    assert!(
+                        !rendered.contains("computed property access"),
+                        "refusal must not restore the whole-Get computed access rejection: {rendered}"
+                    );
+                    return;
+                }
+            };
+            eprintln!("TS_ANNOTATED_NUMBER_HOST_COMPILE_OK");
+            let schemas = vm::catalog_import_schemas(&catalog, "recordProbe::takeNumber");
+            assert_eq!(
+                schemas.len(),
+                1,
+                "raw Number host must expose exactly one catalog schema"
+            );
+            let schema = schemas.into_iter().next().expect("takeNumber catalog schema");
+            let host_schema_matches = compiled
+                .program
+                .host_import_schemas()
+                .iter()
+                .flatten()
+                .any(|actual| actual == &schema);
+            eprintln!(
+                "TS_ANNOTATED_NUMBER_HOST_PROGRAM host_schema_matches_catalog={} import_count={}",
+                host_schema_matches,
+                compiled.program.imports.len()
+            );
+            assert!(
+                host_schema_matches,
+                "compiled program omitted the sole catalog schema {schema:?}"
+            );
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let factory_observed = Arc::clone(&observed);
+            let mut registry = vm::HostFunctionRegistry::new();
+            registry
+                .register_catalog(schema, move || {
+                    Box::new(RecordComputedIntHostProbe(Arc::clone(&factory_observed)))
+                })
+                .expect("raw Number probe binding matches the catalog");
+            let mut machine = Vm::new(compiled.program);
+            machine.set_jit_config(vm::JitConfig {
+                enabled: false,
+                ..*machine.jit_config()
+            });
+            machine.set_fuel(10_000_000);
+            registry
+                .bind_vm_cached(&mut machine)
+                .expect("bind the raw Number probe from the catalog");
+            eprintln!("TS_ANNOTATED_NUMBER_HOST_GUEST_BEGIN");
+            let outcome = machine.run();
+            let stack_before_reset = machine.stack().to_vec();
+            let counts = (machine.jit_native_exec_count(), machine.aot_exec_count());
+            let calls = observed
+                .lock()
+                .expect("annotated number probe lock")
+                .clone();
+            eprintln!(
+                "TS_ANNOTATED_NUMBER_HOST_OBSERVED outcome={outcome:?} calls={} args={:?} stack={:?} native={} aot={}",
+                calls.len(),
+                calls,
+                machine.stack(),
+                counts.0,
+                counts.1
+            );
+            machine.reset_for_reuse().unwrap();
+            assert!(!machine.scope_reset_pending());
+            assert_eq!(machine.host_context().resource_count(), 0);
+            eprintln!("TS_ANNOTATED_NUMBER_HOST_RESET resource_count=0 guest_invocations=1");
+            assert_eq!(
+                counts,
+                (0, 0),
+                "JIT/AOT native execution must stay disabled for the boundary probe"
+            );
+            if allow_call {
+                assert_eq!(
+                    outcome.unwrap(),
+                    VmStatus::Halted,
+                    "annotated Int control must halt normally"
+                );
+                assert_eq!(
+                    calls.len(),
+                    1,
+                    "annotated Int control must reach the raw Number callback exactly once; args={calls:?}"
+                );
+                assert_eq!(
+                    calls,
+                    vec![Value::Int(21)],
+                    "annotated Int control must pass Int 21 unchanged; args={calls:?}"
+                );
+                assert_eq!(
+                    stack_before_reset.as_slice(),
+                    &[Value::Bool(true)],
+                    "annotated Int control must observe Bool true"
+                );
+            } else {
+                assert!(
+                    calls.is_empty(),
+                    "raw Number callback received unchecked computed record Value; args={calls:?}"
+                );
+                assert!(
+                    outcome.is_err(),
+                    "compiled program must deny the computed record before importing the raw Number host: {outcome:?}"
+                );
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn annotated_number_raw_host_accepts_known_int_control() {
+    ts_annotated_number_host_probe(
+        r#"import { takeNumber } from "recordProbe"; const selected: number = 21; takeNumber(selected);"#,
+        true,
+    );
+}
+
+#[test]
+fn annotated_number_cannot_launder_computed_record_string_to_raw_host() {
+    ts_annotated_number_host_probe(
+        r#"import { takeNumber } from "recordProbe"; interface Row { text: string; number: number; } const row: Row = { text: "wrong", number: 21 }; const key: string = "text"; const selected: number = row[key]; takeNumber(selected);"#,
+        false,
+    );
+}
+
+#[test]
+fn annotated_number_alias_initializer_cannot_reach_raw_host() {
+    ts_annotated_number_host_probe(
+        r#"import { takeNumber } from "recordProbe"; interface Row { text: string; number: number; } const row: Row = { text: "wrong", number: 21 }; const key: string = "text"; const raw = row[key]; const selected: number = raw; takeNumber(selected);"#,
+        false,
+    );
+}
+
+#[test]
+fn annotated_number_alias_assignment_cannot_reach_raw_host() {
+    ts_annotated_number_host_probe(
+        r#"import { takeNumber } from "recordProbe"; interface Row { text: string; number: number; } const row: Row = { text: "wrong", number: 21 }; const key: string = "text"; const raw = row[key]; let selected: number = 21; selected = raw; takeNumber(selected);"#,
+        false,
+    );
+}
+
+#[test]
+fn function_local_annotated_number_alias_cannot_reach_raw_host() {
+    ts_annotated_number_host_probe(
+        r#"import { takeNumber } from "recordProbe"; interface Row { text: string; number: number; } function readRow(): boolean { const row: Row = { text: "wrong", number: 21 }; const key: string = "text"; const raw = row[key]; const selected: number = raw; return takeNumber(selected); } readRow();"#,
+        false,
+    );
+}
+
+struct NullableMapHostValueProbe {
+    value: Value,
+    calls: Arc<Mutex<usize>>,
+}
+
+impl vm::HostFunction for NullableMapHostValueProbe {
+    fn call(&mut self, _machine: &mut Vm, args: &[Value]) -> vm::VmResult<vm::CallOutcome> {
+        assert!(args.is_empty(), "nullable value probe takes no arguments");
+        *self.calls.lock().expect("nullable probe counter") += 1;
+        Ok(vm::CallOutcome::Return(vm::CallReturn::one(
+            self.value.clone(),
+        )))
+    }
+}
+
+fn nullable_map_host_probe(source: &str, kind: &str) {
+    let source = source.to_owned();
+    let kind = kind.to_owned();
+    std::thread::Builder::new()
+        .stack_size(33_554_432)
+        .spawn(move || {
+            eprintln!("NULLABLE_MAP_HOST_SOURCE {source:?}");
+            let number_return = kind == "number_control";
+            let expect_refusal = kind == "unknown_refusal";
+            let result_schema = vm::HostTypeSchema::Optional(Box::new(if number_return {
+                vm::HostTypeSchema::Number
+            } else {
+                vm::HostTypeSchema::Unknown
+            }));
+            let mut builder = vm::HostApiBuilder::new();
+            builder.function(vm::HostFunctionSchema::with_return(
+                "nullableProbe::read",
+                Vec::new(),
+                result_schema,
+            ));
+            let catalog = Arc::new(builder.build().expect("synthetic nullable catalog"));
+            let result = vm::compile_source_with_flavor_and_options(
+                &source,
+                vm::SourceFlavor::RustScript,
+                pd_vm_compat_frontends::compile_options_with_catalog(Arc::clone(&catalog)),
+            );
+            let compiled = match result {
+                Err(error) => {
+                    eprintln!("NULLABLE_MAP_HOST_COMPILE_REFUSAL {error:?}");
+                    assert!(expect_refusal, "nullable catalog control refused: {error:?}");
+                    let source_error = match &error {
+                        vm::SourcePathError::Source(error)
+                        | vm::SourcePathError::SourceWithMap { error, .. } => error,
+                        other => panic!("wrong nullable refusal layer: {other:?}"),
+                    };
+                    let vm::SourceError::Compile(vm::CompileError::InvalidFieldAccess { detail, line, span, .. }) = source_error else {
+                        panic!("wrong nullable store refusal category: {source_error:?}");
+                    };
+                    let detail = detail.to_ascii_lowercase();
+                    assert!(detail.contains("number") && (detail.contains("unknown") || detail.contains("not provable")), "wrong nullable proof diagnostic: {detail}");
+                    let start = source.find("state[\"value\"] =").expect("Map store");
+                    let line_number = source[..start].bytes().filter(|byte| *byte == b'\n').count() + 1;
+                    assert_eq!(*line, Some(u32::try_from(line_number).expect("source line fits u32")));
+                    assert!(span.is_some());
+                    eprintln!("NULLABLE_MAP_HOST_REFUSAL_END guest_invocations=0 callbacks=0");
+                    return;
+                }
+                Ok(compiled) => compiled,
+            };
+            assert!(compiled.program.type_map.as_ref().is_some_and(|types| types.strict_types));
+            let schemas = vm::catalog_import_schemas(&catalog, "nullableProbe::read");
+            assert_eq!(schemas.len(), 1);
+            let schema = schemas.into_iter().next().expect("nullable catalog schema");
+            assert!(compiled.program.host_import_schemas().iter().flatten().any(|actual| actual == &schema));
+            eprintln!("NULLABLE_MAP_HOST_COMPILE_OK strict_types=true catalog_schema_matches=true kind={kind}");
+            assert!(!expect_refusal, "strict scalar Map accepted catalog Optional<Unknown> element store");
+            let calls = Arc::new(Mutex::new(0));
+            let factory_calls = Arc::clone(&calls);
+            let return_value = if number_return { Value::Int(9) } else { Value::string("wrong") };
+            let factory_value = return_value.clone();
+            let mut registry = vm::HostFunctionRegistry::new();
+            registry.register_catalog(schema, move || Box::new(NullableMapHostValueProbe {
+                value: factory_value.clone(),
+                calls: Arc::clone(&factory_calls),
+            })).expect("register exact nullable host schema");
+            let mut machine = Vm::new(compiled.program);
+            machine.set_jit_config(vm::JitConfig { enabled: false, ..*machine.jit_config() });
+            machine.set_fuel(10_000_000);
+            registry.bind_vm_cached(&mut machine).expect("bind nullable catalog");
+            eprintln!("NULLABLE_MAP_HOST_GUEST_BEGIN");
+            let outcome = machine.run();
+            let snapshot = machine.stack().to_vec();
+            let call_count = *calls.lock().expect("nullable probe counter");
+            let counts = (machine.jit_native_exec_count(), machine.aot_exec_count());
+            eprintln!("NULLABLE_MAP_HOST_OBSERVED outcome={outcome:?} calls={call_count} stack={snapshot:?} native={} aot={}", counts.0, counts.1);
+            machine.reset_for_reuse().expect("reset nullable host probe");
+            assert!(!machine.scope_reset_pending());
+            assert_eq!(machine.host_context().resource_count(), 0);
+            eprintln!("NULLABLE_MAP_HOST_RESET resource_count=0 guest_invocations=1");
+            assert_eq!(outcome.expect("nullable control guest"), VmStatus::Halted);
+            assert_eq!(snapshot, vec![return_value]);
+            assert_eq!(call_count, 1);
+            assert_eq!(counts, (0, 0));
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn nullable_unknown_host_returns_non_null_string_control() {
+    nullable_map_host_probe(
+        "use nullableProbe;\nnullableProbe::read();\n",
+        "unknown_control",
+    );
+}
+
+#[test]
+fn nullable_number_host_value_remains_valid_map_store() {
+    nullable_map_host_probe(
+        "use nullableProbe;\nlet mut state: map<number> = {value: 1};\nstate[\"value\"] = nullableProbe::read();\nstate[\"value\"];\n",
+        "number_control",
+    );
+}
+
+#[test]
+fn nullable_unknown_host_value_cannot_enter_scalar_map() {
+    nullable_map_host_probe(
+        "use nullableProbe;\nlet mut state: map<number> = {value: 1};\nstate[\"value\"] = nullableProbe::read();\nstate[\"value\"];\n",
+        "unknown_refusal",
+    );
+}
