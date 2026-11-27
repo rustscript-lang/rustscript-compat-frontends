@@ -14,7 +14,7 @@ fn lua_runtime_cases_work() {
                 a = a + 41
                 a
             "#,
-            flavor: SourceFlavor::Lua,
+            flavor: pd_vm_compat_frontends::lua_flavor(),
             expected_stack: vec![Value::Int(42)],
             expected_locals: Some(1),
         },
@@ -28,7 +28,7 @@ fn lua_runtime_cases_work() {
                     0
                 end
             "#,
-            flavor: SourceFlavor::Lua,
+            flavor: pd_vm_compat_frontends::lua_flavor(),
             expected_stack: vec![Value::Int(42)],
             expected_locals: None,
         },
@@ -41,7 +41,7 @@ fn lua_runtime_cases_work() {
                 end
                 i
             "#,
-            flavor: SourceFlavor::Lua,
+            flavor: pd_vm_compat_frontends::lua_flavor(),
             expected_stack: vec![Value::Int(3)],
             expected_locals: None,
         },
@@ -54,7 +54,7 @@ fn lua_runtime_cases_work() {
                 end
                 value
             "#,
-            flavor: SourceFlavor::Lua,
+            flavor: pd_vm_compat_frontends::lua_flavor(),
             expected_stack: vec![Value::Int(42)],
             expected_locals: None,
         },
@@ -68,7 +68,7 @@ fn lua_runtime_cases_work() {
                 c
                 s
             "#,
-            flavor: SourceFlavor::Lua,
+            flavor: pd_vm_compat_frontends::lua_flavor(),
             expected_stack: vec![Value::Float(1.25), Value::string("A"), Value::string("B")],
             expected_locals: None,
         },
@@ -78,7 +78,7 @@ fn lua_runtime_cases_work() {
                 local re = require("re")
                 re.match("^lua$", "LUA", "i")
             "#,
-            flavor: SourceFlavor::Lua,
+            flavor: pd_vm_compat_frontends::lua_flavor(),
             expected_stack: vec![Value::Bool(true)],
             expected_locals: None,
         },
@@ -102,7 +102,7 @@ fn lua_runtime_cases_work() {
                     0
                 end
             "#,
-            flavor: SourceFlavor::Lua,
+            flavor: pd_vm_compat_frontends::lua_flavor(),
             expected_stack: vec![Value::Int(1), Value::Int(42)],
             expected_locals: None,
         },
@@ -113,7 +113,7 @@ fn lua_runtime_cases_work() {
                 local f = function() return x + 1 end
                 f()
             "#,
-            flavor: SourceFlavor::Lua,
+            flavor: pd_vm_compat_frontends::lua_flavor(),
             expected_stack: vec![Value::Int(42)],
             expected_locals: None,
         },
@@ -127,7 +127,7 @@ fn lua_runtime_cases_work() {
                 a
                 b
             "#,
-            flavor: SourceFlavor::Lua,
+            flavor: pd_vm_compat_frontends::lua_flavor(),
             expected_stack: vec![Value::Int(1), Value::Int(2)],
             expected_locals: None,
         },
@@ -140,7 +140,7 @@ fn lua_runtime_cases_work() {
                 local a = x()
                 a
             "#,
-            flavor: SourceFlavor::Lua,
+            flavor: pd_vm_compat_frontends::lua_flavor(),
             expected_stack: vec![Value::Int(1)],
             expected_locals: None,
         },
@@ -155,7 +155,7 @@ fn lua_runtime_cases_work() {
                 b
                 c
             "#,
-            flavor: SourceFlavor::Lua,
+            flavor: pd_vm_compat_frontends::lua_flavor(),
             expected_stack: vec![Value::Int(1), Value::Int(2), Value::Null],
             expected_locals: None,
         },
@@ -174,7 +174,7 @@ fn lua_runtime_cases_work() {
                 b
                 c
             "#,
-            flavor: SourceFlavor::Lua,
+            flavor: pd_vm_compat_frontends::lua_flavor(),
             expected_stack: vec![Value::Int(1), Value::Null, Value::Null],
             expected_locals: None,
         },
@@ -189,7 +189,7 @@ fn lua_runtime_cases_work() {
                 a
                 b
             "#,
-            flavor: SourceFlavor::Lua,
+            flavor: pd_vm_compat_frontends::lua_flavor(),
             expected_stack: vec![Value::Bool(true), Value::Int(1), Value::Int(2)],
             expected_locals: None,
         },
@@ -202,7 +202,7 @@ fn lua_runtime_cases_work() {
                 local ok = pcall(x)
                 ok
             "#,
-            flavor: SourceFlavor::Lua,
+            flavor: pd_vm_compat_frontends::lua_flavor(),
             expected_stack: vec![Value::Bool(true)],
             expected_locals: None,
         },
@@ -220,7 +220,7 @@ fn lua_runtime_cases_work() {
                 sum
                 rhs
             "#,
-            flavor: SourceFlavor::Lua,
+            flavor: pd_vm_compat_frontends::lua_flavor(),
             expected_stack: vec![Value::Bool(true), Value::Int(7), Value::Int(4)],
             expected_locals: None,
         },
@@ -230,7 +230,7 @@ fn lua_runtime_cases_work() {
                 local f = function() end
                 f()
             "#,
-            flavor: SourceFlavor::Lua,
+            flavor: pd_vm_compat_frontends::lua_flavor(),
             expected_stack: vec![Value::Null],
             expected_locals: None,
         },
@@ -240,7 +240,7 @@ fn lua_runtime_cases_work() {
                 local f = function() return end
                 f()
             "#,
-            flavor: SourceFlavor::Lua,
+            flavor: pd_vm_compat_frontends::lua_flavor(),
             expected_stack: vec![Value::Null],
             expected_locals: None,
         },
@@ -259,7 +259,7 @@ fn lua_do_block_lowers_without_synthetic_true_guard() {
             end
             value
         "#,
-        SourceFlavor::Lua,
+        pd_vm_compat_frontends::lua_flavor(),
         pd_vm_compat_frontends::compile_options(),
     )
     .expect("lua source should compile");
@@ -282,7 +282,7 @@ fn lua_rejection_cases_work() {
         source: r#"
                 value = 1
             "#,
-        flavor: SourceFlavor::Lua,
+        flavor: pd_vm_compat_frontends::lua_flavor(),
         expected_contains_all: &["unknown local 'value'"],
     }];
 
@@ -332,7 +332,7 @@ fn lua_runtime_namespace_host_calls_are_supported() {
             local runtime = require("runtime")
             runtime.sleep(1)
         "#,
-        flavor: SourceFlavor::Lua,
+        flavor: pd_vm_compat_frontends::lua_flavor(),
         expected_stack: vec![Value::Bool(true)],
         expected_locals: None,
     };
@@ -352,7 +352,7 @@ fn lua_non_strict_comparisons_treat_nan_as_false() {
             nan <= 1.0
             nan >= 1.0
         "#,
-        flavor: SourceFlavor::Lua,
+        flavor: pd_vm_compat_frontends::lua_flavor(),
         expected_stack: vec![Value::Bool(false), Value::Bool(false)],
         expected_locals: None,
     };

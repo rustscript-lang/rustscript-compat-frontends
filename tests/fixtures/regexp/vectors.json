@@ -1,0 +1,644 @@
+[
+  {
+    "id": "literal",
+    "pattern": "ab",
+    "flags": "g",
+    "original_js": "new RegExp(\"ab\",\"g\").exec(\"zzab!\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      122,
+      122,
+      97,
+      98,
+      33
+    ]
+  },
+  {
+    "id": "literal_miss",
+    "pattern": "ab",
+    "flags": "",
+    "original_js": "new RegExp(\"ab\",\"\").exec(\"zzac!\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      122,
+      122,
+      97,
+      99,
+      33
+    ]
+  },
+  {
+    "id": "empty",
+    "pattern": "",
+    "flags": "g",
+    "original_js": "new RegExp(\"\",\"g\").exec(\"ab\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      97,
+      98
+    ]
+  },
+  {
+    "id": "noncapture",
+    "pattern": "(?:ab|c)+",
+    "flags": "",
+    "original_js": "new RegExp(\"(?:ab|c)+\",\"\").exec(\"abc\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      97,
+      98,
+      99
+    ]
+  },
+  {
+    "id": "alternative_backtrack",
+    "pattern": "(a|ab)c",
+    "flags": "",
+    "original_js": "new RegExp(\"(a|ab)c\",\"\").exec(\"abc\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      97,
+      98,
+      99
+    ]
+  },
+  {
+    "id": "failed_alternative_capture",
+    "pattern": "(a(b)|ac)z",
+    "flags": "",
+    "original_js": "new RegExp(\"(a(b)|ac)z\",\"\").exec(\"acz\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      97,
+      99,
+      122
+    ]
+  },
+  {
+    "id": "optional_unmatched",
+    "pattern": "(a)?a",
+    "flags": "",
+    "original_js": "new RegExp(\"(a)?a\",\"\").exec(\"a\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      97
+    ]
+  },
+  {
+    "id": "capture_reset",
+    "pattern": "((a)|(b))+",
+    "flags": "",
+    "original_js": "new RegExp(\"((a)|(b))+\",\"\").exec(\"ab\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      97,
+      98
+    ]
+  },
+  {
+    "id": "greedy",
+    "pattern": "(a+)(a)",
+    "flags": "",
+    "original_js": "new RegExp(\"(a+)(a)\",\"\").exec(\"aaaa\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      97,
+      97,
+      97,
+      97
+    ]
+  },
+  {
+    "id": "nongreedy",
+    "pattern": "(a+?)(a)",
+    "flags": "",
+    "original_js": "new RegExp(\"(a+?)(a)\",\"\").exec(\"aaaa\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      97,
+      97,
+      97,
+      97
+    ]
+  },
+  {
+    "id": "bounded",
+    "pattern": "(a{2,3})(a?)",
+    "flags": "",
+    "original_js": "new RegExp(\"(a{2,3})(a?)\",\"\").exec(\"aaaa\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      97,
+      97,
+      97,
+      97
+    ]
+  },
+  {
+    "id": "bounded_lazy",
+    "pattern": "(a{2,3}?)(a?)",
+    "flags": "",
+    "original_js": "new RegExp(\"(a{2,3}?)(a?)\",\"\").exec(\"aaaa\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      97,
+      97,
+      97,
+      97
+    ]
+  },
+  {
+    "id": "empty_star",
+    "pattern": "()*",
+    "flags": "",
+    "original_js": "new RegExp(\"()*\",\"\").exec(\"x\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      120
+    ]
+  },
+  {
+    "id": "empty_mandatory",
+    "pattern": "(){2,}",
+    "flags": "",
+    "original_js": "new RegExp(\"(){2,}\",\"\").exec(\"x\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      120
+    ]
+  },
+  {
+    "id": "empty_alternative",
+    "pattern": "(?:|a)*b",
+    "flags": "",
+    "original_js": "new RegExp(\"(?:|a)*b\",\"\").exec(\"aab\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      97,
+      97,
+      98
+    ]
+  },
+  {
+    "id": "empty_capture_repeat",
+    "pattern": "(a*)*b",
+    "flags": "",
+    "original_js": "new RegExp(\"(a*)*b\",\"\").exec(\"aaab\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      97,
+      97,
+      97,
+      98
+    ]
+  },
+  {
+    "id": "backreference",
+    "pattern": "(a|b)+\\1",
+    "flags": "",
+    "original_js": "new RegExp(\"(a|b)+\\\\1\",\"\").exec(\"abb\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      97,
+      98,
+      98
+    ]
+  },
+  {
+    "id": "unmatched_backreference",
+    "pattern": "(a)?b\\1",
+    "flags": "",
+    "original_js": "new RegExp(\"(a)?b\\\\1\",\"\").exec(\"b\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      98
+    ]
+  },
+  {
+    "id": "forward_backreference",
+    "pattern": "\\1(a)",
+    "flags": "",
+    "original_js": "new RegExp(\"\\\\1(a)\",\"\").exec(\"a\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      97
+    ]
+  },
+  {
+    "id": "case_backreference",
+    "pattern": "(a)\\1",
+    "flags": "i",
+    "original_js": "new RegExp(\"(a)\\\\1\",\"i\").exec(\"aA\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      97,
+      65
+    ]
+  },
+  {
+    "id": "lookahead_capture",
+    "pattern": "(?=(ab))a",
+    "flags": "",
+    "original_js": "new RegExp(\"(?=(ab))a\",\"\").exec(\"ab\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      97,
+      98
+    ]
+  },
+  {
+    "id": "lookahead_atomic",
+    "pattern": "(?=(a|ab))\\1c",
+    "flags": "",
+    "original_js": "new RegExp(\"(?=(a|ab))\\\\1c\",\"\").exec(\"abc\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      97,
+      98,
+      99
+    ]
+  },
+  {
+    "id": "lookahead_backtrack",
+    "pattern": "(?=(a+))a*b\\1",
+    "flags": "",
+    "original_js": "new RegExp(\"(?=(a+))a*b\\\\1\",\"\").exec(\"baabac\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      98,
+      97,
+      97,
+      98,
+      97,
+      99
+    ]
+  },
+  {
+    "id": "negative_lookahead",
+    "pattern": "(a)(?!(b))c\\2",
+    "flags": "",
+    "original_js": "new RegExp(\"(a)(?!(b))c\\\\2\",\"\").exec(\"ac\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      97,
+      99
+    ]
+  },
+  {
+    "id": "negative_failure_restore",
+    "pattern": "(?:(?!(a))b|a)\\1",
+    "flags": "",
+    "original_js": "new RegExp(\"(?:(?!(a))b|a)\\\\1\",\"\").exec(\"a\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      97
+    ]
+  },
+  {
+    "id": "nested_look",
+    "pattern": "(?=(a(?!(b))))a",
+    "flags": "",
+    "original_js": "new RegExp(\"(?=(a(?!(b))))a\",\"\").exec(\"ac\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      97,
+      99
+    ]
+  },
+  {
+    "id": "normative_repeat",
+    "pattern": "(z)((a+)?(b+)?(c))*",
+    "flags": "",
+    "original_js": "new RegExp(\"(z)((a+)?(b+)?(c))*\",\"\").exec(\"zaacbbbcac\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      122,
+      97,
+      97,
+      99,
+      98,
+      98,
+      98,
+      99,
+      97,
+      99
+    ]
+  },
+  {
+    "id": "normative_look",
+    "pattern": "(.*?)a(?!(a+)b\\2c)\\2(.*)",
+    "flags": "",
+    "original_js": "new RegExp(\"(.*?)a(?!(a+)b\\\\2c)\\\\2(.*)\",\"\").exec(\"baaabaac\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      98,
+      97,
+      97,
+      97,
+      98,
+      97,
+      97,
+      99
+    ]
+  },
+  {
+    "id": "anchor_multiline",
+    "pattern": "^(a+)$",
+    "flags": "m",
+    "original_js": "new RegExp(\"^(a+)$\",\"m\").exec(\"x\\naa\\ny\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      120,
+      10,
+      97,
+      97,
+      10,
+      121
+    ]
+  },
+  {
+    "id": "anchor_no_multiline",
+    "pattern": "^a$",
+    "flags": "",
+    "original_js": "new RegExp(\"^a$\",\"\").exec(\"a\\n\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      97,
+      10
+    ]
+  },
+  {
+    "id": "anchors_crlf",
+    "pattern": "^$",
+    "flags": "m",
+    "original_js": "new RegExp(\"^$\",\"m\").exec(\"\\r\\n\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      13,
+      10
+    ]
+  },
+  {
+    "id": "word_boundary",
+    "pattern": "\\b(a+)\\b",
+    "flags": "",
+    "original_js": "new RegExp(\"\\\\b(a+)\\\\b\",\"\").exec(\" aa!\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      32,
+      97,
+      97,
+      33
+    ]
+  },
+  {
+    "id": "nonword_boundary",
+    "pattern": "\\B(a+)\\B",
+    "flags": "",
+    "original_js": "new RegExp(\"\\\\B(a+)\\\\B\",\"\").exec(\"baac\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      98,
+      97,
+      97,
+      99
+    ]
+  },
+  {
+    "id": "class_range",
+    "pattern": "([a-c]+)([^0-9]?)",
+    "flags": "",
+    "original_js": "new RegExp(\"([a-c]+)([^0-9]?)\",\"\").exec(\"bcaz\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      98,
+      99,
+      97,
+      122
+    ]
+  },
+  {
+    "id": "class_empty",
+    "pattern": "[]",
+    "flags": "",
+    "original_js": "new RegExp(\"[]\",\"\").exec(\"a\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      97
+    ]
+  },
+  {
+    "id": "class_negated_empty",
+    "pattern": "[^]",
+    "flags": "",
+    "original_js": "new RegExp(\"[^]\",\"\").exec(\"\\n\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      10
+    ]
+  },
+  {
+    "id": "escaped",
+    "pattern": "(\\x41\\u0042\\cC\\0)",
+    "flags": "",
+    "original_js": "new RegExp(\"(\\\\x41\\\\u0042\\\\cC\\\\0)\",\"\").exec(\"AB\\u0003\\u0000\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      65,
+      66,
+      3,
+      0
+    ]
+  },
+  {
+    "id": "class_controls",
+    "pattern": "[\\b\\t\\n]+",
+    "flags": "",
+    "original_js": "new RegExp(\"[\\\\b\\\\t\\\\n]+\",\"\").exec(\"\\b\\t\\n\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      8,
+      9,
+      10
+    ]
+  },
+  {
+    "id": "class_shorthands",
+    "pattern": "(\\d+)(\\W)(\\w+)",
+    "flags": "",
+    "original_js": "new RegExp(\"(\\\\d+)(\\\\W)(\\\\w+)\",\"\").exec(\"12!ab_\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      49,
+      50,
+      33,
+      97,
+      98,
+      95
+    ]
+  },
+  {
+    "id": "class_fold",
+    "pattern": "[a-z]+",
+    "flags": "i",
+    "original_js": "new RegExp(\"[a-z]+\",\"i\").exec(\"AzZ\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      65,
+      122,
+      90
+    ]
+  },
+  {
+    "id": "class_negated_fold",
+    "pattern": "[^a]+",
+    "flags": "i",
+    "original_js": "new RegExp(\"[^a]+\",\"i\").exec(\"Aba\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      65,
+      98,
+      97
+    ]
+  },
+  {
+    "id": "unicode_fold",
+    "pattern": "(\\u03c2)\\1",
+    "flags": "i",
+    "original_js": "new RegExp(\"(\\\\u03c2)\\\\1\",\"i\").exec(\"\\u03c3\\u03a3\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      963,
+      931
+    ]
+  },
+  {
+    "id": "ascii_exclusion",
+    "pattern": "k",
+    "flags": "i",
+    "original_js": "new RegExp(\"k\",\"i\").exec(\"\\u212a\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      8490
+    ]
+  },
+  {
+    "id": "long_s_exclusion",
+    "pattern": "s",
+    "flags": "i",
+    "original_js": "new RegExp(\"s\",\"i\").exec(\"\\u017f\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      383
+    ]
+  },
+  {
+    "id": "multi_uppercase_exclusion",
+    "pattern": "\\u1f80",
+    "flags": "i",
+    "original_js": "new RegExp(\"\\\\u1f80\",\"i\").exec(\"\\u1f88\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      8072
+    ]
+  },
+  {
+    "id": "surrogate_high",
+    "pattern": "(\\uD800)(.)",
+    "flags": "",
+    "original_js": "new RegExp(\"(\\\\uD800)(.)\",\"\").exec(\"\\ud800\\udc00\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      55296,
+      56320
+    ]
+  },
+  {
+    "id": "surrogate_low",
+    "pattern": "(\\uDC00)",
+    "flags": "",
+    "original_js": "new RegExp(\"(\\\\uDC00)\",\"\").exec(\"x\\udc00\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      120,
+      56320
+    ]
+  },
+  {
+    "id": "surrogate_class",
+    "pattern": "([\\uD800-\\uDFFF]+)",
+    "flags": "",
+    "original_js": "new RegExp(\"([\\\\uD800-\\\\uDFFF]+)\",\"\").exec(\"x\\ud800\\udc00y\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      120,
+      55296,
+      56320,
+      121
+    ]
+  },
+  {
+    "id": "replacement_distinct",
+    "pattern": "\\uD800",
+    "flags": "",
+    "original_js": "new RegExp(\"\\\\uD800\",\"\").exec(\"\\ufffd\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      65533
+    ]
+  },
+  {
+    "id": "line_dot",
+    "pattern": ".",
+    "flags": "",
+    "original_js": "new RegExp(\".\",\"\").exec(\"\\u2028\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      8232
+    ]
+  },
+  {
+    "id": "line_dot_other",
+    "pattern": ".",
+    "flags": "",
+    "original_js": "new RegExp(\".\",\"\").exec(\"\\u2027\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      8231
+    ]
+  },
+  {
+    "id": "spaces",
+    "pattern": "\\s+",
+    "flags": "",
+    "original_js": "new RegExp(\"\\\\s+\",\"\").exec(\"\\ufeff\\u2028\\t\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      65279,
+      8232,
+      9
+    ]
+  },
+  {
+    "id": "nonglobal_search",
+    "pattern": "a",
+    "flags": "",
+    "original_js": "new RegExp(\"a\",\"\").exec(\"ba\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      98,
+      97
+    ]
+  },
+  {
+    "id": "global_search",
+    "pattern": "a",
+    "flags": "g",
+    "original_js": "new RegExp(\"a\",\"g\").exec(\"ba\")",
+    "classification": "ES5.1 normative semantics; Node reference (indices d is observation-only)",
+    "subject_units": [
+      98,
+      97
+    ]
+  }
+]

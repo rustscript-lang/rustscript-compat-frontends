@@ -1,0 +1,397 @@
+{
+  "scope": "P6-A exact raw Script-completion vectors. Product expectations are es51_boundary_value. node_relation version-difference is a modern Node observation, not an ES5.1 expected value.",
+  "normative_source": "https://262.ecma-international.org/5.1/",
+  "normative_sections": [
+    "12.1",
+    "12.5",
+    "14"
+  ],
+  "vectors": [
+    {
+      "id": "empty-block",
+      "source": "7; {}",
+      "es51_boundary_value": {
+        "kind": "Number",
+        "value": 7
+      },
+      "node_relation": "agreement"
+    },
+    {
+      "id": "empty-statement",
+      "source": "7; ;",
+      "es51_boundary_value": {
+        "kind": "Number",
+        "value": 7
+      },
+      "node_relation": "agreement"
+    },
+    {
+      "id": "empty-var",
+      "source": "7; var x;",
+      "es51_boundary_value": {
+        "kind": "Number",
+        "value": 7
+      },
+      "node_relation": "agreement"
+    },
+    {
+      "id": "if-selected-empty",
+      "source": "7; if (true) {}",
+      "es51_boundary_value": {
+        "kind": "Number",
+        "value": 7
+      },
+      "node_relation": "version-difference"
+    },
+    {
+      "id": "if-unselected-no-else",
+      "source": "7; if (false) {9;}",
+      "es51_boundary_value": {
+        "kind": "Number",
+        "value": 7
+      },
+      "node_relation": "version-difference"
+    },
+    {
+      "id": "if-selected-empty-else",
+      "source": "7; if (false) {9;} else {}",
+      "es51_boundary_value": {
+        "kind": "Number",
+        "value": 7
+      },
+      "node_relation": "version-difference"
+    },
+    {
+      "id": "if-explicit-undefined",
+      "source": "7; if (true) {undefined;}",
+      "es51_boundary_value": {
+        "kind": "Undefined"
+      },
+      "node_relation": "agreement"
+    },
+    {
+      "id": "if-nonempty",
+      "source": "7; if (true) {8;}",
+      "es51_boundary_value": {
+        "kind": "Number",
+        "value": 8
+      },
+      "node_relation": "agreement"
+    }
+  ],
+  "typeof_cache_vectors": [
+    {
+      "id": "ident-false-sibling",
+      "source": "var c=0;var x=1;if(c){var a=typeof x;}else{var s=typeof x;}s",
+      "es51_type": "number",
+      "condition": "ident",
+      "polarity": "false",
+      "shape": "sibling",
+      "utf16": [
+        110,
+        117,
+        109,
+        98,
+        101,
+        114
+      ],
+      "node_relation": "agreement",
+      "observe": "s"
+    },
+    {
+      "id": "ident-true-sibling",
+      "source": "var c=1;var x=1;if(c){var s=typeof x;}else{var b=typeof x;}s",
+      "es51_type": "number",
+      "condition": "ident",
+      "polarity": "true",
+      "shape": "sibling",
+      "utf16": [
+        110,
+        117,
+        109,
+        98,
+        101,
+        114
+      ],
+      "node_relation": "agreement",
+      "observe": "s"
+    },
+    {
+      "id": "member-false-sibling",
+      "source": "var o={flag:0};var x='z';if(o.flag){var a=typeof x;}else{var s=typeof x;}s",
+      "es51_type": "string",
+      "condition": "member",
+      "polarity": "false",
+      "shape": "sibling",
+      "utf16": [
+        115,
+        116,
+        114,
+        105,
+        110,
+        103
+      ],
+      "node_relation": "agreement",
+      "observe": "s"
+    },
+    {
+      "id": "member-true-sibling",
+      "source": "var o={flag:1};var x='z';if(o.flag){var s=typeof x;}else{var b=typeof x;}s",
+      "es51_type": "string",
+      "condition": "member",
+      "polarity": "true",
+      "shape": "sibling",
+      "utf16": [
+        115,
+        116,
+        114,
+        105,
+        110,
+        103
+      ],
+      "node_relation": "agreement",
+      "observe": "s"
+    },
+    {
+      "id": "param-false-return",
+      "source": "function f(c){'use strict';var x=1;if(c){return typeof x;}else{return typeof x;}}var s=f(0);s",
+      "es51_type": "number",
+      "condition": "parameter",
+      "polarity": "false",
+      "shape": "strict-return",
+      "utf16": [
+        110,
+        117,
+        109,
+        98,
+        101,
+        114
+      ],
+      "node_relation": "agreement",
+      "observe": "s"
+    },
+    {
+      "id": "param-true-return",
+      "source": "function f(c){'use strict';var x=1;if(c){return typeof x;}else{return typeof x;}}var s=f(1);s",
+      "es51_type": "number",
+      "condition": "parameter",
+      "polarity": "true",
+      "shape": "strict-return",
+      "utf16": [
+        110,
+        117,
+        109,
+        98,
+        101,
+        114
+      ],
+      "node_relation": "agreement",
+      "observe": "s"
+    },
+    {
+      "id": "post-join-false",
+      "source": "var c=0;var x=1;if(c){typeof x;}else{;}var s=typeof x;s",
+      "es51_type": "number",
+      "condition": "ident",
+      "polarity": "false",
+      "shape": "post-join",
+      "utf16": [
+        110,
+        117,
+        109,
+        98,
+        101,
+        114
+      ],
+      "node_relation": "agreement",
+      "observe": "s"
+    },
+    {
+      "id": "post-join-true",
+      "source": "var c=1;var x=1;if(c){typeof x;}else{;}var s=typeof x;s",
+      "es51_type": "number",
+      "condition": "ident",
+      "polarity": "true",
+      "shape": "post-join",
+      "utf16": [
+        110,
+        117,
+        109,
+        98,
+        101,
+        114
+      ],
+      "node_relation": "agreement",
+      "observe": "s"
+    },
+    {
+      "id": "nested-inner-else",
+      "source": "var c=1;var d=0;var x=true;if(c){if(d){var a=typeof x;}else{var s=typeof x;}}else{var e=typeof x;}s",
+      "es51_type": "boolean",
+      "condition": "ident",
+      "polarity": "inner-false",
+      "shape": "nested",
+      "utf16": [
+        98,
+        111,
+        111,
+        108,
+        101,
+        97,
+        110
+      ],
+      "node_relation": "agreement",
+      "observe": "s"
+    },
+    {
+      "id": "nested-outer-else",
+      "source": "var c=0;var d=1;var x=true;if(c){if(d){var a=typeof x;}else{var b=typeof x;}}else{var s=typeof x;}s",
+      "es51_type": "boolean",
+      "condition": "ident",
+      "polarity": "outer-false",
+      "shape": "nested",
+      "utf16": [
+        98,
+        111,
+        111,
+        108,
+        101,
+        97,
+        110
+      ],
+      "node_relation": "agreement",
+      "observe": "s"
+    },
+    {
+      "id": "resolved-undefined-else",
+      "source": "var c=0;var x;if(c){var a=typeof x;}else{var s=typeof x;}s",
+      "es51_type": "undefined",
+      "condition": "ident",
+      "polarity": "false",
+      "shape": "resolved-binding",
+      "utf16": [
+        117,
+        110,
+        100,
+        101,
+        102,
+        105,
+        110,
+        101,
+        100
+      ],
+      "node_relation": "agreement",
+      "observe": "s"
+    },
+    {
+      "id": "resolved-function-else",
+      "source": "function g(){'use strict';return 1;}var c=0;if(c){var a=typeof g;}else{var s=typeof g;}s",
+      "es51_type": "function",
+      "condition": "ident",
+      "polarity": "false",
+      "shape": "resolved-binding",
+      "utf16": [
+        102,
+        117,
+        110,
+        99,
+        116,
+        105,
+        111,
+        110
+      ],
+      "node_relation": "agreement",
+      "observe": "s"
+    },
+    {
+      "id": "dominating-script",
+      "source": "var x=1;var pre=typeof x;var c=0;if(c){var a=typeof x;}else{var s=typeof x;}s",
+      "es51_type": "number",
+      "condition": "ident",
+      "polarity": "false",
+      "shape": "dominating-cache",
+      "utf16": [
+        110,
+        117,
+        109,
+        98,
+        101,
+        114
+      ],
+      "node_relation": "agreement",
+      "observe": "s"
+    },
+    {
+      "id": "dominating-function",
+      "source": "function f(c){'use strict';var x=1;var pre=typeof x;if(c){return typeof x;}else{return typeof x;}}var s=f(0);s",
+      "es51_type": "number",
+      "condition": "parameter",
+      "polarity": "false",
+      "shape": "dominating-cache",
+      "utf16": [
+        110,
+        117,
+        109,
+        98,
+        101,
+        114
+      ],
+      "node_relation": "agreement",
+      "observe": "s"
+    },
+    {
+      "id": "native-grouped",
+      "source": "function arm(c){'use strict';var x=1;if(c){return typeof x;}else{return typeof x;}}function nest(c,d){'use strict';var x=true;if(c){if(d){return typeof x;}else{return typeof x;}}else{return typeof x;}}function dominated(c){'use strict';var x='z';var pre=typeof x;if(c){return typeof x;}else{return typeof x;}}function memberArm(flag){'use strict';var x=1;var o={flag:flag};if(o.flag){return typeof x;}else{return typeof x;}}var c=0;var x=1;if(c){var a=typeof x;}else{var b=typeof x;}var j=typeof x;var r0=arm(0);var r1=arm(1);var n0=nest(1,0);var d0=dominated(0);var m0=memberArm(0);var ok=r0==='number'&&r1==='number'&&n0==='boolean'&&d0==='string'&&b==='number'&&j==='number'&&m0==='number';var s=r0;s",
+      "es51_type": "number",
+      "also_bool": "ok",
+      "condition": "ident-member-parameter",
+      "polarity": "both",
+      "shape": "grouped",
+      "utf16": [
+        110,
+        117,
+        109,
+        98,
+        101,
+        114
+      ],
+      "node_relation": "agreement",
+      "observe": "s"
+    },
+    {
+      "id": "dominating-function-prefix",
+      "source": "function f(c){'use strict';var x=1;if((typeof x)==='number'&&c){return typeof x;}else{return typeof x;}}var s=f(0);s",
+      "es51_type": "number",
+      "condition": "condition-prefix",
+      "polarity": "false",
+      "shape": "dominating-cache",
+      "utf16": [110, 117, 109, 98, 101, 114],
+      "node_relation": "agreement",
+      "observe": "s"
+    },
+    {
+      "id": "grouped-prefix-control",
+      "source": "function arm(c){'use strict';var x=1;if(c){return typeof x;}else{return typeof x;}}function nest(c,d){'use strict';var x=true;if(c){if(d){return typeof x;}else{return typeof x;}}else{return typeof x;}}function dominated(c){'use strict';var x='z';if((typeof x)==='string'&&c){return typeof x;}else{return typeof x;}}function memberArm(flag){'use strict';var x=1;var o={flag:flag};if(o.flag){return typeof x;}else{return typeof x;}}var c=0;var x=1;if(c){var a=typeof x;}else{var b=typeof x;}var j=typeof x;var r0=arm(0);var r1=arm(1);var n0=nest(1,0);var d0=dominated(0);var m0=memberArm(0);var ok=r0==='number'&&r1==='number'&&n0==='boolean'&&d0==='string'&&b==='number'&&j==='number'&&m0==='number';var s=r0;s",
+      "es51_type": "number",
+      "also_bool": "ok",
+      "condition": "condition-prefix",
+      "polarity": "both",
+      "shape": "grouped-prefix",
+      "utf16": [110, 117, 109, 98, 101, 114],
+      "node_relation": "agreement",
+      "observe": "s"
+    },
+    {
+      "id": "sequential-guard-typeof",
+      "source": "function f(){'use strict';var x=1;var a=typeof x;var b=typeof x;return b;}var s=f();s",
+      "es51_type": "number",
+      "condition": "none",
+      "polarity": "sequential",
+      "shape": "returned-guard",
+      "utf16": [110, 117, 109, 98, 101, 114],
+      "node_relation": "agreement",
+      "observe": "s"
+    }
+  ],
+  "typeof_cache_note": "typeof of resolved bindings across runtime if. utf16 is Node charCodeAt of the same source bytes. Empty-if vectors and their node_relation fields are unchanged."
+}

@@ -1,0 +1,24 @@
+{
+  "schema": "historical-test262-retained-inputs-v1",
+  "repo": "tc39/test262",
+  "commit": "46359091c7d26fa35d23cd0a1ebf47e3442d15d4",
+  "commit_date": "2012-12-18T07:49:06Z",
+  "archive_url": "https://codeload.github.com/tc39/test262/tar.gz/46359091c7d26fa35d23cd0a1ebf47e3442d15d4",
+  "selected_roots": ["test/suite/ch06", "test/suite/ch07", "test/suite/ch08", "test/suite/ch09", "test/suite/ch10", "test/suite/ch11", "test/suite/ch12", "test/suite/ch13", "test/suite/ch14", "test/suite/ch15"],
+  "expected": {"original_paths": 11572, "retained_files": 11598, "harness_inputs": 19, "license_files": 2},
+  "required_external_inputs": ["manifest.json", "corpus", "test262-46359091c7d26fa35d23cd0a1ebf47e3442d15d4.tar.gz", "commit-api-reverified.json"],
+  "baseline_harness": ["cth.js", "sta.js", "ed.js", "testBuiltInObject.js", "testIntl.js"],
+  "licenses_in_retained_corpus": ["LICENSE", "external/contributions/Google/sputniktests/LICENSE"],
+  "byte_policy": "Every retained byte and every original metadata entry are rechecked directly against the archive. Corpus inputs are not copied into this repository.",
+  "preparer_reuse": {
+    "product_path": "tools/es5_corpus_prepare.py",
+    "original": "accepted standalone prepare_manifest.py for this exact pin",
+    "copy_policy": "Implementation is byte-identical to the accepted preparer; tests adapt imports, explicit TMPDIR and optional real-header fixture location only.",
+    "upstream_python_or_shell_executed": false
+  },
+  "historical_contract_sources": ["tools/packaging/test262.py:209-222,329-340,342-376", "tools/packaging/parseTestRecord.py", "test/harness/sta.js:269-307,311-901"],
+  "harness_include_policy": "sta.js contains the definitions for all six observed include names; original $INCLUDE is a no-op. environment.js, Date_constants.js and Date_library.js are empty. math_precision.js, math_isequal.js and numeric_conversion.js are older standalone implementations and are not additionally evaluated.",
+  "negative_policy": "Historical @negative values are optional error-text patterns, not phase declarations. No filename or SyntaxError-based phase inference. No negative passes without reviewed typed case-origin diagnostic authority.",
+  "native_policy": "Deferred without reviewed real SSA, useful instruction counts and lowering evidence; no generic count, AOT entry or fallback acceptance.",
+  "P12_complete": false
+}

@@ -1,0 +1,2512 @@
+{
+  "reference": "/mnt/TEMP/es51-frontend-31be4f3/interpreter-parallel-p8-p9-p11-p12/p8-math/OUT/node-vectors.raw.json",
+  "unicode": "3.0",
+  "rows": [
+    {
+      "source": "Math.E",
+      "section": "15.8.1",
+      "node": "2.718281828459045",
+      "expected": "2.718281828459045",
+      "id": 0
+    },
+    {
+      "source": "Math.LN10",
+      "section": "15.8.1",
+      "node": "2.302585092994046",
+      "expected": "2.302585092994046",
+      "id": 1
+    },
+    {
+      "source": "Math.LN2",
+      "section": "15.8.1",
+      "node": "0.6931471805599453",
+      "expected": "0.6931471805599453",
+      "id": 2
+    },
+    {
+      "source": "Math.LOG2E",
+      "section": "15.8.1",
+      "node": "1.4426950408889634",
+      "expected": "1.4426950408889634",
+      "id": 3
+    },
+    {
+      "source": "Math.LOG10E",
+      "section": "15.8.1",
+      "node": "0.4342944819032518",
+      "expected": "0.4342944819032518",
+      "id": 4
+    },
+    {
+      "source": "Math.PI",
+      "section": "15.8.1",
+      "node": "3.141592653589793",
+      "expected": "3.141592653589793",
+      "id": 5
+    },
+    {
+      "source": "Math.SQRT1_2",
+      "section": "15.8.1",
+      "node": "0.7071067811865476",
+      "expected": "0.7071067811865476",
+      "id": 6
+    },
+    {
+      "source": "Math.SQRT2",
+      "section": "15.8.1",
+      "node": "1.4142135623730951",
+      "expected": "1.4142135623730951",
+      "id": 7
+    },
+    {
+      "source": "Math.abs(undefined)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 8
+    },
+    {
+      "source": "Math.abs(null)",
+      "section": "15.8.2",
+      "node": "0",
+      "expected": "0",
+      "id": 9
+    },
+    {
+      "source": "Math.abs(true)",
+      "section": "15.8.2",
+      "node": "1",
+      "expected": "1",
+      "id": 10
+    },
+    {
+      "source": "Math.abs(false)",
+      "section": "15.8.2",
+      "node": "0",
+      "expected": "0",
+      "id": 11
+    },
+    {
+      "source": "Math.abs(0)",
+      "section": "15.8.2",
+      "node": "0",
+      "expected": "0",
+      "id": 12
+    },
+    {
+      "source": "Math.abs(-0)",
+      "section": "15.8.2",
+      "node": "0",
+      "expected": "0",
+      "id": 13
+    },
+    {
+      "source": "Math.abs(0.5)",
+      "section": "15.8.2",
+      "node": "0.5",
+      "expected": "0.5",
+      "id": 14
+    },
+    {
+      "source": "Math.abs(-0.5)",
+      "section": "15.8.2",
+      "node": "0.5",
+      "expected": "0.5",
+      "id": 15
+    },
+    {
+      "source": "Math.abs(1)",
+      "section": "15.8.2",
+      "node": "1",
+      "expected": "1",
+      "id": 16
+    },
+    {
+      "source": "Math.abs(-1)",
+      "section": "15.8.2",
+      "node": "1",
+      "expected": "1",
+      "id": 17
+    },
+    {
+      "source": "Math.abs(2)",
+      "section": "15.8.2",
+      "node": "2",
+      "expected": "2",
+      "id": 18
+    },
+    {
+      "source": "Math.abs(-2)",
+      "section": "15.8.2",
+      "node": "2",
+      "expected": "2",
+      "id": 19
+    },
+    {
+      "source": "Math.abs(Infinity)",
+      "section": "15.8.2",
+      "node": "+Infinity",
+      "expected": "+Infinity",
+      "id": 20
+    },
+    {
+      "source": "Math.abs(-Infinity)",
+      "section": "15.8.2",
+      "node": "+Infinity",
+      "expected": "+Infinity",
+      "id": 21
+    },
+    {
+      "source": "Math.abs(NaN)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 22
+    },
+    {
+      "source": "Math.abs(\" 2 \")",
+      "section": "15.8.2",
+      "node": "2",
+      "expected": "2",
+      "id": 23
+    },
+    {
+      "source": "Math.abs(\"bad\")",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 24
+    },
+    {
+      "source": "Math.abs()",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 25
+    },
+    {
+      "source": "Math.acos(undefined)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 26
+    },
+    {
+      "source": "Math.acos(null)",
+      "section": "15.8.2",
+      "node": "1.5707963267948966",
+      "expected": "1.5707963267948966",
+      "id": 27
+    },
+    {
+      "source": "Math.acos(true)",
+      "section": "15.8.2",
+      "node": "0",
+      "expected": "0",
+      "id": 28
+    },
+    {
+      "source": "Math.acos(false)",
+      "section": "15.8.2",
+      "node": "1.5707963267948966",
+      "expected": "1.5707963267948966",
+      "id": 29
+    },
+    {
+      "source": "Math.acos(0)",
+      "section": "15.8.2",
+      "node": "1.5707963267948966",
+      "expected": "1.5707963267948966",
+      "id": 30
+    },
+    {
+      "source": "Math.acos(-0)",
+      "section": "15.8.2",
+      "node": "1.5707963267948966",
+      "expected": "1.5707963267948966",
+      "id": 31
+    },
+    {
+      "source": "Math.acos(0.5)",
+      "section": "15.8.2",
+      "node": "1.0471975511965979",
+      "expected": "1.0471975511965979",
+      "id": 32
+    },
+    {
+      "source": "Math.acos(-0.5)",
+      "section": "15.8.2",
+      "node": "2.0943951023931957",
+      "expected": "2.0943951023931957",
+      "id": 33
+    },
+    {
+      "source": "Math.acos(1)",
+      "section": "15.8.2",
+      "node": "0",
+      "expected": "0",
+      "id": 34
+    },
+    {
+      "source": "Math.acos(-1)",
+      "section": "15.8.2",
+      "node": "3.141592653589793",
+      "expected": "3.141592653589793",
+      "id": 35
+    },
+    {
+      "source": "Math.acos(2)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 36
+    },
+    {
+      "source": "Math.acos(-2)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 37
+    },
+    {
+      "source": "Math.acos(Infinity)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 38
+    },
+    {
+      "source": "Math.acos(-Infinity)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 39
+    },
+    {
+      "source": "Math.acos(NaN)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 40
+    },
+    {
+      "source": "Math.acos(\" 2 \")",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 41
+    },
+    {
+      "source": "Math.acos(\"bad\")",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 42
+    },
+    {
+      "source": "Math.acos()",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 43
+    },
+    {
+      "source": "Math.asin(undefined)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 44
+    },
+    {
+      "source": "Math.asin(null)",
+      "section": "15.8.2",
+      "node": "0",
+      "expected": "0",
+      "id": 45
+    },
+    {
+      "source": "Math.asin(true)",
+      "section": "15.8.2",
+      "node": "1.5707963267948966",
+      "expected": "1.5707963267948966",
+      "id": 46
+    },
+    {
+      "source": "Math.asin(false)",
+      "section": "15.8.2",
+      "node": "0",
+      "expected": "0",
+      "id": 47
+    },
+    {
+      "source": "Math.asin(0)",
+      "section": "15.8.2",
+      "node": "0",
+      "expected": "0",
+      "id": 48
+    },
+    {
+      "source": "Math.asin(-0)",
+      "section": "15.8.2",
+      "node": "-0",
+      "expected": "-0",
+      "id": 49
+    },
+    {
+      "source": "Math.asin(0.5)",
+      "section": "15.8.2",
+      "node": "0.5235987755982989",
+      "expected": "0.5235987755982989",
+      "id": 50
+    },
+    {
+      "source": "Math.asin(-0.5)",
+      "section": "15.8.2",
+      "node": "-0.5235987755982989",
+      "expected": "-0.5235987755982989",
+      "id": 51
+    },
+    {
+      "source": "Math.asin(1)",
+      "section": "15.8.2",
+      "node": "1.5707963267948966",
+      "expected": "1.5707963267948966",
+      "id": 52
+    },
+    {
+      "source": "Math.asin(-1)",
+      "section": "15.8.2",
+      "node": "-1.5707963267948966",
+      "expected": "-1.5707963267948966",
+      "id": 53
+    },
+    {
+      "source": "Math.asin(2)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 54
+    },
+    {
+      "source": "Math.asin(-2)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 55
+    },
+    {
+      "source": "Math.asin(Infinity)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 56
+    },
+    {
+      "source": "Math.asin(-Infinity)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 57
+    },
+    {
+      "source": "Math.asin(NaN)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 58
+    },
+    {
+      "source": "Math.asin(\" 2 \")",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 59
+    },
+    {
+      "source": "Math.asin(\"bad\")",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 60
+    },
+    {
+      "source": "Math.asin()",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 61
+    },
+    {
+      "source": "Math.atan(undefined)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 62
+    },
+    {
+      "source": "Math.atan(null)",
+      "section": "15.8.2",
+      "node": "0",
+      "expected": "0",
+      "id": 63
+    },
+    {
+      "source": "Math.atan(true)",
+      "section": "15.8.2",
+      "node": "0.7853981633974483",
+      "expected": "0.7853981633974483",
+      "id": 64
+    },
+    {
+      "source": "Math.atan(false)",
+      "section": "15.8.2",
+      "node": "0",
+      "expected": "0",
+      "id": 65
+    },
+    {
+      "source": "Math.atan(0)",
+      "section": "15.8.2",
+      "node": "0",
+      "expected": "0",
+      "id": 66
+    },
+    {
+      "source": "Math.atan(-0)",
+      "section": "15.8.2",
+      "node": "-0",
+      "expected": "-0",
+      "id": 67
+    },
+    {
+      "source": "Math.atan(0.5)",
+      "section": "15.8.2",
+      "node": "0.4636476090008061",
+      "expected": "0.4636476090008061",
+      "id": 68
+    },
+    {
+      "source": "Math.atan(-0.5)",
+      "section": "15.8.2",
+      "node": "-0.4636476090008061",
+      "expected": "-0.4636476090008061",
+      "id": 69
+    },
+    {
+      "source": "Math.atan(1)",
+      "section": "15.8.2",
+      "node": "0.7853981633974483",
+      "expected": "0.7853981633974483",
+      "id": 70
+    },
+    {
+      "source": "Math.atan(-1)",
+      "section": "15.8.2",
+      "node": "-0.7853981633974483",
+      "expected": "-0.7853981633974483",
+      "id": 71
+    },
+    {
+      "source": "Math.atan(2)",
+      "section": "15.8.2",
+      "node": "1.1071487177940904",
+      "expected": "1.1071487177940904",
+      "id": 72
+    },
+    {
+      "source": "Math.atan(-2)",
+      "section": "15.8.2",
+      "node": "-1.1071487177940904",
+      "expected": "-1.1071487177940904",
+      "id": 73
+    },
+    {
+      "source": "Math.atan(Infinity)",
+      "section": "15.8.2",
+      "node": "1.5707963267948966",
+      "expected": "1.5707963267948966",
+      "id": 74
+    },
+    {
+      "source": "Math.atan(-Infinity)",
+      "section": "15.8.2",
+      "node": "-1.5707963267948966",
+      "expected": "-1.5707963267948966",
+      "id": 75
+    },
+    {
+      "source": "Math.atan(NaN)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 76
+    },
+    {
+      "source": "Math.atan(\" 2 \")",
+      "section": "15.8.2",
+      "node": "1.1071487177940904",
+      "expected": "1.1071487177940904",
+      "id": 77
+    },
+    {
+      "source": "Math.atan(\"bad\")",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 78
+    },
+    {
+      "source": "Math.atan()",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 79
+    },
+    {
+      "source": "Math.ceil(undefined)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 80
+    },
+    {
+      "source": "Math.ceil(null)",
+      "section": "15.8.2",
+      "node": "0",
+      "expected": "0",
+      "id": 81
+    },
+    {
+      "source": "Math.ceil(true)",
+      "section": "15.8.2",
+      "node": "1",
+      "expected": "1",
+      "id": 82
+    },
+    {
+      "source": "Math.ceil(false)",
+      "section": "15.8.2",
+      "node": "0",
+      "expected": "0",
+      "id": 83
+    },
+    {
+      "source": "Math.ceil(0)",
+      "section": "15.8.2",
+      "node": "0",
+      "expected": "0",
+      "id": 84
+    },
+    {
+      "source": "Math.ceil(-0)",
+      "section": "15.8.2",
+      "node": "-0",
+      "expected": "-0",
+      "id": 85
+    },
+    {
+      "source": "Math.ceil(0.5)",
+      "section": "15.8.2",
+      "node": "1",
+      "expected": "1",
+      "id": 86
+    },
+    {
+      "source": "Math.ceil(-0.5)",
+      "section": "15.8.2",
+      "node": "-0",
+      "expected": "-0",
+      "id": 87
+    },
+    {
+      "source": "Math.ceil(1)",
+      "section": "15.8.2",
+      "node": "1",
+      "expected": "1",
+      "id": 88
+    },
+    {
+      "source": "Math.ceil(-1)",
+      "section": "15.8.2",
+      "node": "-1",
+      "expected": "-1",
+      "id": 89
+    },
+    {
+      "source": "Math.ceil(2)",
+      "section": "15.8.2",
+      "node": "2",
+      "expected": "2",
+      "id": 90
+    },
+    {
+      "source": "Math.ceil(-2)",
+      "section": "15.8.2",
+      "node": "-2",
+      "expected": "-2",
+      "id": 91
+    },
+    {
+      "source": "Math.ceil(Infinity)",
+      "section": "15.8.2",
+      "node": "+Infinity",
+      "expected": "+Infinity",
+      "id": 92
+    },
+    {
+      "source": "Math.ceil(-Infinity)",
+      "section": "15.8.2",
+      "node": "-Infinity",
+      "expected": "-Infinity",
+      "id": 93
+    },
+    {
+      "source": "Math.ceil(NaN)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 94
+    },
+    {
+      "source": "Math.ceil(\" 2 \")",
+      "section": "15.8.2",
+      "node": "2",
+      "expected": "2",
+      "id": 95
+    },
+    {
+      "source": "Math.ceil(\"bad\")",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 96
+    },
+    {
+      "source": "Math.ceil()",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 97
+    },
+    {
+      "source": "Math.cos(undefined)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 98
+    },
+    {
+      "source": "Math.cos(null)",
+      "section": "15.8.2",
+      "node": "1",
+      "expected": "1",
+      "id": 99
+    },
+    {
+      "source": "Math.cos(true)",
+      "section": "15.8.2",
+      "node": "0.5403023058681398",
+      "expected": "0.5403023058681398",
+      "id": 100
+    },
+    {
+      "source": "Math.cos(false)",
+      "section": "15.8.2",
+      "node": "1",
+      "expected": "1",
+      "id": 101
+    },
+    {
+      "source": "Math.cos(0)",
+      "section": "15.8.2",
+      "node": "1",
+      "expected": "1",
+      "id": 102
+    },
+    {
+      "source": "Math.cos(-0)",
+      "section": "15.8.2",
+      "node": "1",
+      "expected": "1",
+      "id": 103
+    },
+    {
+      "source": "Math.cos(0.5)",
+      "section": "15.8.2",
+      "node": "0.8775825618903728",
+      "expected": "0.8775825618903728",
+      "id": 104
+    },
+    {
+      "source": "Math.cos(-0.5)",
+      "section": "15.8.2",
+      "node": "0.8775825618903728",
+      "expected": "0.8775825618903728",
+      "id": 105
+    },
+    {
+      "source": "Math.cos(1)",
+      "section": "15.8.2",
+      "node": "0.5403023058681398",
+      "expected": "0.5403023058681398",
+      "id": 106
+    },
+    {
+      "source": "Math.cos(-1)",
+      "section": "15.8.2",
+      "node": "0.5403023058681398",
+      "expected": "0.5403023058681398",
+      "id": 107
+    },
+    {
+      "source": "Math.cos(2)",
+      "section": "15.8.2",
+      "node": "-0.4161468365471424",
+      "expected": "-0.4161468365471424",
+      "id": 108
+    },
+    {
+      "source": "Math.cos(-2)",
+      "section": "15.8.2",
+      "node": "-0.4161468365471424",
+      "expected": "-0.4161468365471424",
+      "id": 109
+    },
+    {
+      "source": "Math.cos(Infinity)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 110
+    },
+    {
+      "source": "Math.cos(-Infinity)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 111
+    },
+    {
+      "source": "Math.cos(NaN)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 112
+    },
+    {
+      "source": "Math.cos(\" 2 \")",
+      "section": "15.8.2",
+      "node": "-0.4161468365471424",
+      "expected": "-0.4161468365471424",
+      "id": 113
+    },
+    {
+      "source": "Math.cos(\"bad\")",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 114
+    },
+    {
+      "source": "Math.cos()",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 115
+    },
+    {
+      "source": "Math.exp(undefined)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 116
+    },
+    {
+      "source": "Math.exp(null)",
+      "section": "15.8.2",
+      "node": "1",
+      "expected": "1",
+      "id": 117
+    },
+    {
+      "source": "Math.exp(true)",
+      "section": "15.8.2",
+      "node": "2.718281828459045",
+      "expected": "2.718281828459045",
+      "id": 118
+    },
+    {
+      "source": "Math.exp(false)",
+      "section": "15.8.2",
+      "node": "1",
+      "expected": "1",
+      "id": 119
+    },
+    {
+      "source": "Math.exp(0)",
+      "section": "15.8.2",
+      "node": "1",
+      "expected": "1",
+      "id": 120
+    },
+    {
+      "source": "Math.exp(-0)",
+      "section": "15.8.2",
+      "node": "1",
+      "expected": "1",
+      "id": 121
+    },
+    {
+      "source": "Math.exp(0.5)",
+      "section": "15.8.2",
+      "node": "1.6487212707001282",
+      "expected": "1.6487212707001282",
+      "id": 122
+    },
+    {
+      "source": "Math.exp(-0.5)",
+      "section": "15.8.2",
+      "node": "0.6065306597126334",
+      "expected": "0.6065306597126334",
+      "id": 123
+    },
+    {
+      "source": "Math.exp(1)",
+      "section": "15.8.2",
+      "node": "2.718281828459045",
+      "expected": "2.718281828459045",
+      "id": 124
+    },
+    {
+      "source": "Math.exp(-1)",
+      "section": "15.8.2",
+      "node": "0.36787944117144233",
+      "expected": "0.36787944117144233",
+      "id": 125
+    },
+    {
+      "source": "Math.exp(2)",
+      "section": "15.8.2",
+      "node": "7.38905609893065",
+      "expected": "7.38905609893065",
+      "id": 126
+    },
+    {
+      "source": "Math.exp(-2)",
+      "section": "15.8.2",
+      "node": "0.1353352832366127",
+      "expected": "0.1353352832366127",
+      "id": 127
+    },
+    {
+      "source": "Math.exp(Infinity)",
+      "section": "15.8.2",
+      "node": "+Infinity",
+      "expected": "+Infinity",
+      "id": 128
+    },
+    {
+      "source": "Math.exp(-Infinity)",
+      "section": "15.8.2",
+      "node": "0",
+      "expected": "0",
+      "id": 129
+    },
+    {
+      "source": "Math.exp(NaN)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 130
+    },
+    {
+      "source": "Math.exp(\" 2 \")",
+      "section": "15.8.2",
+      "node": "7.38905609893065",
+      "expected": "7.38905609893065",
+      "id": 131
+    },
+    {
+      "source": "Math.exp(\"bad\")",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 132
+    },
+    {
+      "source": "Math.exp()",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 133
+    },
+    {
+      "source": "Math.floor(undefined)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 134
+    },
+    {
+      "source": "Math.floor(null)",
+      "section": "15.8.2",
+      "node": "0",
+      "expected": "0",
+      "id": 135
+    },
+    {
+      "source": "Math.floor(true)",
+      "section": "15.8.2",
+      "node": "1",
+      "expected": "1",
+      "id": 136
+    },
+    {
+      "source": "Math.floor(false)",
+      "section": "15.8.2",
+      "node": "0",
+      "expected": "0",
+      "id": 137
+    },
+    {
+      "source": "Math.floor(0)",
+      "section": "15.8.2",
+      "node": "0",
+      "expected": "0",
+      "id": 138
+    },
+    {
+      "source": "Math.floor(-0)",
+      "section": "15.8.2",
+      "node": "-0",
+      "expected": "-0",
+      "id": 139
+    },
+    {
+      "source": "Math.floor(0.5)",
+      "section": "15.8.2",
+      "node": "0",
+      "expected": "0",
+      "id": 140
+    },
+    {
+      "source": "Math.floor(-0.5)",
+      "section": "15.8.2",
+      "node": "-1",
+      "expected": "-1",
+      "id": 141
+    },
+    {
+      "source": "Math.floor(1)",
+      "section": "15.8.2",
+      "node": "1",
+      "expected": "1",
+      "id": 142
+    },
+    {
+      "source": "Math.floor(-1)",
+      "section": "15.8.2",
+      "node": "-1",
+      "expected": "-1",
+      "id": 143
+    },
+    {
+      "source": "Math.floor(2)",
+      "section": "15.8.2",
+      "node": "2",
+      "expected": "2",
+      "id": 144
+    },
+    {
+      "source": "Math.floor(-2)",
+      "section": "15.8.2",
+      "node": "-2",
+      "expected": "-2",
+      "id": 145
+    },
+    {
+      "source": "Math.floor(Infinity)",
+      "section": "15.8.2",
+      "node": "+Infinity",
+      "expected": "+Infinity",
+      "id": 146
+    },
+    {
+      "source": "Math.floor(-Infinity)",
+      "section": "15.8.2",
+      "node": "-Infinity",
+      "expected": "-Infinity",
+      "id": 147
+    },
+    {
+      "source": "Math.floor(NaN)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 148
+    },
+    {
+      "source": "Math.floor(\" 2 \")",
+      "section": "15.8.2",
+      "node": "2",
+      "expected": "2",
+      "id": 149
+    },
+    {
+      "source": "Math.floor(\"bad\")",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 150
+    },
+    {
+      "source": "Math.floor()",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 151
+    },
+    {
+      "source": "Math.log(undefined)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 152
+    },
+    {
+      "source": "Math.log(null)",
+      "section": "15.8.2",
+      "node": "-Infinity",
+      "expected": "-Infinity",
+      "id": 153
+    },
+    {
+      "source": "Math.log(true)",
+      "section": "15.8.2",
+      "node": "0",
+      "expected": "0",
+      "id": 154
+    },
+    {
+      "source": "Math.log(false)",
+      "section": "15.8.2",
+      "node": "-Infinity",
+      "expected": "-Infinity",
+      "id": 155
+    },
+    {
+      "source": "Math.log(0)",
+      "section": "15.8.2",
+      "node": "-Infinity",
+      "expected": "-Infinity",
+      "id": 156
+    },
+    {
+      "source": "Math.log(-0)",
+      "section": "15.8.2",
+      "node": "-Infinity",
+      "expected": "-Infinity",
+      "id": 157
+    },
+    {
+      "source": "Math.log(0.5)",
+      "section": "15.8.2",
+      "node": "-0.6931471805599453",
+      "expected": "-0.6931471805599453",
+      "id": 158
+    },
+    {
+      "source": "Math.log(-0.5)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 159
+    },
+    {
+      "source": "Math.log(1)",
+      "section": "15.8.2",
+      "node": "0",
+      "expected": "0",
+      "id": 160
+    },
+    {
+      "source": "Math.log(-1)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 161
+    },
+    {
+      "source": "Math.log(2)",
+      "section": "15.8.2",
+      "node": "0.6931471805599453",
+      "expected": "0.6931471805599453",
+      "id": 162
+    },
+    {
+      "source": "Math.log(-2)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 163
+    },
+    {
+      "source": "Math.log(Infinity)",
+      "section": "15.8.2",
+      "node": "+Infinity",
+      "expected": "+Infinity",
+      "id": 164
+    },
+    {
+      "source": "Math.log(-Infinity)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 165
+    },
+    {
+      "source": "Math.log(NaN)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 166
+    },
+    {
+      "source": "Math.log(\" 2 \")",
+      "section": "15.8.2",
+      "node": "0.6931471805599453",
+      "expected": "0.6931471805599453",
+      "id": 167
+    },
+    {
+      "source": "Math.log(\"bad\")",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 168
+    },
+    {
+      "source": "Math.log()",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 169
+    },
+    {
+      "source": "Math.round(undefined)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 170
+    },
+    {
+      "source": "Math.round(null)",
+      "section": "15.8.2",
+      "node": "0",
+      "expected": "0",
+      "id": 171
+    },
+    {
+      "source": "Math.round(true)",
+      "section": "15.8.2",
+      "node": "1",
+      "expected": "1",
+      "id": 172
+    },
+    {
+      "source": "Math.round(false)",
+      "section": "15.8.2",
+      "node": "0",
+      "expected": "0",
+      "id": 173
+    },
+    {
+      "source": "Math.round(0)",
+      "section": "15.8.2",
+      "node": "0",
+      "expected": "0",
+      "id": 174
+    },
+    {
+      "source": "Math.round(-0)",
+      "section": "15.8.2",
+      "node": "-0",
+      "expected": "-0",
+      "id": 175
+    },
+    {
+      "source": "Math.round(0.5)",
+      "section": "15.8.2",
+      "node": "1",
+      "expected": "1",
+      "id": 176
+    },
+    {
+      "source": "Math.round(-0.5)",
+      "section": "15.8.2",
+      "node": "-0",
+      "expected": "-0",
+      "id": 177
+    },
+    {
+      "source": "Math.round(1)",
+      "section": "15.8.2",
+      "node": "1",
+      "expected": "1",
+      "id": 178
+    },
+    {
+      "source": "Math.round(-1)",
+      "section": "15.8.2",
+      "node": "-1",
+      "expected": "-1",
+      "id": 179
+    },
+    {
+      "source": "Math.round(2)",
+      "section": "15.8.2",
+      "node": "2",
+      "expected": "2",
+      "id": 180
+    },
+    {
+      "source": "Math.round(-2)",
+      "section": "15.8.2",
+      "node": "-2",
+      "expected": "-2",
+      "id": 181
+    },
+    {
+      "source": "Math.round(Infinity)",
+      "section": "15.8.2",
+      "node": "+Infinity",
+      "expected": "+Infinity",
+      "id": 182
+    },
+    {
+      "source": "Math.round(-Infinity)",
+      "section": "15.8.2",
+      "node": "-Infinity",
+      "expected": "-Infinity",
+      "id": 183
+    },
+    {
+      "source": "Math.round(NaN)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 184
+    },
+    {
+      "source": "Math.round(\" 2 \")",
+      "section": "15.8.2",
+      "node": "2",
+      "expected": "2",
+      "id": 185
+    },
+    {
+      "source": "Math.round(\"bad\")",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 186
+    },
+    {
+      "source": "Math.round()",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 187
+    },
+    {
+      "source": "Math.sin(undefined)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 188
+    },
+    {
+      "source": "Math.sin(null)",
+      "section": "15.8.2",
+      "node": "0",
+      "expected": "0",
+      "id": 189
+    },
+    {
+      "source": "Math.sin(true)",
+      "section": "15.8.2",
+      "node": "0.8414709848078965",
+      "expected": "0.8414709848078965",
+      "id": 190
+    },
+    {
+      "source": "Math.sin(false)",
+      "section": "15.8.2",
+      "node": "0",
+      "expected": "0",
+      "id": 191
+    },
+    {
+      "source": "Math.sin(0)",
+      "section": "15.8.2",
+      "node": "0",
+      "expected": "0",
+      "id": 192
+    },
+    {
+      "source": "Math.sin(-0)",
+      "section": "15.8.2",
+      "node": "-0",
+      "expected": "-0",
+      "id": 193
+    },
+    {
+      "source": "Math.sin(0.5)",
+      "section": "15.8.2",
+      "node": "0.479425538604203",
+      "expected": "0.479425538604203",
+      "id": 194
+    },
+    {
+      "source": "Math.sin(-0.5)",
+      "section": "15.8.2",
+      "node": "-0.479425538604203",
+      "expected": "-0.479425538604203",
+      "id": 195
+    },
+    {
+      "source": "Math.sin(1)",
+      "section": "15.8.2",
+      "node": "0.8414709848078965",
+      "expected": "0.8414709848078965",
+      "id": 196
+    },
+    {
+      "source": "Math.sin(-1)",
+      "section": "15.8.2",
+      "node": "-0.8414709848078965",
+      "expected": "-0.8414709848078965",
+      "id": 197
+    },
+    {
+      "source": "Math.sin(2)",
+      "section": "15.8.2",
+      "node": "0.9092974268256817",
+      "expected": "0.9092974268256817",
+      "id": 198
+    },
+    {
+      "source": "Math.sin(-2)",
+      "section": "15.8.2",
+      "node": "-0.9092974268256817",
+      "expected": "-0.9092974268256817",
+      "id": 199
+    },
+    {
+      "source": "Math.sin(Infinity)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 200
+    },
+    {
+      "source": "Math.sin(-Infinity)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 201
+    },
+    {
+      "source": "Math.sin(NaN)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 202
+    },
+    {
+      "source": "Math.sin(\" 2 \")",
+      "section": "15.8.2",
+      "node": "0.9092974268256817",
+      "expected": "0.9092974268256817",
+      "id": 203
+    },
+    {
+      "source": "Math.sin(\"bad\")",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 204
+    },
+    {
+      "source": "Math.sin()",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 205
+    },
+    {
+      "source": "Math.sqrt(undefined)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 206
+    },
+    {
+      "source": "Math.sqrt(null)",
+      "section": "15.8.2",
+      "node": "0",
+      "expected": "0",
+      "id": 207
+    },
+    {
+      "source": "Math.sqrt(true)",
+      "section": "15.8.2",
+      "node": "1",
+      "expected": "1",
+      "id": 208
+    },
+    {
+      "source": "Math.sqrt(false)",
+      "section": "15.8.2",
+      "node": "0",
+      "expected": "0",
+      "id": 209
+    },
+    {
+      "source": "Math.sqrt(0)",
+      "section": "15.8.2",
+      "node": "0",
+      "expected": "0",
+      "id": 210
+    },
+    {
+      "source": "Math.sqrt(-0)",
+      "section": "15.8.2",
+      "node": "-0",
+      "expected": "-0",
+      "id": 211
+    },
+    {
+      "source": "Math.sqrt(0.5)",
+      "section": "15.8.2",
+      "node": "0.7071067811865476",
+      "expected": "0.7071067811865476",
+      "id": 212
+    },
+    {
+      "source": "Math.sqrt(-0.5)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 213
+    },
+    {
+      "source": "Math.sqrt(1)",
+      "section": "15.8.2",
+      "node": "1",
+      "expected": "1",
+      "id": 214
+    },
+    {
+      "source": "Math.sqrt(-1)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 215
+    },
+    {
+      "source": "Math.sqrt(2)",
+      "section": "15.8.2",
+      "node": "1.4142135623730951",
+      "expected": "1.4142135623730951",
+      "id": 216
+    },
+    {
+      "source": "Math.sqrt(-2)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 217
+    },
+    {
+      "source": "Math.sqrt(Infinity)",
+      "section": "15.8.2",
+      "node": "+Infinity",
+      "expected": "+Infinity",
+      "id": 218
+    },
+    {
+      "source": "Math.sqrt(-Infinity)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 219
+    },
+    {
+      "source": "Math.sqrt(NaN)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 220
+    },
+    {
+      "source": "Math.sqrt(\" 2 \")",
+      "section": "15.8.2",
+      "node": "1.4142135623730951",
+      "expected": "1.4142135623730951",
+      "id": 221
+    },
+    {
+      "source": "Math.sqrt(\"bad\")",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 222
+    },
+    {
+      "source": "Math.sqrt()",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 223
+    },
+    {
+      "source": "Math.tan(undefined)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 224
+    },
+    {
+      "source": "Math.tan(null)",
+      "section": "15.8.2",
+      "node": "0",
+      "expected": "0",
+      "id": 225
+    },
+    {
+      "source": "Math.tan(true)",
+      "section": "15.8.2",
+      "node": "1.5574077246549023",
+      "expected": "1.5574077246549023",
+      "id": 226
+    },
+    {
+      "source": "Math.tan(false)",
+      "section": "15.8.2",
+      "node": "0",
+      "expected": "0",
+      "id": 227
+    },
+    {
+      "source": "Math.tan(0)",
+      "section": "15.8.2",
+      "node": "0",
+      "expected": "0",
+      "id": 228
+    },
+    {
+      "source": "Math.tan(-0)",
+      "section": "15.8.2",
+      "node": "-0",
+      "expected": "-0",
+      "id": 229
+    },
+    {
+      "source": "Math.tan(0.5)",
+      "section": "15.8.2",
+      "node": "0.5463024898437905",
+      "expected": "0.5463024898437905",
+      "id": 230
+    },
+    {
+      "source": "Math.tan(-0.5)",
+      "section": "15.8.2",
+      "node": "-0.5463024898437905",
+      "expected": "-0.5463024898437905",
+      "id": 231
+    },
+    {
+      "source": "Math.tan(1)",
+      "section": "15.8.2",
+      "node": "1.5574077246549023",
+      "expected": "1.5574077246549023",
+      "id": 232
+    },
+    {
+      "source": "Math.tan(-1)",
+      "section": "15.8.2",
+      "node": "-1.5574077246549023",
+      "expected": "-1.5574077246549023",
+      "id": 233
+    },
+    {
+      "source": "Math.tan(2)",
+      "section": "15.8.2",
+      "node": "-2.185039863261519",
+      "expected": "-2.185039863261519",
+      "id": 234
+    },
+    {
+      "source": "Math.tan(-2)",
+      "section": "15.8.2",
+      "node": "2.185039863261519",
+      "expected": "2.185039863261519",
+      "id": 235
+    },
+    {
+      "source": "Math.tan(Infinity)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 236
+    },
+    {
+      "source": "Math.tan(-Infinity)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 237
+    },
+    {
+      "source": "Math.tan(NaN)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 238
+    },
+    {
+      "source": "Math.tan(\" 2 \")",
+      "section": "15.8.2",
+      "node": "-2.185039863261519",
+      "expected": "-2.185039863261519",
+      "id": 239
+    },
+    {
+      "source": "Math.tan(\"bad\")",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 240
+    },
+    {
+      "source": "Math.tan()",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 241
+    },
+    {
+      "source": "Math.min()",
+      "section": "15.8.2",
+      "node": "+Infinity",
+      "expected": "+Infinity",
+      "id": 242
+    },
+    {
+      "source": "Math.min(0,-0)",
+      "section": "15.8.2",
+      "node": "-0",
+      "expected": "-0",
+      "id": 243
+    },
+    {
+      "source": "Math.min(-0,0)",
+      "section": "15.8.2",
+      "node": "-0",
+      "expected": "-0",
+      "id": 244
+    },
+    {
+      "source": "Math.min(1,2,-3)",
+      "section": "15.8.2",
+      "node": "-3",
+      "expected": "-3",
+      "id": 245
+    },
+    {
+      "source": "Math.min(NaN,1)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 246
+    },
+    {
+      "source": "Math.min(Infinity,-Infinity)",
+      "section": "15.8.2",
+      "node": "-Infinity",
+      "expected": "-Infinity",
+      "id": 247
+    },
+    {
+      "source": "Math.min(true,\"2\",null)",
+      "section": "15.8.2",
+      "node": "0",
+      "expected": "0",
+      "id": 248
+    },
+    {
+      "source": "Math.max()",
+      "section": "15.8.2",
+      "node": "-Infinity",
+      "expected": "-Infinity",
+      "id": 249
+    },
+    {
+      "source": "Math.max(0,-0)",
+      "section": "15.8.2",
+      "node": "0",
+      "expected": "0",
+      "id": 250
+    },
+    {
+      "source": "Math.max(-0,0)",
+      "section": "15.8.2",
+      "node": "0",
+      "expected": "0",
+      "id": 251
+    },
+    {
+      "source": "Math.max(1,2,-3)",
+      "section": "15.8.2",
+      "node": "2",
+      "expected": "2",
+      "id": 252
+    },
+    {
+      "source": "Math.max(NaN,1)",
+      "section": "15.8.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 253
+    },
+    {
+      "source": "Math.max(Infinity,-Infinity)",
+      "section": "15.8.2",
+      "node": "+Infinity",
+      "expected": "+Infinity",
+      "id": 254
+    },
+    {
+      "source": "Math.max(true,\"2\",null)",
+      "section": "15.8.2",
+      "node": "2",
+      "expected": "2",
+      "id": 255
+    },
+    {
+      "source": "Math.atan2(0,0)",
+      "section": "15.8.2.5",
+      "node": "0",
+      "expected": "0",
+      "id": 256
+    },
+    {
+      "source": "Math.atan2(-0,0)",
+      "section": "15.8.2.5",
+      "node": "-0",
+      "expected": "-0",
+      "id": 257
+    },
+    {
+      "source": "Math.atan2(0,-0)",
+      "section": "15.8.2.5",
+      "node": "3.141592653589793",
+      "expected": "3.141592653589793",
+      "id": 258
+    },
+    {
+      "source": "Math.atan2(-0,-0)",
+      "section": "15.8.2.5",
+      "node": "-3.141592653589793",
+      "expected": "-3.141592653589793",
+      "id": 259
+    },
+    {
+      "source": "Math.atan2(1,Infinity)",
+      "section": "15.8.2.5",
+      "node": "0",
+      "expected": "0",
+      "id": 260
+    },
+    {
+      "source": "Math.atan2(-1,Infinity)",
+      "section": "15.8.2.5",
+      "node": "-0",
+      "expected": "-0",
+      "id": 261
+    },
+    {
+      "source": "Math.atan2(1,-Infinity)",
+      "section": "15.8.2.5",
+      "node": "3.141592653589793",
+      "expected": "3.141592653589793",
+      "id": 262
+    },
+    {
+      "source": "Math.atan2(-1,-Infinity)",
+      "section": "15.8.2.5",
+      "node": "-3.141592653589793",
+      "expected": "-3.141592653589793",
+      "id": 263
+    },
+    {
+      "source": "Math.atan2(Infinity,Infinity)",
+      "section": "15.8.2.5",
+      "node": "0.7853981633974483",
+      "expected": "0.7853981633974483",
+      "id": 264
+    },
+    {
+      "source": "Math.atan2(-Infinity,-Infinity)",
+      "section": "15.8.2.5",
+      "node": "-2.356194490192345",
+      "expected": "-2.356194490192345",
+      "id": 265
+    },
+    {
+      "source": "Math.atan2(Infinity,-Infinity)",
+      "section": "15.8.2.5",
+      "node": "2.356194490192345",
+      "expected": "2.356194490192345",
+      "id": 266
+    },
+    {
+      "source": "Math.atan2(-Infinity,Infinity)",
+      "section": "15.8.2.5",
+      "node": "-0.7853981633974483",
+      "expected": "-0.7853981633974483",
+      "id": 267
+    },
+    {
+      "source": "Math.atan2(NaN,1)",
+      "section": "15.8.2.5",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 268
+    },
+    {
+      "source": "Math.pow(NaN,0)",
+      "section": "15.8.2.13",
+      "node": "1",
+      "expected": "1",
+      "id": 269
+    },
+    {
+      "source": "Math.pow(1,Infinity)",
+      "section": "15.8.2.13",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 270
+    },
+    {
+      "source": "Math.pow(-1,Infinity)",
+      "section": "15.8.2.13",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 271
+    },
+    {
+      "source": "Math.pow(0,-3)",
+      "section": "15.8.2.13",
+      "node": "+Infinity",
+      "expected": "+Infinity",
+      "id": 272
+    },
+    {
+      "source": "Math.pow(-0,-3)",
+      "section": "15.8.2.13",
+      "node": "-Infinity",
+      "expected": "-Infinity",
+      "id": 273
+    },
+    {
+      "source": "Math.pow(-0,3)",
+      "section": "15.8.2.13",
+      "node": "-0",
+      "expected": "-0",
+      "id": 274
+    },
+    {
+      "source": "Math.pow(-0,2)",
+      "section": "15.8.2.13",
+      "node": "0",
+      "expected": "0",
+      "id": 275
+    },
+    {
+      "source": "Math.pow(-Infinity,-3)",
+      "section": "15.8.2.13",
+      "node": "-0",
+      "expected": "-0",
+      "id": 276
+    },
+    {
+      "source": "Math.pow(-Infinity,3)",
+      "section": "15.8.2.13",
+      "node": "-Infinity",
+      "expected": "-Infinity",
+      "id": 277
+    },
+    {
+      "source": "Math.pow(-2,0.5)",
+      "section": "15.8.2.13",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 278
+    },
+    {
+      "source": "Math.pow(2,3)",
+      "section": "15.8.2.13",
+      "node": "8",
+      "expected": "8",
+      "id": 279
+    },
+    {
+      "source": "Math.pow(Infinity,-1)",
+      "section": "15.8.2.13",
+      "node": "0",
+      "expected": "0",
+      "id": 280
+    },
+    {
+      "source": "parseInt(\"  -0x10\")",
+      "section": "15.1.2.2",
+      "node": "-16",
+      "expected": "-16",
+      "id": 281
+    },
+    {
+      "source": "parseInt(\"08\")",
+      "section": "15.1.2.2",
+      "node": "8",
+      "expected": "8",
+      "id": 282
+    },
+    {
+      "source": "parseInt(\"0b11\")",
+      "section": "15.1.2.2",
+      "node": "0",
+      "expected": "0",
+      "id": 283
+    },
+    {
+      "source": "parseInt(\"11\",2)",
+      "section": "15.1.2.2",
+      "node": "3",
+      "expected": "3",
+      "id": 284
+    },
+    {
+      "source": "parseInt(\"z\",36)",
+      "section": "15.1.2.2",
+      "node": "35",
+      "expected": "35",
+      "id": 285
+    },
+    {
+      "source": "parseInt(\"123x\",10)",
+      "section": "15.1.2.2",
+      "node": "123",
+      "expected": "123",
+      "id": 286
+    },
+    {
+      "source": "parseInt(\"-0\",10)",
+      "section": "15.1.2.2",
+      "node": "-0",
+      "expected": "-0",
+      "id": 287
+    },
+    {
+      "source": "parseInt(\"12\",4294967298)",
+      "section": "15.1.2.2",
+      "node": "1",
+      "expected": "1",
+      "id": 288
+    },
+    {
+      "source": "parseInt(\"12\",1)",
+      "section": "15.1.2.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 289
+    },
+    {
+      "source": "parseInt(\"12\",37)",
+      "section": "15.1.2.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 290
+    },
+    {
+      "source": "parseInt(\"12\",null)",
+      "section": "15.1.2.2",
+      "node": "12",
+      "expected": "12",
+      "id": 291
+    },
+    {
+      "source": "parseInt(\"12\",true)",
+      "section": "15.1.2.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 292
+    },
+    {
+      "source": "parseInt(\"0x10\",10)",
+      "section": "15.1.2.2",
+      "node": "0",
+      "expected": "0",
+      "id": 293
+    },
+    {
+      "source": "parseInt(\"0x10\",16)",
+      "section": "15.1.2.2",
+      "node": "16",
+      "expected": "16",
+      "id": 294
+    },
+    {
+      "source": "parseInt(\"\\u200012\")",
+      "section": "15.1.2.2",
+      "node": "12",
+      "expected": "12",
+      "id": 295
+    },
+    {
+      "source": "parseInt(\"\\u180e12\")",
+      "section": "15.1.2.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 296
+    },
+    {
+      "source": "parseInt(\"\\u200b12\")",
+      "section": "15.1.2.2",
+      "node": "NaN",
+      "expected": "12",
+      "id": 297
+    },
+    {
+      "source": "parseInt(true)",
+      "section": "15.1.2.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 298
+    },
+    {
+      "source": "parseInt(null)",
+      "section": "15.1.2.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 299
+    },
+    {
+      "source": "parseInt(undefined)",
+      "section": "15.1.2.2",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 300
+    },
+    {
+      "source": "parseInt(1e21)",
+      "section": "15.1.2.2",
+      "node": "1",
+      "expected": "1",
+      "id": 301
+    },
+    {
+      "source": "parseInt(1e-7)",
+      "section": "15.1.2.2",
+      "node": "1",
+      "expected": "1",
+      "id": 302
+    },
+    {
+      "source": "parseInt(-0)",
+      "section": "15.1.2.2",
+      "node": "0",
+      "expected": "0",
+      "id": 303
+    },
+    {
+      "source": "parseFloat(\" -0 \")",
+      "section": "15.1.2.3",
+      "node": "-0",
+      "expected": "-0",
+      "id": 304
+    },
+    {
+      "source": "parseFloat(\"1.25tail\")",
+      "section": "15.1.2.3",
+      "node": "1.25",
+      "expected": "1.25",
+      "id": 305
+    },
+    {
+      "source": "parseFloat(\"1e+\")",
+      "section": "15.1.2.3",
+      "node": "1",
+      "expected": "1",
+      "id": 306
+    },
+    {
+      "source": "parseFloat(\".5\")",
+      "section": "15.1.2.3",
+      "node": "0.5",
+      "expected": "0.5",
+      "id": 307
+    },
+    {
+      "source": "parseFloat(\"1.e2\")",
+      "section": "15.1.2.3",
+      "node": "100",
+      "expected": "100",
+      "id": 308
+    },
+    {
+      "source": "parseFloat(\"Infinitytail\")",
+      "section": "15.1.2.3",
+      "node": "+Infinity",
+      "expected": "+Infinity",
+      "id": 309
+    },
+    {
+      "source": "parseFloat(\"-Infinity\")",
+      "section": "15.1.2.3",
+      "node": "-Infinity",
+      "expected": "-Infinity",
+      "id": 310
+    },
+    {
+      "source": "parseFloat(\"0x10\")",
+      "section": "15.1.2.3",
+      "node": "0",
+      "expected": "0",
+      "id": 311
+    },
+    {
+      "source": "parseFloat(\"bad\")",
+      "section": "15.1.2.3",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 312
+    },
+    {
+      "source": "parseFloat(\"\\u180e2\")",
+      "section": "15.1.2.3",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 313
+    },
+    {
+      "source": "parseFloat(\"\\u200b2\")",
+      "section": "15.1.2.3",
+      "node": "NaN",
+      "expected": "2",
+      "id": 314
+    },
+    {
+      "source": "parseFloat(1e21)",
+      "section": "15.1.2.3",
+      "node": "1e+21",
+      "expected": "1e+21",
+      "id": 315
+    },
+    {
+      "source": "parseFloat(-0)",
+      "section": "15.1.2.3",
+      "node": "0",
+      "expected": "0",
+      "id": 316
+    },
+    {
+      "source": "parseFloat(true)",
+      "section": "15.1.2.3",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 317
+    },
+    {
+      "source": "parseFloat(null)",
+      "section": "15.1.2.3",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 318
+    },
+    {
+      "source": "parseFloat(undefined)",
+      "section": "15.1.2.3",
+      "node": "NaN",
+      "expected": "NaN",
+      "id": 319
+    },
+    {
+      "source": "isNaN()",
+      "section": "15.1.2.4",
+      "node": "true",
+      "expected": "true",
+      "id": 320
+    },
+    {
+      "source": "isNaN(undefined)",
+      "section": "15.1.2.4",
+      "node": "true",
+      "expected": "true",
+      "id": 321
+    },
+    {
+      "source": "isNaN(null)",
+      "section": "15.1.2.4",
+      "node": "false",
+      "expected": "false",
+      "id": 322
+    },
+    {
+      "source": "isNaN(true)",
+      "section": "15.1.2.4",
+      "node": "false",
+      "expected": "false",
+      "id": 323
+    },
+    {
+      "source": "isNaN(false)",
+      "section": "15.1.2.4",
+      "node": "false",
+      "expected": "false",
+      "id": 324
+    },
+    {
+      "source": "isNaN(\"\")",
+      "section": "15.1.2.4",
+      "node": "false",
+      "expected": "false",
+      "id": 325
+    },
+    {
+      "source": "isNaN(\"  \")",
+      "section": "15.1.2.4",
+      "node": "false",
+      "expected": "false",
+      "id": 326
+    },
+    {
+      "source": "isNaN(\"0x10\")",
+      "section": "15.1.2.4",
+      "node": "false",
+      "expected": "false",
+      "id": 327
+    },
+    {
+      "source": "isNaN(\"0b10\")",
+      "section": "15.1.2.4",
+      "node": "false",
+      "expected": "true",
+      "id": 328
+    },
+    {
+      "source": "isNaN(\"0o10\")",
+      "section": "15.1.2.4",
+      "node": "false",
+      "expected": "true",
+      "id": 329
+    },
+    {
+      "source": "isNaN(\"+0x10\")",
+      "section": "15.1.2.4",
+      "node": "true",
+      "expected": "true",
+      "id": 330
+    },
+    {
+      "source": "isNaN(\"Infinity\")",
+      "section": "15.1.2.4",
+      "node": "false",
+      "expected": "false",
+      "id": 331
+    },
+    {
+      "source": "isNaN(\"-Infinity\")",
+      "section": "15.1.2.4",
+      "node": "false",
+      "expected": "false",
+      "id": 332
+    },
+    {
+      "source": "isNaN(\"1e2\")",
+      "section": "15.1.2.4",
+      "node": "false",
+      "expected": "false",
+      "id": 333
+    },
+    {
+      "source": "isNaN(\"\\u180e2\")",
+      "section": "15.1.2.4",
+      "node": "true",
+      "expected": "true",
+      "id": 334
+    },
+    {
+      "source": "isNaN(\"\\u200b2\")",
+      "section": "15.1.2.4",
+      "node": "true",
+      "expected": "false",
+      "id": 335
+    },
+    {
+      "source": "isNaN(NaN)",
+      "section": "15.1.2.4",
+      "node": "true",
+      "expected": "true",
+      "id": 336
+    },
+    {
+      "source": "isNaN(Infinity)",
+      "section": "15.1.2.4",
+      "node": "false",
+      "expected": "false",
+      "id": 337
+    },
+    {
+      "source": "isNaN(-0)",
+      "section": "15.1.2.4",
+      "node": "false",
+      "expected": "false",
+      "id": 338
+    },
+    {
+      "source": "isFinite()",
+      "section": "15.1.2.5",
+      "node": "false",
+      "expected": "false",
+      "id": 339
+    },
+    {
+      "source": "isFinite(undefined)",
+      "section": "15.1.2.5",
+      "node": "false",
+      "expected": "false",
+      "id": 340
+    },
+    {
+      "source": "isFinite(null)",
+      "section": "15.1.2.5",
+      "node": "true",
+      "expected": "true",
+      "id": 341
+    },
+    {
+      "source": "isFinite(true)",
+      "section": "15.1.2.5",
+      "node": "true",
+      "expected": "true",
+      "id": 342
+    },
+    {
+      "source": "isFinite(false)",
+      "section": "15.1.2.5",
+      "node": "true",
+      "expected": "true",
+      "id": 343
+    },
+    {
+      "source": "isFinite(\"\")",
+      "section": "15.1.2.5",
+      "node": "true",
+      "expected": "true",
+      "id": 344
+    },
+    {
+      "source": "isFinite(\"  \")",
+      "section": "15.1.2.5",
+      "node": "true",
+      "expected": "true",
+      "id": 345
+    },
+    {
+      "source": "isFinite(\"0x10\")",
+      "section": "15.1.2.5",
+      "node": "true",
+      "expected": "true",
+      "id": 346
+    },
+    {
+      "source": "isFinite(\"0b10\")",
+      "section": "15.1.2.5",
+      "node": "true",
+      "expected": "false",
+      "id": 347
+    },
+    {
+      "source": "isFinite(\"0o10\")",
+      "section": "15.1.2.5",
+      "node": "true",
+      "expected": "false",
+      "id": 348
+    },
+    {
+      "source": "isFinite(\"+0x10\")",
+      "section": "15.1.2.5",
+      "node": "false",
+      "expected": "false",
+      "id": 349
+    },
+    {
+      "source": "isFinite(\"Infinity\")",
+      "section": "15.1.2.5",
+      "node": "false",
+      "expected": "false",
+      "id": 350
+    },
+    {
+      "source": "isFinite(\"-Infinity\")",
+      "section": "15.1.2.5",
+      "node": "false",
+      "expected": "false",
+      "id": 351
+    },
+    {
+      "source": "isFinite(\"1e2\")",
+      "section": "15.1.2.5",
+      "node": "true",
+      "expected": "true",
+      "id": 352
+    },
+    {
+      "source": "isFinite(\"\\u180e2\")",
+      "section": "15.1.2.5",
+      "node": "false",
+      "expected": "false",
+      "id": 353
+    },
+    {
+      "source": "isFinite(\"\\u200b2\")",
+      "section": "15.1.2.5",
+      "node": "false",
+      "expected": "true",
+      "id": 354
+    },
+    {
+      "source": "isFinite(NaN)",
+      "section": "15.1.2.5",
+      "node": "false",
+      "expected": "false",
+      "id": 355
+    },
+    {
+      "source": "isFinite(Infinity)",
+      "section": "15.1.2.5",
+      "node": "false",
+      "expected": "false",
+      "id": 356
+    },
+    {
+      "source": "isFinite(-0)",
+      "section": "15.1.2.5",
+      "node": "true",
+      "expected": "true",
+      "id": 357
+    }
+  ]
+}

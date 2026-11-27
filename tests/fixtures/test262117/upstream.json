@@ -1,0 +1,14 @@
+{
+  "repository": "https://github.com/tc39/test262",
+  "commit": "7da91bceb9ce7613f87db47ddd1292a2dda58b42",
+  "files": {
+    "S8.4_A4.js": "test/suite/ch08/8.4/S8.4_A4.js",
+    "S8.4_A3.js": "test/suite/ch08/8.4/S8.4_A3.js",
+    "LICENSE": "LICENSE"
+  },
+  "byte_exact": true,
+  "adapter_prefix": "function $ERROR(message) { throw message; }\n",
+  "adapter_suffix": "\n;1;\n",
+  "A3": "source refusal: mixed String/Number; old probe keeps own-strict ERROR helper",
+  "upstream_qualification": "A4 pending independent review; not full ES5"
+}

@@ -1,0 +1,13 @@
+{
+  "repository": "https://github.com/tc39/test262",
+  "commit": "7da91bceb9ce7613f87db47ddd1292a2dda58b42",
+  "path": "test/suite/ch10/10.2/10.2.1/S10.2.1_A3.js",
+  "id": "S10.2.1_A3",
+  "bytes": 648,
+  "adapter": {
+    "prefix": "function $ERROR(message) { throw message; }\n",
+    "suffix": "\n;1;\n",
+    "mode": "original non-strict Script; body byte-exact"
+  },
+  "license": "LICENSE"
+}
