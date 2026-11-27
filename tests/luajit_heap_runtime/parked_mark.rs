@@ -17974,3 +17974,634 @@ fn abandoned_ordinary_gray_links_do_not_cross_into_the_next_round() {
         "the old unrooted items are collected in the next round"
     );
 }
+
+/// One weak-value owner, its independent weak witness, and a separate strong
+/// metatable. The first round really scans the owner, schedules its rescan,
+/// and is abandoned while that owner still waits on the rescan list.
+struct ReusedRescanFixture {
+    sentinel: TableRef,
+    sentinel_record: u32,
+    left: TableRef,
+    witness: TableRef,
+    old_mt: TableRef,
+    strong_mt: TableRef,
+    subject: TableRef,
+    child: TableRef,
+    orphan: TableRef,
+    dust: TableRef,
+}
+
+fn plant_reused_rescan_fixture() -> (LuaHeap, ReusedRescanFixture) {
+    let mut heap = LuaHeap::new(limits(16, 8, 24));
+    let sentinel = heap.alloc().expect("rescan reuse sentinel");
+    let witness = heap.alloc().expect("rescan reuse witness");
+    let old_mt = heap.alloc().expect("rescan reuse weak metatable");
+    let strong_mt = heap.alloc().expect("rescan reuse strong metatable");
+    let left = heap.alloc().expect("rescan reuse owner");
+    let subject = heap.alloc().expect("rescan reuse subject");
+    let child = heap.alloc().expect("rescan reuse child");
+    let orphan = heap.alloc().expect("rescan reuse orphan");
+    let dust = heap.alloc().expect("rescan reuse dust");
+    heap.set_mode_scalar(old_mt, Value::string("v"))
+        .expect("rescan reuse weak mode");
+    heap.set_metatable(left, Some(old_mt))
+        .expect("rescan reuse weak owner metatable");
+    heap.set_metatable(witness, Some(old_mt))
+        .expect("rescan reuse weak witness metatable");
+    heap.set_named_scalar(sentinel, "pending", Value::Bool(true))
+        .expect("rescan reuse sentinel edge");
+    heap.set_named_edge(left, "subj", subject)
+        .expect("rescan reuse weak value");
+    heap.set_named_edge(subject, "next", child)
+        .expect("rescan reuse strong successor");
+    heap.set_named_edge(witness, "orphan", orphan)
+        .expect("rescan reuse independent orphan");
+    let frame = heap.enter_roots(4).expect("rescan reuse roots");
+    heap.write_root(frame, 0, sentinel)
+        .expect("rescan reuse root sentinel");
+    heap.write_root(frame, 1, witness)
+        .expect("rescan reuse root witness");
+    heap.write_root(frame, 2, strong_mt)
+        .expect("rescan reuse root strong metatable");
+    heap.write_root(frame, 3, left)
+        .expect("rescan reuse root owner");
+    let (_, sentinel_record) = heap
+        .locate_named(sentinel.slot(), "pending")
+        .expect("rescan reuse sentinel record");
+    (
+        heap,
+        ReusedRescanFixture {
+            sentinel,
+            sentinel_record,
+            left,
+            witness,
+            old_mt,
+            strong_mt,
+            subject,
+            child,
+            orphan,
+            dust,
+        },
+    )
+}
+
+struct ReusedRescanOutcome {
+    epoch: u64,
+    queued_before: bool,
+    scheduled: u64,
+    head_before: Option<u32>,
+    head_after: Option<u32>,
+    left_slot: u32,
+    left_alive: bool,
+    subject_alive: bool,
+    child_alive: bool,
+    orphan_alive: bool,
+    orphan_value: Value,
+    dust_alive: bool,
+}
+
+/// Runs the abandoned first round, restores the weak mode with no active
+/// mark, and opens the next real round. `reuse_stamp` advances the heap stamp
+/// to `u64::MAX` so the new round really takes stamp one again; no rescan link
+/// field is written by the fixture. `strengthen` is the arm that asks the
+/// already-scanned owner for its rescan.
+fn run_reused_rescan(reuse_stamp: bool, strengthen: bool) -> ReusedRescanOutcome {
+    let (mut heap, fixture) = plant_reused_rescan_fixture();
+    {
+        let mut parked = ParkedMark::start(&mut heap).expect("first rescan-reuse round");
+        assert_eq!(
+            parked.with_saved_heap(|heap| heap.rescan_epoch),
+            1,
+            "a fresh heap really opens the first round at stamp one"
+        );
+        let pending = pause_at(
+            &mut parked,
+            fixture.sentinel.slot(),
+            fixture.sentinel_record,
+        );
+        assert!(parked.marked(fixture.left), "the owner was already scanned");
+        assert!(!parked.marked(fixture.subject), "the weak value is white");
+        assert!(!parked.marked(fixture.child), "the successor is white");
+        let before = parked.meter();
+        assert_eq!(
+            parked.rescan_head(),
+            None,
+            "the first round has no rescan head before the write"
+        );
+        write_metatable(&mut parked, fixture.left, Some(fixture.strong_mt))
+            .expect("the first round schedules the weak-to-strong rescan");
+        assert_eq!(
+            parked.meter().owner_rescan_schedules,
+            before.owner_rescan_schedules + 1,
+            "the setter schedules exactly one rescan"
+        );
+        assert_eq!(
+            parked.rescan_head(),
+            Some(fixture.left.slot()),
+            "the setter writes the rescan head once"
+        );
+        assert!(same_pending(Some(pending), parked.pending()));
+    }
+    assert!(
+        heap.saved_mark_query().is_none(),
+        "dropping the first-round driver abandons the mark"
+    );
+    assert!(
+        heap.alive(fixture.left),
+        "abandoning the mark keeps the owner generation"
+    );
+    heap.set_metatable(fixture.left, Some(fixture.old_mt))
+        .expect("restore the weak metatable with no active mark");
+    if reuse_stamp {
+        heap.rescan_epoch = u64::MAX;
+    }
+    let _ = heap.take_scan_meter();
+    let mut parked = ParkedMark::start(&mut heap).expect("second rescan-reuse round");
+    let epoch = parked.with_saved_heap(|heap| heap.rescan_epoch);
+    let pending = pause_at(
+        &mut parked,
+        fixture.sentinel.slot(),
+        fixture.sentinel_record,
+    );
+    assert!(
+        parked.marked(fixture.left),
+        "the next round really scans the owner again"
+    );
+    assert!(
+        !parked.marked(fixture.subject),
+        "the weak value is still white before the strengthen"
+    );
+    assert!(
+        !parked.marked(fixture.child),
+        "the successor is still white before the strengthen"
+    );
+    let queued_before = parked.with_saved_heap(|heap| {
+        let stored = &heap.slots[fixture.left.slot() as usize];
+        stored.rescan_queued
+    });
+    let before = parked.meter();
+    let head_before = parked.rescan_head();
+    if strengthen {
+        write_metatable(&mut parked, fixture.left, Some(fixture.strong_mt))
+            .expect("strengthen in the reused-stamp round");
+    }
+    let scheduled = parked.meter().owner_rescan_schedules - before.owner_rescan_schedules;
+    let head_after = parked.rescan_head();
+    assert!(
+        same_pending(Some(pending), parked.pending()),
+        "the setter does not move the ordinary cursor"
+    );
+    let _ = finish(&mut parked);
+    parked.complete().expect("sweep the reused-stamp round");
+    let left_slot = fixture.left.slot();
+    drop(parked);
+    ReusedRescanOutcome {
+        epoch,
+        queued_before,
+        scheduled,
+        head_before,
+        head_after,
+        left_slot,
+        left_alive: heap.alive(fixture.left),
+        subject_alive: heap.alive(fixture.subject),
+        child_alive: heap.alive(fixture.child),
+        orphan_alive: heap.alive(fixture.orphan),
+        orphan_value: heap
+            .named_value(fixture.witness, "orphan")
+            .expect("read the independent weak orphan"),
+        dust_alive: heap.alive(fixture.dust),
+    }
+}
+
+/// The next round really reuses stamp one after the first round was
+/// abandoned with a queued rescan owner. Reset must clear that abandoned
+/// membership; the real strengthen then has to schedule one rescan, and the
+/// real collection has to keep the skipped value and its strong successor.
+/// The scheduling observations are recorded separately from the post-sweep
+/// business outcome.
+#[test]
+fn rescan_reused_stamp_strengthen_still_marks_skipped_value() {
+    let reused = run_reused_rescan(true, true);
+    assert_eq!(
+        reused.epoch, 1,
+        "advancing to u64::MAX makes the next real round take stamp one"
+    );
+    assert!(
+        reused.subject_alive && reused.child_alive,
+        "the strengthened weak value and its strong successor must survive the real collection; \
+         scheduled={} head {:?} -> {:?} queued_before={}",
+        reused.scheduled,
+        reused.head_before,
+        reused.head_after,
+        reused.queued_before,
+    );
+    assert!(reused.left_alive, "the rooted owner survives");
+    assert_eq!(
+        reused.orphan_value,
+        Value::Null,
+        "the independent weak orphan is cleared"
+    );
+    assert!(
+        !reused.orphan_alive,
+        "the independent weak orphan is released"
+    );
+    assert!(!reused.dust_alive, "the unrooted dust node is released");
+    assert!(
+        !reused.queued_before,
+        "Reset cleared the abandoned round's queue membership before the owner restarted"
+    );
+    assert_eq!(
+        reused.scheduled, 1,
+        "the strengthen schedules exactly one rescan"
+    );
+    assert_eq!(reused.head_before, None, "the new round starts headless");
+    assert_eq!(
+        reused.head_after,
+        Some(reused.left_slot),
+        "the strengthen writes the rescan head once"
+    );
+}
+
+/// Two controls for the reused-stamp arm. A different next stamp proves the
+/// abandoned tag is inert on its own; omitting the strengthen proves the
+/// business assertion needs the transition and not merely a surviving owner.
+#[test]
+fn rescan_reused_stamp_controls_keep_their_own_outcomes() {
+    let different_stamp = run_reused_rescan(false, true);
+    assert_eq!(
+        different_stamp.epoch, 2,
+        "without recycling, the next round has a different stamp"
+    );
+    assert!(
+        different_stamp.subject_alive && different_stamp.child_alive,
+        "a different stamp does not suppress the rescan"
+    );
+    assert_eq!(different_stamp.scheduled, 1);
+    assert_eq!(different_stamp.head_after, Some(different_stamp.left_slot));
+
+    let omitted = run_reused_rescan(true, false);
+    assert_eq!(omitted.epoch, 1, "the omission arm still reuses stamp one");
+    assert!(
+        !omitted.subject_alive && !omitted.child_alive,
+        "without the strengthen the weak value and its successor are collected"
+    );
+    assert_eq!(omitted.scheduled, 0, "no strengthen schedules no rescan");
+    assert_eq!(omitted.head_before, None);
+    assert_eq!(
+        omitted.head_after, None,
+        "the omission writes no rescan head"
+    );
+    assert_eq!(
+        omitted.orphan_value,
+        Value::Null,
+        "the independent weak orphan still clears in the omission arm"
+    );
+}
+
+/// Two weak owners, their own skipped values and strong successors, two
+/// independent weak witnesses, and a fresh owner used by the next round.
+/// The first round schedules both owners on the real rescan list.
+struct StaleRescanChainFixture {
+    sentinel: TableRef,
+    sentinel_record: u32,
+    left_a: TableRef,
+    left_b: TableRef,
+    weak_mt: TableRef,
+    strong_mt: TableRef,
+    subject_a: TableRef,
+    child_a: TableRef,
+    subject_b: TableRef,
+    child_b: TableRef,
+    witness_old: TableRef,
+    orphan_old: TableRef,
+    witness_fresh: TableRef,
+    orphan_fresh: TableRef,
+    fresh: TableRef,
+    fresh_subject: TableRef,
+    fresh_child: TableRef,
+    dust: TableRef,
+    frame: RootFrameId,
+}
+
+fn rescan_link_fields(heap: &LuaHeap, table: TableRef) -> (u64, bool, Option<u32>, Option<u32>) {
+    let stored = &heap.slots[table.slot() as usize];
+    (
+        stored.rescan_epoch,
+        stored.rescan_queued,
+        stored.rescan_prev,
+        stored.rescan_next,
+    )
+}
+
+fn plant_stale_rescan_chain() -> (LuaHeap, StaleRescanChainFixture) {
+    let mut heap = LuaHeap::new(limits(24, 12, 48));
+    let sentinel = heap.alloc().expect("stale rescan sentinel");
+    let witness_old = heap.alloc().expect("stale rescan old witness");
+    let witness_fresh = heap.alloc().expect("stale rescan fresh witness");
+    let weak_mt = heap.alloc().expect("stale rescan weak metatable");
+    let strong_mt = heap.alloc().expect("stale rescan strong metatable");
+    let left_a = heap.alloc().expect("stale rescan owner a");
+    let left_b = heap.alloc().expect("stale rescan owner b");
+    let subject_a = heap.alloc().expect("stale rescan subject a");
+    let child_a = heap.alloc().expect("stale rescan child a");
+    let subject_b = heap.alloc().expect("stale rescan subject b");
+    let child_b = heap.alloc().expect("stale rescan child b");
+    let orphan_old = heap.alloc().expect("stale rescan old orphan");
+    let orphan_fresh = heap.alloc().expect("stale rescan fresh orphan");
+    let fresh = heap.alloc().expect("stale rescan fresh owner");
+    let fresh_subject = heap.alloc().expect("stale rescan fresh subject");
+    let fresh_child = heap.alloc().expect("stale rescan fresh child");
+    let dust = heap.alloc().expect("stale rescan dust");
+    heap.set_mode_scalar(weak_mt, Value::string("v"))
+        .expect("stale rescan weak mode");
+    for owner in [left_a, left_b, fresh] {
+        heap.set_metatable(owner, Some(weak_mt))
+            .expect("stale rescan weak owner metatable");
+    }
+    for witness in [witness_old, witness_fresh] {
+        heap.set_metatable(witness, Some(weak_mt))
+            .expect("stale rescan weak witness metatable");
+    }
+    heap.set_named_scalar(sentinel, "pending", Value::Bool(true))
+        .expect("stale rescan sentinel edge");
+    for (owner, subject, child) in [
+        (left_a, subject_a, child_a),
+        (left_b, subject_b, child_b),
+        (fresh, fresh_subject, fresh_child),
+    ] {
+        heap.set_named_edge(owner, "subj", subject)
+            .expect("stale rescan weak value");
+        heap.set_named_edge(subject, "next", child)
+            .expect("stale rescan strong successor");
+    }
+    heap.set_named_edge(witness_old, "orphan", orphan_old)
+        .expect("stale rescan old orphan edge");
+    heap.set_named_edge(witness_fresh, "orphan", orphan_fresh)
+        .expect("stale rescan fresh orphan edge");
+    let frame = heap.enter_roots(6).expect("stale rescan roots");
+    heap.write_root(frame, 0, sentinel)
+        .expect("stale rescan root sentinel");
+    heap.write_root(frame, 1, witness_old)
+        .expect("stale rescan root old witness");
+    heap.write_root(frame, 2, witness_fresh)
+        .expect("stale rescan root fresh witness");
+    heap.write_root(frame, 3, strong_mt)
+        .expect("stale rescan root strong metatable");
+    heap.write_root(frame, 4, left_a)
+        .expect("stale rescan root owner a");
+    heap.write_root(frame, 5, left_b)
+        .expect("stale rescan root owner b");
+    let (_, sentinel_record) = heap
+        .locate_named(sentinel.slot(), "pending")
+        .expect("stale rescan sentinel record");
+    (
+        heap,
+        StaleRescanChainFixture {
+            sentinel,
+            sentinel_record,
+            left_a,
+            left_b,
+            weak_mt,
+            strong_mt,
+            subject_a,
+            child_a,
+            subject_b,
+            child_b,
+            witness_old,
+            orphan_old,
+            witness_fresh,
+            orphan_fresh,
+            fresh,
+            fresh_subject,
+            fresh_child,
+            dust,
+            frame,
+        },
+    )
+}
+
+/// The abandoned round leaves a real two-item rescan chain under stamp one.
+/// The next round reuses the stamp, and a rollback during Reset must not turn
+/// the old head's successor into a new-list head or rewrite that neighbour.
+/// After the rollback, a different owner is really rescanned in the same
+/// round: its strong successor is marked and its independent weak orphan is
+/// cleared.
+#[test]
+fn rescan_reused_stamp_stale_head_rollback_keeps_the_empty_chain() {
+    let (mut heap, fixture) = plant_stale_rescan_chain();
+    {
+        let mut parked = ParkedMark::start(&mut heap).expect("first two-owner rescan round");
+        assert_eq!(
+            parked.with_saved_heap(|heap| heap.rescan_epoch),
+            1,
+            "the fresh heap opens the first round at stamp one"
+        );
+        let pending = pause_at(
+            &mut parked,
+            fixture.sentinel.slot(),
+            fixture.sentinel_record,
+        );
+        for owner in [fixture.left_a, fixture.left_b] {
+            assert!(parked.marked(owner), "both weak owners were scanned");
+        }
+        assert!(
+            parked.with_saved_heap(|heap| heap.alive(fixture.weak_mt)),
+            "the weak metatable is live during the first round"
+        );
+        assert!(!parked.marked(fixture.orphan_old));
+        assert!(!parked.marked(fixture.subject_a));
+        assert!(!parked.marked(fixture.child_a));
+        assert!(!parked.marked(fixture.subject_b));
+        assert!(!parked.marked(fixture.child_b));
+        let before = parked.meter();
+        assert_eq!(parked.rescan_head(), None);
+        write_metatable(&mut parked, fixture.left_a, Some(fixture.strong_mt))
+            .expect("schedule the first owner");
+        assert_eq!(parked.rescan_head(), Some(fixture.left_a.slot()));
+        write_metatable(&mut parked, fixture.left_b, Some(fixture.strong_mt))
+            .expect("schedule the second owner at the head");
+        assert_eq!(
+            parked.meter().owner_rescan_schedules,
+            before.owner_rescan_schedules + 2,
+            "both owners schedule a real rescan"
+        );
+        assert_eq!(parked.rescan_head(), Some(fixture.left_b.slot()));
+        assert_eq!(
+            parked.with_saved_heap(|heap| rescan_link_fields(heap, fixture.left_b)),
+            (1, true, None, Some(fixture.left_a.slot())),
+            "the second strengthen is the real rescan head"
+        );
+        assert_eq!(
+            parked.with_saved_heap(|heap| rescan_link_fields(heap, fixture.left_a)),
+            (1, true, Some(fixture.left_b.slot()), None),
+            "the first strengthen is the real successor"
+        );
+        assert!(
+            parked.pending_rescan().is_none(),
+            "no rescan item has been popped yet"
+        );
+        assert!(same_pending(Some(pending), parked.pending()));
+    }
+    assert!(
+        heap.saved_mark_query().is_none(),
+        "the abandoned round left no saved mark"
+    );
+    assert!(
+        heap.alive(fixture.left_a) && heap.alive(fixture.left_b),
+        "both owner generations survive abandonment"
+    );
+    for slot in 0..6 {
+        heap.clear_root(fixture.frame, slot)
+            .expect("clear an abandoned first-round root");
+    }
+    heap.write_root(fixture.frame, 0, fixture.sentinel)
+        .expect("next rescan root sentinel");
+    heap.write_root(fixture.frame, 1, fixture.witness_old)
+        .expect("next rescan root old witness");
+    heap.write_root(fixture.frame, 2, fixture.witness_fresh)
+        .expect("next rescan root fresh witness");
+    heap.write_root(fixture.frame, 3, fixture.strong_mt)
+        .expect("next rescan root strong metatable");
+    heap.write_root(fixture.frame, 4, fixture.fresh)
+        .expect("next rescan root fresh owner");
+    heap.rescan_epoch = u64::MAX;
+    let _ = heap.take_scan_meter();
+    let mut parked = ParkedMark::start(&mut heap).expect("reused-stamp rescan round");
+    assert_eq!(
+        parked.with_saved_heap(|heap| heap.rescan_epoch),
+        1,
+        "advancing to u64::MAX makes the next real round take stamp one"
+    );
+    let view = parked.pulse(1);
+    assert!(!view.finished, "Reset still has slots to visit");
+    assert_eq!(
+        parked.phase_name(),
+        "reset",
+        "the pulse visited slot zero only"
+    );
+    let neighbour_before = parked.with_saved_heap(|heap| rescan_link_fields(heap, fixture.left_a));
+    let released_before = parked.with_saved_heap(|heap| rescan_link_fields(heap, fixture.left_b));
+    assert_eq!(
+        neighbour_before,
+        (1, true, Some(fixture.left_b.slot()), None),
+        "the abandoned successor still carries its old links"
+    );
+    assert_eq!(
+        released_before,
+        (1, true, None, Some(fixture.left_a.slot())),
+        "the abandoned head still carries its old links"
+    );
+    assert_eq!(
+        parked.rescan_head(),
+        None,
+        "the new round starts with an empty rescan list"
+    );
+
+    parked
+        .with_saved_heap(|heap| heap.rollback(fixture.left_b))
+        .expect("real rollback of the abandoned head before Reset visits it");
+    let head_after = parked.rescan_head();
+    let neighbour_after = parked.with_saved_heap(|heap| rescan_link_fields(heap, fixture.left_a));
+    let released_after = parked.with_saved_heap(|heap| rescan_link_fields(heap, fixture.left_b));
+    assert!(
+        !parked.with_saved_heap(|heap| heap.alive(fixture.left_b)),
+        "the rollback really released the old head"
+    );
+    assert_eq!(
+        head_after, None,
+        "an empty current rescan list must not adopt the abandoned successor"
+    );
+    assert_eq!(
+        neighbour_after, neighbour_before,
+        "the rollback must not rewrite the non-released old neighbour"
+    );
+    assert_eq!(
+        released_after,
+        (0, false, None, None),
+        "only the released slot's own rescan state is cleared"
+    );
+
+    let pending = pause_at(
+        &mut parked,
+        fixture.sentinel.slot(),
+        fixture.sentinel_record,
+    );
+    assert!(
+        parked.marked(fixture.fresh),
+        "the fresh owner is really scanned in the reused-stamp round"
+    );
+    assert!(
+        !parked.marked(fixture.fresh_subject),
+        "the fresh weak value is white before its strengthen"
+    );
+    assert!(
+        !parked.marked(fixture.fresh_child),
+        "the fresh successor is white before its strengthen"
+    );
+    assert_eq!(
+        parked.rescan_head(),
+        None,
+        "Reset cleared the abandoned membership before Gray"
+    );
+    let before_rescan = parked.meter();
+    write_metatable(&mut parked, fixture.fresh, Some(fixture.strong_mt))
+        .expect("strengthen the independent owner in the same round");
+    assert_eq!(
+        parked.meter().owner_rescan_schedules,
+        before_rescan.owner_rescan_schedules + 1,
+        "the independent owner schedules exactly one rescan"
+    );
+    assert_eq!(
+        parked.rescan_head(),
+        Some(fixture.fresh.slot()),
+        "the independent owner is the one current rescan head"
+    );
+    assert_eq!(
+        parked
+            .with_saved_heap(|heap| rescan_link_fields(heap, fixture.fresh))
+            .3,
+        None,
+        "the current rescan list has no abandoned successor behind the head"
+    );
+    assert!(same_pending(Some(pending), parked.pending()));
+    let _ = finish(&mut parked);
+    let heads = parked.meter().owner_rescan_heads - before_rescan.owner_rescan_heads;
+    parked.complete().expect("sweep the reused-stamp round");
+    let fresh_slot = fixture.fresh.slot();
+    drop(parked);
+    assert!(
+        heap.alive(fixture.fresh)
+            && heap.alive(fixture.fresh_subject)
+            && heap.alive(fixture.fresh_child),
+        "the independent rescan marks the fresh owner's skipped value and successor"
+    );
+    assert_eq!(
+        heap.named_value(fixture.witness_fresh, "orphan"),
+        Ok(Value::Null),
+        "the fresh independent weak orphan is cleared"
+    );
+    assert!(
+        !heap.alive(fixture.orphan_fresh),
+        "the fresh independent weak orphan is released"
+    );
+    assert_eq!(
+        heads, 1,
+        "only the fresh owner is opened by the current rescan (fresh slot {fresh_slot})"
+    );
+    assert!(
+        !heap.alive(fixture.left_a),
+        "the stale queued owner is not rescued by the abandoned list"
+    );
+    assert_eq!(
+        heap.named_value(fixture.witness_old, "orphan"),
+        Ok(Value::Null),
+        "the old independent weak orphan is cleared"
+    );
+    assert!(!heap.alive(fixture.orphan_old));
+    assert!(!heap.alive(fixture.subject_b));
+    assert!(!heap.alive(fixture.child_b));
+    assert!(
+        !heap.alive(fixture.dust),
+        "the unrooted dust node is released"
+    );
+}

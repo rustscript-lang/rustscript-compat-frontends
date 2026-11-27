@@ -602,6 +602,14 @@ impl<'a> ParkedMark<'a> {
         })
     }
 
+    /// Test-only direct read of the saved mark's rescan list head. The node
+    /// links live on the slots; this accessor observes only the header that
+    /// the setter path writes when it schedules one owner.
+    #[cfg(test)]
+    pub(super) fn rescan_head(&self) -> Option<u32> {
+        self.heap.mark.as_ref().and_then(|state| state.rescan_head)
+    }
+
     /// Next slot a deleted-mode probe will read. `None` when that walk is
     /// not armed. This does not move the cursor.
     #[cfg(test)]
@@ -1101,13 +1109,22 @@ fn step_reset(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
         return false;
     }
     let index = state.index;
-    // Every slot the round may reuse loses the ordinary Gray tag and both
-    // neighbour links here, in the existing per-slot Reset unit. The stamp can
-    // wrap and be reused by a later round, so a tag left by an abandoned mark
-    // must never be mistaken for a member of the new chain.
-    clear_gray_slot(&mut heap.slots[index]);
-    if let SlotState::Live { marked } = &mut heap.slots[index].state {
-        *marked = false;
+    // Every slot the round may reuse loses the ordinary Gray tag, both Gray
+    // neighbour links, and this slot's weak-start/rescan membership tag in the
+    // existing per-slot Reset unit. The stamp can wrap and be reused by a later
+    // round, so flags left by an abandoned mark must never suppress or join
+    // the new round's rescan scheduling. The rescan header and cursor live in
+    // the new state and are not touched here.
+    {
+        let stored = &mut heap.slots[index];
+        clear_gray_slot(stored);
+        stored.rescan_epoch = 0;
+        stored.rescan_queued = false;
+        stored.rescan_prev = None;
+        stored.rescan_next = None;
+        if let SlotState::Live { marked } = &mut stored.state {
+            *marked = false;
+        }
     }
     heap.scan.node_slot_visits += 1;
     heap.scan.weak_mode_slot_checks += 1;
@@ -2659,6 +2676,12 @@ fn push_rescan(heap: &mut LuaHeap, state: &mut MarkState, owner: u32) {
 /// not walk the queue. A tag from an older epoch is not in the current list;
 /// it is cleared without touching the current head. A released slot must never
 /// stay queued: reuse would otherwise inherit queue membership.
+///
+/// The stamp can wrap and be reused, so the tag and the queued bit alone do
+/// not prove current membership. The header must name this exact node, or the
+/// recorded predecessor must really link to it under the same stamp. A stale
+/// head from an abandoned round fails both checks: its release clears only
+/// this slot and never adopts the old successor or rewrites that neighbour.
 pub(super) fn release_rescan_slot(
     mut state: Option<&mut MarkState>,
     slots: &mut [Slot],
@@ -2674,13 +2697,42 @@ pub(super) fn release_rescan_slot(
     let same_cycle = state
         .as_ref()
         .is_some_and(|state| state.rescan_epoch == epoch);
-    if same_cycle && queued {
-        if let Some(prev) = prev {
-            if let Some(prev_slot) = slots.get_mut(prev as usize) {
-                prev_slot.rescan_next = next;
-            }
-        } else if let Some(state) = state.as_mut() {
+    // A nonempty current header proves the reset walk reached Gray, so any
+    // matching tag was pushed by this round. While the header is empty the
+    // list is not open: even an internally consistent old predecessor link
+    // must not be followed or rewritten, and only the released slot changes.
+    let chain_open = same_cycle
+        && state
+            .as_ref()
+            .is_some_and(|state| state.rescan_head.is_some());
+    let linked_head = chain_open
+        && queued
+        && state
+            .as_ref()
+            .is_some_and(|state| state.rescan_head == Some(index));
+    let linked_prev = chain_open
+        && queued
+        && prev.is_some_and(|prev| {
+            slots.get(prev as usize).is_some_and(|prev_slot| {
+                prev_slot.rescan_epoch == epoch
+                    && prev_slot.rescan_queued
+                    && prev_slot.rescan_next == Some(index)
+            })
+        });
+    if linked_head {
+        if let Some(state) = state.as_mut() {
             state.rescan_head = next;
+        }
+        if let Some(next) = next
+            && let Some(next_slot) = slots.get_mut(next as usize)
+        {
+            next_slot.rescan_prev = None;
+        }
+    } else if linked_prev {
+        if let Some(prev) = prev
+            && let Some(prev_slot) = slots.get_mut(prev as usize)
+        {
+            prev_slot.rescan_next = next;
         }
         if let Some(next) = next
             && let Some(next_slot) = slots.get_mut(next as usize)
