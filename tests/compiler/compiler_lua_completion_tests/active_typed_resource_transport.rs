@@ -88,11 +88,36 @@
 //! fabricated handle, no relaxed schema. The child's real `Bool` return is
 //! observed in the parent frame.
 //!
-//! Not claimed here: a finalizer dequeue, the pending queue, commit, root
-//! handoff, close, collection, scheduling pauses, or a source-level general
-//! closure bridge. The heap only issues one real table carrier, one real
-//! `lua.userdata` token and one real `lua.table` token; nothing is collected or
-//! closed.
+//! The first four arms do not claim a finalizer dequeue, the pending queue,
+//! commit, root handoff, close, collection, scheduling pauses, or a
+//! source-level general closure bridge. The heap only issues one real table
+//! carrier, one real `lua.userdata` token and one real `lua.table` token;
+//! nothing is collected or closed there.
+//!
+//! ## Typed published head commit
+//!
+//! Four more arms run one real `.lua` fixture. `fault()` builds, in this same
+//! VM, two real typed userdata A and B whose shared metatable stores
+//! `__gc = recv`, clears one independent weak-value orphan with the real
+//! selecting collection, finishes the published Release tail, and returns A's
+//! real token. The plugin inserts `bind(recv, target)`, `wrong_token()`,
+//! `admit`, and `commit` as exact statics. `admit` is the read-only
+//! `Borrow/Value/Borrow` seam over the same typed local and the same two
+//! parent slots. `commit` re-reads the live published head, metatable, raw
+//! action, issued receiver carrier, exact stored callable `Arc`, typed payload
+//! owner, token, and a fresh three-root plan in one exclusive heap borrow; it
+//! opens the root frame and pops, roots, and settles only after all of them
+//! match. The following `CallValue(2)` uses the same local and the same two
+//! slots into the real two-parameter child frame, and the parent continuation
+//! re-borrows the same token. After the run, withdrawing only the three commit
+//! roots and collecting retires A's token and generation while B stays the
+//! published head and the independently rooted sentinel stays readable. Three
+//! controls pass the queued successor's real token, an equal-valued unissued
+//! receiver array, or a raw `__call` rewritten between the seam and the
+//! commit; each is refused by the same entry before any write, and the same VM
+//! then re-takes the real credentials and commits A. A mutation that removes
+//! only the callable `Arc` comparison turns the raw-edge control into a real
+//! `Ok(Halted)` business failure.
 //!
 //! ## Pre-commit borrow seam
 //!
@@ -139,7 +164,9 @@ use vm::{
 };
 
 use super::{FUEL_BUDGET, FUEL_CHECK_INTERVAL, decoded_call_sites};
-use crate::heap::{self, GuestClass, LuaTableResource, LuaUserdataResource, TableRef, UserdataRef};
+use crate::heap::{
+    self, GuestClass, HandleKind, LuaTableResource, LuaUserdataResource, TableRef, UserdataRef,
+};
 
 /// The fixture the positive and resource-key control arms execute.
 const FIXTURE: &str = "active_typed_resource_transport.lua";
@@ -161,6 +188,23 @@ const PRECOMMIT_ENTRY_LABEL: &str = "precommit-admit-enter";
 /// The static body's own diagnostic kinds; the test host never wraps these.
 const PRECOMMIT_REFUSAL_RECEIVER: &str =
     "typed precommit seam refused: receiver is not the issued LuaHeap carrier";
+
+/// The fixture that carries a real published typed head through the parent.
+const PUBLISHED_COMMIT_FIXTURE: &str = "active_typed_published_commit.lua";
+/// Its parent has the pre-commit operands plus the successor token and mode.
+const PUBLISHED_PARENT_PARAMS: usize = 9;
+const PUBLISHED_WRONG_SLOT: usize = 7;
+/// The parent's `second` parameter carries the exact alternate closure Arc.
+const PUBLISHED_ALTERNATE_SLOT: usize = 2;
+/// The exact imports the published-commit plugin resolves and inserts. None of
+/// these names is a guest-lowered host name; the plugin adds the IR calls.
+const BIND_IMPORT: &str = "bind";
+const COMMIT_IMPORT: &str = "commit";
+const SWAP_IMPORT: &str = "swap";
+const WRONG_TOKEN_IMPORT: &str = "wrong_token";
+const COMMIT_ENTRY_LABEL: &str = "published-commit-enter";
+/// The typed commit body's own diagnostic prefix; the test host never wraps it.
+const COMMIT_REFUSAL_PREFIX: &str = "typed published commit refused: ";
 
 /// The first statement of the two declared closures names them.
 const TARGET_LABEL: &str = "target-enter";
@@ -388,6 +432,10 @@ enum Arm {
     OtherArgumentToken,
     PrecommitBorrowSeam,
     PrecommitUnissuedReceiver,
+    PublishedCommit,
+    PublishedCommitOtherOwner,
+    PublishedCommitUnissuedReceiver,
+    PublishedCommitRawArcChanged,
 }
 
 impl Arm {
@@ -398,12 +446,20 @@ impl Arm {
             Arm::OtherArgumentToken => "other-argument-token",
             Arm::PrecommitBorrowSeam => "precommit-borrow-seam",
             Arm::PrecommitUnissuedReceiver => "precommit-unissued-receiver",
+            Arm::PublishedCommit => "published-commit",
+            Arm::PublishedCommitOtherOwner => "published-commit-other-owner",
+            Arm::PublishedCommitUnissuedReceiver => "published-commit-unissued-receiver",
+            Arm::PublishedCommitRawArcChanged => "published-commit-raw-arc-changed",
         }
     }
 
     fn fixture(self) -> &'static str {
         match self {
             Arm::OtherArgumentToken => OTHER_ARGUMENT_FIXTURE,
+            Arm::PublishedCommit
+            | Arm::PublishedCommitOtherOwner
+            | Arm::PublishedCommitUnissuedReceiver
+            | Arm::PublishedCommitRawArcChanged => PUBLISHED_COMMIT_FIXTURE,
             _ => FIXTURE,
         }
     }
@@ -411,6 +467,10 @@ impl Arm {
     fn select(self) -> usize {
         match self {
             Arm::OtherResourceKey => 5,
+            Arm::PublishedCommit => 3,
+            Arm::PublishedCommitOtherOwner => 4,
+            Arm::PublishedCommitRawArcChanged => 6,
+            Arm::PublishedCommitUnissuedReceiver => 7,
             _ => 0,
         }
     }
@@ -419,6 +479,10 @@ impl Arm {
         match self {
             Arm::PrecommitBorrowSeam => 1,
             Arm::PrecommitUnissuedReceiver => 2,
+            Arm::PublishedCommit => 3,
+            Arm::PublishedCommitOtherOwner => 4,
+            Arm::PublishedCommitUnissuedReceiver => 5,
+            Arm::PublishedCommitRawArcChanged => 6,
             _ => 0,
         }
     }
@@ -487,6 +551,33 @@ fn precommit_import_schema() -> HostFunctionSchema {
     )
 }
 
+/// The typed exclusive commit body. It takes the same actual operands as the
+/// read-only seam: the typed callable local, the original receiver carrier and
+/// the actual typed userdata token. The static body re-checks them against the
+/// live published head before it writes anything.
+fn commit_import_schema() -> HostFunctionSchema {
+    HostFunctionSchema::with_return(
+        COMMIT_IMPORT,
+        vec![
+            HostParamSchema::with_passing(
+                "target",
+                typed_host_callable_schema(),
+                HostParamPassing::Borrow,
+            ),
+            HostParamSchema::value(
+                "receiver",
+                HostTypeSchema::Array(Box::new(HostTypeSchema::Int)),
+            ),
+            HostParamSchema::with_passing(
+                "token",
+                HostTypeSchema::Resource(LuaUserdataResource::key()),
+                HostParamPassing::Borrow,
+            ),
+        ],
+        HostTypeSchema::Bool,
+    )
+}
+
 fn transport_catalog() -> &'static Arc<HostApiCatalog> {
     static CATALOG: OnceLock<Arc<HostApiCatalog>> = OnceLock::new();
     CATALOG.get_or_init(|| {
@@ -527,6 +618,34 @@ fn transport_catalog() -> &'static Arc<HostApiCatalog> {
         // contains a resource), the original issued receiver carrier and the
         // actual typed userdata token (borrowed). No `Unknown` parameter.
         builder.function(precommit_import_schema());
+        // The published-commit fixture's own exact statics. `prepare` issues
+        // A, installs the shared `__gc = receiver` and the raw `__call`
+        // closure, clears one weak orphan, and finishes the published tail;
+        // `wrong_token` returns the queued successor's real typed token;
+        // `swap` rewrites the receiver's raw `__call` between the seam and the
+        // commit; `commit` is the typed exclusive commit body.
+        builder.function(HostFunctionSchema::with_return(
+            BIND_IMPORT,
+            vec![
+                HostParamSchema::value("owner", HostTypeSchema::Unknown),
+                HostParamSchema::value("target", HostTypeSchema::Unknown),
+            ],
+            HostTypeSchema::Bool,
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            WRONG_TOKEN_IMPORT,
+            Vec::new(),
+            HostTypeSchema::Resource(LuaUserdataResource::key()),
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            SWAP_IMPORT,
+            vec![
+                HostParamSchema::value("owner", HostTypeSchema::Unknown),
+                HostParamSchema::value("target", HostTypeSchema::Unknown),
+            ],
+            HostTypeSchema::Bool,
+        ));
+        builder.function(commit_import_schema());
         // One freshly issued LuaHeap table carrier, whose real shape is
         // `Array<Int>`.
         builder.function(HostFunctionSchema::with_return(
@@ -567,6 +686,15 @@ fn bind_hosts(vm: &mut Vm) -> Result<(), VmError> {
     )?;
     registry.register_exact_static("tick", 1, catalog_schema("tick"), host_tick)?;
     registry.register_exact_static("fault", 0, catalog_schema("fault"), host_fault)?;
+    registry.register_exact_static(BIND_IMPORT, 2, catalog_schema(BIND_IMPORT), host_bind)?;
+    registry.register_exact_static(
+        WRONG_TOKEN_IMPORT,
+        0,
+        catalog_schema(WRONG_TOKEN_IMPORT),
+        host_wrong_token,
+    )?;
+    registry.register_exact_static("swap", 2, catalog_schema("swap"), host_swap)?;
+    registry.register_exact_static(COMMIT_IMPORT, 3, catalog_schema(COMMIT_IMPORT), host_commit)?;
     registry.bind_vm_cached(vm)
 }
 
@@ -597,6 +725,48 @@ struct GateRecord {
     token_parts: Option<(u64, u32, u32)>,
     token_is_issued: bool,
     refused: bool,
+}
+
+/// One prepared published head, read after the released Release tail finished.
+/// It is a fixed snapshot of the real A/B state, not a queue lease and not a
+/// root: the commit body must re-read every identity in its own borrow.
+#[derive(Clone, Debug)]
+struct PublishedPrepareRecord {
+    receiver: TableRef,
+    receiver_metatable: TableRef,
+    finalizer_metatable: TableRef,
+    userdata: UserdataRef,
+    userdata_raw: i64,
+    successor: UserdataRef,
+    successor_raw: i64,
+    call_closure: Option<heap::ClosureRef>,
+    weak_table: TableRef,
+    sentinel: TableRef,
+    root_frame: heap::RootFrameId,
+    published_count: usize,
+    queue_len: usize,
+}
+
+/// One actual invocation of the typed commit body, recorded from its real
+/// operands and the live heap before the exclusive borrow returns.
+#[derive(Clone, Debug)]
+struct PublishedCommitRecord {
+    callable: Value,
+    receiver: Value,
+    receiver_class: GuestClass,
+    token_raw: i64,
+    payload_parts: Option<(u64, u32, u32)>,
+    payload_is_head: bool,
+    weak_matches_callable: bool,
+    head_parts: (u64, u32, u32),
+    head_raw: i64,
+    metatable_parts: (u64, u32, u32),
+    action_receiver: (u64, u32, u32),
+    action_closure: (u64, u32, u32),
+    published_before: usize,
+    queue_before: usize,
+    outcome: Result<(heap::RootFrameId, u32), String>,
+    taken_userdata: Option<UserdataRef>,
 }
 
 /// The first observation of one host callback. Recorded before any frame
@@ -669,6 +839,8 @@ struct Witness {
     marks: Vec<MarkRecord>,
     picks: Vec<PickRecord>,
     gates: Vec<GateRecord>,
+    prepared: Option<PublishedPrepareRecord>,
+    commits: Vec<PublishedCommitRecord>,
     issued_table: Option<Value>,
     issued_table_ref: Option<TableRef>,
     issued_userdata: Option<UserdataRef>,
@@ -796,7 +968,9 @@ fn host_mark(vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
                 current.and_then(|frame| {
                     let prototype_id = frame.prototype_id?;
                     let prototype = program.callable_prototypes.get(prototype_id as usize)?;
-                    if prototype.parameter_slots.len() != PARENT_PARAMS {
+                    if prototype.parameter_slots.len() != PARENT_PARAMS
+                        && prototype.parameter_slots.len() != PUBLISHED_PARENT_PARAMS
+                    {
                         return None;
                     }
                     let slot = *prototype.parameter_slots.get(PARENT_ARGUMENT_SLOT)?;
@@ -814,7 +988,9 @@ fn host_mark(vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
                 current.and_then(|frame| {
                     let prototype_id = frame.prototype_id?;
                     let prototype = program.callable_prototypes.get(prototype_id as usize)?;
-                    if prototype.parameter_slots.len() != PARENT_PARAMS {
+                    if prototype.parameter_slots.len() != PARENT_PARAMS
+                        && prototype.parameter_slots.len() != PUBLISHED_PARENT_PARAMS
+                    {
                         return None;
                     }
                     let slot = *prototype.parameter_slots.get(PARENT_ARGUMENT_SLOT)?;
@@ -995,7 +1171,7 @@ fn host_note(vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
         ));
     };
     let chosen = match *mode {
-        0 | 4 => target,
+        0 | 3 | 4 | 6 | 7 => target,
         5 => other,
         other_mode => {
             return Err(host_fault_error(format!(
@@ -1044,10 +1220,23 @@ fn host_tick(vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
     Ok(CallOutcome::Return(CallReturn::one(issued)))
 }
 
-/// Issues one real typed `lua.userdata` token.
+/// Issues one real typed `lua.userdata` token, or, for the published-commit
+/// arms, builds the complete published A/B state first.
+///
+/// The published arms select at least three. Their receiver must already be the
+/// table `tick` issued; this body gives it a metatable with the false raw
+/// `__call` sentinel, publishes B and then A as real typed userdata, attaches
+/// their shared `__gc = receiver` metatable, roots a separate weak table and
+/// one unrelated sentinel, runs the real selecting collection, and finishes
+/// the saved Release tail. The exact `bind` import runs after this and installs
+/// the raw `__call`. The returned token is A's real typed `lua.userdata`.
 fn host_fault(vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
     if !args.is_empty() {
         return Err(host_fault_error("fault takes no arguments"));
+    }
+    let select = with_run_scope(vm, |scope| scope.select);
+    if select >= 3 {
+        return host_build_published_head(vm);
     }
     let mut host = vm.host_context();
     let userdata = heap::publish_userdata(&mut host).map_err(heap_fault)?;
@@ -1145,6 +1334,367 @@ fn host_precommit(vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
     Ok(CallOutcome::Return(CallReturn::one(Value::Bool(true))))
 }
 
+/// Builds the real published typed-head state for the published-commit arms.
+///
+/// The receiver must be the table `tick` issued without a metatable. This body
+/// installs the receiver's own metatable with the false raw `__call` sentinel,
+/// hands the exact target `Arc` into that record through the same private heap
+/// admission the controlled field import uses, publishes B and then A as real
+/// typed userdata, attaches their shared `__gc = receiver` metatable, roots a
+/// separate weak table and one unrelated sentinel, publishes them with the
+/// real selecting collection, and finishes the saved Release tail. Only then
+/// does it read the fixed A/B identities and return A's real typed token.
+fn host_build_published_head(vm: &mut Vm) -> vm::VmResult<CallOutcome> {
+    let receiver_ref = with_run_scope(vm, |scope| scope.witness.issued_table_ref)
+        .ok_or_else(|| host_fault_error("fault requires the issued receiver table"))?;
+    let receiver_metatable = {
+        let mut host = vm.host_context();
+        let existing =
+            heap::with_heap(&mut host, |heap| heap.metatable(receiver_ref)).map_err(heap_fault)?;
+        if existing.is_some() {
+            return Err(host_fault_error(
+                "fault expects a receiver without a metatable",
+            ));
+        }
+        let metatable = heap::with_heap(&mut host, |heap| heap.alloc()).map_err(heap_fault)?;
+        heap::with_heap(&mut host, |heap| {
+            heap.set_metatable(receiver_ref, Some(metatable))
+        })
+        .map_err(heap_fault)?;
+        heap::with_heap(&mut host, |heap| {
+            heap.set_named_scalar(metatable, "__call", Value::Bool(false))
+        })
+        .map_err(heap_fault)?;
+        metatable
+    };
+
+    let mut host = vm.host_context();
+    // B is published first and A second, so the selecting scan's reverse
+    // allocation order makes A the published head and B its successor.
+    let successor = heap::publish_userdata(&mut host).map_err(heap_fault)?;
+    let successor_raw = heap::with_heap(&mut host, |heap| heap.published_userdata_token(successor))
+        .map_err(heap_fault)?;
+    let userdata = heap::publish_userdata(&mut host).map_err(heap_fault)?;
+    let userdata_raw = heap::with_heap(&mut host, |heap| heap.published_userdata_token(userdata))
+        .map_err(heap_fault)?;
+    let finalizer_metatable =
+        heap::with_heap(&mut host, |heap| heap.alloc()).map_err(heap_fault)?;
+    heap::with_heap(&mut host, |heap| {
+        heap.set_named_edge(finalizer_metatable, "__gc", receiver_ref)
+    })
+    .map_err(heap_fault)?;
+    for candidate in [userdata, successor] {
+        heap::with_heap(&mut host, |heap| {
+            heap.set_userdata_metatable(candidate, Some(finalizer_metatable))
+        })
+        .map_err(heap_fault)?;
+    }
+
+    // One real issued-table weak-value orphan: the real selecting publication
+    // clears the only weak reference to it.
+    let orphan = {
+        let value = heap::publish_guest(&mut host).map_err(heap_fault)?;
+        let class =
+            heap::with_heap(&mut host, |heap| Ok(heap.guest_class(&value))).map_err(heap_fault)?;
+        let GuestClass::Table(orphan) = class else {
+            return Err(host_fault_error(
+                "prepare's weak orphan must be an issued heap table",
+            ));
+        };
+        orphan
+    };
+    heap::with_heap(&mut host, |heap| heap.set_edge(orphan, 1, orphan)).map_err(heap_fault)?;
+    let weak_table = heap::with_heap(&mut host, |heap| heap.alloc()).map_err(heap_fault)?;
+    let weak_mode = heap::with_heap(&mut host, |heap| heap.alloc()).map_err(heap_fault)?;
+    heap::with_heap(&mut host, |heap| {
+        heap.set_mode_scalar(weak_mode, Value::string("v"))
+    })
+    .map_err(heap_fault)?;
+    heap::with_heap(&mut host, |heap| {
+        heap.set_metatable(weak_table, Some(weak_mode))
+    })
+    .map_err(heap_fault)?;
+    heap::with_heap(&mut host, |heap| {
+        heap.set_number_edge(weak_table, 1.0, orphan)
+    })
+    .map_err(heap_fault)?;
+    let sentinel = heap::with_heap(&mut host, |heap| heap.alloc()).map_err(heap_fault)?;
+    let root_frame = heap::with_heap(&mut host, |heap| heap.enter_roots(4)).map_err(heap_fault)?;
+    heap::with_heap(&mut host, |heap| heap.write_root(root_frame, 0, weak_table))
+        .map_err(heap_fault)?;
+    heap::with_heap(&mut host, |heap| {
+        heap.write_root(root_frame, 1, receiver_ref)
+    })
+    .map_err(heap_fault)?;
+    heap::with_heap(&mut host, |heap| heap.write_root(root_frame, 2, sentinel))
+        .map_err(heap_fault)?;
+
+    let queue_before = heap::pending_finalizer_count(&mut host).map_err(heap_fault)?;
+    if queue_before != 0 {
+        return Err(host_fault_error(
+            "prepare expects an empty pending queue before publication",
+        ));
+    }
+    let boundary = heap::collect_pending_finalizers(&mut host).map_err(heap_fault)?;
+    if !matches!(boundary, heap::PublishedBoundary::Published { .. }) {
+        return Err(host_fault_error(
+            "prepare's real selecting collection must save a Release tail",
+        ));
+    }
+    let finished = heap::resume_published_sweep(&mut host, u64::MAX).map_err(heap_fault)?;
+    if !matches!(finished, heap::PublishedResume::Completed(_)) {
+        return Err(host_fault_error(
+            "prepare must finish the published Release tail",
+        ));
+    }
+    let published_count = heap::pending_finalizer_published_count(&mut host).map_err(heap_fault)?;
+    let queue_len = heap::pending_finalizer_count(&mut host).map_err(heap_fault)?;
+    if published_count != 2 || queue_len != 2 {
+        return Err(host_fault_error(format!(
+            "prepare expected A and B published, saw published={published_count} queue={queue_len}"
+        )));
+    }
+    let weak_cleared = heap::with_heap(&mut host, |heap| heap.number_value(weak_table, 1.0))
+        .map(|value| value == Value::Null)
+        .map_err(heap_fault)?;
+    if !weak_cleared {
+        return Err(host_fault_error(
+            "prepare's independent weak value must be cleared at publication",
+        ));
+    }
+    let userdata_raw_i64 = i64::try_from(userdata_raw)
+        .map_err(|_| host_fault_error("the prepared token does not fit a signed carrier"))?;
+    let record = PublishedPrepareRecord {
+        receiver: receiver_ref,
+        receiver_metatable,
+        finalizer_metatable,
+        userdata,
+        userdata_raw: userdata_raw_i64,
+        successor,
+        successor_raw: i64::try_from(successor_raw)
+            .map_err(|_| host_fault_error("the successor token does not fit a signed carrier"))?,
+        call_closure: None,
+        weak_table,
+        sentinel,
+        root_frame,
+        published_count,
+        queue_len,
+    };
+    let _ = host;
+    with_run_scope(vm, |scope| {
+        scope.witness.issued_table_ref = Some(receiver_ref);
+        scope.witness.issued_userdata = Some(userdata);
+        scope.witness.issued_userdata_raw = Some(userdata_raw_i64);
+        scope.witness.prepared = Some(record);
+    });
+    Ok(CallOutcome::Return(CallReturn::one(Value::Int(
+        userdata_raw_i64,
+    ))))
+}
+
+/// Installs the exact target `Arc` into the receiver's own metatable raw
+/// `__call` record, the same heap admission the controlled field import runs,
+/// and pins that installed closure generation in the prepared witness.
+fn host_bind(vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
+    let [owner, target] = args else {
+        return Err(host_fault_error("bind expects the owner and the callable"));
+    };
+    let Value::Callable(target_arc) = target else {
+        return Err(host_fault_error("bind expects a callable target"));
+    };
+    install_guest_callable_into_raw_call(vm, owner, target).map_err(heap_fault)?;
+    let (receiver, metatable, closure) = {
+        let mut host = vm.host_context();
+        let class =
+            heap::with_heap(&mut host, |heap| Ok(heap.guest_class(owner))).map_err(heap_fault)?;
+        let GuestClass::Table(receiver) = class else {
+            return Err(host_fault_error(
+                "bind expects the issued receiver table carrier",
+            ));
+        };
+        let metatable = heap::with_heap(&mut host, |heap| heap.metatable(receiver))
+            .map_err(heap_fault)?
+            .ok_or_else(|| host_fault_error("bind expects the receiver metatable"))?;
+        let closure = heap::with_heap(&mut host, |heap| {
+            heap.named_closure_edge(metatable, "__call")
+        })
+        .map_err(heap_fault)?;
+        let stored = heap::with_heap(&mut host, |heap| heap.closure_callable(closure))
+            .map_err(heap_fault)?;
+        if !Arc::ptr_eq(&stored, target_arc) {
+            return Err(host_fault_error(
+                "bind's raw __call must hold the exact target Arc",
+            ));
+        }
+        (receiver, metatable, closure)
+    };
+    let stored = with_run_scope(vm, |scope| {
+        let Some(record) = scope.witness.prepared.as_mut() else {
+            return false;
+        };
+        if record.receiver != receiver {
+            return false;
+        }
+        record.receiver_metatable = metatable;
+        record.call_closure = Some(closure);
+        true
+    });
+    if !stored {
+        return Err(host_fault_error(
+            "bind must follow the prepared published head for its own receiver",
+        ));
+    }
+    Ok(CallOutcome::Return(CallReturn::one(Value::Bool(true))))
+}
+
+/// Returns the queued successor's real typed token. It is a legal
+/// `lua.userdata` handle naming a different object than the published head.
+fn host_wrong_token(vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
+    if !args.is_empty() {
+        return Err(host_fault_error("wrong_token takes no arguments"));
+    }
+    let raw = with_run_scope(vm, |scope| {
+        scope
+            .witness
+            .prepared
+            .as_ref()
+            .map(|record| record.successor_raw)
+    })
+    .ok_or_else(|| host_fault_error("wrong_token requires the prepared published head"))?;
+    Ok(CallOutcome::Return(CallReturn::one(Value::Int(raw))))
+}
+
+/// Rewrites the receiver's raw `__call` to the given zero-capture closure
+/// between the typed seam and the typed commit. Only the arm whose selected
+/// mode is the raw-edge-change control performs the real heap admission; the
+/// other published arms execute the same compiled call but keep their edge.
+fn host_swap(vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
+    let [owner, target] = args else {
+        return Err(host_fault_error("swap expects the owner and the callable"));
+    };
+    let select = with_run_scope(vm, |scope| scope.select);
+    if select == 6 {
+        install_guest_callable_into_raw_call(vm, owner, target).map_err(heap_fault)?;
+    }
+    Ok(CallOutcome::Return(CallReturn::one(Value::Bool(true))))
+}
+
+/// The typed exclusive commit body.
+///
+/// The operands are the parent frame's actual values: the same typed callable
+/// local the following `CallValue(2)` uses, the original receiver carrier and
+/// the actual typed userdata token. The body first reads a fixed snapshot and
+/// the real `lua.userdata` payload, then hands those exact identities to the
+/// heap's exclusive commit. That entry re-reads the live head, metatable,
+/// action, issued receiver, closure `Arc`, and root plan in one borrow and
+/// refuses before any write; the body never trusts the snapshot, a bare
+/// handle, or the later `CallValue` check.
+fn host_commit(vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
+    let entry = frame_entry(vm, COMMIT_ENTRY_LABEL);
+    with_run_scope(vm, |scope| scope.witness.entries.push(entry));
+
+    let [callable, receiver, token] = args else {
+        return Err(host_fault_error(
+            "the typed commit body expects three operands",
+        ));
+    };
+    let Value::Callable(callable_arc) = callable else {
+        return Err(host_fault_error(
+            "the typed commit body received a non-callable first operand",
+        ));
+    };
+    let Value::Int(token_raw) = *token else {
+        return Err(host_fault_error(
+            "the typed commit body received a non-handle token operand",
+        ));
+    };
+
+    let (snapshot, payload, receiver_class, weak_matches) = {
+        let mut host = vm.host_context();
+        let snapshot = snapshot_published_typed_table_call(&mut host).map_err(heap_fault)?;
+        let receiver_class = heap::with_heap(&mut host, |heap| Ok(heap.guest_class(receiver)))
+            .map_err(heap_fault)?;
+        let payload = raw_handle(token_raw).ok().and_then(|handle| {
+            host.borrow_resource_with_key::<LuaUserdataResource>(
+                handle,
+                &LuaUserdataResource::key(),
+            )
+            .ok()
+            .map(|borrowed| borrowed.get().userdata())
+        });
+        let weak_matches = snapshot
+            .callable
+            .upgrade()
+            .is_some_and(|stored| Arc::ptr_eq(&stored, callable_arc));
+        (snapshot, payload, receiver_class, weak_matches)
+    };
+    let payload_is_head = payload == Some(snapshot.userdata);
+    let head_parts = (
+        snapshot.userdata.domain(),
+        snapshot.userdata.slot(),
+        snapshot.userdata.generation(),
+    );
+    let metatable_parts = (
+        snapshot.metatable.domain(),
+        snapshot.metatable.slot(),
+        snapshot.metatable.generation(),
+    );
+    let action_receiver = (
+        snapshot.receiver.domain(),
+        snapshot.receiver.slot(),
+        snapshot.receiver.generation(),
+    );
+    let action_closure = (
+        snapshot.closure.domain(),
+        snapshot.closure.slot(),
+        snapshot.closure.generation(),
+    );
+    let published_before = snapshot.published_count;
+    let queue_before = snapshot.queue_len;
+    let token_u64 = u64::try_from(token_raw).unwrap_or(u64::MAX);
+
+    let mut host = vm.host_context();
+    let outcome = commit_published_typed_table_call(
+        &mut host,
+        callable_arc,
+        payload,
+        snapshot.metatable,
+        receiver,
+        token_u64,
+    );
+    let _ = host;
+    let (recorded_outcome, taken_userdata) = match &outcome {
+        Ok((frame, taken)) => (Ok((*frame, taken.roots_written)), Some(taken.userdata)),
+        Err(error) => (Err(format!("{error:?}")), None),
+    };
+    let record = PublishedCommitRecord {
+        callable: callable.clone(),
+        receiver: receiver.clone(),
+        receiver_class,
+        token_raw,
+        payload_parts: payload
+            .map(|userdata| (userdata.domain(), userdata.slot(), userdata.generation())),
+        payload_is_head,
+        weak_matches_callable: weak_matches,
+        head_parts,
+        head_raw: i64::try_from(snapshot.raw_token).unwrap_or(i64::MAX),
+        metatable_parts,
+        action_receiver,
+        action_closure,
+        published_before,
+        queue_before,
+        outcome: recorded_outcome,
+        taken_userdata,
+    };
+    with_run_scope(vm, |scope| scope.witness.commits.push(record));
+    match outcome {
+        Ok(_) => Ok(CallOutcome::Return(CallReturn::one(Value::Bool(true)))),
+        Err(error) => Err(host_fault_error(format!(
+            "{COMMIT_REFUSAL_PREFIX}{error:?}"
+        ))),
+    }
+}
+
 // ---- the private plugin: real lowering plus declared schemas --------------
 
 #[derive(Clone, Debug)]
@@ -1167,12 +1717,54 @@ struct GatePatch {
     resolution: ResolvedHostCall,
 }
 
+/// The actual operand choice the published-commit arm passes to the typed
+/// commit body. `Argument` is the head's real token, `Wrong` is the queued
+/// successor's real token, and `ForgedArgument` additionally builds an
+/// equal-valued array from the issued receiver's two integers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommitArgument {
+    Argument,
+    Wrong,
+    ForgedArgument,
+}
+
+/// The inserted exclusive commit call and its actual operand plan.
+#[derive(Clone, Debug)]
+struct CommitPatch {
+    import_index: u16,
+    typed_local: LocalSlot,
+    result_slot: LocalSlot,
+    resolution: ResolvedHostCall,
+    argument: CommitArgument,
+}
+
+/// One resolved import the published-commit plugin adds to the IR directly.
+#[derive(Clone)]
+struct PublishedImport {
+    import_index: u16,
+    resolution: ResolvedHostCall,
+}
+
+/// The resolved exclusive commit import plus the operand choice for this arm.
+#[derive(Clone)]
+struct PublishedCommitSpec {
+    import_index: u16,
+    resolution: ResolvedHostCall,
+    argument: CommitArgument,
+    /// The raw-edge-change arm inserts the real heap `swap` between the seam
+    /// and the commit.
+    swap: Option<PublishedImport>,
+}
+
 #[derive(Clone, Debug, Default)]
 struct PatchReport {
     typed_local: Option<LocalSlot>,
     declared_schema: Option<TypeSchema>,
     call: Option<CallPatch>,
     gate: Option<GatePatch>,
+    commit: Option<CommitPatch>,
+    sentinel_bind: Option<LocalSlot>,
+    sentinel_wrong: Option<LocalSlot>,
     parent_parameters: Vec<LocalSlot>,
     target_declared: bool,
     other_declared: bool,
@@ -1206,6 +1798,167 @@ impl SourcePlugin for TransportPlugin {
 
 fn patch_error(message: impl Into<String>) -> ParseError {
     ParseError::at_line(1, message)
+}
+
+/// Resolves and declares one plugin-added exact static import.
+fn insert_published_import(
+    ir: &mut FrontendIr,
+    resolver: &HostCallResolver<'_>,
+    name: &str,
+    args: &[TypeSchema],
+    value_type: vm::ValueType,
+) -> Result<PublishedImport, ParseError> {
+    let import_index = u16::try_from(ir.functions.len())
+        .map_err(|_| patch_error("too many declared host functions"))?;
+    let resolution = resolver
+        .resolve(name, args)
+        .map_err(|error| patch_error(format!("the {name} import did not resolve: {error}")))?;
+    let arity = u8::try_from(resolution.params.len())
+        .map_err(|_| patch_error("a plugin import arity overflows a byte"))?;
+    ir.functions.push(FunctionDecl {
+        name: name.to_string(),
+        arity,
+        index: import_index,
+        args: resolution
+            .params
+            .iter()
+            .map(|param| param.name.clone())
+            .collect(),
+        arg_schemas: resolution
+            .params
+            .iter()
+            .map(|param| Some(param.schema.clone()))
+            .collect(),
+        return_schema: Some(resolution.return_type.clone()),
+        type_params: Vec::new(),
+        exported: false,
+        return_type: value_type,
+        symbol: None,
+    });
+    Ok(PublishedImport {
+        import_index,
+        resolution,
+    })
+}
+
+/// Adds the chunk-level `bind(recv, target)` and `wrong_token()` calls the
+/// published-commit fixture cannot name itself, and rewrites the parent call's
+/// eighth operand to the successor-token local.
+fn patch_published_chunk(
+    stmts: &mut Vec<Stmt>,
+    bind: &PublishedImport,
+    wrong: &PublishedImport,
+    next_local: &mut usize,
+    report: &mut PatchReport,
+) -> Result<bool, ParseError> {
+    let mut fault_position = None;
+    let mut receiver_slot = None;
+    let mut target_slot = None;
+    let mut parent_position = None;
+    for (position, stmt) in stmts.iter_mut().enumerate() {
+        match stmt {
+            Stmt::Let {
+                index: _,
+                expr: Expr::Call(_, _, _, Some(resolution), _),
+                ..
+            } if resolution.name == "fault" => {
+                fault_position = Some(position);
+            }
+            Stmt::Let {
+                index,
+                expr: Expr::Call(_, _, _, Some(resolution), _),
+                ..
+            } if resolution.name == "tick" => {
+                receiver_slot = Some(*index);
+            }
+            Stmt::Let {
+                index,
+                expr: Expr::Closure(closure),
+                ..
+            } => {
+                if closure_first_mark_label(closure) == Some(TARGET_LABEL) {
+                    target_slot = Some(*index);
+                }
+            }
+            Stmt::Let {
+                expr: Expr::LocalCall(_, _, args, _),
+                ..
+            } if args.len() == PUBLISHED_PARENT_PARAMS => {
+                parent_position = Some(position);
+            }
+            _ => {}
+        }
+    }
+    if let (Some(fault_position), Some(receiver_slot), Some(target_slot), Some(parent_position)) =
+        (fault_position, receiver_slot, target_slot, parent_position)
+    {
+        let bind_result = LocalSlot::try_from(*next_local)
+            .map_err(|_| patch_error("the bind result local overflows a slot"))?;
+        *next_local = next_local
+            .checked_add(1)
+            .ok_or_else(|| patch_error("too many locals for the bind result"))?;
+        let wrong_slot = LocalSlot::try_from(*next_local)
+            .map_err(|_| patch_error("the wrong-token local overflows a slot"))?;
+        *next_local = next_local
+            .checked_add(1)
+            .ok_or_else(|| patch_error("too many locals for the wrong token"))?;
+        let Stmt::Let {
+            expr: Expr::LocalCall(_, _, args, _),
+            ..
+        } = &mut stmts[parent_position]
+        else {
+            return Err(patch_error("the published parent call changed shape"));
+        };
+        args[PUBLISHED_WRONG_SLOT] = Expr::Var(wrong_slot);
+        let bind_statement = Stmt::Let {
+            index: bind_result,
+            declared_schema: None,
+            expr: Expr::Call(
+                bind.import_index,
+                Vec::new(),
+                vec![Expr::Var(receiver_slot), Expr::Var(target_slot)],
+                Some(Box::new(bind.resolution.clone())),
+                None,
+            ),
+            line: 1,
+        };
+        let wrong_statement = Stmt::Let {
+            index: wrong_slot,
+            declared_schema: None,
+            expr: Expr::Call(
+                wrong.import_index,
+                Vec::new(),
+                Vec::new(),
+                Some(Box::new(wrong.resolution.clone())),
+                None,
+            ),
+            line: 1,
+        };
+        stmts.insert(fault_position + 1, wrong_statement);
+        stmts.insert(fault_position + 1, bind_statement);
+        report.sentinel_bind = Some(bind_result);
+        report.sentinel_wrong = Some(wrong_slot);
+        return Ok(true);
+    }
+    // The completion lowering wraps the chunk statements in one block
+    // expression; descend until the level that owns the fault and parent call.
+    for stmt in stmts.iter_mut() {
+        let inner = match stmt {
+            Stmt::Expr {
+                expr: Expr::Block { stmts: inner, .. },
+                ..
+            }
+            | Stmt::Let {
+                expr: Expr::Block { stmts: inner, .. },
+                ..
+            } => inner,
+            _ => continue,
+        };
+        if patch_published_chunk(inner, bind, wrong, next_local, report)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// The resolved pre-commit seam the plugin installs, when the current arm asks
@@ -1275,8 +2028,102 @@ fn patch_ir(
             forged_receiver: gate_mode == 2,
         })
     };
+    // A published-commit arm gets a second exact static import resolved with
+    // the same concrete operands. The commit body runs after the read-only
+    // seam and before the parent's own `CallValue(2)`.
+    let mut commit = if gate_mode >= 3 {
+        let import_index = u16::try_from(ir.functions.len())
+            .map_err(|_| patch_error("too many declared host functions"))?;
+        let resolution = resolver
+            .resolve(
+                COMMIT_IMPORT,
+                &[
+                    userdata_callable_schema(),
+                    TypeSchema::Array(Box::new(TypeSchema::Int)),
+                    TypeSchema::Resource(LuaUserdataResource::key()),
+                ],
+            )
+            .map_err(|error| patch_error(format!("the commit import did not resolve: {error}")))?;
+        let arity = u8::try_from(resolution.params.len())
+            .map_err(|_| patch_error("the commit import arity overflows a byte"))?;
+        ir.functions.push(FunctionDecl {
+            name: COMMIT_IMPORT.to_string(),
+            arity,
+            index: import_index,
+            args: resolution
+                .params
+                .iter()
+                .map(|param| param.name.clone())
+                .collect(),
+            arg_schemas: resolution
+                .params
+                .iter()
+                .map(|param| Some(param.schema.clone()))
+                .collect(),
+            return_schema: Some(resolution.return_type.clone()),
+            type_params: Vec::new(),
+            exported: false,
+            return_type: vm::ValueType::Bool,
+            symbol: None,
+        });
+        let argument = match gate_mode {
+            4 => CommitArgument::Wrong,
+            5 => CommitArgument::ForgedArgument,
+            _ => CommitArgument::Argument,
+        };
+        Some(PublishedCommitSpec {
+            import_index,
+            resolution,
+            argument,
+            swap: None,
+        })
+    } else {
+        None
+    };
+    // The published-commit fixture's chunk gets two more exact static calls
+    // that are not guest-lowered names: `bind(recv, target)` installs the raw
+    // `__call` and `wrong_token()` returns the queued successor's real token.
+    // The parent call's eighth operand is rewritten to that token slot.
+    let published_chunk = if gate_mode >= 3 {
+        let bind = insert_published_import(
+            ir,
+            resolver,
+            BIND_IMPORT,
+            &[TypeSchema::Unknown, TypeSchema::Unknown],
+            vm::ValueType::Bool,
+        )?;
+        let wrong =
+            insert_published_import(ir, resolver, WRONG_TOKEN_IMPORT, &[], vm::ValueType::Int)?;
+        if gate_mode == 6
+            && let Some(spec) = commit.as_mut()
+        {
+            spec.swap = Some(insert_published_import(
+                ir,
+                resolver,
+                SWAP_IMPORT,
+                &[TypeSchema::Unknown, TypeSchema::Unknown],
+                vm::ValueType::Bool,
+            )?);
+        }
+        Some((bind, wrong))
+    } else {
+        None
+    };
     let mut next_local = ir.locals;
-    patch_stmts(&mut ir.stmts, gate.as_ref(), &mut next_local, &mut report)?;
+    patch_stmts(
+        &mut ir.stmts,
+        gate.as_ref(),
+        commit.as_ref(),
+        &mut next_local,
+        &mut report,
+    )?;
+    if let Some((bind, wrong)) = &published_chunk
+        && !patch_published_chunk(&mut ir.stmts, bind, wrong, &mut next_local, &mut report)?
+    {
+        return Err(patch_error(
+            "the published-commit chunk is missing its fault, tick, target or parent call",
+        ));
+    }
     ir.locals = next_local;
     // The private lowerer reads every admitted Lua callable through an
     // explicit `ToOwned` copy. This pin classifies a callable whose schema
@@ -1338,6 +2185,7 @@ fn strip_to_owned(expr: &mut Expr) {
 fn patch_stmts(
     stmts: &mut [Stmt],
     gate: Option<&GateSpec>,
+    commit: Option<&PublishedCommitSpec>,
     next_local: &mut usize,
     report: &mut PatchReport,
 ) -> Result<(), ParseError> {
@@ -1370,14 +2218,16 @@ fn patch_stmts(
                     }
                     _ => {}
                 }
-                if closure.param_slots.len() == PARENT_PARAMS {
-                    patch_parent(closure, gate, next_local, report)?;
+                if closure.param_slots.len() == PARENT_PARAMS
+                    || closure.param_slots.len() == PUBLISHED_PARENT_PARAMS
+                {
+                    patch_parent(closure, gate, commit, next_local, report)?;
                 }
             }
             Stmt::Expr {
                 expr: Expr::Block { stmts, .. },
                 ..
-            } => patch_stmts(stmts, gate, next_local, report)?,
+            } => patch_stmts(stmts, gate, commit, next_local, report)?,
             _ => {}
         }
     }
@@ -1422,6 +2272,7 @@ fn reads_completion(expr: &Expr, completion: LocalSlot) -> bool {
 fn patch_parent(
     closure: &mut ClosureExpr,
     gate: Option<&GateSpec>,
+    commit: Option<&PublishedCommitSpec>,
     next_local: &mut usize,
     report: &mut PatchReport,
 ) -> Result<(), ParseError> {
@@ -1429,13 +2280,19 @@ fn patch_parent(
         return Err(patch_error("the parent body is not a block"));
     };
     let parameters = closure.param_slots.clone();
-    if parameters.len() != PARENT_PARAMS {
+    if parameters.len() != PARENT_PARAMS && parameters.len() != PUBLISHED_PARENT_PARAMS {
         return Err(patch_error("the parent parameter list changed"));
+    }
+    if commit.is_some() != (parameters.len() == PUBLISHED_PARENT_PARAMS) {
+        return Err(patch_error(
+            "only the published-commit parent carries the commit import",
+        ));
     }
     report.parent_parameters = parameters.clone();
 
     let mut typed_local = None;
-    for stmt in stmts.iter_mut() {
+    let mut note_position = None;
+    for (position, stmt) in stmts.iter_mut().enumerate() {
         let Stmt::Let {
             index,
             declared_schema,
@@ -1455,6 +2312,7 @@ fn patch_parent(
         }
         *declared_schema = Some(userdata_callable_schema());
         typed_local = Some(*index);
+        note_position = Some(position);
     }
     let Some(typed_local) = typed_local else {
         return Err(patch_error("the parent has no typed candidate local"));
@@ -1534,6 +2392,14 @@ fn patch_parent(
         let Some(position) = call_position else {
             return Err(patch_error("the parent has no admitted dynamic call"));
         };
+        let Some(note_position) = note_position else {
+            return Err(patch_error("the parent has no typed candidate local"));
+        };
+        let admit_position = if commit.is_some() {
+            note_position + 1
+        } else {
+            position
+        };
         let result_slot = LocalSlot::try_from(*next_local)
             .map_err(|_| patch_error("the precommit result local overflows a slot"))?;
         *next_local = next_local
@@ -1557,8 +2423,84 @@ fn patch_parent(
             Some(Box::new(gate.resolution.clone())),
             None,
         );
+        if let Some(commit) = commit {
+            let commit_result = LocalSlot::try_from(*next_local)
+                .map_err(|_| patch_error("the commit result local overflows a slot"))?;
+            *next_local = next_local
+                .checked_add(1)
+                .ok_or_else(|| patch_error("too many locals for the commit result"))?;
+            let commit_receiver = if commit.argument == CommitArgument::ForgedArgument {
+                forged_receiver_expr(parameters[PARENT_RECEIVER_SLOT])
+            } else {
+                Expr::Var(parameters[PARENT_RECEIVER_SLOT])
+            };
+            let argument_slot = match commit.argument {
+                CommitArgument::Wrong => parameters[PUBLISHED_WRONG_SLOT],
+                CommitArgument::Argument | CommitArgument::ForgedArgument => {
+                    parameters[PARENT_ARGUMENT_SLOT]
+                }
+            };
+            let commit_expr = Expr::Call(
+                commit.import_index,
+                Vec::new(),
+                vec![
+                    Expr::Var(typed_local),
+                    commit_receiver,
+                    Expr::Var(argument_slot),
+                ],
+                Some(Box::new(commit.resolution.clone())),
+                None,
+            );
+            stmts.insert(
+                position,
+                Stmt::Let {
+                    index: commit_result,
+                    declared_schema: None,
+                    expr: commit_expr,
+                    line: 1,
+                },
+            );
+            report.commit = Some(CommitPatch {
+                import_index: commit.import_index,
+                typed_local,
+                result_slot: commit_result,
+                resolution: commit.resolution.clone(),
+                argument: commit.argument,
+            });
+        }
+        // The raw-edge-change arm runs the real heap `swap(recv, alternate)`
+        // after the read-only seam and before the exclusive commit. `second`
+        // carries the exact `alternate` Arc the fixture passed as candidate.
+        if let Some(commit) = commit
+            && let Some(swap) = commit.swap.as_ref()
+        {
+            let swap_result = LocalSlot::try_from(*next_local)
+                .map_err(|_| patch_error("the swap result local overflows a slot"))?;
+            *next_local = next_local
+                .checked_add(1)
+                .ok_or_else(|| patch_error("too many locals for the swap result"))?;
+            let swap_expr = Expr::Call(
+                swap.import_index,
+                Vec::new(),
+                vec![
+                    Expr::Var(parameters[PARENT_RECEIVER_SLOT]),
+                    Expr::Var(parameters[PUBLISHED_ALTERNATE_SLOT]),
+                ],
+                Some(Box::new(swap.resolution.clone())),
+                None,
+            );
+            stmts.insert(
+                position,
+                Stmt::Let {
+                    index: swap_result,
+                    declared_schema: None,
+                    expr: swap_expr,
+                    line: 1,
+                },
+            );
+        }
         stmts.insert(
-            position,
+            admit_position,
             Stmt::Let {
                 index: result_slot,
                 declared_schema: None,
@@ -1619,12 +2561,14 @@ struct ArmRun {
     patch: PatchReport,
     call_sites: Vec<super::DecodedCallSite>,
     host_call_sites: Vec<(usize, u8, Option<u32>)>,
+    commit_call_sites: Vec<(usize, u8, Option<u32>)>,
     prototypes: Vec<vm::CallablePrototype>,
     host_imports: Vec<HostImport>,
     host_schemas: Vec<Option<HostImportSchema>>,
     local_schemas: Vec<Option<TypeSchema>>,
     fuel_consumed: u64,
     bound_functions: usize,
+    vm: Vm,
 }
 
 /// Every compiled static host `Call` site for `import`: `(ip, argc, owner)`.
@@ -1671,6 +2615,7 @@ struct CompiledArm {
     patch: PatchReport,
     call_sites: Vec<super::DecodedCallSite>,
     host_call_sites: Vec<(usize, u8, Option<u32>)>,
+    commit_call_sites: Vec<(usize, u8, Option<u32>)>,
     prototypes: Vec<vm::CallablePrototype>,
     host_imports: Vec<HostImport>,
     host_schemas: Vec<Option<HostImportSchema>>,
@@ -1700,6 +2645,11 @@ fn compile_arm_with(arm: Arm, plugin: TransportPlugin) -> CompiledArm {
         .as_ref()
         .map(|gate| decoded_host_calls(&compiled.program, gate.import_index))
         .unwrap_or_default();
+    let commit_call_sites = patch
+        .commit
+        .as_ref()
+        .map(|commit| decoded_host_calls(&compiled.program, commit.import_index))
+        .unwrap_or_default();
     let prototypes = compiled.program.callable_prototypes.clone();
     let host_imports = compiled.program.imports.clone();
     let host_schemas = compiled.program.host_import_schemas().to_vec();
@@ -1715,6 +2665,7 @@ fn compile_arm_with(arm: Arm, plugin: TransportPlugin) -> CompiledArm {
         patch,
         call_sites,
         host_call_sites,
+        commit_call_sites,
         prototypes,
         host_imports,
         host_schemas,
@@ -1774,12 +2725,14 @@ fn run_compiled(compiled: CompiledArm) -> ArmRun {
         patch: compiled.patch,
         call_sites: compiled.call_sites,
         host_call_sites: compiled.host_call_sites,
+        commit_call_sites: compiled.commit_call_sites,
         prototypes: compiled.prototypes,
         host_imports: compiled.host_imports,
         host_schemas: compiled.host_schemas,
         local_schemas: compiled.local_schemas,
         fuel_consumed,
         bound_functions,
+        vm: runtime,
     };
     run.report();
     run
@@ -2935,7 +3888,7 @@ fn assert_precommit_import(run: &ArmRun) {
     );
     assert_eq!(
         run.bound_functions, 5,
-        "{label}: all five exact static imports must bind"
+        "{label}: all five precommit exact static imports must bind"
     );
     eprintln!(
         "{label}: precommit import slot={index} schema={schema:?} resolution_fingerprint={:?} bound={}",
@@ -3577,4 +4530,1232 @@ fn typed_transport_runtime_scope_is_isolated_between_two_concurrent_arms() {
     assert_precommit_positive(&first);
     assert_other_resource_key_control(&first, &second);
     assert_runtime_scope_ownership(&first, &second);
+}
+
+// ---- the typed published head commit --------------------------------------
+
+fn published_prepared(run: &ArmRun) -> &PublishedPrepareRecord {
+    run.witness
+        .prepared
+        .as_ref()
+        .unwrap_or_else(|| panic!("{}: no prepared published head", run.arm.label()))
+}
+
+fn published_commit(run: &ArmRun) -> &PublishedCommitRecord {
+    let commits = &run.witness.commits;
+    assert_eq!(
+        commits.len(),
+        1,
+        "{}: the typed commit body must run exactly once, saw {}",
+        run.arm.label(),
+        commits.len()
+    );
+    &commits[0]
+}
+
+fn commit_entries(run: &ArmRun) -> Vec<&EntryRecord> {
+    run.witness
+        .entries
+        .iter()
+        .filter(|entry| entry.label == COMMIT_ENTRY_LABEL)
+        .collect()
+}
+
+fn heap_query<T>(
+    vm: &mut Vm,
+    body: impl FnOnce(&mut heap::LuaHeap) -> Result<T, heap::HeapError>,
+) -> T {
+    let mut host = vm.host_context();
+    heap::with_heap(&mut host, body).unwrap_or_else(|error| panic!("heap query: {error:?}"))
+}
+
+/// One read-only view of the current published head for the typed commit
+/// body. It holds a `Weak` callable identity, never a strong `Arc` or root.
+#[derive(Clone)]
+struct PublishedTypedCommitSnapshot {
+    userdata: UserdataRef,
+    raw_token: u64,
+    metatable: TableRef,
+    receiver: TableRef,
+    closure: heap::ClosureRef,
+    callable: std::sync::Weak<vm::CallableValue>,
+    published_count: usize,
+    queue_len: usize,
+}
+
+fn snapshot_published_typed_table_call(
+    host: &mut vm::HostContext,
+) -> Result<PublishedTypedCommitSnapshot, heap::HeapError> {
+    let Some(heap) = host.scope_state::<heap::LuaHeap>() else {
+        return Err(heap::HeapError::SweepDenied);
+    };
+    if heap.has_sweep_tail() {
+        return Err(heap::HeapError::SweepPending);
+    }
+    if heap.has_saved_mark() {
+        return Err(heap::HeapError::MarkActive);
+    }
+    let head = heap.pending_finalizer_published_front()?;
+    let handle =
+        ResourceHandle::from_raw(head.raw).map_err(|_| heap::HeapError::CarrierOutOfRange)?;
+    let userdata = {
+        let borrowed = host
+            .borrow_resource_with_key::<LuaUserdataResource>(handle, &LuaUserdataResource::key())
+            .map_err(heap::HeapError::from_scope)?;
+        borrowed.get().userdata()
+    };
+    if userdata.domain() != heap.domain()
+        || userdata.slot() != head.slot
+        || userdata.generation() != head.generation
+        || userdata.kind() != HandleKind::Userdata
+    {
+        return Err(heap::HeapError::TokenMismatch);
+    }
+    if heap.published_userdata_token(userdata)? != head.raw {
+        return Err(heap::HeapError::TokenMismatch);
+    }
+    let metatable = heap
+        .userdata_metatable(userdata)?
+        .ok_or(heap::HeapError::StaleHandle)?;
+    let heap::PendingFinalizerAction::TableCall { receiver, call } =
+        heap.pending_finalizer_action(userdata)
+    else {
+        return Err(heap::HeapError::Scope(
+            "lua typed published head is not a table call".to_string(),
+        ));
+    };
+    let callable = Arc::downgrade(&heap.closure_callable(call)?);
+    Ok(PublishedTypedCommitSnapshot {
+        userdata,
+        raw_token: head.raw,
+        metatable,
+        receiver,
+        closure: call,
+        callable,
+        published_count: heap.pending_finalizer_published_count(),
+        queue_len: heap.pending_finalizer_count(),
+    })
+}
+
+/// The typed commit body's exclusive entry: every identity check runs in the
+/// one borrow that pops, roots, and settles, before the first write.
+fn commit_published_typed_table_call(
+    host: &mut vm::HostContext,
+    expected_callable: &Arc<vm::CallableValue>,
+    expected_payload: Option<UserdataRef>,
+    expected_metatable: TableRef,
+    expected_receiver: &Value,
+    expected_token: u64,
+) -> Result<(heap::RootFrameId, heap::TakenPendingFinalizer), heap::HeapError> {
+    heap::with_heap(host, |heap| {
+        heap.deny_unbarriered()?;
+        let head = heap.pending_finalizer_published_front()?;
+        let Some(userdata) = expected_payload else {
+            return Err(heap::HeapError::TokenMismatch);
+        };
+        let head_userdata = heap.pending_finalizer_head_identity(head)?;
+        if head_userdata != userdata {
+            return Err(heap::HeapError::TokenMismatch);
+        }
+        if heap.published_userdata_token(userdata)? != expected_token {
+            return Err(heap::HeapError::TokenMismatch);
+        }
+        if heap.userdata_metatable(userdata)? != Some(expected_metatable) {
+            return Err(heap::HeapError::StaleHandle);
+        }
+        let action = heap.pending_finalizer_action(userdata);
+        let heap::PendingFinalizerAction::TableCall { receiver, call } = action else {
+            return Err(heap::HeapError::Scope(
+                "lua typed published commit requires a table call".to_string(),
+            ));
+        };
+        if heap.guest_class(expected_receiver) != GuestClass::Table(receiver) {
+            return Err(heap::HeapError::WrongKind);
+        }
+        let Value::Array(operand) = expected_receiver else {
+            return Err(heap::HeapError::WrongKind);
+        };
+        let Value::Array(issued) = heap.issued_value(receiver)? else {
+            return Err(heap::HeapError::StaleHandle);
+        };
+        if !Arc::ptr_eq(operand, &issued) {
+            return Err(heap::HeapError::WrongKind);
+        }
+        let stored = heap.closure_callable(call)?;
+        if !Arc::ptr_eq(&stored, expected_callable) {
+            return Err(heap::HeapError::TokenMismatch);
+        }
+        let frame = heap.enter_roots(3)?;
+        let slots = [0u32, 1, 2];
+        let indices = heap.pending_finalizer_root_indices(frame, &slots, 3)?;
+        let userdata = heap.commit_published_finalizer(
+            head,
+            userdata,
+            &[
+                (indices[0], heap::table::Rooted::Userdata(userdata)),
+                (indices[1], heap::table::Rooted::Closure(call)),
+                (indices[2], heap::table::Rooted::Table(receiver)),
+            ],
+        )?;
+        Ok((
+            frame,
+            heap::TakenPendingFinalizer {
+                userdata,
+                action,
+                roots_written: 3,
+            },
+        ))
+    })
+}
+
+/// Test-only bridge to the private heap-owned guest callable field admission.
+fn install_guest_callable_into_raw_call(
+    vm: &mut Vm,
+    owner: &Value,
+    target: &Value,
+) -> Result<(), heap::HeapError> {
+    let Value::Callable(target_arc) = target else {
+        return Err(heap::HeapError::CallableHasEnvironment);
+    };
+    let prototype = vm
+        .program()
+        .callable_prototypes
+        .get(target_arc.prototype_id as usize)
+        .ok_or(heap::HeapError::CarrierNotBound)?;
+    let captures = prototype.capture_slots.len();
+    let mut host = vm.host_context();
+    heap::with_heap(&mut host, |heap| {
+        heap.handoff_guest_callable_to_raw_call(owner, Arc::clone(target_arc), captures)
+            .map(|_| ())
+    })
+}
+
+fn published_pending(run: &mut ArmRun) -> Vec<(u64, u32, u32)> {
+    heap_query(&mut run.vm, |heap| Ok(heap.pending_finalizer_records()))
+}
+
+fn published_count(run: &mut ArmRun) -> usize {
+    let mut host = run.vm.host_context();
+    heap::pending_finalizer_published_count(&mut host)
+        .unwrap_or_else(|error| panic!("published count: {error:?}"))
+}
+
+fn published_pending_flag(run: &mut ArmRun, userdata: UserdataRef) -> bool {
+    heap_query(&mut run.vm, |heap| heap.slot_pending_finalizer(userdata))
+}
+
+fn published_settled_flag(run: &mut ArmRun, userdata: UserdataRef) -> bool {
+    heap_query(&mut run.vm, |heap| heap.slot_finalizer_settled(userdata))
+}
+
+fn published_slot_generation(run: &mut ArmRun, userdata: UserdataRef) -> u32 {
+    heap_query(&mut run.vm, |heap| {
+        heap.slot_generation(userdata.slot())
+            .ok_or(heap::HeapError::StaleHandle)
+    })
+}
+
+/// The two static Calls owned by the parent and its one dynamic
+/// `CallValue(2)`, in compiled program order: read-only seam, exclusive
+/// commit, then the parent's own call.
+fn published_parent_sites(run: &ArmRun) -> (usize, usize, usize) {
+    let parent = run
+        .mark("parent-enter")
+        .last_prototype
+        .unwrap_or_else(|| panic!("{}: the parent frame has no prototype", run.arm.label()));
+    let admits: Vec<_> = run
+        .host_call_sites
+        .iter()
+        .filter(|(_, _, owner)| *owner == Some(parent))
+        .collect();
+    assert_eq!(
+        admits.len(),
+        1,
+        "{}: expected one admit Call owned by the parent, saw {:?}",
+        run.arm.label(),
+        run.host_call_sites
+    );
+    assert_eq!(admits[0].1, 3, "{}: the seam Call arity", run.arm.label());
+    let commits: Vec<_> = run
+        .commit_call_sites
+        .iter()
+        .filter(|(_, _, owner)| *owner == Some(parent))
+        .collect();
+    assert_eq!(
+        commits.len(),
+        1,
+        "{}: expected one commit Call owned by the parent, saw {:?}",
+        run.arm.label(),
+        run.commit_call_sites
+    );
+    assert_eq!(
+        commits[0].1,
+        3,
+        "{}: the commit Call arity",
+        run.arm.label()
+    );
+    let calls: Vec<_> = run
+        .call_sites
+        .iter()
+        .filter(|site| site.owner == Some(parent) && site.argc == CALL_ARGC)
+        .collect();
+    assert_eq!(
+        calls.len(),
+        1,
+        "{}: expected one CallValue(2) owned by the parent, saw {:?}",
+        run.arm.label(),
+        run.call_sites
+    );
+    assert!(
+        admits[0].0 < commits[0].0,
+        "{}: the read-only seam must precede the exclusive commit",
+        run.arm.label()
+    );
+    assert!(
+        commits[0].0 < calls[0].ip,
+        "{}: the exclusive commit must precede CallValue(2)",
+        run.arm.label()
+    );
+    (admits[0].0, commits[0].0, calls[0].ip)
+}
+
+fn assert_published_import(run: &ArmRun) {
+    let label = run.arm.label();
+    let catalog = transport_catalog();
+    let function = catalog
+        .function(COMMIT_IMPORT)
+        .unwrap_or_else(|| panic!("{label}: the catalog is missing '{COMMIT_IMPORT}'"));
+    assert_eq!(
+        function,
+        &commit_import_schema(),
+        "{label}: the live catalog install"
+    );
+    let expected = HostImportSchema::from_function(catalog, function);
+    assert_eq!(
+        expected.fingerprint,
+        catalog.fingerprint(),
+        "{label}: the catalog fingerprint"
+    );
+    let index = run
+        .host_imports
+        .iter()
+        .position(|import| import.name == COMMIT_IMPORT)
+        .unwrap_or_else(|| panic!("{label}: '{COMMIT_IMPORT}' is not a compiled import"));
+    assert_eq!(
+        run.host_imports[index].arity, 3,
+        "{label}: the commit import arity"
+    );
+    assert_eq!(
+        run.host_imports[index].return_type,
+        vm::ValueType::Bool,
+        "{label}: the commit import's coarse return"
+    );
+    let schema = run.host_schemas[index]
+        .as_ref()
+        .unwrap_or_else(|| panic!("{label}: the commit import must carry its full schema"));
+    assert_eq!(
+        schema, &expected,
+        "{label}: the program must carry the complete catalog schema and fingerprint"
+    );
+    let patch = run
+        .patch
+        .commit
+        .as_ref()
+        .unwrap_or_else(|| panic!("{label}: the commit seam was not inserted"));
+    assert_eq!(
+        patch.import_index, index as u16,
+        "{label}: the commit import slot"
+    );
+    assert_eq!(
+        patch.resolution.name, COMMIT_IMPORT,
+        "{label}: the resolved commit name"
+    );
+    assert_eq!(
+        patch.resolution.passing,
+        [
+            HostParamPassing::Borrow,
+            HostParamPassing::Value,
+            HostParamPassing::Borrow,
+        ],
+        "{label}: the commit resolution's passing modes"
+    );
+    assert_eq!(
+        patch.resolution.host_params,
+        [
+            typed_host_callable_schema(),
+            HostTypeSchema::Array(Box::new(HostTypeSchema::Int)),
+            HostTypeSchema::Resource(LuaUserdataResource::key()),
+        ],
+        "{label}: the commit resolution's concrete operand schemas"
+    );
+    assert_eq!(
+        patch.resolution.host_return_type,
+        HostTypeSchema::Bool,
+        "{label}: the commit resolution's return"
+    );
+    assert_eq!(
+        patch.resolution.fingerprint,
+        catalog.fingerprint(),
+        "{label}: the commit resolution fingerprint"
+    );
+    assert_eq!(
+        Some(patch.typed_local),
+        run.patch.typed_local,
+        "{label}: the commit and the call must share the typed local"
+    );
+    let call = run
+        .patch
+        .call
+        .as_ref()
+        .unwrap_or_else(|| panic!("{label}: the dynamic call was not patched"));
+    assert_eq!(
+        call.typed_callee, patch.typed_local,
+        "{label}: CallValue must use the typed local the commit reviewed"
+    );
+    assert_eq!(
+        run.patch.parent_parameters.len(),
+        PUBLISHED_PARENT_PARAMS,
+        "{label}: the published parent parameter list"
+    );
+    let gate = run
+        .patch
+        .gate
+        .as_ref()
+        .unwrap_or_else(|| panic!("{label}: the read-only seam was not inserted"));
+    assert_eq!(
+        gate.resolution.passing,
+        [
+            HostParamPassing::Borrow,
+            HostParamPassing::Value,
+            HostParamPassing::Borrow,
+        ],
+        "{label}: the read-only seam's Borrow/Value/Borrow transport"
+    );
+    assert!(
+        gate.result_slot != patch.result_slot,
+        "{label}: the two static results must be distinct locals"
+    );
+    assert!(
+        run.patch.sentinel_bind.is_some() && run.patch.sentinel_wrong.is_some(),
+        "{label}: the plugin must add the chunk-level bind and wrong-token calls"
+    );
+}
+
+fn assert_published_positive(run: &mut ArmRun) {
+    run.assert_fuel();
+    assert_published_import(run);
+    assert!(
+        matches!(run.status, Ok(VmStatus::Halted)),
+        "published-commit: the parent must run to a normal halt, got {:?}",
+        run.status
+    );
+    assert_eq!(
+        run.labels(),
+        ["parent-enter", "target-enter", "parent-after", "done"],
+        "published-commit: the child must run between the parent's markers"
+    );
+    let values = run.exit().unwrap_or_else(|| {
+        panic!(
+            "published-commit: expected a chunk completion, got {:?}",
+            run.status
+        )
+    });
+    assert_eq!(
+        values.len(),
+        3,
+        "published-commit: [true] plus the parent result and receiver"
+    );
+    assert_eq!(values[0], Value::Bool(true));
+    assert_eq!(
+        values[1],
+        Value::Bool(true),
+        "published-commit: the parent result"
+    );
+    let receiver_value = &values[2];
+
+    let pick = run.pick().clone();
+    assert!(
+        pick.chosen_is_target,
+        "published-commit: note must return the exact written target Arc"
+    );
+    let prepared = published_prepared(run).clone();
+    let prepared_closure = prepared
+        .call_closure
+        .expect("published-commit: bind must install the raw __call");
+    assert_eq!(
+        prepared.published_count, 2,
+        "published-commit: both selected userdata are a published prefix"
+    );
+    assert_eq!(
+        prepared.queue_len, 2,
+        "published-commit: both records are queued"
+    );
+    assert_ne!(
+        prepared.userdata, prepared.successor,
+        "published-commit: A and B are distinct objects"
+    );
+    assert!(
+        same_array(
+            receiver_value,
+            &run.witness.issued_table.clone().expect("issued receiver")
+        ),
+        "published-commit: the chunk returned the exact issued receiver carrier"
+    );
+
+    let commit = published_commit(run).clone();
+    assert!(
+        same_callable(&commit.callable, &pick.chosen),
+        "published-commit: the commit operand must be the exact note Arc"
+    );
+    assert!(
+        same_array(&commit.receiver, receiver_value),
+        "published-commit: the commit receiver must be the exact issued carrier"
+    );
+    assert_eq!(
+        commit.receiver_class,
+        GuestClass::Table(prepared.receiver),
+        "published-commit: the live heap must classify the receiver as the action receiver"
+    );
+    assert_eq!(
+        commit.token_raw, prepared.userdata_raw,
+        "published-commit: the commit receives A's real token"
+    );
+    assert_eq!(
+        commit.payload_parts,
+        Some((
+            prepared.userdata.domain(),
+            prepared.userdata.slot(),
+            prepared.userdata.generation(),
+        )),
+        "published-commit: the Core payload must name A"
+    );
+    assert!(
+        commit.payload_is_head,
+        "published-commit: the typed payload owner must be the published head"
+    );
+    assert!(
+        commit.weak_matches_callable,
+        "published-commit: the snapshot Weak must name the operand Arc"
+    );
+    assert_eq!(
+        commit.head_parts,
+        (
+            prepared.userdata.domain(),
+            prepared.userdata.slot(),
+            prepared.userdata.generation(),
+        ),
+        "published-commit: the snapshot head is A"
+    );
+    assert_eq!(
+        commit.head_raw, prepared.userdata_raw,
+        "published-commit: the snapshot head token is A's real token"
+    );
+    assert_eq!(
+        commit.metatable_parts,
+        (
+            prepared.finalizer_metatable.domain(),
+            prepared.finalizer_metatable.slot(),
+            prepared.finalizer_metatable.generation(),
+        ),
+        "published-commit: the snapshot metatable is A's finalizer metatable"
+    );
+    assert_eq!(
+        commit.published_before, 2,
+        "published-commit: the commit starts from a two-record prefix"
+    );
+    assert_eq!(
+        commit.queue_before, 2,
+        "published-commit: the commit starts from a two-record queue"
+    );
+    assert_eq!(
+        commit.action_receiver,
+        (
+            prepared.receiver.domain(),
+            prepared.receiver.slot(),
+            prepared.receiver.generation(),
+        ),
+        "published-commit: the raw __gc action names the issued receiver"
+    );
+    assert_eq!(
+        commit.action_closure,
+        (
+            prepared_closure.domain(),
+            prepared_closure.slot(),
+            prepared_closure.generation(),
+        ),
+        "published-commit: the raw __call action names the installed closure"
+    );
+    let (frame, roots) = commit
+        .outcome
+        .as_ref()
+        .unwrap_or_else(|error| panic!("published-commit: the commit refused: {error}"));
+    assert_eq!(*roots, 3, "published-commit: three roots written");
+    assert_eq!(
+        commit.taken_userdata,
+        Some(prepared.userdata),
+        "published-commit: the committed object is A"
+    );
+
+    let (admit_ip, commit_ip, call_ip) = published_parent_sites(run);
+    let parent = run.mark("parent-enter");
+    let entries = commit_entries(run);
+    assert_eq!(
+        entries.len(),
+        1,
+        "published-commit: exactly one raw commit entry"
+    );
+    let entry = entries[0];
+    assert_eq!(
+        (entry.frame_len, entry.prototype_id, entry.parent_prototype),
+        (
+            parent.frame_len,
+            parent.last_prototype,
+            parent.parent_prototype
+        ),
+        "published-commit: the commit body must run in the active parent frame"
+    );
+
+    // The child entry carries the same two actual slots, and the parent
+    // continuation re-borrows the same token after one script call.
+    let target_id = callable_id(&pick.chosen);
+    let callee = run
+        .witness
+        .marks
+        .iter()
+        .find_map(|mark| mark.callee.as_ref())
+        .expect("published-commit: the child frame must be observed");
+    assert_eq!(callee.prototype_id, target_id);
+    assert_eq!(
+        callee.parameter_values.first().cloned().flatten(),
+        Some(commit.receiver.clone()),
+        "published-commit: the child receiver slot reuses the commit operand"
+    );
+    assert_eq!(
+        callee.parameter_values.get(1).cloned().flatten(),
+        Some(Value::Int(commit.token_raw)),
+        "published-commit: the child token slot reuses the commit operand"
+    );
+    assert_eq!(
+        callee.token.parts,
+        (
+            prepared.userdata.domain(),
+            prepared.userdata.slot(),
+            prepared.userdata.generation(),
+        ),
+        "published-commit: the child formal token borrows A"
+    );
+    assert_eq!(
+        callee.token.rebound_parts, callee.token.parts,
+        "published-commit: the heap still names the same payload"
+    );
+    assert!(
+        callee.table_token_refused,
+        "published-commit: A's token is not a lua.table resource"
+    );
+    let continuation = run
+        .mark("parent-after")
+        .continuation
+        .as_ref()
+        .expect("published-commit: the parent continuation must re-borrow the token");
+    assert_eq!(
+        continuation.parts, callee.token.parts,
+        "published-commit: the continuation reads the same A token"
+    );
+    let callback_entry = run
+        .witness
+        .entries
+        .iter()
+        .find(|entry| entry.label == "target-enter")
+        .expect("published-commit: the child entry must be recorded first");
+    let child_return_ip = run
+        .mark("target-enter")
+        .last_return_ip
+        .expect("published-commit: the child frame must resume bytecode");
+    assert_eq!(
+        callback_entry.return_ip,
+        Some(child_return_ip),
+        "published-commit: the child entry resume address is the real call"
+    );
+    let call_site = run
+        .call_sites
+        .iter()
+        .find(|site| site.owner == parent.last_prototype && site.argc == CALL_ARGC)
+        .expect("published-commit: the parent CallValue(2)");
+    assert_eq!(
+        child_return_ip, call_site.return_ip,
+        "published-commit: the child resumes at the compiled call's return address"
+    );
+
+    // After the pop, B is still the true published head with its own exact
+    // identity and the same raw action.
+    assert_eq!(
+        published_pending(run),
+        vec![(
+            u64::try_from(prepared.successor_raw).expect("successor token"),
+            prepared.successor.slot(),
+            prepared.successor.generation(),
+        )],
+        "published-commit: only B remains queued"
+    );
+    assert_eq!(published_count(run), 1);
+    assert!(
+        published_pending_flag(run, prepared.successor)
+            && !published_settled_flag(run, prepared.successor),
+        "published-commit: B is still pending and not settled"
+    );
+    assert!(
+        !published_pending_flag(run, prepared.userdata)
+            && published_settled_flag(run, prepared.userdata),
+        "published-commit: A is settled exactly once"
+    );
+    assert_eq!(
+        heap_query(&mut run.vm, |heap| heap
+            .userdata_metatable(prepared.successor)),
+        Some(prepared.finalizer_metatable),
+        "published-commit: B keeps the same finalizer metatable"
+    );
+    let next = {
+        let mut host = run.vm.host_context();
+        snapshot_published_typed_table_call(&mut host)
+            .unwrap_or_else(|error| panic!("published-commit: B snapshot: {error:?}"))
+    };
+    assert_eq!(
+        next.userdata, prepared.successor,
+        "published-commit: B is the real published front"
+    );
+    assert_eq!(
+        next.raw_token,
+        u64::try_from(prepared.successor_raw).expect("successor token")
+    );
+    assert_eq!(next.receiver, prepared.receiver);
+    assert_eq!(next.closure, prepared_closure);
+    eprintln!(
+        "LUA_TYPED_RESOURCE arm=published-commit admit_ip={admit_ip} commit_ip={commit_ip} call_ip={call_ip} head=A successor=B roots={roots}"
+    );
+
+    // The three written roots of the commit frame, and only those, are
+    // present before withdrawal.
+    let mut host = run.vm.host_context();
+    assert_eq!(
+        heap::rooted_userdata(&mut host, *frame, 0),
+        Ok(Some(prepared.userdata))
+    );
+    assert_eq!(
+        heap::rooted_closure(&mut host, *frame, 1),
+        Ok(Some(prepared_closure))
+    );
+    assert_eq!(
+        heap::rooted_table(&mut host, *frame, 2),
+        Ok(Some(prepared.receiver))
+    );
+    let prepare_frame = prepared.root_frame;
+    assert_eq!(
+        heap::rooted_table(&mut host, prepare_frame, 1),
+        Ok(Some(prepared.receiver))
+    );
+    assert_eq!(
+        heap::rooted_table(&mut host, prepare_frame, 2),
+        Ok(Some(prepared.sentinel))
+    );
+    assert_eq!(
+        heap::rooted_table(&mut host, prepare_frame, 0),
+        Ok(Some(prepared.weak_table))
+    );
+    for slot in [0u32, 1, 2] {
+        heap::with_heap(&mut host, |heap| heap.clear_root(*frame, slot))
+            .unwrap_or_else(|error| panic!("published-commit: clear root: {error:?}"));
+    }
+    // Only the commit's three roots are withdrawn: the independent prepare
+    // frame roots still name their exact tables.
+    assert_eq!(
+        heap::rooted_table(&mut host, prepare_frame, 1),
+        Ok(Some(prepared.receiver))
+    );
+    assert_eq!(
+        heap::rooted_table(&mut host, prepare_frame, 2),
+        Ok(Some(prepared.sentinel))
+    );
+    assert_eq!(heap::rooted_userdata(&mut host, *frame, 0), Ok(None));
+    let _ = heap::collect(&mut host).expect("published-commit: real collection");
+    let _ = host;
+
+    // A's exact generation and token retire before reset; B and the
+    // independent root survive.
+    assert!(
+        !published_userdata_alive(run, prepared.userdata),
+        "published-commit: A is collected after its three roots are withdrawn"
+    );
+    assert!(
+        !published_token_open(run, prepared.userdata_raw),
+        "published-commit: A's Core token is retired"
+    );
+    assert_eq!(
+        published_slot_generation(run, prepared.userdata),
+        prepared.userdata.generation() + 1,
+        "published-commit: A's slot advances exactly one generation"
+    );
+    assert!(
+        published_userdata_alive(run, prepared.successor),
+        "published-commit: the queued B stays alive"
+    );
+    assert!(
+        published_token_open(run, prepared.successor_raw),
+        "published-commit: B's typed token stays open"
+    );
+    assert_eq!(
+        published_slot_generation(run, prepared.successor),
+        prepared.successor.generation(),
+        "published-commit: B does not advance its generation"
+    );
+    assert_eq!(
+        published_pending(run),
+        vec![(
+            u64::try_from(prepared.successor_raw).expect("successor token"),
+            prepared.successor.slot(),
+            prepared.successor.generation(),
+        )],
+        "published-commit: the collection does not consume B"
+    );
+    assert_eq!(published_count(run), 1);
+    assert!(
+        heap_query(&mut run.vm, |heap| Ok(heap.alive(prepared.sentinel))),
+        "published-commit: the independent sentinel root stays readable"
+    );
+    assert!(
+        heap_query(&mut run.vm, |heap| Ok(heap.alive(prepared.receiver))),
+        "published-commit: the receiver stays readable through its independent root and B"
+    );
+    assert!(
+        heap_query(&mut run.vm, |heap| Ok(heap.alive(prepared.weak_table))),
+        "published-commit: the still-rooted weak witness table stays"
+    );
+}
+
+fn published_userdata_alive(run: &mut ArmRun, userdata: UserdataRef) -> bool {
+    heap_query(&mut run.vm, |heap| Ok(heap.userdata_alive(userdata)))
+}
+
+fn published_token_open(run: &mut ArmRun, raw: i64) -> bool {
+    let Ok(raw) = u64::try_from(raw) else {
+        return false;
+    };
+    let Ok(handle) = ResourceHandle::from_raw(raw) else {
+        return false;
+    };
+    let host = run.vm.host_context();
+    host.typed_resource_with_key::<LuaUserdataResource>(handle, &LuaUserdataResource::key())
+        .is_ok()
+}
+
+fn assert_published_queue_intact(run: &mut ArmRun) {
+    let prepared = published_prepared(run).clone();
+    assert_eq!(
+        published_pending(run),
+        vec![
+            (
+                u64::try_from(prepared.userdata_raw).expect("A token"),
+                prepared.userdata.slot(),
+                prepared.userdata.generation(),
+            ),
+            (
+                u64::try_from(prepared.successor_raw).expect("B token"),
+                prepared.successor.slot(),
+                prepared.successor.generation(),
+            ),
+        ],
+        "{}: the refused commit must leave A then B queued",
+        run.arm.label()
+    );
+    assert_eq!(published_count(run), 2);
+    assert!(
+        published_pending_flag(run, prepared.userdata)
+            && !published_settled_flag(run, prepared.userdata),
+        "{}: A stays pending and unsettled",
+        run.arm.label()
+    );
+    assert!(
+        published_pending_flag(run, prepared.successor)
+            && !published_settled_flag(run, prepared.successor),
+        "{}: B stays pending and unsettled",
+        run.arm.label()
+    );
+    let mut host = run.vm.host_context();
+    assert_eq!(
+        heap::rooted_table(&mut host, prepared.root_frame, 1),
+        Ok(Some(prepared.receiver)),
+        "{}: the independent receiver root is unchanged",
+        run.arm.label()
+    );
+    assert_eq!(
+        heap::rooted_table(&mut host, prepared.root_frame, 2),
+        Ok(Some(prepared.sentinel)),
+        "{}: the independent sentinel root is unchanged",
+        run.arm.label()
+    );
+}
+
+fn assert_commit_refusal(
+    run: &ArmRun,
+    needle: &str,
+    expected_class: GuestClass,
+    expected_payload_is_head: bool,
+    expected_weak_match: bool,
+) {
+    run.assert_fuel();
+    assert_published_import(run);
+    let message = match &run.status {
+        Err(VmError::HostError(message)) => message.clone(),
+        other => panic!(
+            "{}: expected the typed commit body's HostError, got {other:?}",
+            run.arm.label()
+        ),
+    };
+    assert!(
+        message.starts_with(COMMIT_REFUSAL_PREFIX),
+        "{}: the diagnostic must come from the commit body: {message}",
+        run.arm.label()
+    );
+    assert!(
+        message.contains(needle),
+        "{}: expected '{needle}' in the commit diagnostic: {message}",
+        run.arm.label()
+    );
+    assert_eq!(
+        run.labels(),
+        ["parent-enter"],
+        "{}: the parent must stop at the exclusive commit",
+        run.arm.label()
+    );
+    assert_eq!(
+        typed_callback_entries(run).len(),
+        0,
+        "{}: no typed child frame may start",
+        run.arm.label()
+    );
+    assert!(
+        run.exit().is_none(),
+        "{}: the refused run has no chunk completion",
+        run.arm.label()
+    );
+    let prepared = published_prepared(run);
+    let commit = published_commit(run);
+    assert_eq!(
+        commit.receiver_class,
+        expected_class,
+        "{}: the actual receiver operand classification",
+        run.arm.label()
+    );
+    assert_eq!(
+        commit.payload_is_head,
+        expected_payload_is_head,
+        "{}: the typed payload owner relation",
+        run.arm.label()
+    );
+    assert_eq!(
+        commit.weak_matches_callable,
+        expected_weak_match,
+        "{}: the Weak credential relation to the actual operand Arc",
+        run.arm.label()
+    );
+    assert!(
+        commit.outcome.is_err(),
+        "{}: the exclusive commit must refuse",
+        run.arm.label()
+    );
+    assert!(
+        commit.taken_userdata.is_none(),
+        "{}: a refusal consumes nothing",
+        run.arm.label()
+    );
+    let parent = run.mark("parent-enter");
+    let entries = commit_entries(run);
+    assert_eq!(
+        entries.len(),
+        1,
+        "{}: exactly one raw commit entry",
+        run.arm.label()
+    );
+    let entry = entries[0];
+    assert_eq!(
+        (entry.frame_len, entry.prototype_id, entry.parent_prototype),
+        (
+            parent.frame_len,
+            parent.last_prototype,
+            parent.parent_prototype
+        ),
+        "{}: the commit body runs in the active parent frame",
+        run.arm.label()
+    );
+    let _ = prepared;
+}
+
+/// Re-takes the real credentials in this same VM, proves the commit entry
+/// refuses a missing typed payload and a real lua.table key, then commits A
+/// with the same callable Arc and receiver.
+fn retry_published_commit(run: &mut ArmRun, restore_old_closure: bool) {
+    let prepared = published_prepared(run).clone();
+    let prepared_closure = prepared
+        .call_closure
+        .expect("the bind import must install the raw __call");
+    let pick = run.pick();
+    let Value::Callable(target_arc) = &pick.chosen else {
+        panic!("{}: the picked token is not callable", run.arm.label());
+    };
+    let target_arc = Arc::clone(target_arc);
+    let receiver_value = run
+        .witness
+        .issued_table
+        .clone()
+        .expect("the issued receiver carrier");
+    let mut host = run.vm.host_context();
+    if restore_old_closure {
+        assert!(
+            heap::with_heap(&mut host, |heap| Ok(heap.closure_alive(prepared_closure)))
+                .unwrap_or_else(|error| panic!("closure liveness: {error:?}")),
+            "{}: the original closure generation is still live before restore",
+            run.arm.label()
+        );
+        heap::with_heap(&mut host, |heap| {
+            heap.set_named_closure(prepared.receiver_metatable, "__call", prepared_closure)
+        })
+        .unwrap_or_else(|error| panic!("{}: restore raw __call: {error:?}", run.arm.label()));
+    }
+    let snapshot = snapshot_published_typed_table_call(&mut host)
+        .unwrap_or_else(|error| panic!("{}: retry snapshot: {error:?}", run.arm.label()));
+    assert_eq!(snapshot.userdata, prepared.userdata);
+    assert_eq!(snapshot.receiver, prepared.receiver);
+    assert_eq!(snapshot.closure, prepared_closure);
+    let payload = {
+        let raw = u64::try_from(prepared.userdata_raw).expect("A token");
+        let handle = ResourceHandle::from_raw(raw).expect("A handle");
+        let borrowed = host
+            .borrow_resource_with_key::<LuaUserdataResource>(handle, &LuaUserdataResource::key())
+            .unwrap_or_else(|error| panic!("{}: A borrow: {error}", run.arm.label()));
+        borrowed.get().userdata()
+    };
+    assert_eq!(payload, prepared.userdata);
+
+    // A real lua.table token does not pass the lua.userdata key, and A's real
+    // token does not pass the lua.table key. The commit entry with no typed
+    // payload refuses before any write.
+    let table_token = heap::publish(&mut host).expect("a real lua.table token");
+    let Value::Int(table_raw) = table_token else {
+        panic!("{}: the fresh table token is not a handle", run.arm.label());
+    };
+    let table_handle = ResourceHandle::from_raw(u64::try_from(table_raw).expect("table token"))
+        .expect("table handle");
+    assert!(
+        host.borrow_resource_with_key::<LuaUserdataResource>(
+            table_handle,
+            &LuaUserdataResource::key()
+        )
+        .is_err(),
+        "{}: a lua.table token must not borrow as lua.userdata",
+        run.arm.label()
+    );
+    let a_handle = ResourceHandle::from_raw(u64::try_from(prepared.userdata_raw).expect("A token"))
+        .expect("A handle");
+    assert!(
+        host.borrow_resource_with_key::<LuaTableResource>(a_handle, &LuaTableResource::key())
+            .is_err(),
+        "{}: A's lua.userdata token must not borrow as lua.table",
+        run.arm.label()
+    );
+    let refused = commit_published_typed_table_call(
+        &mut host,
+        &target_arc,
+        None,
+        prepared.finalizer_metatable,
+        &receiver_value,
+        u64::try_from(prepared.userdata_raw).expect("A token"),
+    );
+    assert!(
+        matches!(refused, Err(heap::HeapError::TokenMismatch)),
+        "{}: the commit entry must refuse a missing typed payload, saw {refused:?}",
+        run.arm.label()
+    );
+    let after_refusal = heap::with_heap(&mut host, |heap| Ok(heap.pending_finalizer_records()))
+        .unwrap_or_else(|error| panic!("{}: pending read: {error:?}", run.arm.label()));
+    assert_eq!(
+        after_refusal,
+        vec![
+            (
+                u64::try_from(prepared.userdata_raw).expect("A token"),
+                prepared.userdata.slot(),
+                prepared.userdata.generation(),
+            ),
+            (
+                u64::try_from(prepared.successor_raw).expect("B token"),
+                prepared.successor.slot(),
+                prepared.successor.generation(),
+            ),
+        ],
+        "{}: the refused entry leaves the queue unchanged",
+        run.arm.label()
+    );
+    let (frame, taken) = commit_published_typed_table_call(
+        &mut host,
+        &target_arc,
+        Some(payload),
+        prepared.finalizer_metatable,
+        &receiver_value,
+        u64::try_from(prepared.userdata_raw).expect("A token"),
+    )
+    .unwrap_or_else(|error| panic!("{}: same-VM retry commit: {error:?}", run.arm.label()));
+    assert_eq!(taken.userdata, prepared.userdata);
+    assert_eq!(taken.roots_written, 3);
+    assert_eq!(
+        heap::rooted_userdata(&mut host, frame, 0),
+        Ok(Some(prepared.userdata))
+    );
+    assert_eq!(
+        heap::rooted_closure(&mut host, frame, 1),
+        Ok(Some(prepared_closure))
+    );
+    assert_eq!(
+        heap::rooted_table(&mut host, frame, 2),
+        Ok(Some(prepared.receiver))
+    );
+    let _ = host;
+    assert_eq!(
+        published_pending(run),
+        vec![(
+            u64::try_from(prepared.successor_raw).expect("B token"),
+            prepared.successor.slot(),
+            prepared.successor.generation(),
+        )],
+        "{}: the retry consumes exactly A",
+        run.arm.label()
+    );
+    assert_eq!(published_count(run), 1);
+    assert!(
+        published_pending_flag(run, prepared.successor)
+            && !published_settled_flag(run, prepared.successor),
+        "{}: B is still the pending head after the retry",
+        run.arm.label()
+    );
+    let mut host = run.vm.host_context();
+    let _ = heap::collect(&mut host).expect("retry cleanup collection");
+}
+
+#[test]
+fn active_parent_commits_the_published_typed_head_before_the_same_slot_call() {
+    let mut run = run_arm(Arm::PublishedCommit);
+    assert_eq!(
+        run.patch.commit.as_ref().map(|commit| commit.argument),
+        Some(CommitArgument::Argument),
+        "published-commit: the positive arm passes the head's real token"
+    );
+    assert_published_positive(&mut run);
+}
+
+#[test]
+fn typed_published_commit_refuses_wrong_operands_without_consuming_the_head() {
+    let mut other_owner = run_arm(Arm::PublishedCommitOtherOwner);
+    assert_eq!(
+        other_owner
+            .patch
+            .commit
+            .as_ref()
+            .map(|commit| commit.argument),
+        Some(CommitArgument::Wrong),
+        "other-owner: the commit operands select the successor token"
+    );
+    let prepared = published_prepared(&other_owner).clone();
+    assert_commit_refusal(
+        &other_owner,
+        "TokenMismatch",
+        GuestClass::Table(prepared.receiver),
+        false,
+        true,
+    );
+    let commit = published_commit(&other_owner);
+    assert_eq!(
+        commit.token_raw, prepared.successor_raw,
+        "other-owner: the actual token is the queued successor's"
+    );
+    assert_eq!(
+        commit.payload_parts,
+        Some((
+            prepared.successor.domain(),
+            prepared.successor.slot(),
+            prepared.successor.generation(),
+        )),
+        "other-owner: the Core payload is B, a legal lua.userdata for another object"
+    );
+    assert!(
+        commit.token_raw != prepared.userdata_raw,
+        "other-owner: the token differs from the head's real token"
+    );
+    assert_published_queue_intact(&mut other_owner);
+    retry_published_commit(&mut other_owner, false);
+
+    let mut forged = run_arm(Arm::PublishedCommitUnissuedReceiver);
+    assert_eq!(
+        forged.patch.commit.as_ref().map(|commit| commit.argument),
+        Some(CommitArgument::ForgedArgument),
+        "unissued receiver: the commit operands select the forged receiver"
+    );
+    assert_commit_refusal(&forged, "WrongKind", GuestClass::Unissued, true, true);
+    let commit = published_commit(&forged);
+    let Value::Array(forged_items) = &commit.receiver else {
+        panic!("unissued receiver: the operand must be an array");
+    };
+    let Value::Array(issued_items) = &forged
+        .witness
+        .issued_table
+        .clone()
+        .expect("issued receiver")
+    else {
+        panic!("unissued receiver: the issued value must be an array");
+    };
+    assert_eq!(
+        forged_items.as_slice(),
+        issued_items.as_slice(),
+        "unissued receiver: the copy has the issued values"
+    );
+    assert!(
+        !same_array(&commit.receiver, &Value::Array(Arc::clone(issued_items))),
+        "unissued receiver: the copy is a different VM array object"
+    );
+    assert_published_queue_intact(&mut forged);
+    retry_published_commit(&mut forged, false);
+
+    let mut changed = run_arm(Arm::PublishedCommitRawArcChanged);
+    let prepared = published_prepared(&changed).clone();
+    let prepared_closure = prepared
+        .call_closure
+        .expect("raw-arc-changed: bind must install the raw __call");
+    assert_commit_refusal(
+        &changed,
+        "TokenMismatch",
+        GuestClass::Table(prepared.receiver),
+        true,
+        false,
+    );
+    let commit = published_commit(&changed).clone();
+    let current = heap_query(&mut changed.vm, |heap| {
+        heap.named_closure_edge(prepared.receiver_metatable, "__call")
+    });
+    assert_ne!(
+        current, prepared_closure,
+        "raw-arc-changed: the guest swap replaced the raw __call generation"
+    );
+    assert_eq!(
+        commit.action_closure,
+        (current.domain(), current.slot(), current.generation()),
+        "raw-arc-changed: the commit re-read the replacement generation"
+    );
+    assert!(
+        heap_query(&mut changed.vm, |heap| Ok(
+            heap.closure_alive(prepared_closure)
+        )),
+        "raw-arc-changed: the pre-swap generation is still live before restore"
+    );
+    assert!(
+        heap_query(&mut changed.vm, |heap| Ok(heap.closure_alive(current))),
+        "raw-arc-changed: the replacement generation is live"
+    );
+    assert_published_queue_intact(&mut changed);
+    retry_published_commit(&mut changed, true);
 }
