@@ -283,6 +283,17 @@ struct Slot {
     /// value-dead for weak-value publication and for a hash value of a
     /// `k`-only weak table. Release and slot reuse clear the flag.
     finalizer_settled: bool,
+    /// Previous node in this heap's live-userdata chain, with its exact
+    /// generation. `None` at the head and for a slot that is not linked.
+    live_userdata_prev: Option<(u32, u32)>,
+    /// Next node in this heap's live-userdata chain, with its exact
+    /// generation. `None` at the tail and for a slot that is not linked.
+    live_userdata_next: Option<(u32, u32)>,
+    /// This slot is linked in the live-userdata chain at its current
+    /// generation. A new userdata links at the head; a release unlinks in
+    /// constant work before the generation advances. Every other kind is
+    /// false.
+    live_userdata_linked: bool,
     /// Next slot in the current selecting pass's settlement journal, if this
     /// slot is a journal node. The links live on the slots, so one settlement
     /// is a constant number of slot writes and never grows or copies a vector.
@@ -837,8 +848,10 @@ pub struct ScanMeter {
     /// Deferred owner checks and edge writes consumed after every parse.
     pub mode_late_deferred: u64,
     /// Live slot records read by the private pending-finalizer selection scan.
-    /// One per slot in the separate selection phase; a slot that cannot be
-    /// selected still counts. Not charged by an ordinary collection.
+    /// One per live-userdata chain node in the separate selection phase; a
+    /// node that cannot be selected still counts, while a table, closure,
+    /// cell, free slot, and retired slot is never read by this walk. Not
+    /// charged by an ordinary collection.
     pub pending_finalizer_scan_slots: u64,
     /// Userdata slots newly retained by the private pending-finalizer
     /// selection. One per record appended; an already pending userdata or a
@@ -1034,6 +1047,14 @@ pub struct LuaHeap {
     /// [`PendingQueue`]'s counted boundary, including the test-only release
     /// meter. No call site counts by hand.
     pending_finalizers: PendingQueue,
+    /// Head and tail of the intrusive live-userdata chain, with the exact
+    /// generation of each endpoint. A new userdata links at the head and a
+    /// release unlinks its own node in constant work. The chain is the
+    /// private pending selection order: allocation-reverse inside one cohort
+    /// and no batch sort or vector rebuild. Release reads only the released
+    /// slot's own links; it does not walk this chain.
+    live_userdata_head: Option<(u32, u32)>,
+    live_userdata_tail: Option<(u32, u32)>,
     /// Head and length of the current selecting pass's settlement journal.
     ///
     /// Each node is a live userdata slot whose `settlement_next` links the
@@ -1066,6 +1087,12 @@ pub struct LuaHeap {
     /// adds none. The pairs are `(metatable_slot, edge_record_index)`.
     #[cfg(test)]
     pending_gc_edge_trace: std::cell::RefCell<Vec<(u32, u32)>>,
+    /// Test-only: live-userdata chain nodes read by the private selection, in
+    /// visit order. Each entry is one real slot-record read and the exact
+    /// generation the chain cursor named, so a test can distinguish a real
+    /// chain walk from a counter that merely reports the number of candidates.
+    #[cfg(test)]
+    pending_live_trace: std::cell::RefCell<Vec<(u32, u32)>>,
     /// Test-only: identities actually visited by a failed settlement
     /// journal rollback, in visit order. A successful pass and Release leave
     /// it empty, so the trace distinguishes precise cleanup from a drain
@@ -1120,12 +1147,11 @@ mod pending_queue {
     /// The queue is a `VecDeque`. Appending publishes nothing; a successful
     /// private collection stores `published = len` only after its real weak
     /// publication completed. The leading `published` records are then
-    /// consumable in the order the selecting scan offered them. That is the
-    /// only promise of this first slice: this representation scans ascending
-    /// slots, so the order is not LuaJIT's reverse allocation order and is not
-    /// a guest callback order. A front pop is O(1) in the stored-record count:
-    /// it reads the head record and moves one record, and it neither reads nor
-    /// shifts a successor.
+    /// consumable in the order the selecting scan offered them: the live
+    /// chain walks newest allocation first inside one cohort, and a later
+    /// cohort appends after every retained earlier record. A front pop is O(1)
+    /// in the stored-record count: it reads the head record and moves one
+    /// record, and it neither reads nor shifts a successor.
     ///
     /// Every read of a stored record goes through one of the accessors below,
     /// which is also the single place where the test-only read meter observes
@@ -1483,6 +1509,8 @@ impl LuaHeap {
             payload_bytes: 0,
             pending_userdata: None,
             pending_finalizers: PendingQueue::default(),
+            live_userdata_head: None,
+            live_userdata_tail: None,
             settlement_head: None,
             #[cfg(test)]
             settlement_journal_len: 0,
@@ -1492,6 +1520,8 @@ impl LuaHeap {
             selection_slot_trace: std::cell::RefCell::new(Vec::new()),
             #[cfg(test)]
             pending_gc_edge_trace: std::cell::RefCell::new(Vec::new()),
+            #[cfg(test)]
+            pending_live_trace: std::cell::RefCell::new(Vec::new()),
             #[cfg(test)]
             settlement_journal_trace: std::cell::RefCell::new(Vec::new()),
             #[cfg(test)]
@@ -1557,6 +1587,7 @@ impl LuaHeap {
             self.deny_unbarriered()?;
         }
         let (index, generation) = self.alloc_slot(HandleKind::Userdata)?;
+        self.link_live_userdata_head(index, generation);
         Ok(UserdataRef::userdata(self.domain, index, generation))
     }
 
@@ -1588,6 +1619,9 @@ impl LuaHeap {
         slot.metatable = None;
         slot.pending_finalizer = false;
         slot.finalizer_settled = false;
+        slot.live_userdata_prev = None;
+        slot.live_userdata_next = None;
+        slot.live_userdata_linked = false;
         slot.settlement_next = None;
         slot.settlement_generation = 0;
         slot.pending_gc_generation = 0;
@@ -1636,6 +1670,9 @@ impl LuaHeap {
             metatable: None,
             pending_finalizer: false,
             finalizer_settled: false,
+            live_userdata_prev: None,
+            live_userdata_next: None,
+            live_userdata_linked: false,
             settlement_next: None,
             settlement_generation: 0,
             pending_gc_generation: 0,
@@ -3716,8 +3753,8 @@ impl LuaHeap {
         }
     }
 
-    /// Examines one slot for the private pending-finalizer selection, without
-    /// reading the metatable edge chain.
+    /// Examines one live-userdata chain node for the private pending-finalizer
+    /// selection, without reading the metatable edge chain.
     ///
     /// A candidate is a live, unmarked userdata that already published a
     /// typed Core token, is not pending or settled yet, and stores a live
@@ -4372,8 +4409,9 @@ impl LuaHeap {
     ///
     /// The host entry borrows each token with that raw and its concrete
     /// `lua.userdata` key before it closes any doomed token or publishes weak
-    /// edges. Order is the selection order, which is ascending slot order for
-    /// one cycle.
+    /// edges. Order is the live-userdata chain order: newest allocation first
+    /// inside one cohort, with each later cohort stored after the earlier
+    /// records that are still queued.
     pub(crate) fn pending_finalizer_records(&self) -> Vec<(u64, u32, u32)> {
         self.pending_finalizers
             .iter()
@@ -4930,6 +4968,46 @@ impl LuaHeap {
         self.pending_gc_edge_trace.borrow_mut().clear();
     }
 
+    /// Live-userdata chain nodes read by the private selection since the last
+    /// clear, as `(slot, generation)` in visit order. Test-only: each entry is
+    /// one real slot-record read, not a selected-record count.
+    #[cfg(test)]
+    pub(crate) fn pending_live_trace(&self) -> Vec<(u32, u32)> {
+        self.pending_live_trace.borrow().clone()
+    }
+
+    /// Clears the live-userdata chain-read trace. Test-only.
+    #[cfg(test)]
+    pub(crate) fn clear_pending_live_trace(&mut self) {
+        self.pending_live_trace.borrow_mut().clear();
+    }
+
+    /// Walks the live-userdata chain head to tail and asserts each link is
+    /// internally consistent at its exact generation. Test-only observation
+    /// for release, rollback, neighbour, and same-slot successor checks.
+    #[cfg(test)]
+    pub(crate) fn live_userdata_chain(&self) -> Vec<(u32, u32)> {
+        let mut chain = Vec::new();
+        let mut previous = None;
+        let mut cursor = self.live_userdata_head;
+        while let Some((index, generation)) = cursor {
+            let slot = self
+                .slots
+                .get(index as usize)
+                .expect("a live-userdata chain node names a slot");
+            assert_eq!(slot.generation, generation, "chain generation");
+            assert_eq!(slot.kind, HandleKind::Userdata, "chain node kind");
+            assert!(slot.live_userdata_linked, "chain node is linked");
+            assert_eq!(slot.live_userdata_prev, previous, "chain back link");
+            chain.push((index, generation));
+            previous = Some((index, generation));
+            cursor = slot.live_userdata_next;
+            assert!(chain.len() <= self.slots.len(), "chain must not cycle");
+        }
+        assert_eq!(previous, self.live_userdata_tail, "chain tail");
+        chain
+    }
+
     /// Identities currently linked in the settlement journal, from the head.
     /// Test-only: the walk observes membership and does not count as a
     /// rollback visit or as a successful-pass drain.
@@ -5109,7 +5187,97 @@ impl LuaHeap {
         session.into_snapshot()
     }
 
+    /// Links one freshly allocated userdata at the live-chain head.
+    ///
+    /// The caller has already committed the live slot at `generation`. The
+    /// append is four link writes and the two head/tail fields; it grows
+    /// nothing and moves no other node. A slot that is already linked is a
+    /// caller bug.
+    fn link_live_userdata_head(&mut self, index: u32, generation: u32) {
+        debug_assert_eq!(self.slots[index as usize].generation, generation);
+        debug_assert_eq!(self.slots[index as usize].kind, HandleKind::Userdata);
+        debug_assert!(matches!(
+            self.slots[index as usize].state,
+            SlotState::Live { .. }
+        ));
+        debug_assert!(!self.slots[index as usize].live_userdata_linked);
+        let head = self.live_userdata_head;
+        {
+            let slot = &mut self.slots[index as usize];
+            slot.live_userdata_prev = None;
+            slot.live_userdata_next = head;
+            slot.live_userdata_linked = true;
+        }
+        if let Some((head_index, head_generation)) = head {
+            let head_slot = &mut self.slots[head_index as usize];
+            debug_assert_eq!(head_slot.generation, head_generation);
+            debug_assert!(head_slot.live_userdata_linked);
+            debug_assert!(head_slot.live_userdata_prev.is_none());
+            head_slot.live_userdata_prev = Some((index, generation));
+        }
+        self.live_userdata_head = Some((index, generation));
+        if self.live_userdata_tail.is_none() {
+            self.live_userdata_tail = Some((index, generation));
+        }
+    }
+
+    /// Unlinks one live userdata from the chain in constant work.
+    ///
+    /// The links carry the exact generation of each neighbour, so a successor
+    /// generation cannot be reached through an old link. A slot that is not
+    /// linked is left alone: release of a table, closure, or cell does not
+    /// touch this chain. The head and tail updates are the same bounded
+    /// neighbour writes; no node is scanned, moved, or sorted.
+    fn unlink_live_userdata(&mut self, index: u32) {
+        if !self.slots[index as usize].live_userdata_linked {
+            return;
+        }
+        debug_assert_eq!(self.slots[index as usize].kind, HandleKind::Userdata);
+        let identity = (index, self.slots[index as usize].generation);
+        let prev = self.slots[index as usize].live_userdata_prev.take();
+        let next = self.slots[index as usize].live_userdata_next.take();
+        self.slots[index as usize].live_userdata_linked = false;
+        match prev {
+            Some((prev_index, prev_generation)) => {
+                let prev_slot = &mut self.slots[prev_index as usize];
+                debug_assert_eq!(prev_slot.generation, prev_generation);
+                debug_assert!(prev_slot.live_userdata_linked);
+                debug_assert_eq!(prev_slot.live_userdata_next, Some(identity));
+                prev_slot.live_userdata_next = next;
+            }
+            None => {
+                debug_assert_eq!(self.live_userdata_head, Some(identity));
+                self.live_userdata_head = next;
+            }
+        }
+        match next {
+            Some((next_index, next_generation)) => {
+                let next_slot = &mut self.slots[next_index as usize];
+                debug_assert_eq!(next_slot.generation, next_generation);
+                debug_assert!(next_slot.live_userdata_linked);
+                debug_assert_eq!(next_slot.live_userdata_prev, Some(identity));
+                next_slot.live_userdata_prev = prev;
+            }
+            None => {
+                debug_assert_eq!(self.live_userdata_tail, Some(identity));
+                self.live_userdata_tail = prev;
+            }
+        }
+    }
+
     fn release_slot(&mut self, index: u32) {
+        // A live userdata leaves the selection chain before the generation
+        // advances, the state becomes Free/Retired, or any field is cleared.
+        // The unlink is the released slot's own two neighbours and two links,
+        // never a walk of the chain and never a pending-queue read.
+        if self.slots[index as usize].kind == HandleKind::Userdata {
+            self.unlink_live_userdata(index);
+        } else {
+            debug_assert!(
+                !self.slots[index as usize].live_userdata_linked,
+                "a non-userdata slot cannot join the live-userdata chain"
+            );
+        }
         debug_assert!(
             self.slots[index as usize].edge_head.is_none()
                 && self.slots[index as usize].edge_tail.is_none(),

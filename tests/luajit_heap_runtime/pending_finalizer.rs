@@ -372,9 +372,8 @@ fn selected_userdata_keeps_token_and_metatable_graph_at_weak_publish() {
         let meter = heap::take_scan_meter(&mut host).expect("publish meter");
         assert_eq!(meter.pending_finalizers_selected, 1);
         assert_eq!(
-            meter.pending_finalizer_scan_slots,
-            u64::from(heap::stats(&mut host).expect("slot storage").node_slots),
-            "the selection scan reads every slot record once"
+            meter.pending_finalizer_scan_slots, 1,
+            "the selection scan reads only the one live userdata chain node"
         );
         assert_eq!(
             meter.pending_finalizer_offers, 0,
@@ -973,15 +972,17 @@ fn owner_verification_failure_rolls_back_the_new_batch_and_recovers() {
             )]
         );
 
-        // This batch: C is selected and verified before A, whose slot is
-        // temporarily bound to B's real same-type token.
+        // This batch: A is the live chain head and is selected first; its
+        // slot is temporarily bound to B's real same-type token. C is selected
+        // after A. Both new records must be rolled back while the earlier
+        // record stays.
         let b = heap::publish_userdata(&mut host).expect("rooted B");
         let b_raw = bound_raw(&mut host, b);
         let c = publish_eligible(&mut host);
         let a = publish_eligible(&mut host);
         assert!(
             c.userdata.slot() < a.userdata.slot(),
-            "C must be verified before A"
+            "A is allocated after C and is the live chain head"
         );
         let orphan = heap::with_heap(&mut host, |heap| heap.alloc()).expect("orphan table");
         let (_orphan_weak, frame) = heap::with_heap(&mut host, |heap| {
@@ -2845,9 +2846,9 @@ fn settlement_rolls_back_at_owner_verification_and_retry_selects() {
         })
         .expect("S root");
 
-        // The failed batch: A is a real raw-`__gc` candidate selected before
-        // C1 and C2, which have no raw field. B owns the real token used for
-        // the same-type misbinding.
+        // The failed batch: C2 and C1 are selected before A, which is a real
+        // raw-`__gc` candidate; C1 and C2 have no raw field. B owns the real
+        // token used for the same-type misbinding.
         let b = heap::publish_userdata(&mut host).expect("token owner B");
         let b_raw = bound_raw(&mut host, b);
         let b_frame = heap::with_heap(&mut host, |heap| {
@@ -2895,10 +2896,10 @@ fn settlement_rolls_back_at_owner_verification_and_retry_selects() {
         assert_eq!(
             trace,
             vec![
-                (c_second.userdata.slot(), c_second.userdata.generation()),
                 (c_first.userdata.slot(), c_first.userdata.generation()),
+                (c_second.userdata.slot(), c_second.userdata.generation()),
             ],
-            "the rollback visits only the new nodes, newest first; old settled S is untouched"
+            "the rollback visits this pass's nodes in journal order, newest first; old settled S is untouched"
         );
         assert_eq!(
             heap::with_heap(&mut host, |heap| Ok(heap.settlement_journal_len()))
@@ -4246,11 +4247,11 @@ fn finish_if_published(host: &mut vm::HostContext<'_>, boundary: PublishedBounda
 fn published_head_hands_one_typed_token_to_a_root_and_settles_its_generation() {
     crate::support::with_idle_vm(|vm| {
         let mut host = vm.host_context();
-        let first = publish_eligible(&mut host);
         let second = publish_eligible(&mut host);
+        let first = publish_eligible(&mut host);
         assert!(
-            first.userdata.slot() < second.userdata.slot(),
-            "the provided candidate order is the ascending slot order here"
+            first.userdata.slot() > second.userdata.slot(),
+            "the head is the later allocation and has the higher slot"
         );
         let frame = heap::with_heap(&mut host, |heap| {
             let frame = heap.enter_roots(4)?;
@@ -4856,6 +4857,9 @@ fn published_front_pop_reads_and_moves_a_constant_amount_per_item() {
                 eligible.userdata.generation(),
             ));
         }
+        // The live chain publishes the newest allocation first, so the
+        // provided queue order is the reverse of the allocation loop.
+        expected.reverse();
         let boundary = publish_boundary(&mut host);
         assert!(matches!(boundary, PublishedBoundary::Published { .. }));
         assert_eq!(pending_records(&mut host).len(), count);
@@ -5056,14 +5060,14 @@ fn detach_receiver_source_edges(
 }
 
 /// Publishes two real eligible userdata in one selecting pass and finishes the
-/// Release tail. The selecting scan offers ascending slots, so `first` is the
+/// Release tail. The live chain head is the later allocation, so `first` is the
 /// published head.
 fn publish_two_eligible(host: &mut vm::HostContext<'_>) -> (Eligible, Eligible) {
-    let first = publish_eligible(host);
     let second = publish_eligible(host);
+    let first = publish_eligible(host);
     assert!(
-        first.userdata.slot() < second.userdata.slot(),
-        "the selecting order is ascending slots in this representation"
+        first.userdata.slot() > second.userdata.slot(),
+        "the live chain head has the higher allocation slot here"
     );
     let boundary = publish_boundary(host);
     assert!(matches!(boundary, PublishedBoundary::Published { .. }));
@@ -5933,10 +5937,10 @@ fn published_action_table_call_relookup_observes_sibling_call_changes() {
         crate::support::with_idle_vm(|vm| {
             let mut host = vm.host_context();
             heap::install(&mut host, limits()).expect("install");
-            let first = publish_eligible(&mut host);
             let head = publish_receiver_eligible(&mut host, ReceiverForm::Table);
+            let first = publish_eligible(&mut host);
             let receiver = head.receiver.table();
-            assert!(first.userdata.slot() < head.userdata.slot());
+            assert!(first.userdata.slot() > head.userdata.slot());
             let frame = heap::with_heap(&mut host, |heap| heap.enter_roots(4)).expect("roots");
             let boundary = publish_boundary(&mut host);
             assert!(matches!(boundary, PublishedBoundary::Published { .. }));
@@ -6390,4 +6394,671 @@ fn published_action_receiver_rejects_missing_nested_and_inherited_call() {
             });
         }
     }
+}
+
+// -- Observable live-userdata cohort order --------------------------------
+//
+// LuaJIT inserts a new userdata at the head of the main thread object chain
+// and appends each newly separated cohort to the pending queue tail. The
+// private heap mirrors only that ordering: allocation order inside one cohort
+// reverses at selection, while an earlier published batch stays in front of a
+// later one. The fixture below keeps two low sacrificial slots for the same
+// generation-reuse check and changes the `__gc` installation order so the
+// expected order cannot be explained by slot numbers or installation time.
+
+fn cohort_limits() -> HeapLimits {
+    HeapLimits {
+        nodes: 64,
+        roots: 32,
+        edges: 128,
+        max_generation: 8,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CohortMember {
+    userdata: UserdataRef,
+    raw: u64,
+    slot: u32,
+    generation: u32,
+}
+
+impl CohortMember {
+    fn record(self) -> (u64, u32, u32) {
+        (self.raw, self.slot, self.generation)
+    }
+}
+
+struct CohortReceipt {
+    a: CohortMember,
+    b: CohortMember,
+    c: CohortMember,
+    d: CohortMember,
+    e: CohortMember,
+    sacrifice_first: (u32, u32),
+    sacrifice_second: (u32, u32),
+    first_records: Vec<(u64, u32, u32)>,
+    first_taken: UserdataRef,
+    first_left: UserdataRef,
+    before_second_records: Vec<(u64, u32, u32)>,
+    before_second_values: [Option<UserdataRef>; 3],
+    second_records: Vec<(u64, u32, u32)>,
+    second_values: [Option<UserdataRef>; 3],
+    second_keys: [Value; 3],
+    second_published: usize,
+    taken_order: Vec<UserdataRef>,
+}
+
+/// Builds the shared cohort fixture. The two arms differ only at the second
+/// weak-publication boundary: one publishes the new batch while the old B is
+/// still queued, the other consumes B before any new batch exists.
+fn cohort_receipt(publish_second: bool) -> CohortReceipt {
+    let mut receipt = None;
+    crate::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, cohort_limits()).expect("install");
+
+        // The two lowest slots are unrooted tables. Only the first real
+        // Release reclaims them, so C and D can reuse them with new
+        // generations while E has to grow the slot vector.
+        let (first_sacrifice, second_sacrifice) =
+            heap::with_heap(&mut host, |heap| Ok((heap.alloc()?, heap.alloc()?)))
+                .expect("sacrifice tables");
+        let sacrifice_first = (first_sacrifice.slot(), first_sacrifice.generation());
+        let sacrifice_second = (second_sacrifice.slot(), second_sacrifice.generation());
+
+        // Pre-build and root every auxiliary weak table. Five value-weak and
+        // five key-weak tables cover B, A, C, D, and E.
+        let (value_tables, key_tables) = heap::with_heap(&mut host, |heap| {
+            let mut values = Vec::with_capacity(5);
+            let mut keys = Vec::with_capacity(5);
+            for _ in 0..5 {
+                values.push(weak_table(heap, "v")?);
+                keys.push(weak_table(heap, "k")?);
+            }
+            Ok((values, keys))
+        })
+        .expect("weak auxiliary tables");
+        let frame = heap::with_heap(&mut host, |heap| {
+            let frame = heap.enter_roots(15)?;
+            for (offset, table) in value_tables.iter().enumerate() {
+                heap.write_root(frame, offset as u32, *table)?;
+            }
+            for (offset, table) in key_tables.iter().enumerate() {
+                heap.write_root(frame, (5 + offset) as u32, *table)?;
+            }
+            Ok(frame)
+        })
+        .expect("rooted weak tables");
+
+        // Old cohort: B is allocated before A, so A is the live head.
+        let b = heap::publish_userdata(&mut host).expect("B");
+        let b_raw = bound_raw(&mut host, b);
+        let a = heap::publish_userdata(&mut host).expect("A");
+        let a_raw = bound_raw(&mut host, a);
+        heap::with_heap(&mut host, |heap| {
+            for (index, userdata, label) in [(0usize, b, "B"), (1usize, a, "A")] {
+                let metatable = heap.alloc()?;
+                heap.set_named_scalar(metatable, "__gc", Value::Bool(false))?;
+                heap.set_userdata_metatable(userdata, Some(metatable))?;
+                heap.set_number_userdata(value_tables[index], 1.0, userdata)?;
+                heap.set_userdata_key_scalar(key_tables[index], userdata, Value::string(label))?;
+            }
+            Ok(())
+        })
+        .expect("old cohort lattice");
+
+        let first_boundary = publish_boundary(&mut host);
+        assert!(
+            matches!(first_boundary, PublishedBoundary::Published { .. }),
+            "the old cohort must reach a real weak publication"
+        );
+        let first_records = pending_records(&mut host);
+        finish_release(&mut host);
+        let first_taken = heap::take_published_pending_finalizer(&mut host, frame, 10)
+            .expect("the first published head");
+        let first_left = if first_taken == a { b } else { a };
+
+        // New cohort: C and D take the two reclaimed low slots, E grows.
+        let c = heap::publish_userdata(&mut host).expect("C");
+        let c_raw = bound_raw(&mut host, c);
+        let d = heap::publish_userdata(&mut host).expect("D");
+        let d_raw = bound_raw(&mut host, d);
+        let e = heap::publish_userdata(&mut host).expect("E");
+        let e_raw = bound_raw(&mut host, e);
+        assert!(
+            d.slot() < c.slot() && c.slot() < e.slot(),
+            "the fixture must reuse two low slots before growing"
+        );
+        assert_eq!(c.slot(), sacrifice_second.0);
+        assert_eq!(d.slot(), sacrifice_first.0);
+        assert_eq!(c.generation(), sacrifice_second.1 + 1);
+        assert_eq!(d.generation(), sacrifice_first.1 + 1);
+
+        // Install `__gc` in E, C, D order, which differs from allocation.
+        heap::with_heap(&mut host, |heap| {
+            for (index, userdata, label) in [(4usize, e, "E"), (2usize, c, "C"), (3usize, d, "D")] {
+                let metatable = heap.alloc()?;
+                heap.set_named_scalar(metatable, "__gc", Value::Bool(false))?;
+                heap.set_userdata_metatable(userdata, Some(metatable))?;
+                heap.set_number_userdata(value_tables[index], 1.0, userdata)?;
+                heap.set_userdata_key_scalar(key_tables[index], userdata, Value::string(label))?;
+            }
+            Ok(())
+        })
+        .expect("new cohort lattice");
+
+        let before_second_records = pending_records(&mut host);
+        let before_second_values = [
+            weak_value(&mut host, value_tables[2], 1.0),
+            weak_value(&mut host, value_tables[3], 1.0),
+            weak_value(&mut host, value_tables[4], 1.0),
+        ];
+
+        let (second_records, second_values, second_keys, second_published, taken_order) =
+            if publish_second {
+                let second_boundary = publish_boundary(&mut host);
+                assert!(
+                    matches!(second_boundary, PublishedBoundary::Published { .. }),
+                    "the new cohort must reach a real weak publication"
+                );
+                let second_records = pending_records(&mut host);
+                let second_published = published_count(&mut host);
+                let second_values = [
+                    weak_value(&mut host, value_tables[2], 1.0),
+                    weak_value(&mut host, value_tables[3], 1.0),
+                    weak_value(&mut host, value_tables[4], 1.0),
+                ];
+                let second_keys = [
+                    weak_key(&mut host, key_tables[2], c),
+                    weak_key(&mut host, key_tables[3], d),
+                    weak_key(&mut host, key_tables[4], e),
+                ];
+                finish_release(&mut host);
+                let mut taken = Vec::new();
+                for slot in 11..15 {
+                    taken.push(
+                        heap::take_published_pending_finalizer(&mut host, frame, slot)
+                            .expect("a published cohort head"),
+                    );
+                }
+                (
+                    second_records,
+                    second_values,
+                    second_keys,
+                    second_published,
+                    taken,
+                )
+            } else {
+                // No second weak publication yet. The old head is consumed
+                // first; the new weak values and their order stay separate.
+                let mut taken = Vec::new();
+                taken.push(
+                    heap::take_published_pending_finalizer(&mut host, frame, 11)
+                        .expect("the old published head"),
+                );
+                let second_boundary = publish_boundary(&mut host);
+                assert!(
+                    matches!(second_boundary, PublishedBoundary::Published { .. }),
+                    "the delayed new cohort must reach a real weak publication"
+                );
+                let second_records = pending_records(&mut host);
+                let second_published = published_count(&mut host);
+                let second_values = [
+                    weak_value(&mut host, value_tables[2], 1.0),
+                    weak_value(&mut host, value_tables[3], 1.0),
+                    weak_value(&mut host, value_tables[4], 1.0),
+                ];
+                let second_keys = [
+                    weak_key(&mut host, key_tables[2], c),
+                    weak_key(&mut host, key_tables[3], d),
+                    weak_key(&mut host, key_tables[4], e),
+                ];
+                finish_release(&mut host);
+                for slot in 12..15 {
+                    taken.push(
+                        heap::take_published_pending_finalizer(&mut host, frame, slot)
+                            .expect("a delayed cohort head"),
+                    );
+                }
+                (
+                    second_records,
+                    second_values,
+                    second_keys,
+                    second_published,
+                    taken,
+                )
+            };
+
+        receipt = Some(CohortReceipt {
+            a: CohortMember {
+                userdata: a,
+                raw: a_raw,
+                slot: a.slot(),
+                generation: a.generation(),
+            },
+            b: CohortMember {
+                userdata: b,
+                raw: b_raw,
+                slot: b.slot(),
+                generation: b.generation(),
+            },
+            c: CohortMember {
+                userdata: c,
+                raw: c_raw,
+                slot: c.slot(),
+                generation: c.generation(),
+            },
+            d: CohortMember {
+                userdata: d,
+                raw: d_raw,
+                slot: d.slot(),
+                generation: d.generation(),
+            },
+            e: CohortMember {
+                userdata: e,
+                raw: e_raw,
+                slot: e.slot(),
+                generation: e.generation(),
+            },
+            sacrifice_first,
+            sacrifice_second,
+            first_records,
+            first_taken,
+            first_left,
+            before_second_records,
+            before_second_values,
+            second_records,
+            second_values,
+            second_keys,
+            second_published,
+            taken_order,
+        });
+    });
+    receipt.expect("cohort arm")
+}
+
+fn cohort_records(members: &[CohortMember]) -> Vec<(u64, u32, u32)> {
+    members.iter().map(|member| member.record()).collect()
+}
+
+#[test]
+fn live_userdata_cohort_order_reverses_allocation_and_keeps_batch_fifo() {
+    let receipt = cohort_receipt(true);
+
+    assert_eq!(
+        receipt.second_records,
+        cohort_records(&[receipt.b, receipt.e, receipt.d, receipt.c]),
+        "the old B stays in front; the new cohort is E, D, C in allocation-reverse order"
+    );
+    assert_eq!(receipt.c.slot, receipt.sacrifice_second.0);
+    assert_eq!(receipt.d.slot, receipt.sacrifice_first.0);
+    assert_eq!(
+        receipt.c.generation,
+        receipt.sacrifice_second.1 + 1,
+        "C reuses the higher sacrifice slot at the next generation"
+    );
+    assert_eq!(
+        receipt.d.generation,
+        receipt.sacrifice_first.1 + 1,
+        "D reuses the lower sacrifice slot at the next generation"
+    );
+    assert!(
+        receipt.d.slot < receipt.c.slot && receipt.c.slot < receipt.e.slot,
+        "slot(D) < slot(C) < slot(E)"
+    );
+    assert_eq!(
+        receipt.before_second_records,
+        cohort_records(&[receipt.b]),
+        "C, D, and E are not queued before the second weak publication"
+    );
+    assert!(
+        receipt.before_second_values.iter().all(Option::is_some),
+        "the new cohort's weak values are still readable before publication"
+    );
+    assert_eq!(receipt.second_published, 4);
+    assert_eq!(receipt.second_values, [None, None, None]);
+    assert_eq!(
+        receipt.second_keys,
+        [Value::string("C"), Value::string("D"), Value::string("E")],
+        "the second weak publication keeps the original weak keys"
+    );
+    assert_eq!(
+        receipt.taken_order,
+        vec![
+            receipt.b.userdata,
+            receipt.e.userdata,
+            receipt.d.userdata,
+            receipt.c.userdata
+        ],
+        "the observable dequeue order is B, E, D, C"
+    );
+    assert_eq!(
+        receipt.first_records,
+        cohort_records(&[receipt.a, receipt.b]),
+        "the old cohort selects A before B"
+    );
+    assert_eq!(receipt.first_taken, receipt.a.userdata);
+    assert_eq!(receipt.first_left, receipt.b.userdata);
+
+    // The same expected batch is not ascending slots, descending slots, or a
+    // whole-queue birth-age sort.
+    let ascending = cohort_records(&[receipt.b, receipt.d, receipt.c, receipt.e]);
+    let descending = cohort_records(&[receipt.b, receipt.e, receipt.c, receipt.d]);
+    let birth_age = cohort_records(&[receipt.e, receipt.d, receipt.c, receipt.b]);
+    assert_ne!(receipt.second_records, ascending);
+    assert_ne!(receipt.second_records, descending);
+    assert_ne!(receipt.second_records, birth_age);
+}
+
+#[test]
+fn live_userdata_cohort_order_without_second_publication_keeps_values_and_order_separate() {
+    let receipt = cohort_receipt(false);
+
+    assert_eq!(
+        receipt.before_second_records,
+        cohort_records(&[receipt.b]),
+        "the old B is the only queued record before the second publication"
+    );
+    assert!(
+        receipt.before_second_values.iter().all(Option::is_some),
+        "omitting the second weak publication leaves the new weak values readable"
+    );
+    assert_eq!(
+        receipt.second_records,
+        cohort_records(&[receipt.e, receipt.d, receipt.c]),
+        "the delayed new cohort publishes after B was already consumed"
+    );
+    assert_eq!(receipt.second_published, 3);
+    assert_eq!(receipt.second_values, [None, None, None]);
+    assert_eq!(
+        receipt.second_keys,
+        [Value::string("C"), Value::string("D"), Value::string("E")]
+    );
+    assert_eq!(
+        receipt.taken_order,
+        vec![
+            receipt.b.userdata,
+            receipt.e.userdata,
+            receipt.d.userdata,
+            receipt.c.userdata
+        ],
+        "the separated order still consumes B before the delayed cohort"
+    );
+}
+
+struct PulseCohortReceipt {
+    steps: Vec<PulseStep>,
+    meter: ScanMeter,
+    trace: Vec<(u32, u32)>,
+    records: Vec<(u64, u32, u32)>,
+    expected_trace: Vec<(u32, u32)>,
+    expected_records: Vec<(u64, u32, u32)>,
+    node_slots: u32,
+}
+
+fn chain_stamp(userdata: UserdataRef) -> (u32, u32) {
+    (userdata.slot(), userdata.generation())
+}
+
+/// Three eligible userdata separated by an unrelated number of table slots.
+/// The weak tables are the only roots. `pulse_steps` drives the real selecting
+/// mark one charged unit at a time.
+fn pulse_cohort_arm(padding: usize) -> PulseCohortReceipt {
+    let mut out = None;
+    crate::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, cohort_limits()).expect("install");
+
+        let mut padding_tables = Vec::new();
+        heap::with_heap(&mut host, |heap| {
+            for _ in 0..padding {
+                padding_tables.push(heap.alloc()?);
+            }
+            Ok(())
+        })
+        .expect("leading padding");
+
+        let first = heap::publish_userdata(&mut host).expect("first");
+        let first_raw = bound_raw(&mut host, first);
+        let first_weak = heap::with_heap(&mut host, |heap| {
+            let metatable = heap.alloc()?;
+            heap.set_named_scalar(metatable, "__gc", Value::Bool(false))?;
+            heap.set_userdata_metatable(first, Some(metatable))?;
+            let weak = weak_table(heap, "v")?;
+            heap.set_number_userdata(weak, 1.0, first)?;
+            Ok(weak)
+        })
+        .expect("first lattice");
+        heap::with_heap(&mut host, |heap| {
+            for _ in 0..padding {
+                padding_tables.push(heap.alloc()?);
+            }
+            Ok(())
+        })
+        .expect("middle padding");
+
+        let second = heap::publish_userdata(&mut host).expect("second");
+        let second_raw = bound_raw(&mut host, second);
+        let second_weak = heap::with_heap(&mut host, |heap| {
+            let metatable = heap.alloc()?;
+            heap.set_named_scalar(metatable, "__gc", Value::Bool(false))?;
+            heap.set_userdata_metatable(second, Some(metatable))?;
+            let weak = weak_table(heap, "v")?;
+            heap.set_number_userdata(weak, 1.0, second)?;
+            Ok(weak)
+        })
+        .expect("second lattice");
+        heap::with_heap(&mut host, |heap| {
+            for _ in 0..padding {
+                padding_tables.push(heap.alloc()?);
+            }
+            Ok(())
+        })
+        .expect("trailing padding");
+
+        let third = heap::publish_userdata(&mut host).expect("third");
+        let third_raw = bound_raw(&mut host, third);
+        let third_weak = heap::with_heap(&mut host, |heap| {
+            let metatable = heap.alloc()?;
+            heap.set_named_scalar(metatable, "__gc", Value::Bool(false))?;
+            heap.set_userdata_metatable(third, Some(metatable))?;
+            let weak = weak_table(heap, "v")?;
+            heap.set_number_userdata(weak, 1.0, third)?;
+            Ok(weak)
+        })
+        .expect("third lattice");
+        heap::with_heap(&mut host, |heap| {
+            let frame = heap.enter_roots(3)?;
+            heap.write_root(frame, 0, first_weak)?;
+            heap.write_root(frame, 1, second_weak)?;
+            heap.write_root(frame, 2, third_weak)?;
+            Ok(())
+        })
+        .expect("weak roots");
+
+        let expected_trace = vec![chain_stamp(third), chain_stamp(second), chain_stamp(first)];
+        let expected_records = vec![
+            (third_raw, third.slot(), third.generation()),
+            (second_raw, second.slot(), second.generation()),
+            (first_raw, first.slot(), first.generation()),
+        ];
+        let (steps, meter, trace, records, node_slots) = heap::with_heap(&mut host, |heap| {
+            heap.clear_pending_live_trace();
+            let _ = heap.take_scan_meter();
+            let (steps, meter) = pulse_steps(heap, 50_000);
+            Ok((
+                steps,
+                meter,
+                heap.pending_live_trace(),
+                heap.pending_finalizer_records(),
+                heap.stats().node_slots,
+            ))
+        })
+        .expect("pulse cohort");
+        let _ = padding_tables;
+        out = Some(PulseCohortReceipt {
+            steps,
+            meter,
+            trace,
+            records,
+            expected_trace,
+            expected_records,
+            node_slots,
+        });
+    });
+    out.expect("pulse cohort arm")
+}
+
+#[test]
+fn live_userdata_selection_reads_one_chain_node_per_pulse_ignoring_non_userdata() {
+    for padding in [0usize, 11usize] {
+        let receipt = pulse_cohort_arm(padding);
+        assert_eq!(
+            receipt.trace, receipt.expected_trace,
+            "padding {padding}: each real selection pulse reads one live userdata node"
+        );
+        assert_eq!(
+            receipt.records, receipt.expected_records,
+            "padding {padding}: selection order is reverse allocation"
+        );
+        assert_eq!(
+            receipt.meter.pending_finalizer_scan_slots, 3,
+            "padding {padding}: only the three live userdata nodes are read"
+        );
+        assert!(
+            receipt.steps.iter().all(|step| step.scan_slots <= 1),
+            "padding {padding}: one pulse never advances more than one chain node"
+        );
+        assert_eq!(
+            receipt
+                .steps
+                .iter()
+                .filter(|step| step.scan_slots == 1)
+                .count(),
+            3,
+            "padding {padding}: three pulses perform the three real node reads"
+        );
+        assert!(
+            receipt.node_slots > 3,
+            "padding {padding}: the heap has unrelated non-userdata slots"
+        );
+    }
+}
+
+#[test]
+fn live_userdata_chain_unlinks_neighbours_and_reheads_a_successor_generation() {
+    let mut heap = heap::LuaHeap::new(HeapLimits {
+        nodes: 8,
+        roots: 4,
+        edges: 8,
+        max_generation: 8,
+    });
+    let a = heap.alloc_userdata().expect("A");
+    let b = heap.alloc_userdata().expect("B");
+    let c = heap.alloc_userdata().expect("C");
+    assert_eq!(
+        heap.live_userdata_chain(),
+        vec![chain_stamp(c), chain_stamp(b), chain_stamp(a)]
+    );
+
+    let frame = heap.enter_roots(2).expect("frame");
+    heap.write_userdata_root(frame, 0, a).expect("root A");
+    heap.write_userdata_root(frame, 1, c).expect("root C");
+    let _ = heap.collect();
+    assert_eq!(
+        heap.live_userdata_chain(),
+        vec![chain_stamp(c), chain_stamp(a)],
+        "releasing the middle node relinks its two neighbours"
+    );
+
+    heap.clear_root(frame, 1).expect("clear C");
+    let _ = heap.collect();
+    assert_eq!(
+        heap.live_userdata_chain(),
+        vec![chain_stamp(a)],
+        "releasing the head moves the head to its successor"
+    );
+
+    heap.clear_root(frame, 0).expect("clear A");
+    let _ = heap.collect();
+    assert!(
+        heap.live_userdata_chain().is_empty(),
+        "releasing the tail empties the chain"
+    );
+
+    let d = heap.alloc_userdata().expect("D");
+    assert_eq!(d.slot(), a.slot(), "the last released slot is reused first");
+    assert_eq!(d.generation(), a.generation() + 1);
+    assert_eq!(
+        heap.live_userdata_chain(),
+        vec![chain_stamp(d)],
+        "a same-slot successor re-enters at the head with its new generation"
+    );
+
+    let e = heap.alloc_userdata().expect("E");
+    assert_eq!(e.slot(), c.slot());
+    assert_eq!(e.generation(), c.generation() + 1);
+    assert_eq!(
+        heap.live_userdata_chain(),
+        vec![chain_stamp(e), chain_stamp(d)],
+        "every new generation is the new head"
+    );
+}
+
+#[test]
+fn live_userdata_registration_rollback_unlinks_and_reheads_the_same_slot() {
+    crate::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(
+            &mut host,
+            HeapLimits {
+                nodes: 8,
+                roots: 4,
+                edges: 8,
+                max_generation: 8,
+            },
+        )
+        .expect("install");
+        let first = heap::publish_userdata(&mut host).expect("first");
+        let second = heap::publish_userdata(&mut host).expect("second");
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| Ok(heap.live_userdata_chain())).expect("chain"),
+            vec![chain_stamp(second), chain_stamp(first)]
+        );
+
+        heap::arm_userdata_rollback_refusal(&mut host).expect("arm refusal");
+        heap::publish_userdata_after_register_failure(&mut host).expect_err("refused rollback");
+        let witness =
+            heap::last_userdata_post_register_failure(&host).expect("post-register witness");
+        let reserved = witness.userdata;
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| Ok(heap.live_userdata_chain())).expect("chain"),
+            vec![
+                chain_stamp(reserved),
+                chain_stamp(second),
+                chain_stamp(first)
+            ],
+            "a valid reservation links at the head before its token is published"
+        );
+
+        heap::retry_pending_userdata_rollback(&mut host, reserved).expect("retry rollback");
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| Ok(heap.live_userdata_chain())).expect("chain"),
+            vec![chain_stamp(second), chain_stamp(first)],
+            "the rollback unlinks before the generation advances"
+        );
+
+        let successor = heap::publish_userdata(&mut host).expect("successor");
+        assert_eq!(successor.slot(), reserved.slot());
+        assert_eq!(successor.generation(), reserved.generation() + 1);
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| Ok(heap.live_userdata_chain())).expect("chain"),
+            vec![
+                chain_stamp(successor),
+                chain_stamp(second),
+                chain_stamp(first)
+            ]
+        );
+    });
 }
