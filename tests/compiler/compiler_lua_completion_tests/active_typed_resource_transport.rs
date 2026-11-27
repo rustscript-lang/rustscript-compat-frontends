@@ -61,6 +61,21 @@
 //! typed local itself, and the runtime layer is what produces these two
 //! diagnostics.
 //!
+//! The callback entry is observed before any fallible work: every marker host
+//! call first records the live last frame's actual prototype id, depth and
+//! resume address. Marker records are still committed only after the typed
+//! borrows, so the raw entry record is what preserves the evidence when a
+//! probe fails after the frame really entered. The positive run has exactly
+//! one entry into a declared two-parameter typed script callable; both
+//! negative controls have none.
+//!
+//! Control B binds its diagnostic to the native
+//! `resource_type_key_mismatch` error itself: the stable code, the
+//! `resource::table` operation, the expected `lua.userdata` and actual
+//! `lua.table` keys, and the raw handle of this run's issued `lua.table`
+//! token. It is an exact native message, so any test probe wrapper (which
+//! prefixes its own text) can no longer satisfy the assertion.
+//!
 //! Two more fixed-pin constraints are recorded here rather than hidden: the
 //! completion status read `get(completion, 0)` cannot be typed for a callable
 //! whose declared result is the required concrete `Bool`
@@ -279,6 +294,25 @@ struct TableTokenRecord {
     parts: (u64, u32, u32),
 }
 
+/// The first observation of one host callback. Recorded before any frame
+/// verification, resource probe, or error wrapping, from the live execution
+/// frames alone, so a later probe failure cannot erase whether the callback
+/// frame actually entered.
+#[derive(Clone, Debug)]
+struct EntryRecord {
+    /// The first marker the entered frame executes.
+    label: String,
+    /// The actual execution-frame depth at entry.
+    frame_len: usize,
+    /// The actual prototype id of the entered (last) frame.
+    prototype_id: Option<u32>,
+    /// The actual resume address of the entered frame, when it resumes
+    /// bytecode through the executed `CallValue`.
+    return_ip: Option<usize>,
+    /// The actual prototype id of the caller frame.
+    parent_prototype: Option<u32>,
+}
+
 #[derive(Clone, Debug)]
 struct ParentEntryFacts {
     argument_raw: i64,
@@ -326,6 +360,7 @@ struct PickRecord {
 
 #[derive(Clone, Debug, Default)]
 struct Witness {
+    entries: Vec<EntryRecord>,
     marks: Vec<MarkRecord>,
     picks: Vec<PickRecord>,
     issued_table: Option<Value>,
@@ -398,6 +433,27 @@ fn host_mark(vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
         return Err(host_fault_error("mark expects one string label"));
     };
     let label = label.as_str().to_string();
+
+    // The first observation of this host callback. This runs before every
+    // fallible frame check, resource probe and error wrapper below, so a
+    // probe that fails after the frame really entered still leaves the
+    // entered frame's actual prototype, depth and resume address recorded.
+    let entry = {
+        let frames = vm.execution_frames();
+        let current = frames.last();
+        let parent = frames.iter().rev().nth(1);
+        EntryRecord {
+            label: label.clone(),
+            frame_len: frames.len(),
+            prototype_id: current.and_then(|frame| frame.prototype_id),
+            return_ip: current.and_then(|frame| match &frame.continuation {
+                VmFrameContinuation::ResumeBytecode { return_ip } => Some(*return_ip),
+                _ => None,
+            }),
+            parent_prototype: parent.and_then(|frame| frame.prototype_id),
+        }
+    };
+    with_witness(|witness| witness.entries.push(entry));
 
     if label == "chunk-mode" {
         let select = i64::try_from(SELECT.load(Ordering::SeqCst))
@@ -1105,6 +1161,11 @@ impl ArmRun {
             self.patch
         );
         eprintln!(
+            "LUA_TYPED_RESOURCE arm={} entries={:?}",
+            self.arm.label(),
+            self.witness.entries
+        );
+        eprintln!(
             "LUA_TYPED_RESOURCE arm={} marks={:?}",
             self.arm.label(),
             self.witness
@@ -1414,6 +1475,31 @@ fn callable_id(value: &Value) -> u32 {
         Value::Callable(callable) => callable.prototype_id,
         other => panic!("expected a callable, got {other:?}"),
     }
+}
+
+/// Every raw callback entry whose actual frame was one of the declared
+/// two-parameter typed script closures this module compiles. This reads the
+/// entry record, not the marker record: a probe or frame check that fails
+/// after entry cannot remove the evidence that the frame started.
+fn typed_callback_entries(run: &ArmRun) -> Vec<&EntryRecord> {
+    run.witness
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .prototype_id
+                .and_then(|id| run.prototypes.get(id as usize))
+                .is_some_and(|prototype| {
+                    matches!(prototype.target, vm::CallableTarget::ScriptFunction(_))
+                        && matches!(
+                            prototype.schema.as_ref(),
+                            Some(TypeSchema::Callable { params, .. })
+                                if params.len() == usize::from(CALL_ARGC)
+                                    && matches!(params.get(1), Some(TypeSchema::Resource(_)))
+                        )
+                })
+        })
+        .collect()
 }
 
 /// Binds the executed callee marker to the one decoded `CallValue` whose
@@ -1743,6 +1829,53 @@ fn assert_positive(run: &ArmRun) {
         "positive: the chunk marker has no caller"
     );
 
+    // The raw entry record is committed before any probe or frame check, so
+    // exactly one typed callback entry must exist independently of the marker
+    // records that are committed after the typed borrows.
+    let callback_entries = typed_callback_entries(run);
+    assert_eq!(
+        callback_entries.len(),
+        1,
+        "positive: exactly one typed callback frame entry, saw {:?}",
+        run.witness.entries
+    );
+    let callback_entry = callback_entries[0];
+    assert_eq!(
+        callback_entry.prototype_id,
+        Some(target_id),
+        "positive: the entry must be the returned callable's prototype"
+    );
+    assert_eq!(
+        callback_entry.label.as_str(),
+        TARGET_LABEL,
+        "positive: the entry must be the target's first marker"
+    );
+    assert_eq!(
+        callback_entry.frame_len,
+        run.mark("target-enter").frame_len,
+        "positive: the raw entry depth must match the child marker depth"
+    );
+    assert_eq!(
+        callback_entry.return_ip,
+        run.mark("target-enter").last_return_ip,
+        "positive: the raw entry must carry the child's resume address"
+    );
+    assert_eq!(
+        callback_entry.return_ip,
+        Some(return_ip),
+        "positive: the entry resume address must be the decoded CallValue"
+    );
+    assert_eq!(
+        callback_entry.parent_prototype,
+        Some(caller),
+        "positive: the entry's caller must be the parent prototype"
+    );
+    assert_eq!(
+        callback_entry.frame_len,
+        run.mark("parent-enter").frame_len + 1,
+        "positive: the typed callback is one frame below its caller"
+    );
+
     let call = run
         .patch
         .call
@@ -1799,6 +1932,11 @@ fn assert_other_resource_key_control(positive: &ArmRun, run: &ArmRun) {
         run.labels(),
         ["parent-enter"],
         "other-resource-key: the parent must stop at the typed host return"
+    );
+    assert_eq!(
+        typed_callback_entries(run).len(),
+        0,
+        "other-resource-key: the refused callable must not enter a callback frame"
     );
     let pick = run.pick();
     assert_eq!(
@@ -1897,19 +2035,31 @@ fn assert_other_argument_control(run: &ArmRun) {
     run.assert_fuel();
     run.assert_typed_import();
     run.assert_typed_local();
+    let table = run
+        .witness
+        .table_token
+        .as_ref()
+        .expect("other-argument-token: the fixture issued one table token");
     let message = match &run.status {
         Err(VmError::HostError(message)) => message.clone(),
         other => panic!(
             "other-argument-token: expected the Core resource key HostError at the call boundary, got {other:?}"
         ),
     };
-    assert!(
-        message.contains("resource type key does not match expected key 'lua.userdata'"),
-        "other-argument-token: the expected key must be lua.userdata, got {message}"
+    // This is the native Core diagnostic itself: stable code, operation scope,
+    // both keys and the raw handle of the actual (issued) `lua.table` token.
+    // The exact equality also rejects the test's own probe wrappers, which
+    // prefix their own text before the same native message.
+    let expected = format!(
+        "resource error [resource_type_key_mismatch] in resource::table: \
+         resource type key does not match expected key 'lua.userdata'; \
+         actual key is 'lua.table' (value: {})",
+        table.raw
     );
-    assert!(
-        message.contains("actual key is 'lua.table'"),
-        "other-argument-token: the actual key must be lua.table, got {message}"
+    assert_eq!(
+        message, expected,
+        "other-argument-token: the diagnostic must be the native resource_type_key_mismatch \
+         error bound to the issued lua.table token, not a test probe wrapper"
     );
     eprintln!(
         "LUA_TYPED_RESOURCE arm=other-argument-token layer=call-boundary diagnostic=HostError({message})"
@@ -1918,6 +2068,11 @@ fn assert_other_argument_control(run: &ArmRun) {
         run.labels(),
         ["parent-enter"],
         "other-argument-token: the parent must stop at the CallValue"
+    );
+    assert_eq!(
+        typed_callback_entries(run).len(),
+        0,
+        "other-argument-token: the typed callback frame must not enter"
     );
     let pick = run.pick();
     assert_eq!(pick.mode, 0, "other-argument-token: the staged arm");
@@ -1945,11 +2100,6 @@ fn assert_other_argument_control(run: &ArmRun) {
         "other-argument-token: the failed run must have no chunk completion"
     );
 
-    let table = run
-        .witness
-        .table_token
-        .as_ref()
-        .expect("other-argument-token: the fixture issued one table token");
     let issued = run
         .witness
         .issued_userdata_raw
