@@ -1101,6 +1101,11 @@ fn step_reset(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
         return false;
     }
     let index = state.index;
+    // Every slot the round may reuse loses the ordinary Gray tag and both
+    // neighbour links here, in the existing per-slot Reset unit. The stamp can
+    // wrap and be reused by a later round, so a tag left by an abandoned mark
+    // must never be mistaken for a member of the new chain.
+    clear_gray_slot(&mut heap.slots[index]);
     if let SlotState::Live { marked } = &mut heap.slots[index].state {
         *marked = false;
     }
@@ -2388,6 +2393,16 @@ pub(super) fn release_ordinary_gray(state: Option<&mut MarkState>, slots: &mut [
     let linked_generation = stored.generation;
     let link = read_gray_link(slots, state, index);
     if link.epoch != state.rescan_epoch || link.generation != linked_generation {
+        if let Some(stored) = slots.get_mut(index as usize) {
+            clear_gray_slot(stored);
+        }
+        return;
+    }
+    if state.gray_len == 0 {
+        // The current round links no node, so a tag that matches its reused
+        // stamp is left over from an abandoned mark (the stamp wrapped). It is
+        // not a queue member: clear this slot only and never follow its old
+        // neighbours or move the header.
         if let Some(stored) = slots.get_mut(index as usize) {
             clear_gray_slot(stored);
         }

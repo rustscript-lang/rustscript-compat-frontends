@@ -17527,71 +17527,367 @@ fn ordinary_gray_pop_reads_and_writes_a_local_constant() {
     assert!(heap.alive(first) && heap.alive(second) && heap.alive(gate));
 }
 
-/// The mark round stamp skips zero when it wraps. Old node tags from the
-/// u64::MAX round stay inert in the round that wraps to one.
-#[test]
-fn ordinary_gray_round_stamp_wrap_keeps_old_links_inert() {
-    let mut heap = LuaHeap::new(limits(16, 4, 16));
-    let old = heap.alloc().expect("wrap old");
-    let gate = heap.alloc().expect("wrap gate");
+/// The abandoned first round holds a real four-node ordinary Gray chain under
+/// stamp one. The helper then advances the heap stamp to `u64::MAX`, so the
+/// next mark really takes one again. Every link was built by a real push; the
+/// helper never writes a link field.
+struct ReusedStampFixture {
+    gate: TableRef,
+    gate_record: u32,
+    old_a: TableRef,
+    old_b: TableRef,
+    old_c: TableRef,
+    old_d: TableRef,
+    weak_owner: TableRef,
+    orphan: TableRef,
+    keep: TableRef,
+    kept_child: TableRef,
+}
+
+fn gray_link_fields(heap: &LuaHeap, table: TableRef) -> (u64, u32, Option<u32>, Option<u32>) {
+    let stored = &heap.slots[table.slot() as usize];
+    (
+        stored.gray_epoch,
+        stored.gray_generation,
+        stored.gray_prev,
+        stored.gray_next,
+    )
+}
+
+fn plant_reused_stamp_chain() -> (LuaHeap, ReusedStampFixture) {
+    let mut heap = LuaHeap::new(limits(64, 16, 64));
+    let gate = heap.alloc().expect("reuse gate");
     heap.set_named_scalar(gate, "g0", Value::Bool(true))
-        .expect("wrap gate scalar");
+        .expect("reuse gate scalar");
     let (_, gate_record) = heap
         .locate_named(gate.slot(), "g0")
-        .expect("wrap gate record");
-    let frame = heap.enter_roots(2).expect("wrap roots");
-    heap.write_root(frame, 0, old).expect("wrap root old");
-    heap.write_root(frame, 1, gate).expect("wrap root gate");
+        .expect("reuse gate record");
+    let old_a = heap.alloc().expect("reuse old a");
+    let old_b = heap.alloc().expect("reuse old b");
+    let old_c = heap.alloc().expect("reuse old c");
+    let old_d = heap.alloc().expect("reuse old d");
+    let weak_mt = heap.alloc().expect("reuse weak metatable");
+    heap.set_mode_scalar(weak_mt, Value::string("v"))
+        .expect("reuse weak mode");
+    let weak_owner = heap.alloc().expect("reuse weak owner");
+    heap.set_metatable(weak_owner, Some(weak_mt))
+        .expect("reuse weak metatable attach");
+    let orphan = heap.alloc().expect("reuse weak orphan");
+    heap.set_named_edge(weak_owner, "dead", orphan)
+        .expect("reuse weak orphan edge");
+    let keep = heap.alloc().expect("reuse keep owner");
+    let kept_child = heap.alloc().expect("reuse keep child");
+    heap.set_named_edge(keep, "keep", kept_child)
+        .expect("reuse keep edge");
+    let frame = heap.enter_roots(8).expect("reuse roots");
+    for (slot, table) in [old_a, old_b, old_c, old_d, gate].into_iter().enumerate() {
+        heap.write_root(frame, slot as u32, table)
+            .expect("first-round root");
+    }
     let _ = heap.take_scan_meter();
-
-    heap.rescan_epoch = u64::MAX - 1;
+    // A fresh heap starts at zero, so this round really takes stamp one.
     {
-        let mut parked = ParkedMark::start(&mut heap).expect("wrap first mark");
-        let epoch = parked.with_saved_heap(|heap| heap.rescan_epoch);
-        assert_ne!(epoch, 0, "a mark round is never stamped zero");
+        let mut parked = ParkedMark::start(&mut heap).expect("first-round mark");
+        assert_eq!(
+            parked.with_saved_heap(|heap| heap.rescan_epoch),
+            1,
+            "the first round takes stamp one"
+        );
         pause_at(&mut parked, gate.slot(), gate_record);
         let chain = gray_chain(&mut parked);
         assert_eq!(
             chain.nodes,
-            vec![(old.slot(), old.generation())],
-            "the first round holds the old root"
+            vec![
+                (old_d.slot(), old_d.generation()),
+                (old_c.slot(), old_c.generation()),
+                (old_b.slot(), old_b.generation()),
+                (old_a.slot(), old_a.generation()),
+            ],
+            "the abandoned round really pushed four nodes and stopped before opening them"
         );
-        assert_eq!(chain.nodes[0].1, old.generation());
     }
-    heap.clear_root(frame, 0).expect("clear the old root");
+    assert!(
+        heap.saved_mark_query().is_none(),
+        "dropping the driver abandons the first round"
+    );
+    for slot in 0..5 {
+        heap.clear_root(frame, slot)
+            .expect("clear a first-round root");
+    }
+    heap.write_root(frame, 0, keep).expect("reuse root keep");
+    heap.write_root(frame, 1, gate).expect("reuse root gate");
+    heap.write_root(frame, 2, weak_mt)
+        .expect("reuse root weak metatable");
+    heap.write_root(frame, 3, weak_owner)
+        .expect("reuse root weak owner");
+    heap.rescan_epoch = u64::MAX;
+    let _ = heap.take_scan_meter();
+    (
+        heap,
+        ReusedStampFixture {
+            gate,
+            gate_record,
+            old_a,
+            old_b,
+            old_c,
+            old_d,
+            weak_owner,
+            orphan,
+            keep,
+            kept_child,
+        },
+    )
+}
 
-    let mut parked = ParkedMark::start(&mut heap).expect("wrap next mark");
+/// The heap stamp is advanced to `u64::MAX`, so the next mark really reuses
+/// stamp one. A rollback before Reset has visited the old slot must clear only
+/// that slot: the abandoned one-stamp link is not a member of the empty
+/// current chain, and the old neighbour link must not be followed. Reset then
+/// clears every remaining reusable link before any push, and the different
+/// owner's graph is scanned and swept from real marks.
+#[test]
+fn ordinary_gray_reused_stamp_rollback_before_reset_visit_clears_only_the_old_slot() {
+    let (mut heap, fixture) = plant_reused_stamp_chain();
+    let mut parked = ParkedMark::start(&mut heap).expect("reused-stamp mark");
     assert_eq!(
         parked.with_saved_heap(|heap| heap.rescan_epoch),
         1,
-        "the wrapping stamp skips zero and restarts at one"
+        "advancing to u64::MAX makes the next real round take one again"
     );
-    clear_open_trace();
     assert!(
         gray_chain(&mut parked).nodes.is_empty(),
-        "a tag from the u64::MAX round is inert after the wrap"
+        "the abandoned round's header is gone"
     );
-    for _ in 0..HARNESS_BOUND {
-        let view = parked.pulse(1);
-        assert_eq!(view.meter.sweep_edge_checks, 0);
-        if view.finished {
-            break;
-        }
-    }
-    let trace = open_trace();
-    assert!(
-        trace_position(&trace, old.slot(), old.generation()).is_none(),
-        "the wrapped round does not open the old item"
+    let old_b_before = parked.with_saved_heap(|heap| gray_link_fields(heap, fixture.old_b));
+    assert_eq!(
+        old_b_before,
+        (
+            1,
+            fixture.old_b.generation(),
+            Some(fixture.old_c.slot()),
+            Some(fixture.old_a.slot()),
+        ),
+        "the abandoned one-stamp chain is still really linked on the old slots"
     );
-    assert!(
-        trace_position(&trace, gate.slot(), gate.generation()).is_some(),
-        "the live root still opens after the wrap"
+    let access_before =
+        parked.with_saved_heap(|heap| heap.saved_mark_gray_access().expect("saved mark"));
+    let view = parked.pulse(1);
+    assert!(!view.finished, "Reset still has slots to visit");
+    assert_eq!(
+        parked.phase_name(),
+        "reset",
+        "the pulse visited slot zero only"
     );
 
-    parked.complete().expect("wrap sweep");
+    parked
+        .with_saved_heap(|heap| heap.rollback(fixture.old_a))
+        .expect("real rollback before Reset reaches the old slot");
+    assert!(
+        !parked.with_saved_heap(|heap| heap.alive(fixture.old_a)),
+        "the rollback really released the old tail"
+    );
+    assert!(
+        gray_chain(&mut parked).nodes.is_empty(),
+        "a reused stamp on an empty current chain must not join or unlink anything"
+    );
+    let old_b_after = parked.with_saved_heap(|heap| gray_link_fields(heap, fixture.old_b));
+    assert_eq!(
+        old_b_after, old_b_before,
+        "the empty-chain release clears only the released slot; it never follows the old neighbour link"
+    );
+    let access_after =
+        parked.with_saved_heap(|heap| heap.saved_mark_gray_access().expect("saved mark"));
+    assert_eq!(
+        (
+            access_after.0 - access_before.0,
+            access_after.1 - access_before.1,
+            access_after.2 - access_before.2,
+        ),
+        (1, 0, 0),
+        "the empty-chain release reads one old tag, writes no counted link, and moves no header"
+    );
+    assert_eq!(
+        parked.with_saved_heap(|heap| gray_link_fields(heap, fixture.old_a)),
+        (0, 0, None, None),
+        "the released old slot itself is cleared"
+    );
+
+    clear_open_trace();
+    pause_at(&mut parked, fixture.gate.slot(), fixture.gate_record);
+    for old in [fixture.old_b, fixture.old_c, fixture.old_d] {
+        assert_eq!(
+            parked.with_saved_heap(|heap| gray_link_fields(heap, old)),
+            (0, 0, None, None),
+            "every slot Reset visited no longer carries the abandoned stamp or its neighbours"
+        );
+    }
+    assert_eq!(
+        gray_chain(&mut parked).nodes,
+        vec![(fixture.keep.slot(), fixture.keep.generation())],
+        "the current chain names only the different owner"
+    );
+    let opened = open_trace();
+    for old in [fixture.old_a, fixture.old_b, fixture.old_c, fixture.old_d] {
+        assert!(
+            trace_position(&opened, old.slot(), old.generation()).is_none(),
+            "no old chain member opens in the reused-stamp round: {opened:?}"
+        );
+    }
+
+    let _ = finish(&mut parked);
+    let opened = open_trace();
+    let keep_pos = trace_position(&opened, fixture.keep.slot(), fixture.keep.generation())
+        .unwrap_or_else(|| panic!("the different owner never opened: {opened:?}"));
+    assert!(
+        opened[keep_pos].live && opened[keep_pos].marked,
+        "the different owner opens after the cleared Reset"
+    );
+    assert!(
+        parked.marked(fixture.kept_child),
+        "the different owner scans its exclusive strong child"
+    );
+    parked.complete().expect("reused-stamp sweep");
     drop(parked);
-    assert!(heap.alive(gate));
-    assert!(!heap.alive(old), "the old unrooted item is collected");
+    assert!(
+        heap.alive(fixture.keep) && heap.alive(fixture.kept_child),
+        "the different owner and its exclusive strong child survive the real scan"
+    );
+    assert!(
+        !heap.alive(fixture.old_a) && !heap.alive(fixture.old_d),
+        "the released old items stay released"
+    );
+    assert!(
+        !heap.alive(fixture.old_b) && !heap.alive(fixture.old_c),
+        "the unrooted old chain members are collected, never retained by the abandoned links"
+    );
+    assert!(
+        !heap.alive(fixture.orphan),
+        "the independent weak orphan is cleared"
+    );
+    assert_eq!(
+        heap.named_value(fixture.weak_owner, "dead"),
+        Ok(Value::Null),
+        "the weak edge is cleared in the same round"
+    );
+}
+
+/// Same reused stamp, but the stale rollback happens while the current round's
+/// Gray queue holds a different owner. The stale head must not clear or
+/// replace that owner: its exclusive strong child has to be reached by the
+/// real scan. The old generation is then legitimately offered again, so the
+/// same stamp must not be mistaken for a duplicate membership.
+#[test]
+fn ordinary_gray_reused_stamp_rollback_under_a_different_owner_keeps_it_scanned() {
+    let (mut heap, fixture) = plant_reused_stamp_chain();
+    let mut parked = ParkedMark::start(&mut heap).expect("reused-stamp Gray mark");
+    assert_eq!(
+        parked.with_saved_heap(|heap| heap.rescan_epoch),
+        1,
+        "the wrapping stamp is really reused"
+    );
+    clear_open_trace();
+    pause_at(&mut parked, fixture.gate.slot(), fixture.gate_record);
+    let before = gray_chain(&mut parked);
+    assert_eq!(
+        before.nodes,
+        vec![(fixture.keep.slot(), fixture.keep.generation())],
+        "the current chain holds the different owner before the stale release"
+    );
+    let old_d_at_pause = parked.with_saved_heap(|heap| gray_link_fields(heap, fixture.old_d));
+    assert!(
+        parked.with_saved_heap(|heap| heap.table_in_gray(fixture.keep)),
+        "the different owner is the current chain"
+    );
+    let access_before =
+        parked.with_saved_heap(|heap| heap.saved_mark_gray_access().expect("saved mark"));
+
+    parked
+        .with_saved_heap(|heap| heap.rollback(fixture.old_d))
+        .expect("real rollback of the reused old head during Gray");
+    assert!(
+        !parked.with_saved_heap(|heap| heap.alive(fixture.old_d)),
+        "the rollback really released the old head"
+    );
+    let old_d_after = parked.with_saved_heap(|heap| gray_link_fields(heap, fixture.old_d));
+    let keep_linked_after = parked.with_saved_heap(|heap| heap.table_in_gray(fixture.keep));
+    let access_after =
+        parked.with_saved_heap(|heap| heap.saved_mark_gray_access().expect("saved mark"));
+    let release_access = (
+        access_after.0 - access_before.0,
+        access_after.1 - access_before.1,
+        access_after.2 - access_before.2,
+    );
+    assert_eq!(
+        old_d_after,
+        (0, 0, None, None),
+        "only the released old slot is cleared"
+    );
+
+    parked
+        .accept_root_batch(&[super::Rooted::Table(fixture.old_b)])
+        .expect("the legitimate re-offer of an old generation");
+    let old_b_marked_now = parked.marked(fixture.old_b);
+
+    let _ = finish(&mut parked);
+    let opened = open_trace();
+    let keep_pos = trace_position(&opened, fixture.keep.slot(), fixture.keep.generation());
+    let old_b_pos = trace_position(&opened, fixture.old_b.slot(), fixture.old_b.generation());
+    let old_c_pos = trace_position(&opened, fixture.old_c.slot(), fixture.old_c.generation());
+    parked.complete().expect("reused-stamp Gray sweep");
+    drop(parked);
+    let kept_child_alive = heap.alive(fixture.kept_child);
+    let keep_alive = heap.alive(fixture.keep);
+    let old_b_alive = heap.alive(fixture.old_b);
+    let old_c_alive = heap.alive(fixture.old_c);
+    let orphan_alive = heap.alive(fixture.orphan);
+    let weak_value = heap
+        .named_value(fixture.weak_owner, "dead")
+        .expect("weak entry after sweep");
+    eprintln!(
+        "ordinary_gray_reused_stamp result keep_linked_after={keep_linked_after} \
+         release_access={release_access:?} kept_child_alive={kept_child_alive} \
+         keep_alive={keep_alive} old_b_alive={old_b_alive} old_c_alive={old_c_alive} \
+         orphan_alive={orphan_alive} weak_value={weak_value:?}"
+    );
+
+    assert!(
+        kept_child_alive,
+        "the different owner's exclusive strong child is really scanned and survives the reused-stamp release"
+    );
+    assert!(keep_alive, "the different owner stays marked and live");
+    assert!(
+        keep_linked_after,
+        "rolling back the reused old head must not clear the current owner from the chain"
+    );
+    let keep_pos =
+        keep_pos.unwrap_or_else(|| panic!("the different owner never opened: {opened:?}"));
+    assert!(
+        opened[keep_pos].live && opened[keep_pos].marked,
+        "the different owner really opens and scans"
+    );
+    assert!(
+        old_b_marked_now && old_b_pos.is_some_and(|at| opened[at].live && opened[at].marked),
+        "the legitimate old-generation re-offer opens under the current round"
+    );
+    assert!(
+        old_c_pos.is_none(),
+        "the unrooted old member is never opened through an abandoned link: {opened:?}"
+    );
+    assert!(!old_c_alive, "the unrooted old member is collected");
+    assert!(
+        !orphan_alive && weak_value == Value::Null,
+        "the independent weak orphan is cleared"
+    );
+    assert_eq!(
+        release_access,
+        (1, 0, 0),
+        "the stale release reads one tag and moves no link or header"
+    );
+    assert_eq!(
+        old_d_at_pause,
+        (0, 0, None, None),
+        "Reset had already cleared the abandoned stamp before this Gray rollback"
+    );
 }
 
 /// An abandoned mark drops its head with the saved state. A new round starts
