@@ -38,6 +38,9 @@ mod callable_carrier;
 #[path = "compiler_lua_completion_tests/callable_raw_call.rs"]
 mod callable_raw_call;
 
+#[path = "compiler_lua_completion_tests/active_typed_resource_transport.rs"]
+mod active_typed_resource_transport;
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
