@@ -204,6 +204,16 @@ const COMMIT_ENTRY_LABEL: &str = "published-commit-enter";
 /// The typed commit body's own diagnostic prefix; the test host never wraps it.
 const COMMIT_REFUSAL_PREFIX: &str = "typed published commit refused: ";
 
+/// The fixture whose parent asks the private exact static `produce` for the
+/// callable instead of taking one of its own callable arguments.
+const PRODUCER_FIXTURE: &str = "active_typed_published_head_producer.lua";
+/// The exact static that reads the published head's raw `__gc` / `__call`
+/// chain and returns the stored callable Arc for Core's typed return check.
+const PRODUCER_IMPORT: &str = "produce";
+const PRODUCER_ENTRY_LABEL: &str = "producer-enter";
+/// The distinct source-level marker of the before-read replacement closure.
+const ALTERNATE_LABEL: &str = "alternate-enter";
+
 /// The first statement of the two declared closures names them.
 const TARGET_LABEL: &str = "target-enter";
 const OTHER_LABEL: &str = "other-enter";
@@ -434,6 +444,10 @@ enum Arm {
     PublishedCommitOtherOwner,
     PublishedCommitUnissuedReceiver,
     PublishedCommitRawArcChanged,
+    PublishedHeadProducer,
+    PublishedHeadProducerReplacedBeforeRead,
+    PublishedHeadProducerReplacedBeforeCommit,
+    PublishedHeadProducerWrongSignature,
 }
 
 impl Arm {
@@ -448,6 +462,14 @@ impl Arm {
             Arm::PublishedCommitOtherOwner => "published-commit-other-owner",
             Arm::PublishedCommitUnissuedReceiver => "published-commit-unissued-receiver",
             Arm::PublishedCommitRawArcChanged => "published-commit-raw-arc-changed",
+            Arm::PublishedHeadProducer => "published-head-producer",
+            Arm::PublishedHeadProducerReplacedBeforeRead => {
+                "published-head-producer-replaced-before-read"
+            }
+            Arm::PublishedHeadProducerReplacedBeforeCommit => {
+                "published-head-producer-replaced-before-commit"
+            }
+            Arm::PublishedHeadProducerWrongSignature => "published-head-producer-wrong-signature",
         }
     }
 
@@ -458,6 +480,10 @@ impl Arm {
             | Arm::PublishedCommitOtherOwner
             | Arm::PublishedCommitUnissuedReceiver
             | Arm::PublishedCommitRawArcChanged => PUBLISHED_COMMIT_FIXTURE,
+            Arm::PublishedHeadProducer
+            | Arm::PublishedHeadProducerReplacedBeforeRead
+            | Arm::PublishedHeadProducerReplacedBeforeCommit
+            | Arm::PublishedHeadProducerWrongSignature => PRODUCER_FIXTURE,
             _ => FIXTURE,
         }
     }
@@ -469,6 +495,10 @@ impl Arm {
             Arm::PublishedCommitOtherOwner => 4,
             Arm::PublishedCommitRawArcChanged => 6,
             Arm::PublishedCommitUnissuedReceiver => 7,
+            Arm::PublishedHeadProducer => 8,
+            Arm::PublishedHeadProducerReplacedBeforeRead => 9,
+            Arm::PublishedHeadProducerReplacedBeforeCommit => 10,
+            Arm::PublishedHeadProducerWrongSignature => 11,
             _ => 0,
         }
     }
@@ -481,6 +511,10 @@ impl Arm {
             Arm::PublishedCommitOtherOwner => 4,
             Arm::PublishedCommitUnissuedReceiver => 5,
             Arm::PublishedCommitRawArcChanged => 6,
+            Arm::PublishedHeadProducer => 7,
+            Arm::PublishedHeadProducerReplacedBeforeRead => 8,
+            Arm::PublishedHeadProducerReplacedBeforeCommit => 9,
+            Arm::PublishedHeadProducerWrongSignature => 10,
             _ => 0,
         }
     }
@@ -576,6 +610,28 @@ fn commit_import_schema() -> HostFunctionSchema {
     )
 }
 
+/// The read-only exact static that sources the callable from the published
+/// head. It has no callable argument: only the actual issued receiver carrier
+/// and the actual typed userdata token. The return is the same exact callable
+/// schema Core checks for the committed typed local.
+fn produce_import_schema() -> HostFunctionSchema {
+    HostFunctionSchema::with_return(
+        PRODUCER_IMPORT,
+        vec![
+            HostParamSchema::value(
+                "receiver",
+                HostTypeSchema::Array(Box::new(HostTypeSchema::Int)),
+            ),
+            HostParamSchema::with_passing(
+                "token",
+                HostTypeSchema::Resource(LuaUserdataResource::key()),
+                HostParamPassing::Borrow,
+            ),
+        ],
+        typed_host_callable_schema(),
+    )
+}
+
 fn transport_catalog() -> &'static Arc<HostApiCatalog> {
     static CATALOG: OnceLock<Arc<HostApiCatalog>> = OnceLock::new();
     CATALOG.get_or_init(|| {
@@ -644,6 +700,10 @@ fn transport_catalog() -> &'static Arc<HostApiCatalog> {
             HostTypeSchema::Bool,
         ));
         builder.function(commit_import_schema());
+        // The read-only typed head producer. It takes only the issued
+        // receiver carrier and the actual typed userdata token; the callable
+        // itself comes from the heap's published `__gc`/`__call` chain.
+        builder.function(produce_import_schema());
         // One freshly issued LuaHeap table carrier, whose real shape is
         // `Array<Int>`.
         builder.function(HostFunctionSchema::with_return(
@@ -693,6 +753,12 @@ fn bind_hosts(vm: &mut Vm) -> Result<(), VmError> {
     )?;
     registry.register_exact_static("swap", 2, catalog_schema("swap"), host_swap)?;
     registry.register_exact_static(COMMIT_IMPORT, 3, catalog_schema(COMMIT_IMPORT), host_commit)?;
+    registry.register_exact_static(
+        PRODUCER_IMPORT,
+        2,
+        catalog_schema(PRODUCER_IMPORT),
+        host_produce,
+    )?;
     registry.bind_vm_cached(vm)
 }
 
@@ -767,6 +833,37 @@ struct PublishedCommitRecord {
     taken_userdata: Option<UserdataRef>,
 }
 
+/// One read-only invocation of the exact static producer. It records the
+/// actual heap head identities, the stored callable as a `Weak` only, the
+/// actual prototype id of that Arc, and the parent's own callable slot (the
+/// old fixture selection) as an identity comparison, never as an extra strong
+/// `Arc`. The queue/flag/top-frame fields are read before and after the pass.
+#[derive(Clone, Debug)]
+struct ProducerRecord {
+    userdata: UserdataRef,
+    raw_token: i64,
+    metatable: TableRef,
+    receiver: TableRef,
+    closure: heap::ClosureRef,
+    callable: std::sync::Weak<vm::CallableValue>,
+    published_count: usize,
+    queue_len: usize,
+    returned_prototype: u32,
+    receiver_class: GuestClass,
+    payload_is_head: bool,
+    token_still_open: bool,
+    parent_candidate_matches: bool,
+    parent_candidate_prototype: Option<u32>,
+    queue_before: Vec<(u64, u32, u32)>,
+    queue_after: Vec<(u64, u32, u32)>,
+    top_frame_before: Option<heap::RootFrameId>,
+    top_frame_after: Option<heap::RootFrameId>,
+    pending_before: [bool; 2],
+    pending_after: [bool; 2],
+    settled_before: [bool; 2],
+    settled_after: [bool; 2],
+}
+
 /// The first observation of one host callback. Recorded before any frame
 /// verification, resource probe, or error wrapping, from the live execution
 /// frames alone, so a later probe failure cannot erase whether the callback
@@ -839,6 +936,7 @@ struct Witness {
     gates: Vec<GateRecord>,
     prepared: Option<PublishedPrepareRecord>,
     commits: Vec<PublishedCommitRecord>,
+    producers: Vec<ProducerRecord>,
     issued_table: Option<Value>,
     issued_table_ref: Option<TableRef>,
     issued_userdata: Option<UserdataRef>,
@@ -1171,6 +1269,10 @@ fn host_note(vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
     let chosen = match *mode {
         0 | 3 | 4 | 6 | 7 => target,
         5 => other,
+        // The producer arms still call the old selection once. Its staged mode
+        // is the published-head arm selector, and like every other published
+        // arm it names the written target candidate.
+        8..=11 => target,
         other_mode => {
             return Err(host_fault_error(format!(
                 "note mode {other_mode} is not a fixture arm"
@@ -1490,6 +1592,154 @@ fn host_build_published_head(vm: &mut Vm) -> vm::VmResult<CallOutcome> {
     ))))
 }
 
+/// The read-only exact static producer.
+///
+/// The two operands are the actual parent-frame values: the original issued
+/// receiver carrier and the actual typed userdata token. This body never
+/// receives a candidate callable. It borrows the token payload through the
+/// formal Core API, then reads the published head, the current userdata
+/// metatable's raw `__gc`, and one layer of raw `__call` through the heap
+/// owner's read-only preflight. That preflight returns the stored callable as
+/// a `Weak`, and this body upgrades exactly one strong `Arc` to return to
+/// Core, which validates it against the exact `(Array<Int>,
+/// Resource(lua.userdata)) -> Bool` return schema and stores it in the typed
+/// local. The record keeps only heap identities, the `Weak`, the returned
+/// prototype id, and a pointer comparison against the parent's own callable
+/// slot, so this body adds no second strong reference and opens no root.
+fn host_produce(vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
+    let entry = frame_entry(vm, PRODUCER_ENTRY_LABEL);
+    with_run_scope(vm, |scope| scope.witness.entries.push(entry));
+
+    let [receiver, token] = args else {
+        return Err(host_fault_error(
+            "the typed producer expects the receiver and token operands",
+        ));
+    };
+    let Value::Int(token_raw) = *token else {
+        return Err(host_fault_error(
+            "the typed producer received a non-handle token operand",
+        ));
+    };
+    let token_u64 = u64::try_from(token_raw)
+        .map_err(|_| host_fault_error("the userdata token is not a positive handle"))?;
+
+    let prepared = with_run_scope(vm, |scope| scope.witness.prepared.clone())
+        .ok_or_else(|| host_fault_error("produce requires the prepared published head"))?;
+
+    // The actual typed payload comes from the Core resource table with the
+    // exact concrete key. The borrow ends before any heap read.
+    let payload = {
+        let host = vm.host_context();
+        let borrowed = host
+            .borrow_resource_with_key::<LuaUserdataResource>(
+                raw_handle(token_raw)?,
+                &LuaUserdataResource::key(),
+            )
+            .map_err(|error| {
+                host_fault_error(format!("the producer token borrow was refused: {error}"))
+            })?;
+        borrowed.get().userdata()
+    };
+
+    // The parent's own first parameter is the old fixture selection. Read its
+    // prototype id and later its exact Arc identity by reference; no clone of
+    // that candidate Arc is kept by this body.
+    let parent_candidate_prototype = {
+        let frames = vm.execution_frames();
+        let program = vm.program();
+        let locals = vm.locals();
+        frames.last().and_then(|frame| {
+            let prototype = frame
+                .prototype_id
+                .and_then(|id| program.callable_prototypes.get(id as usize))?;
+            if prototype.parameter_slots.len() != PUBLISHED_PARENT_PARAMS {
+                return None;
+            }
+            let slot = *prototype.parameter_slots.first()?;
+            match locals.get(frame.local_base.checked_add(usize::from(slot))?) {
+                Some(Value::Callable(candidate)) => Some(candidate.prototype_id),
+                _ => None,
+            }
+        })
+    };
+
+    let (read, receiver_class) = {
+        let mut host = vm.host_context();
+        let receiver_class = heap::with_heap(&mut host, |heap| Ok(heap.guest_class(receiver)))
+            .map_err(heap_fault)?;
+        let read = read_published_typed_call_head(
+            &mut host,
+            receiver,
+            Some(payload),
+            token_u64,
+            prepared.successor,
+            prepared.root_frame,
+        )
+        .map_err(heap_fault)?;
+        (read, receiver_class)
+    };
+    let token_still_open = {
+        let host = vm.host_context();
+        host.typed_resource_with_key::<LuaUserdataResource>(
+            raw_handle(token_raw)?,
+            &LuaUserdataResource::key(),
+        )
+        .is_ok()
+    };
+    let callable = read
+        .callable
+        .upgrade()
+        .ok_or_else(|| host_fault_error("the published head callable is no longer live"))?;
+    // Re-run the identity comparison against the upgraded heap Arc. The
+    // parent slot is read by reference and is never cloned here; this is the
+    // only strong Arc the producer returns.
+    let parent_candidate_matches = {
+        let frames = vm.execution_frames();
+        let program = vm.program();
+        let locals = vm.locals();
+        frames.last().is_some_and(|frame| {
+            frame
+                .prototype_id
+                .and_then(|id| program.callable_prototypes.get(id as usize))
+                .filter(|prototype| prototype.parameter_slots.len() == PUBLISHED_PARENT_PARAMS)
+                .and_then(|prototype| prototype.parameter_slots.first())
+                .and_then(|slot| locals.get(frame.local_base.checked_add(usize::from(*slot))?))
+                .is_some_and(|value| match value {
+                    Value::Callable(candidate) => Arc::ptr_eq(candidate, &callable),
+                    _ => false,
+                })
+        })
+    };
+    let record = ProducerRecord {
+        userdata: read.userdata,
+        raw_token: i64::try_from(read.raw_token).unwrap_or(i64::MAX),
+        metatable: read.metatable,
+        receiver: read.receiver,
+        closure: read.closure,
+        callable: read.callable.clone(),
+        published_count: read.published_count,
+        queue_len: read.queue_len,
+        returned_prototype: callable.prototype_id,
+        receiver_class,
+        payload_is_head: payload == read.userdata,
+        token_still_open,
+        parent_candidate_matches,
+        parent_candidate_prototype,
+        queue_before: read.queue_before,
+        queue_after: read.queue_after,
+        top_frame_before: read.top_frame_before,
+        top_frame_after: read.top_frame_after,
+        pending_before: read.pending_before,
+        pending_after: read.pending_after,
+        settled_before: read.settled_before,
+        settled_after: read.settled_after,
+    };
+    with_run_scope(vm, |scope| scope.witness.producers.push(record));
+    Ok(CallOutcome::Return(CallReturn::one(Value::Callable(
+        callable,
+    ))))
+}
+
 /// Installs the exact target `Arc` into the receiver's own metatable raw
 /// `__call` record, the same heap admission the controlled field import runs,
 /// and pins that installed closure generation in the prepared witness.
@@ -1571,7 +1821,7 @@ fn host_swap(vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
         return Err(host_fault_error("swap expects the owner and the callable"));
     };
     let select = with_run_scope(vm, |scope| scope.select);
-    if select == 6 {
+    if select == 6 || select == 10 {
         install_guest_callable_into_raw_call(vm, owner, target).map_err(heap_fault)?;
     }
     Ok(CallOutcome::Return(CallReturn::one(Value::Bool(true))))
@@ -1726,6 +1976,17 @@ enum CommitArgument {
     ForgedArgument,
 }
 
+/// The actual fixture callable the chunk-level `bind` installs into the
+/// receiver's raw `__call`. The positive and post-read-replacement controls
+/// install `Target`; the before-read replacement installs `Alternate`; the
+/// wrong-signature control installs `Other`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BindChoice {
+    Target,
+    Alternate,
+    Other,
+}
+
 /// The inserted exclusive commit call and its actual operand plan.
 #[derive(Clone, Debug)]
 struct CommitPatch {
@@ -1765,8 +2026,11 @@ struct PatchReport {
     sentinel_wrong: Option<LocalSlot>,
     parent_parameters: Vec<LocalSlot>,
     target_declared: bool,
+    alternate_declared: bool,
     other_declared: bool,
     continuation_rewritten: bool,
+    producer: bool,
+    producer_import: Option<u16>,
 }
 
 impl SourcePlugin for TransportPlugin {
@@ -1846,12 +2110,15 @@ fn patch_published_chunk(
     stmts: &mut Vec<Stmt>,
     bind: &PublishedImport,
     wrong: &PublishedImport,
+    bind_choice: BindChoice,
     next_local: &mut usize,
     report: &mut PatchReport,
 ) -> Result<bool, ParseError> {
     let mut fault_position = None;
     let mut receiver_slot = None;
     let mut target_slot = None;
+    let mut alternate_slot = None;
+    let mut other_slot = None;
     let mut parent_position = None;
     for (position, stmt) in stmts.iter_mut().enumerate() {
         match stmt {
@@ -1873,11 +2140,12 @@ fn patch_published_chunk(
                 index,
                 expr: Expr::Closure(closure),
                 ..
-            } => {
-                if closure_first_mark_label(closure) == Some(TARGET_LABEL) {
-                    target_slot = Some(*index);
-                }
-            }
+            } => match closure_first_mark_label(closure) {
+                Some(TARGET_LABEL) => target_slot = Some(*index),
+                Some(ALTERNATE_LABEL) => alternate_slot = Some(*index),
+                Some(OTHER_LABEL) => other_slot = Some(*index),
+                _ => {}
+            },
             Stmt::Let {
                 expr: Expr::LocalCall(_, _, args, _),
                 ..
@@ -1887,8 +2155,13 @@ fn patch_published_chunk(
             _ => {}
         }
     }
-    if let (Some(fault_position), Some(receiver_slot), Some(target_slot), Some(parent_position)) =
-        (fault_position, receiver_slot, target_slot, parent_position)
+    let bind_slot = match bind_choice {
+        BindChoice::Target => target_slot,
+        BindChoice::Alternate => alternate_slot,
+        BindChoice::Other => other_slot,
+    };
+    if let (Some(fault_position), Some(receiver_slot), Some(bind_slot), Some(parent_position)) =
+        (fault_position, receiver_slot, bind_slot, parent_position)
     {
         let bind_result = LocalSlot::try_from(*next_local)
             .map_err(|_| patch_error("the bind result local overflows a slot"))?;
@@ -1914,7 +2187,7 @@ fn patch_published_chunk(
             expr: Expr::Call(
                 bind.import_index,
                 Vec::new(),
-                vec![Expr::Var(receiver_slot), Expr::Var(target_slot)],
+                vec![Expr::Var(receiver_slot), Expr::Var(bind_slot)],
                 Some(Box::new(bind.resolution.clone())),
                 None,
             ),
@@ -1952,7 +2225,7 @@ fn patch_published_chunk(
             } => inner,
             _ => continue,
         };
-        if patch_published_chunk(inner, bind, wrong, next_local, report)? {
+        if patch_published_chunk(inner, bind, wrong, bind_choice, next_local, report)? {
             return Ok(true);
         }
     }
@@ -2026,6 +2299,12 @@ fn patch_ir(
             forged_receiver: gate_mode == 2,
         })
     };
+    let producer = gate_mode >= 7;
+    let bind_choice = match gate_mode {
+        8 => BindChoice::Alternate,
+        10 => BindChoice::Other,
+        _ => BindChoice::Target,
+    };
     // A published-commit arm gets a second exact static import resolved with
     // the same concrete operands. The commit body runs after the read-only
     // seam and before the parent's own `CallValue(2)`.
@@ -2092,7 +2371,7 @@ fn patch_ir(
         )?;
         let wrong =
             insert_published_import(ir, resolver, WRONG_TOKEN_IMPORT, &[], vm::ValueType::Int)?;
-        if gate_mode == 6
+        if (gate_mode == 6 || gate_mode == 9)
             && let Some(spec) = commit.as_mut()
         {
             spec.swap = Some(insert_published_import(
@@ -2107,22 +2386,52 @@ fn patch_ir(
     } else {
         None
     };
+    // The producer fixture cannot name a private host call in source. The
+    // plugin inserts the exact static `produce(recv, arg2)`: the callable
+    // operand is absent, and only the actual issued receiver carrier and the
+    // actual typed userdata token cross the boundary. Core's exact return
+    // schema is the same callable schema the typed local declares.
+    let produce = if producer {
+        Some(insert_published_import(
+            ir,
+            resolver,
+            PRODUCER_IMPORT,
+            &[
+                TypeSchema::Array(Box::new(TypeSchema::Int)),
+                TypeSchema::Resource(LuaUserdataResource::key()),
+            ],
+            vm::ValueType::Callable,
+        )?)
+    } else {
+        None
+    };
     let mut next_local = ir.locals;
     patch_stmts(
         &mut ir.stmts,
         gate.as_ref(),
         commit.as_ref(),
+        producer,
+        produce.as_ref(),
         &mut next_local,
         &mut report,
     )?;
     if let Some((bind, wrong)) = &published_chunk
-        && !patch_published_chunk(&mut ir.stmts, bind, wrong, &mut next_local, &mut report)?
+        && !patch_published_chunk(
+            &mut ir.stmts,
+            bind,
+            wrong,
+            bind_choice,
+            &mut next_local,
+            &mut report,
+        )?
     {
         return Err(patch_error(
             "the published-commit chunk is missing its fault, tick, target or parent call",
         ));
     }
     ir.locals = next_local;
+    report.producer = producer;
+    report.producer_import = produce.as_ref().map(|produce| produce.import_index);
     // The private lowerer reads every admitted Lua callable through an
     // explicit `ToOwned` copy. This pin classifies a callable whose schema
     // contains a resource as an owned local and then refuses `.copy()` on it.
@@ -2184,6 +2493,8 @@ fn patch_stmts(
     stmts: &mut [Stmt],
     gate: Option<&GateSpec>,
     commit: Option<&PublishedCommitSpec>,
+    producer: bool,
+    produce: Option<&PublishedImport>,
     next_local: &mut usize,
     report: &mut PatchReport,
 ) -> Result<(), ParseError> {
@@ -2210,6 +2521,18 @@ fn patch_stmts(
                             **expr = Expr::Bool(true);
                         }
                     }
+                    Some(ALTERNATE_LABEL) if producer => {
+                        // The before-read replacement is a second real
+                        // zero-capture closure with the same exact schema and
+                        // its own execution marker. It is only declared on
+                        // the producer fixture, so the original published
+                        // arms keep their compiled shape.
+                        *declared_schema = Some(userdata_callable_schema());
+                        if let Expr::Block { expr, .. } = closure.body.as_mut() {
+                            **expr = Expr::Bool(true);
+                        }
+                        report.alternate_declared = true;
+                    }
                     Some(OTHER_LABEL) => {
                         *declared_schema = Some(table_callable_schema());
                         report.other_declared = true;
@@ -2219,13 +2542,13 @@ fn patch_stmts(
                 if closure.param_slots.len() == PARENT_PARAMS
                     || closure.param_slots.len() == PUBLISHED_PARENT_PARAMS
                 {
-                    patch_parent(closure, gate, commit, next_local, report)?;
+                    patch_parent(closure, gate, commit, producer, produce, next_local, report)?;
                 }
             }
             Stmt::Expr {
                 expr: Expr::Block { stmts, .. },
                 ..
-            } => patch_stmts(stmts, gate, commit, next_local, report)?,
+            } => patch_stmts(stmts, gate, commit, producer, produce, next_local, report)?,
             _ => {}
         }
     }
@@ -2271,6 +2594,8 @@ fn patch_parent(
     closure: &mut ClosureExpr,
     gate: Option<&GateSpec>,
     commit: Option<&PublishedCommitSpec>,
+    producer: bool,
+    produce: Option<&PublishedImport>,
     next_local: &mut usize,
     report: &mut PatchReport,
 ) -> Result<(), ParseError> {
@@ -2288,8 +2613,12 @@ fn patch_parent(
     }
     report.parent_parameters = parameters.clone();
 
-    let mut typed_local = None;
+    // The old fixture selection is `note`. The producer arm keeps it in the
+    // frame for the in-run RED comparison, but the typed local that feeds the
+    // exclusive commit and the following `CallValue(2)` is created by the
+    // plugin's own exact static `produce(recv, arg2)` call.
     let mut note_position = None;
+    let mut note_local = None;
     for (position, stmt) in stmts.iter_mut().enumerate() {
         let Stmt::Let {
             index,
@@ -2303,17 +2632,48 @@ fn patch_parent(
         if resolution.name != "note" {
             continue;
         }
-        if typed_local.is_some() {
+        if note_position.is_some() {
             return Err(patch_error(
                 "the parent declares two typed candidate locals",
             ));
         }
-        *declared_schema = Some(userdata_callable_schema());
-        typed_local = Some(*index);
+        if !producer {
+            *declared_schema = Some(userdata_callable_schema());
+        }
+        note_local = Some(*index);
         note_position = Some(position);
     }
-    let Some(typed_local) = typed_local else {
+    let Some(note_position) = note_position else {
         return Err(patch_error("the parent has no typed candidate local"));
+    };
+    let typed_local = if let Some(produce) = produce {
+        let produced = LocalSlot::try_from(*next_local)
+            .map_err(|_| patch_error("the producer result local overflows a slot"))?;
+        *next_local = next_local
+            .checked_add(1)
+            .ok_or_else(|| patch_error("too many locals for the producer result"))?;
+        let expression = Expr::Call(
+            produce.import_index,
+            Vec::new(),
+            vec![
+                Expr::Var(parameters[PARENT_RECEIVER_SLOT]),
+                Expr::Var(parameters[PARENT_ARGUMENT_SLOT]),
+            ],
+            Some(Box::new(produce.resolution.clone())),
+            None,
+        );
+        stmts.insert(
+            note_position + 1,
+            Stmt::Let {
+                index: produced,
+                declared_schema: Some(userdata_callable_schema()),
+                expr: expression,
+                line: 1,
+            },
+        );
+        produced
+    } else {
+        note_local.ok_or_else(|| patch_error("the parent has no typed candidate local"))?
     };
     report.typed_local = Some(typed_local);
     report.declared_schema = Some(userdata_callable_schema());
@@ -2390,10 +2750,9 @@ fn patch_parent(
         let Some(position) = call_position else {
             return Err(patch_error("the parent has no admitted dynamic call"));
         };
-        let Some(note_position) = note_position else {
-            return Err(patch_error("the parent has no typed candidate local"));
-        };
-        let admit_position = if commit.is_some() {
+        let admit_position = if produce.is_some() {
+            note_position + 2
+        } else if commit.is_some() {
             note_position + 1
         } else {
             position
@@ -2560,6 +2919,7 @@ struct ArmRun {
     call_sites: Vec<super::DecodedCallSite>,
     host_call_sites: Vec<(usize, u8, Option<u32>)>,
     commit_call_sites: Vec<(usize, u8, Option<u32>)>,
+    producer_call_sites: Vec<(usize, u8, Option<u32>)>,
     prototypes: Vec<vm::CallablePrototype>,
     host_imports: Vec<HostImport>,
     host_schemas: Vec<Option<HostImportSchema>>,
@@ -2614,6 +2974,7 @@ struct CompiledArm {
     call_sites: Vec<super::DecodedCallSite>,
     host_call_sites: Vec<(usize, u8, Option<u32>)>,
     commit_call_sites: Vec<(usize, u8, Option<u32>)>,
+    producer_call_sites: Vec<(usize, u8, Option<u32>)>,
     prototypes: Vec<vm::CallablePrototype>,
     host_imports: Vec<HostImport>,
     host_schemas: Vec<Option<HostImportSchema>>,
@@ -2648,6 +3009,10 @@ fn compile_arm_with(arm: Arm, plugin: TransportPlugin) -> CompiledArm {
         .as_ref()
         .map(|commit| decoded_host_calls(&compiled.program, commit.import_index))
         .unwrap_or_default();
+    let producer_call_sites = patch
+        .producer_import
+        .map(|import| decoded_host_calls(&compiled.program, import))
+        .unwrap_or_default();
     let prototypes = compiled.program.callable_prototypes.clone();
     let host_imports = compiled.program.imports.clone();
     let host_schemas = compiled.program.host_import_schemas().to_vec();
@@ -2664,6 +3029,7 @@ fn compile_arm_with(arm: Arm, plugin: TransportPlugin) -> CompiledArm {
         call_sites,
         host_call_sites,
         commit_call_sites,
+        producer_call_sites,
         prototypes,
         host_imports,
         host_schemas,
@@ -2724,6 +3090,7 @@ fn run_compiled(compiled: CompiledArm) -> ArmRun {
         call_sites: compiled.call_sites,
         host_call_sites: compiled.host_call_sites,
         commit_call_sites: compiled.commit_call_sites,
+        producer_call_sites: compiled.producer_call_sites,
         prototypes: compiled.prototypes,
         host_imports: compiled.host_imports,
         host_schemas: compiled.host_schemas,
@@ -4551,6 +4918,26 @@ fn published_commit(run: &ArmRun) -> &PublishedCommitRecord {
     &commits[0]
 }
 
+fn published_producer(run: &ArmRun) -> &ProducerRecord {
+    let producers = &run.witness.producers;
+    assert_eq!(
+        producers.len(),
+        1,
+        "{}: the typed producer must run exactly once, saw {}",
+        run.arm.label(),
+        producers.len()
+    );
+    &producers[0]
+}
+
+fn producer_entries(run: &ArmRun) -> Vec<&EntryRecord> {
+    run.witness
+        .entries
+        .iter()
+        .filter(|entry| entry.label == PRODUCER_ENTRY_LABEL)
+        .collect()
+}
+
 fn commit_entries(run: &ArmRun) -> Vec<&EntryRecord> {
     run.witness
         .entries
@@ -4597,6 +4984,66 @@ fn snapshot_published_typed_table_call(
             callable: call.callable,
             published_count: call.published_count,
             queue_len: call.queue_len,
+        })
+    })
+}
+
+/// One read-only source pass over the published head. The heap owner performs
+/// every identity read and the before/after comparison; this wrapper only
+/// re-shapes its test-only view. The callable stays a `Weak`.
+#[derive(Clone)]
+struct PublishedTypedHeadRead {
+    userdata: UserdataRef,
+    raw_token: u64,
+    metatable: TableRef,
+    receiver: TableRef,
+    closure: heap::ClosureRef,
+    callable: std::sync::Weak<vm::CallableValue>,
+    published_count: usize,
+    queue_len: usize,
+    queue_before: Vec<(u64, u32, u32)>,
+    queue_after: Vec<(u64, u32, u32)>,
+    top_frame_before: Option<heap::RootFrameId>,
+    top_frame_after: Option<heap::RootFrameId>,
+    pending_before: [bool; 2],
+    pending_after: [bool; 2],
+    settled_before: [bool; 2],
+    settled_after: [bool; 2],
+}
+
+fn read_published_typed_call_head(
+    host: &mut vm::HostContext,
+    expected_receiver: &Value,
+    expected_payload: Option<UserdataRef>,
+    expected_token: u64,
+    expected_successor: UserdataRef,
+    expected_top: heap::RootFrameId,
+) -> Result<PublishedTypedHeadRead, heap::HeapError> {
+    heap::with_heap(host, |heap| {
+        let read = heap.test_read_published_typed_call_head(
+            expected_receiver,
+            expected_payload,
+            expected_token,
+            expected_successor,
+            expected_top,
+        )?;
+        Ok(PublishedTypedHeadRead {
+            userdata: read.call.userdata,
+            raw_token: read.call.raw_token,
+            metatable: read.call.metatable,
+            receiver: read.call.receiver,
+            closure: read.call.closure,
+            callable: read.call.callable,
+            published_count: read.call.published_count,
+            queue_len: read.call.queue_len,
+            queue_before: read.queue_before,
+            queue_after: read.queue_after,
+            top_frame_before: read.top_frame_before,
+            top_frame_after: read.top_frame_after,
+            pending_before: read.pending_before,
+            pending_after: read.pending_after,
+            settled_before: read.settled_before,
+            settled_after: read.settled_after,
         })
     })
 }
@@ -5241,6 +5688,1036 @@ fn assert_published_positive(run: &mut ArmRun) {
     );
 }
 
+// ---- the published head producer ------------------------------------------
+
+/// The compiled producer import must carry the exact catalog schema and
+/// fingerprint: only the issued receiver carrier and the actual typed token,
+/// with the exact callable return Core validates. No candidate callable
+/// parameter is present.
+fn assert_producer_import(run: &ArmRun) {
+    let catalog = transport_catalog();
+    let function = catalog.function(PRODUCER_IMPORT).unwrap_or_else(|| {
+        panic!(
+            "{}: the catalog is missing '{PRODUCER_IMPORT}'",
+            run.arm.label()
+        )
+    });
+    assert_eq!(
+        function,
+        &produce_import_schema(),
+        "{}: the live producer catalog install",
+        run.arm.label()
+    );
+    let expected = HostImportSchema::from_function(catalog, function);
+    assert_eq!(
+        expected.fingerprint,
+        catalog.fingerprint(),
+        "{}: the producer catalog fingerprint",
+        run.arm.label()
+    );
+    let index = run
+        .host_imports
+        .iter()
+        .position(|import| import.name == PRODUCER_IMPORT)
+        .unwrap_or_else(|| {
+            panic!(
+                "{}: '{PRODUCER_IMPORT}' is not a compiled import",
+                run.arm.label()
+            )
+        });
+    assert_eq!(
+        run.patch.producer_import,
+        Some(index as u16),
+        "{}: the compiled producer import slot",
+        run.arm.label()
+    );
+    assert_eq!(
+        run.host_imports[index].arity,
+        2,
+        "{}: the producer import arity",
+        run.arm.label()
+    );
+    assert_eq!(
+        run.host_imports[index].return_type,
+        vm::ValueType::Callable,
+        "{}: the producer's coarse return",
+        run.arm.label()
+    );
+    let schema = run.host_schemas[index].as_ref().unwrap_or_else(|| {
+        panic!(
+            "{}: the producer import must carry its full schema",
+            run.arm.label()
+        )
+    });
+    assert_eq!(
+        schema,
+        &expected,
+        "{}: the program must carry the complete producer schema and fingerprint",
+        run.arm.label()
+    );
+    assert_eq!(
+        schema.return_type,
+        typed_host_callable_schema(),
+        "{}: the producer return is the exact typed callable schema",
+        run.arm.label()
+    );
+    assert_eq!(
+        schema.params[0].schema,
+        HostTypeSchema::Array(Box::new(HostTypeSchema::Int)),
+        "{}: the producer receiver is the issued Array<Int> carrier",
+        run.arm.label()
+    );
+    assert_eq!(
+        schema.params[1].schema,
+        HostTypeSchema::Resource(LuaUserdataResource::key()),
+        "{}: the producer token is the concrete lua.userdata key",
+        run.arm.label()
+    );
+    assert_eq!(
+        schema.params[1].passing,
+        HostParamPassing::Borrow,
+        "{}: the producer token is a borrowed actual operand",
+        run.arm.label()
+    );
+    assert!(
+        schema.params.iter().all(|param| {
+            !matches!(
+                param.schema,
+                HostTypeSchema::Callable { .. } | HostTypeSchema::Unknown
+            )
+        }),
+        "{}: the producer has no candidate callable or Unknown parameter",
+        run.arm.label()
+    );
+}
+
+/// The one compiled `produce` Call, the one `admit` Call, the one `commit`
+/// Call and the one `CallValue(2)` owned by the active parent, in program
+/// order.
+fn producer_parent_sites(run: &ArmRun) -> (usize, usize, usize, usize) {
+    let parent = run
+        .mark("parent-enter")
+        .last_prototype
+        .unwrap_or_else(|| panic!("{}: the parent frame has no prototype", run.arm.label()));
+    let produces: Vec<_> = run
+        .producer_call_sites
+        .iter()
+        .filter(|(_, _, owner)| *owner == Some(parent))
+        .collect();
+    assert_eq!(
+        produces.len(),
+        1,
+        "{}: expected one producer Call owned by the parent, saw {:?}",
+        run.arm.label(),
+        run.producer_call_sites
+    );
+    assert_eq!(
+        produces[0].1,
+        2,
+        "{}: the producer Call arity",
+        run.arm.label()
+    );
+    let admits: Vec<_> = run
+        .host_call_sites
+        .iter()
+        .filter(|(_, _, owner)| *owner == Some(parent))
+        .collect();
+    assert_eq!(
+        admits.len(),
+        1,
+        "{}: expected one admit Call owned by the parent, saw {:?}",
+        run.arm.label(),
+        run.host_call_sites
+    );
+    assert_eq!(admits[0].1, 3, "{}: the seam Call arity", run.arm.label());
+    let commits: Vec<_> = run
+        .commit_call_sites
+        .iter()
+        .filter(|(_, _, owner)| *owner == Some(parent))
+        .collect();
+    assert_eq!(
+        commits.len(),
+        1,
+        "{}: expected one commit Call owned by the parent, saw {:?}",
+        run.arm.label(),
+        run.commit_call_sites
+    );
+    assert_eq!(
+        commits[0].1,
+        3,
+        "{}: the commit Call arity",
+        run.arm.label()
+    );
+    let calls: Vec<_> = run
+        .call_sites
+        .iter()
+        .filter(|site| site.owner == Some(parent) && site.argc == CALL_ARGC)
+        .collect();
+    assert_eq!(
+        calls.len(),
+        1,
+        "{}: expected one CallValue(2) owned by the parent, saw {:?}",
+        run.arm.label(),
+        run.call_sites
+    );
+    assert!(
+        produces[0].0 < admits[0].0,
+        "{}: the producer must run before the read-only seam",
+        run.arm.label()
+    );
+    assert!(
+        admits[0].0 < commits[0].0,
+        "{}: the read-only seam must precede the exclusive commit",
+        run.arm.label()
+    );
+    assert!(
+        commits[0].0 < calls[0].ip,
+        "{}: the exclusive commit must precede CallValue(2)",
+        run.arm.label()
+    );
+    (produces[0].0, admits[0].0, commits[0].0, calls[0].ip)
+}
+
+/// The read-phase evidence: the producer's actual heap identities, its
+/// `Weak` against the current raw `__call`, the exact recipient/queue top
+/// frame, the unchanged pending/settled state, and the returned prototype's
+/// exact declared schema. It creates at most one temporary strong `Arc` from
+/// the heap slot for the `Weak` comparison and drops it before returning.
+fn assert_producer_read_phase(
+    run: &mut ArmRun,
+    live_edge_matches_producer: bool,
+    expect_userdata_schema: bool,
+) -> (ProducerRecord, u32) {
+    assert_producer_import(run);
+    let prepared = published_prepared(run).clone();
+    let producer = published_producer(run).clone();
+    let target_id = callable_id(&run.pick().chosen);
+    assert!(
+        run.pick().mode >= 8,
+        "{}: the old fixture selection must still run",
+        run.arm.label()
+    );
+    assert_eq!(
+        producer.userdata,
+        prepared.userdata,
+        "{}: the producer read A as the head",
+        run.arm.label()
+    );
+    assert_eq!(
+        producer.raw_token,
+        prepared.userdata_raw,
+        "{}: the producer read A's real token",
+        run.arm.label()
+    );
+    assert_eq!(
+        producer.metatable,
+        prepared.finalizer_metatable,
+        "{}: the producer read A's finalizer metatable",
+        run.arm.label()
+    );
+    assert_eq!(
+        producer.receiver,
+        prepared.receiver,
+        "{}: the producer followed raw __gc to the issued receiver",
+        run.arm.label()
+    );
+    assert_eq!(
+        producer.receiver_class,
+        GuestClass::Table(prepared.receiver),
+        "{}: the receiver operand is the issued carrier",
+        run.arm.label()
+    );
+    assert!(
+        producer.payload_is_head,
+        "{}: the actual typed payload names the head",
+        run.arm.label()
+    );
+    assert!(
+        producer.token_still_open,
+        "{}: the read pass did not consume the token",
+        run.arm.label()
+    );
+    assert_eq!(
+        producer.published_count,
+        2,
+        "{}: both selected owners remain published",
+        run.arm.label()
+    );
+    assert_eq!(
+        producer.queue_len,
+        2,
+        "{}: both records remain queued",
+        run.arm.label()
+    );
+    let expected_queue = vec![
+        (
+            u64::try_from(prepared.userdata_raw).expect("A token"),
+            prepared.userdata.slot(),
+            prepared.userdata.generation(),
+        ),
+        (
+            u64::try_from(prepared.successor_raw).expect("B token"),
+            prepared.successor.slot(),
+            prepared.successor.generation(),
+        ),
+    ];
+    assert_eq!(
+        producer.queue_before,
+        expected_queue,
+        "{}: the producer starts from A then B",
+        run.arm.label()
+    );
+    assert_eq!(
+        producer.queue_after,
+        expected_queue,
+        "{}: the read pass leaves A then B queued",
+        run.arm.label()
+    );
+    assert_eq!(
+        producer.top_frame_before,
+        Some(prepared.root_frame),
+        "{}: the producer starts on the prepared root frame",
+        run.arm.label()
+    );
+    assert_eq!(
+        producer.top_frame_after,
+        Some(prepared.root_frame),
+        "{}: the read pass opens no root frame",
+        run.arm.label()
+    );
+    assert_eq!(
+        producer.pending_before,
+        [true, true],
+        "{}: both owners are pending before the read",
+        run.arm.label()
+    );
+    assert_eq!(
+        producer.pending_after,
+        [true, true],
+        "{}: both owners stay pending after the read",
+        run.arm.label()
+    );
+    assert_eq!(
+        producer.settled_before,
+        [false, false],
+        "{}: neither owner is settled before the read",
+        run.arm.label()
+    );
+    assert_eq!(
+        producer.settled_after,
+        [false, false],
+        "{}: neither owner is settled by the read",
+        run.arm.label()
+    );
+
+    // The stored Arc must be the exact one the producer read. The live raw
+    // edge is used when the arm did not replace it after the read; the
+    // post-read replacement control compares against the exact closure the
+    // read recorded instead. The upgrade below is only for this comparison;
+    // it is dropped at once.
+    let read_closure = if live_edge_matches_producer {
+        let current_closure = heap_query(&mut run.vm, |heap| {
+            heap.named_closure_edge(prepared.receiver_metatable, "__call")
+        });
+        assert_eq!(
+            producer.closure,
+            current_closure,
+            "{}: the producer read the current raw __call generation",
+            run.arm.label()
+        );
+        current_closure
+    } else {
+        let recorded = prepared
+            .call_closure
+            .expect("the bind import must install the raw __call");
+        assert_eq!(
+            producer.closure,
+            recorded,
+            "{}: the producer read the pre-replacement raw __call",
+            run.arm.label()
+        );
+        recorded
+    };
+    let read_arc = {
+        let mut host = run.vm.host_context();
+        heap::with_heap(&mut host, |heap| heap.closure_callable(read_closure))
+            .unwrap_or_else(|error| panic!("{}: raw __call Arc read: {error:?}", run.arm.label()))
+    };
+    assert!(
+        std::sync::Weak::ptr_eq(&producer.callable, &Arc::downgrade(&read_arc)),
+        "{}: the producer Weak names the raw __call Arc",
+        run.arm.label()
+    );
+    assert_eq!(
+        producer.returned_prototype,
+        read_arc.prototype_id,
+        "{}: the returned prototype is the raw __call instance",
+        run.arm.label()
+    );
+    drop(read_arc);
+
+    assert_eq!(
+        producer.parent_candidate_prototype,
+        Some(target_id),
+        "{}: the parent's own callable slot is the old fixture selection",
+        run.arm.label()
+    );
+
+    let prototype = run.prototype(producer.returned_prototype);
+    assert_eq!(
+        prototype.arity,
+        CALL_ARGC,
+        "{}: the producer result is a two-parameter Lua function",
+        run.arm.label()
+    );
+    if expect_userdata_schema {
+        assert_eq!(
+            prototype.schema,
+            Some(userdata_callable_schema()),
+            "{}: Core checked the exact declared callable schema",
+            run.arm.label()
+        );
+    }
+    assert!(
+        matches!(prototype.target, vm::CallableTarget::ScriptFunction(_)),
+        "{}: the producer result is a script function",
+        run.arm.label()
+    );
+    assert!(
+        prototype.capture_slots.is_empty() && prototype.capture_source_slots.is_empty(),
+        "{}: the producer result is zero-capture",
+        run.arm.label()
+    );
+
+    let entries = producer_entries(run);
+    assert_eq!(
+        entries.len(),
+        1,
+        "{}: exactly one raw producer entry",
+        run.arm.label()
+    );
+    let parent = run.mark("parent-enter");
+    let entry = entries[0];
+    assert_eq!(
+        (entry.frame_len, entry.prototype_id, entry.parent_prototype),
+        (
+            parent.frame_len,
+            parent.last_prototype,
+            parent.parent_prototype
+        ),
+        "{}: the producer runs in the active parent frame",
+        run.arm.label()
+    );
+    if !run.witness.commits.is_empty() {
+        let producer_index = run
+            .witness
+            .entries
+            .iter()
+            .position(|entry| entry.label == PRODUCER_ENTRY_LABEL)
+            .expect("producer entry");
+        let admit_index = run
+            .witness
+            .entries
+            .iter()
+            .position(|entry| entry.label == PRECOMMIT_ENTRY_LABEL)
+            .expect("admit entry");
+        let commit_index = run
+            .witness
+            .entries
+            .iter()
+            .position(|entry| entry.label == COMMIT_ENTRY_LABEL)
+            .expect("commit entry");
+        assert!(
+            producer_index < admit_index && admit_index < commit_index,
+            "{}: the producer, seam and commit entries run in that order",
+            run.arm.label()
+        );
+    }
+    (producer, target_id)
+}
+
+/// The commit operand must be the exact Arc the producer read. The `Weak`
+/// comparison creates a temporary `Weak` from the commit operand; it does not
+/// clone that strong `Arc`.
+fn assert_producer_commit_identity(run: &ArmRun) {
+    let producer = published_producer(run);
+    let commit = published_commit(run);
+    assert_eq!(
+        callable_id(&commit.callable),
+        producer.returned_prototype,
+        "{}: the commit operand is the producer's prototype",
+        run.arm.label()
+    );
+    let Value::Callable(commit_arc) = &commit.callable else {
+        panic!("{}: the commit operand is not callable", run.arm.label());
+    };
+    assert!(
+        std::sync::Weak::ptr_eq(&producer.callable, &Arc::downgrade(commit_arc)),
+        "{}: the commit operand is the exact Arc the producer read",
+        run.arm.label()
+    );
+    assert!(
+        commit.weak_matches_callable,
+        "{}: the commit's own snapshot Weak names the operand Arc",
+        run.arm.label()
+    );
+}
+
+/// The successful replacement transaction: the real child frame, the parent
+/// continuation, B as the remaining head, and retirement of exactly the
+/// commit's three roots.
+fn assert_producer_transaction(run: &mut ArmRun, child_label: &str) {
+    run.assert_fuel();
+    assert_published_import(run);
+    assert!(
+        matches!(run.status, Ok(VmStatus::Halted)),
+        "{}: the parent must halt normally, got {:?}",
+        run.arm.label(),
+        run.status
+    );
+    assert_eq!(
+        run.labels(),
+        ["parent-enter", child_label, "parent-after", "done"],
+        "{}: the actual replacement child must run between the parent markers",
+        run.arm.label()
+    );
+    let values = run.exit().unwrap_or_else(|| {
+        panic!(
+            "{}: expected a chunk completion, got {:?}",
+            run.arm.label(),
+            run.status
+        )
+    });
+    assert_eq!(
+        values.len(),
+        3,
+        "{}: [true] plus the parent result and receiver",
+        run.arm.label()
+    );
+    assert_eq!(values[0], Value::Bool(true));
+    assert_eq!(values[1], Value::Bool(true));
+    assert!(
+        same_array(
+            &values[2],
+            &run.witness
+                .issued_table
+                .clone()
+                .expect("the issued receiver carrier")
+        ),
+        "{}: the chunk returned the exact issued receiver carrier",
+        run.arm.label()
+    );
+
+    let prepared = published_prepared(run).clone();
+    let producer = published_producer(run).clone();
+    let commit = published_commit(run).clone();
+    assert_eq!(
+        callable_id(&commit.callable),
+        producer.returned_prototype,
+        "{}: the commit uses the producer return",
+        run.arm.label()
+    );
+    assert_eq!(
+        commit.receiver_class,
+        GuestClass::Table(prepared.receiver),
+        "{}: the commit receiver is the action receiver",
+        run.arm.label()
+    );
+    assert_eq!(commit.token_raw, prepared.userdata_raw);
+    assert!(commit.payload_is_head);
+    assert!(commit.weak_matches_callable);
+    assert_eq!(
+        commit.action_closure,
+        (
+            producer.closure.domain(),
+            producer.closure.slot(),
+            producer.closure.generation(),
+        ),
+        "{}: the commit re-read the raw __call the producer used",
+        run.arm.label()
+    );
+    let (frame, roots) = commit
+        .outcome
+        .as_ref()
+        .unwrap_or_else(|error| panic!("{}: the commit refused: {error}", run.arm.label()));
+    assert_eq!(*roots, 3);
+    assert_eq!(commit.taken_userdata, Some(prepared.userdata));
+
+    let callee = run
+        .witness
+        .marks
+        .iter()
+        .find_map(|mark| mark.callee.as_ref())
+        .unwrap_or_else(|| panic!("{}: no child frame was observed", run.arm.label()));
+    assert_eq!(
+        callee.prototype_id,
+        producer.returned_prototype,
+        "{}: the child executed the producer's actual instance",
+        run.arm.label()
+    );
+    let child_receiver = callee
+        .parameter_values
+        .first()
+        .cloned()
+        .flatten()
+        .expect("the child receiver formal slot");
+    assert!(
+        same_array(&child_receiver, &commit.receiver),
+        "{}: the child receiver is the exact commit operand Arc",
+        run.arm.label()
+    );
+    assert_eq!(
+        callee.parameter_values.get(1).cloned().flatten(),
+        Some(Value::Int(commit.token_raw)),
+        "{}: the child token slot reuses the commit operand",
+        run.arm.label()
+    );
+    assert_eq!(
+        callee.token.parts,
+        (
+            prepared.userdata.domain(),
+            prepared.userdata.slot(),
+            prepared.userdata.generation(),
+        ),
+        "{}: the child formal token borrows A",
+        run.arm.label()
+    );
+    assert_eq!(
+        callee.token.rebound_parts,
+        callee.token.parts,
+        "{}: the heap still names the same payload",
+        run.arm.label()
+    );
+    assert!(
+        callee.table_token_refused,
+        "{}: A's token is not a lua.table resource",
+        run.arm.label()
+    );
+    let continuation = run
+        .mark("parent-after")
+        .continuation
+        .as_ref()
+        .expect("the parent continuation must re-borrow the token");
+    assert_eq!(
+        continuation.parts,
+        callee.token.parts,
+        "{}: the continuation reads the same A token",
+        run.arm.label()
+    );
+
+    // The child entry is bound to the same compiled call site the parent
+    // resumes, and the child is the declared replacement prototype.
+    let callback_entry = run
+        .witness
+        .entries
+        .iter()
+        .find(|entry| entry.label == child_label)
+        .expect("the child entry must be recorded first");
+    let child_return_ip = run
+        .mark(child_label)
+        .last_return_ip
+        .expect("the child frame must resume bytecode");
+    assert_eq!(
+        callback_entry.return_ip,
+        Some(child_return_ip),
+        "{}: the child entry resume address is the real call",
+        run.arm.label()
+    );
+    let call_site = run
+        .call_sites
+        .iter()
+        .find(|site| {
+            site.owner == run.mark("parent-enter").last_prototype && site.argc == CALL_ARGC
+        })
+        .expect("the parent CallValue(2)");
+    assert_eq!(
+        child_return_ip,
+        call_site.return_ip,
+        "{}: the child resumes at the compiled call's return address",
+        run.arm.label()
+    );
+
+    // B is still the real published head.
+    assert_eq!(
+        published_pending(run),
+        vec![(
+            u64::try_from(prepared.successor_raw).expect("successor token"),
+            prepared.successor.slot(),
+            prepared.successor.generation(),
+        )],
+        "{}: only B remains queued",
+        run.arm.label()
+    );
+    assert_eq!(published_count(run), 1);
+    assert!(
+        published_pending_flag(run, prepared.successor)
+            && !published_settled_flag(run, prepared.successor),
+        "{}: B is still pending and not settled",
+        run.arm.label()
+    );
+    assert!(
+        !published_pending_flag(run, prepared.userdata)
+            && published_settled_flag(run, prepared.userdata),
+        "{}: A is settled exactly once",
+        run.arm.label()
+    );
+    assert_eq!(
+        heap_query(&mut run.vm, |heap| heap
+            .userdata_metatable(prepared.successor)),
+        Some(prepared.finalizer_metatable),
+        "{}: B keeps the same finalizer metatable",
+        run.arm.label()
+    );
+    let next = {
+        let mut host = run.vm.host_context();
+        snapshot_published_typed_table_call(&mut host)
+            .unwrap_or_else(|error| panic!("{}: B snapshot: {error:?}", run.arm.label()))
+    };
+    assert_eq!(next.userdata, prepared.successor);
+    assert_eq!(
+        next.raw_token,
+        u64::try_from(prepared.successor_raw).expect("successor token")
+    );
+    assert_eq!(next.receiver, prepared.receiver);
+    assert_eq!(next.closure, producer.closure);
+
+    // Only the three roots this commit wrote are withdrawn. The prepare
+    // frame's independent roots stay exact.
+    let prepared_closure = prepared
+        .call_closure
+        .expect("the bind import must install the raw __call");
+    let mut host = run.vm.host_context();
+    assert_eq!(
+        heap::rooted_userdata(&mut host, *frame, 0),
+        Ok(Some(prepared.userdata))
+    );
+    assert_eq!(
+        heap::rooted_closure(&mut host, *frame, 1),
+        Ok(Some(prepared_closure))
+    );
+    assert_eq!(
+        heap::rooted_table(&mut host, *frame, 2),
+        Ok(Some(prepared.receiver))
+    );
+    let prepare_frame = prepared.root_frame;
+    assert_eq!(
+        heap::rooted_table(&mut host, prepare_frame, 0),
+        Ok(Some(prepared.weak_table))
+    );
+    assert_eq!(
+        heap::rooted_table(&mut host, prepare_frame, 1),
+        Ok(Some(prepared.receiver))
+    );
+    assert_eq!(
+        heap::rooted_table(&mut host, prepare_frame, 2),
+        Ok(Some(prepared.sentinel))
+    );
+    for slot in [0u32, 1, 2] {
+        heap::with_heap(&mut host, |heap| heap.clear_root(*frame, slot))
+            .unwrap_or_else(|error| panic!("{}: clear root: {error:?}", run.arm.label()));
+    }
+    assert_eq!(
+        heap::rooted_table(&mut host, prepare_frame, 1),
+        Ok(Some(prepared.receiver))
+    );
+    assert_eq!(heap::rooted_userdata(&mut host, *frame, 0), Ok(None));
+    let _ = heap::collect(&mut host).expect("real collection");
+    let _ = host;
+
+    assert!(
+        !published_userdata_alive(run, prepared.userdata),
+        "{}: A is collected after its three roots are withdrawn",
+        run.arm.label()
+    );
+    assert!(
+        !published_token_open(run, prepared.userdata_raw),
+        "{}: A's Core token is retired",
+        run.arm.label()
+    );
+    assert_eq!(
+        published_slot_generation(run, prepared.userdata),
+        prepared.userdata.generation() + 1,
+        "{}: A's slot advances exactly one generation",
+        run.arm.label()
+    );
+    assert!(
+        published_userdata_alive(run, prepared.successor),
+        "{}: the queued B stays alive",
+        run.arm.label()
+    );
+    assert!(
+        published_token_open(run, prepared.successor_raw),
+        "{}: B's typed token stays open",
+        run.arm.label()
+    );
+    assert_eq!(
+        published_slot_generation(run, prepared.successor),
+        prepared.successor.generation(),
+        "{}: B does not advance its generation",
+        run.arm.label()
+    );
+    assert_eq!(
+        published_pending(run),
+        vec![(
+            u64::try_from(prepared.successor_raw).expect("successor token"),
+            prepared.successor.slot(),
+            prepared.successor.generation(),
+        )],
+        "{}: the collection does not consume B",
+        run.arm.label()
+    );
+    assert_eq!(published_count(run), 1);
+    assert!(
+        heap_query(&mut run.vm, |heap| Ok(heap.alive(prepared.sentinel))),
+        "{}: the independent sentinel root stays readable",
+        run.arm.label()
+    );
+    assert!(
+        heap_query(&mut run.vm, |heap| Ok(heap.alive(prepared.receiver))),
+        "{}: the receiver stays readable through its independent root and B",
+        run.arm.label()
+    );
+    assert!(
+        heap_query(&mut run.vm, |heap| Ok(heap.alive(prepared.weak_table))),
+        "{}: the still-rooted weak witness table stays",
+        run.arm.label()
+    );
+}
+
+/// The post-read replacement refusal: the old typed local did not commit, no
+/// child started, and the exact A/B queue, prepared roots and real tokens are
+/// unchanged. The same VM's heap helper then re-prepares with the replacement
+/// raw edge and takes A with the new Arc. The replacement's real guest call is
+/// witnessed by the before-read arm; this faulted VM is not resumed.
+fn assert_producer_post_read_refusal(run: &mut ArmRun) {
+    let prepared = published_prepared(run).clone();
+    let producer = published_producer(run).clone();
+    let old_closure = prepared
+        .call_closure
+        .expect("the bind import must install the raw __call");
+    assert_eq!(
+        producer.closure, old_closure,
+        "the producer read the original raw __call before the swap"
+    );
+    assert!(
+        producer.parent_candidate_matches,
+        "the producer read the old target Arc, not the fixture selection"
+    );
+    let current = heap_query(&mut run.vm, |heap| {
+        heap.named_closure_edge(prepared.receiver_metatable, "__call")
+    });
+    assert_ne!(
+        current, old_closure,
+        "the swap really replaced the raw __call generation"
+    );
+    assert!(
+        heap_query(&mut run.vm, |heap| Ok(heap.closure_alive(old_closure))),
+        "the producer's original closure generation is still live"
+    );
+    assert!(
+        heap_query(&mut run.vm, |heap| Ok(heap.closure_alive(current))),
+        "the replacement closure generation is live"
+    );
+
+    assert_commit_refusal(
+        run,
+        "TokenMismatch",
+        GuestClass::Table(prepared.receiver),
+        true,
+        false,
+    );
+    let commit = published_commit(run).clone();
+    assert_eq!(
+        commit.action_closure,
+        (current.domain(), current.slot(), current.generation()),
+        "the refused commit re-read the replacement generation"
+    );
+    assert_eq!(
+        callable_id(&commit.callable),
+        producer.returned_prototype,
+        "the refused commit still carried the old typed local"
+    );
+    assert_published_queue_intact(run);
+
+    // Re-prepare from the same VM's current raw edge and take A with the new
+    // instance Arc through the same heap-owner helper. The old typed local
+    // Arc is not reused.
+    let new_arc = {
+        let mut host = run.vm.host_context();
+        heap::with_heap(&mut host, |heap| heap.closure_callable(current))
+            .unwrap_or_else(|error| panic!("raw __call Arc read: {error:?}"))
+    };
+    assert!(
+        !std::sync::Weak::ptr_eq(&producer.callable, &Arc::downgrade(&new_arc)),
+        "the old typed local Weak is not the replacement Arc"
+    );
+    let payload = {
+        let host = run.vm.host_context();
+        let handle =
+            ResourceHandle::from_raw(u64::try_from(prepared.userdata_raw).expect("A token"))
+                .expect("A handle");
+        let borrowed = host
+            .borrow_resource_with_key::<LuaUserdataResource>(handle, &LuaUserdataResource::key())
+            .unwrap_or_else(|error| panic!("A borrow: {error}"));
+        borrowed.get().userdata()
+    };
+    let receiver_value = run
+        .witness
+        .issued_table
+        .clone()
+        .expect("the issued receiver carrier");
+    let (frame, taken) = {
+        let mut host = run.vm.host_context();
+        commit_published_typed_table_call(
+            &mut host,
+            &new_arc,
+            Some(payload),
+            prepared.finalizer_metatable,
+            &receiver_value,
+            u64::try_from(prepared.userdata_raw).expect("A token"),
+        )
+        .unwrap_or_else(|error| panic!("same-VM re-prepared commit: {error:?}"))
+    };
+    assert_eq!(taken.userdata, prepared.userdata);
+    assert_eq!(taken.roots_written, 3);
+    let mut host = run.vm.host_context();
+    assert_eq!(
+        heap::rooted_userdata(&mut host, frame, 0),
+        Ok(Some(prepared.userdata))
+    );
+    assert_eq!(heap::rooted_closure(&mut host, frame, 1), Ok(Some(current)));
+    assert_eq!(
+        heap::rooted_table(&mut host, frame, 2),
+        Ok(Some(prepared.receiver))
+    );
+    let _ = host;
+    assert_eq!(
+        published_pending(run),
+        vec![(
+            u64::try_from(prepared.successor_raw).expect("successor token"),
+            prepared.successor.slot(),
+            prepared.successor.generation(),
+        )],
+        "the re-prepared helper consumes exactly A"
+    );
+    assert_eq!(published_count(run), 1);
+    assert!(
+        published_pending_flag(run, prepared.successor)
+            && !published_settled_flag(run, prepared.successor),
+        "B is still the pending head after the re-prepared helper"
+    );
+    let mut host = run.vm.host_context();
+    let _ = heap::collect(&mut host).expect("re-prepared cleanup collection");
+}
+
+/// The same-arity wrong-signature return control: Core refuses the real
+/// callable at the exact return boundary, before any commit or child. The
+/// queue, prepared roots and both real tokens stay exact.
+fn assert_producer_wrong_signature(run: &mut ArmRun) {
+    run.assert_fuel();
+    assert_eq!(
+        run.patch.producer_import.map(|index| {
+            run.host_imports
+                .get(index as usize)
+                .map(|import| import.name.as_str())
+        }),
+        Some(Some(PRODUCER_IMPORT)),
+        "the compiled program must carry the producer import"
+    );
+    match &run.status {
+        Err(VmError::TypeMismatch(kind)) => assert_eq!(
+            *kind,
+            "callable",
+            "{}: the Core callable return check must refuse the value",
+            run.arm.label()
+        ),
+        other => panic!(
+            "{}: expected the Core callable return refusal, got {other:?}",
+            run.arm.label()
+        ),
+    }
+    assert_eq!(
+        run.labels(),
+        ["parent-enter"],
+        "{}: the parent must stop at the producer's Core return check",
+        run.arm.label()
+    );
+    assert_eq!(
+        typed_callback_entries(run).len(),
+        0,
+        "{}: the refused callable must not enter a callback frame",
+        run.arm.label()
+    );
+    assert!(
+        run.witness.commits.is_empty(),
+        "{}: no exclusive commit body may run",
+        run.arm.label()
+    );
+    assert!(
+        run.exit().is_none(),
+        "{}: the refused run has no chunk completion",
+        run.arm.label()
+    );
+    let producer = published_producer(run).clone();
+    assert_eq!(
+        producer.returned_prototype,
+        callable_id(&run.pick().other),
+        "{}: the producer read the installed wrong-signature other instance",
+        run.arm.label()
+    );
+    assert!(
+        !producer.parent_candidate_matches,
+        "{}: the wrong-signature instance is not the old fixture selection",
+        run.arm.label()
+    );
+    let prototype = run.prototype(producer.returned_prototype);
+    assert_eq!(
+        prototype.arity,
+        CALL_ARGC,
+        "{}: the refused callable has the same arity",
+        run.arm.label()
+    );
+    assert_eq!(
+        prototype.schema,
+        Some(table_callable_schema()),
+        "{}: the refused prototype declares lua.table, not lua.userdata",
+        run.arm.label()
+    );
+    let Some(TypeSchema::Callable { params, result }) = &prototype.schema else {
+        panic!(
+            "{}: the refused prototype has no callable schema",
+            run.arm.label()
+        );
+    };
+    assert_eq!(
+        params[0],
+        TypeSchema::Array(Box::new(TypeSchema::Int)),
+        "{}: the receiver schema is identical",
+        run.arm.label()
+    );
+    assert_eq!(
+        params[1],
+        TypeSchema::Resource(LuaTableResource::key()),
+        "{}: the refused declaration names the other real resource key",
+        run.arm.label()
+    );
+    assert_eq!(
+        result.as_ref(),
+        &TypeSchema::Bool,
+        "{}: the declared result is identical",
+        run.arm.label()
+    );
+    assert!(
+        run.witness
+            .marks
+            .iter()
+            .all(|mark| mark.label != OTHER_LABEL),
+        "{}: the refused callback body must not run",
+        run.arm.label()
+    );
+    assert_published_queue_intact(run);
+}
+
 fn published_userdata_alive(run: &mut ArmRun, userdata: UserdataRef) -> bool {
     heap_query(&mut run.vm, |heap| Ok(heap.userdata_alive(userdata)))
 }
@@ -5603,6 +7080,81 @@ fn retry_published_commit(run: &mut ArmRun, restore_old_closure: bool) {
     );
     let mut host = run.vm.host_context();
     let _ = heap::collect(&mut host).expect("retry cleanup collection");
+}
+
+#[test]
+fn active_parent_reads_the_published_typed_head_and_commits_it() {
+    let mut run = run_arm(Arm::PublishedHeadProducer);
+    let (producer, target_id) = assert_producer_read_phase(&mut run, true, true);
+    assert!(
+        producer.parent_candidate_matches,
+        "producer: the positive arm installs the same target the old selection names"
+    );
+    assert_eq!(
+        producer.returned_prototype, target_id,
+        "producer: the heap-sourced Arc is the target instance"
+    );
+    assert_producer_commit_identity(&run);
+    let (produce_ip, admit_ip, commit_ip, call_ip) = producer_parent_sites(&run);
+    assert_published_positive(&mut run);
+    eprintln!(
+        "LUA_TYPED_RESOURCE arm={} layer=published-head-source producer_ip={produce_ip} admit_ip={admit_ip} commit_ip={commit_ip} call_ip={call_ip} prototype={} roots=3",
+        run.arm.label(),
+        producer.returned_prototype
+    );
+}
+
+#[test]
+fn active_parent_reads_the_replacement_before_committing_it() {
+    let mut run = run_arm(Arm::PublishedHeadProducerReplacedBeforeRead);
+    let (producer, target_id) = assert_producer_read_phase(&mut run, true, true);
+    assert!(
+        !producer.parent_candidate_matches,
+        "replacement-before-read: the producer did not take the old fixture selection"
+    );
+    assert_ne!(
+        producer.returned_prototype, target_id,
+        "replacement-before-read: the producer read a different instance"
+    );
+    assert!(
+        run.pick().chosen_is_target,
+        "replacement-before-read: the old selection still names the target candidate"
+    );
+    assert_producer_commit_identity(&run);
+    let sites = producer_parent_sites(&run);
+    assert_producer_transaction(&mut run, ALTERNATE_LABEL);
+    eprintln!(
+        "LUA_TYPED_RESOURCE arm={} layer=published-head-source replacement=1 old_selection={target_id} read_prototype={} sites={sites:?}",
+        run.arm.label(),
+        producer.returned_prototype
+    );
+}
+
+#[test]
+fn typed_published_head_producer_refuses_the_post_read_replacement_and_wrong_signature() {
+    let mut changed = run_arm(Arm::PublishedHeadProducerReplacedBeforeCommit);
+    let (producer, target_id) = assert_producer_read_phase(&mut changed, false, true);
+    assert!(
+        producer.parent_candidate_matches,
+        "post-read-replacement: the read happened before the raw edge changed"
+    );
+    assert_eq!(
+        producer.returned_prototype, target_id,
+        "post-read-replacement: the old typed local carried the target Arc"
+    );
+    assert_producer_post_read_refusal(&mut changed);
+
+    let mut wrong = run_arm(Arm::PublishedHeadProducerWrongSignature);
+    let (producer, target_id) = assert_producer_read_phase(&mut wrong, true, false);
+    assert!(
+        !producer.parent_candidate_matches,
+        "wrong-signature: the installed instance is not the old fixture selection"
+    );
+    assert_ne!(
+        producer.returned_prototype, target_id,
+        "wrong-signature: the read instance is the other-resource closure"
+    );
+    assert_producer_wrong_signature(&mut wrong);
 }
 
 #[test]

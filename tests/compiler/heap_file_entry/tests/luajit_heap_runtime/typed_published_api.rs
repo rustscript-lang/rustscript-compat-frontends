@@ -72,6 +72,128 @@ impl LuaHeap {
             queue_len: self.pending_finalizer_count(),
         })
     }
+}
+
+/// Test-only read view of one read-only published typed-head source pass.
+///
+/// The nested [`TestPublishedTypedCall`] carries the same `Weak` callable
+/// identity as the snapshot. The surrounding fields prove the read pass did
+/// not move the queue, the pending/settled flags, or the top root frame.
+#[derive(Clone)]
+pub struct TestPublishedTypedCallRead {
+    pub call: TestPublishedTypedCall,
+    pub queue_before: Vec<(u64, u32, u32)>,
+    pub queue_after: Vec<(u64, u32, u32)>,
+    pub top_frame_before: Option<RootFrameId>,
+    pub top_frame_after: Option<RootFrameId>,
+    pub pending_before: [bool; 2],
+    pub pending_after: [bool; 2],
+    pub settled_before: [bool; 2],
+    pub settled_after: [bool; 2],
+}
+
+impl LuaHeap {
+    /// Test-only read-only producer entry for the published typed head.
+    ///
+    /// Every operation in this borrow is a read: the queue snapshot, the
+    /// pending/settled flags of the two queued owners, the current root frame,
+    /// the head snapshot (identity, real token, current `__gc` metatable,
+    /// current one-layer raw `__call`), and the issued receiver Arc. The two
+    /// queued owners are re-bound from the queue records, the caller's actual
+    /// typed payload and successor must match them, and the receiver operand
+    /// must be the exact array Arc the heap issued for the action receiver.
+    /// After those reads the same fields are re-read and compared, so a pass
+    /// that consumed a record, settled a generation, or opened a root frame is
+    /// refused instead of returning a credential. No strong `Arc` is created
+    /// here and no guest code runs.
+    pub fn test_read_published_typed_call_head(
+        &self,
+        expected_receiver: &Value,
+        expected_payload: Option<UserdataRef>,
+        expected_token: u64,
+        expected_successor: UserdataRef,
+        expected_top: RootFrameId,
+    ) -> Result<TestPublishedTypedCallRead, HeapError> {
+        let queue_before = self.pending_finalizer_records();
+        let [head, successor] = queue_before.as_slice() else {
+            return Err(HeapError::Scope(
+                "lua typed published head read requires exactly two queued owners".to_string(),
+            ));
+        };
+        let userdata = UserdataRef::userdata(self.domain, head.1, head.2);
+        let successor_ref = UserdataRef::userdata(self.domain, successor.1, successor.2);
+        if Some(userdata) != expected_payload || successor_ref != expected_successor {
+            return Err(HeapError::TokenMismatch);
+        }
+        let top_frame_before = self.current_frame();
+        if top_frame_before != Some(expected_top) {
+            return Err(HeapError::Scope(
+                "lua typed published head read requires the prepared root frame".to_string(),
+            ));
+        }
+        let pending_before = [
+            self.slot_pending_finalizer(userdata)?,
+            self.slot_pending_finalizer(successor_ref)?,
+        ];
+        let settled_before = [
+            self.slot_finalizer_settled(userdata)?,
+            self.slot_finalizer_settled(successor_ref)?,
+        ];
+        if pending_before != [true, true] || settled_before != [false, false] {
+            return Err(HeapError::Scope(
+                "lua typed published head read requires both owners pending and unsettled"
+                    .to_string(),
+            ));
+        }
+
+        let call = self.test_snapshot_published_typed_call()?;
+        if call.userdata != userdata || call.raw_token != expected_token {
+            return Err(HeapError::TokenMismatch);
+        }
+        if self.guest_class(expected_receiver) != GuestClass::Table(call.receiver) {
+            return Err(HeapError::WrongKind);
+        }
+        let Value::Array(operand) = expected_receiver else {
+            return Err(HeapError::WrongKind);
+        };
+        let Value::Array(issued) = self.issued_value(call.receiver)? else {
+            return Err(HeapError::StaleHandle);
+        };
+        if !Arc::ptr_eq(operand, &issued) {
+            return Err(HeapError::WrongKind);
+        }
+
+        let queue_after = self.pending_finalizer_records();
+        let top_frame_after = self.current_frame();
+        let pending_after = [
+            self.slot_pending_finalizer(userdata)?,
+            self.slot_pending_finalizer(successor_ref)?,
+        ];
+        let settled_after = [
+            self.slot_finalizer_settled(userdata)?,
+            self.slot_finalizer_settled(successor_ref)?,
+        ];
+        if queue_after != queue_before
+            || top_frame_after != top_frame_before
+            || pending_after != pending_before
+            || settled_after != settled_before
+        {
+            return Err(HeapError::Scope(
+                "lua typed published head read mutated the queue, flags, or root frame".to_string(),
+            ));
+        }
+        Ok(TestPublishedTypedCallRead {
+            call,
+            queue_before,
+            queue_after,
+            top_frame_before,
+            top_frame_after,
+            pending_before,
+            pending_after,
+            settled_before,
+            settled_after,
+        })
+    }
 
     /// Test-only exclusive typed commit for the published table-call head.
     ///
