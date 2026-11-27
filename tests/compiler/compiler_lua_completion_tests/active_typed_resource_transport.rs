@@ -166,6 +166,9 @@ use vm::{
 use super::{FUEL_BUDGET, FUEL_CHECK_INTERVAL, decoded_call_sites};
 use crate::heap::{self, GuestClass, LuaTableResource, LuaUserdataResource, TableRef, UserdataRef};
 
+#[path = "active_typed_callback_root_retirement.rs"]
+mod active_typed_callback_root_retirement;
+
 /// The fixture the positive and resource-key control arms execute.
 const FIXTURE: &str = "active_typed_resource_transport.lua";
 /// The fixture whose only structural difference is the actual second argument.
@@ -213,6 +216,13 @@ const PRODUCER_IMPORT: &str = "produce";
 const PRODUCER_ENTRY_LABEL: &str = "producer-enter";
 /// The distinct source-level marker of the before-read replacement closure.
 const ALTERNATE_LABEL: &str = "alternate-enter";
+/// The fixture whose parent optionally calls the exact `retire` import after
+/// the real `CallValue(2)` returns, then always reaches the guest `sweep`.
+const RETIREMENT_FIXTURE: &str = "active_typed_callback_root_retirement.lua";
+const RETIRE_IMPORT: &str = "retire";
+const SWEEP_IMPORT: &str = "sweep";
+/// Producer-shaped gate whose compiled target result is `Bool(false)`.
+const FALSE_RETURN_GATE: usize = 11;
 
 /// The first statement of the two declared closures names them.
 const TARGET_LABEL: &str = "target-enter";
@@ -261,6 +271,8 @@ impl TransportPlugin {
 struct RunScope {
     select: usize,
     witness: Witness,
+    /// Compiled `CallValue` result local. Set only for the retirement arms.
+    call_result_slot: Option<LocalSlot>,
 }
 
 fn with_run_scope<T>(vm: &mut Vm, body: impl FnOnce(&mut RunScope) -> T) -> T {
@@ -448,6 +460,9 @@ enum Arm {
     PublishedHeadProducerReplacedBeforeRead,
     PublishedHeadProducerReplacedBeforeCommit,
     PublishedHeadProducerWrongSignature,
+    CallbackRootRetirement,
+    CallbackRootOmission,
+    CallbackRootFalseReturn,
 }
 
 impl Arm {
@@ -470,6 +485,9 @@ impl Arm {
                 "published-head-producer-replaced-before-commit"
             }
             Arm::PublishedHeadProducerWrongSignature => "published-head-producer-wrong-signature",
+            Arm::CallbackRootRetirement => "callback-root-retirement",
+            Arm::CallbackRootOmission => "callback-root-omission",
+            Arm::CallbackRootFalseReturn => "callback-root-false-return",
         }
     }
 
@@ -484,6 +502,9 @@ impl Arm {
             | Arm::PublishedHeadProducerReplacedBeforeRead
             | Arm::PublishedHeadProducerReplacedBeforeCommit
             | Arm::PublishedHeadProducerWrongSignature => PRODUCER_FIXTURE,
+            Arm::CallbackRootRetirement
+            | Arm::CallbackRootOmission
+            | Arm::CallbackRootFalseReturn => RETIREMENT_FIXTURE,
             _ => FIXTURE,
         }
     }
@@ -499,6 +520,8 @@ impl Arm {
             Arm::PublishedHeadProducerReplacedBeforeRead => 9,
             Arm::PublishedHeadProducerReplacedBeforeCommit => 10,
             Arm::PublishedHeadProducerWrongSignature => 11,
+            Arm::CallbackRootRetirement | Arm::CallbackRootFalseReturn => 12,
+            Arm::CallbackRootOmission => 13,
             _ => 0,
         }
     }
@@ -515,8 +538,18 @@ impl Arm {
             Arm::PublishedHeadProducerReplacedBeforeRead => 8,
             Arm::PublishedHeadProducerReplacedBeforeCommit => 9,
             Arm::PublishedHeadProducerWrongSignature => 10,
+            Arm::CallbackRootRetirement => 12,
+            Arm::CallbackRootOmission => 13,
+            Arm::CallbackRootFalseReturn => FALSE_RETURN_GATE,
             _ => 0,
         }
+    }
+
+    fn observes_call_result(self) -> bool {
+        matches!(
+            self,
+            Arm::CallbackRootRetirement | Arm::CallbackRootOmission | Arm::CallbackRootFalseReturn
+        )
     }
 }
 
@@ -704,6 +737,16 @@ fn transport_catalog() -> &'static Arc<HostApiCatalog> {
         // receiver carrier and the actual typed userdata token; the callable
         // itself comes from the heap's published `__gc`/`__call` chain.
         builder.function(produce_import_schema());
+        builder.function(HostFunctionSchema::with_return(
+            RETIRE_IMPORT,
+            Vec::new(),
+            HostTypeSchema::Bool,
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            SWEEP_IMPORT,
+            Vec::new(),
+            HostTypeSchema::Bool,
+        ));
         // One freshly issued LuaHeap table carrier, whose real shape is
         // `Array<Int>`.
         builder.function(HostFunctionSchema::with_return(
@@ -732,7 +775,7 @@ fn catalog_schema(name: &str) -> HostImportSchema {
 /// Binds every host through the exact static path, so the compiled program and
 /// the VM share one catalog schema per import and Core validates the typed
 /// return at run time.
-fn bind_hosts(vm: &mut Vm) -> Result<(), VmError> {
+fn bind_hosts_for(vm: &mut Vm, retirement: bool) -> Result<(), VmError> {
     let mut registry = HostFunctionRegistry::empty();
     registry.register_exact_static("mark", 1, catalog_schema("mark"), host_mark)?;
     registry.register_exact_static("note", 6, catalog_schema("note"), host_note)?;
@@ -759,6 +802,20 @@ fn bind_hosts(vm: &mut Vm) -> Result<(), VmError> {
         catalog_schema(PRODUCER_IMPORT),
         host_produce,
     )?;
+    if retirement {
+        registry.register_exact_static(
+            RETIRE_IMPORT,
+            0,
+            catalog_schema(RETIRE_IMPORT),
+            active_typed_callback_root_retirement::host_retire,
+        )?;
+        registry.register_exact_static(
+            SWEEP_IMPORT,
+            0,
+            catalog_schema(SWEEP_IMPORT),
+            active_typed_callback_root_retirement::host_sweep,
+        )?;
+    }
     registry.bind_vm_cached(vm)
 }
 
@@ -942,6 +999,11 @@ struct Witness {
     issued_userdata: Option<UserdataRef>,
     issued_userdata_raw: Option<i64>,
     table_token: Option<TableTokenRecord>,
+    /// The compiled call-result slot and the value read from it at parent-after.
+    call_result_slot: Option<LocalSlot>,
+    call_result: Option<Value>,
+    /// True when some other parent local is still `Bool(true)`.
+    host_true_beside_call: bool,
 }
 
 /// The independent entry record of the active (last) frame, read from the live
@@ -1177,7 +1239,7 @@ fn host_mark(vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
     };
 
     let mut record = MarkRecord {
-        label,
+        label: label.clone(),
         frame_len,
         last_prototype,
         last_return_ip,
@@ -1246,8 +1308,60 @@ fn host_mark(vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
         record.continuation = Some(probe_userdata(&host, raw)?);
     }
 
+    if label == "parent-after" {
+        let slot = with_run_scope(vm, |scope| scope.call_result_slot);
+        if let Some(slot) = slot {
+            let (value, host_true) = {
+                let frames = vm.execution_frames();
+                let locals = vm.locals();
+                let current = frames.last();
+                let value = current.and_then(|frame| {
+                    let absolute = frame.local_base.checked_add(usize::from(slot))?;
+                    locals.get(absolute).cloned()
+                });
+                let host_true = current.is_some_and(|frame| {
+                    locals
+                        .get(frame.local_base..frame.local_base + frame.local_count)
+                        .is_some_and(|values| {
+                            values.iter().enumerate().any(|(index, local)| {
+                                index != usize::from(slot) && matches!(local, Value::Bool(true))
+                            })
+                        })
+                });
+                (value, host_true)
+            };
+            with_run_scope(vm, |scope| {
+                scope.witness.call_result_slot = Some(slot);
+                scope.witness.call_result = value;
+                scope.witness.host_true_beside_call = host_true;
+            });
+        }
+    }
+
     with_run_scope(vm, |scope| scope.witness.marks.push(record));
     Ok(CallOutcome::Return(CallReturn::one(Value::Int(0))))
+}
+
+/// The VM local written by the `Stloc` immediately after the real
+/// `CallValue(2)`. That is the compiled result slot, not the IR temp.
+fn compiled_call_result_slot(program: &Program) -> Option<LocalSlot> {
+    let code = &program.code;
+    let mut ip = 0;
+    while ip < code.len() {
+        let op = OpCode::try_from(code[ip]).ok()?;
+        let next = ip + 1 + op.operand_len();
+        if next > code.len() {
+            return None;
+        }
+        if op == OpCode::CallValue && code[ip + 1] == CALL_ARGC {
+            if next < code.len() && OpCode::try_from(code[next]).ok() == Some(OpCode::Stloc) {
+                return LocalSlot::try_from(usize::from(code[next + 1])).ok();
+            }
+            return None;
+        }
+        ip = next;
+    }
+    None
 }
 
 /// The raw handle of one guest token, through the formal Core constructor.
@@ -1272,7 +1386,7 @@ fn host_note(vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
         // The producer arms still call the old selection once. Its staged mode
         // is the published-head arm selector, and like every other published
         // arm it names the written target candidate.
-        8..=11 => target,
+        8..=13 => target,
         other_mode => {
             return Err(host_fault_error(format!(
                 "note mode {other_mode} is not a fixture arm"
@@ -2405,13 +2519,47 @@ fn patch_ir(
     } else {
         None
     };
+    // Only the arms that must retire get this import. The omission arm uses
+    // the same fixture and the same producer rewrite, but the plugin does not
+    // insert the call, so the parent continuation never names it.
+    let retire = if gate_mode == 12 || gate_mode == FALSE_RETURN_GATE {
+        Some(insert_published_import(
+            ir,
+            resolver,
+            RETIRE_IMPORT,
+            &[],
+            vm::ValueType::Bool,
+        )?)
+    } else {
+        None
+    };
+    // The guest collection import is also unnamed in source. Every retirement
+    // arm, including the omission arm, gets it before `done`. It does not
+    // leave roots.
+    let sweep = if matches!(gate_mode, FALSE_RETURN_GATE | 12 | 13) {
+        Some(insert_published_import(
+            ir,
+            resolver,
+            SWEEP_IMPORT,
+            &[],
+            vm::ValueType::Bool,
+        )?)
+    } else {
+        None
+    };
     let mut next_local = ir.locals;
+    let rewrite = ProducerRewrite {
+        enabled: producer,
+        produce: produce.as_ref(),
+        retire: retire.as_ref(),
+        observe_call: matches!(gate_mode, FALSE_RETURN_GATE | 12 | 13),
+        callback_false: gate_mode == FALSE_RETURN_GATE,
+    };
     patch_stmts(
         &mut ir.stmts,
         gate.as_ref(),
         commit.as_ref(),
-        producer,
-        produce.as_ref(),
+        &rewrite,
         &mut next_local,
         &mut report,
     )?;
@@ -2427,6 +2575,13 @@ fn patch_ir(
     {
         return Err(patch_error(
             "the published-commit chunk is missing its fault, tick, target or parent call",
+        ));
+    }
+    if let Some(sweep) = sweep.as_ref()
+        && !insert_sweep_before_done(&mut ir.stmts, sweep, &mut next_local)?
+    {
+        return Err(patch_error(
+            "the retirement chunk has no done mark for the guest collection import",
         ));
     }
     ir.locals = next_local;
@@ -2489,12 +2644,19 @@ fn strip_to_owned(expr: &mut Expr) {
     }
 }
 
+struct ProducerRewrite<'a> {
+    enabled: bool,
+    produce: Option<&'a PublishedImport>,
+    retire: Option<&'a PublishedImport>,
+    observe_call: bool,
+    callback_false: bool,
+}
+
 fn patch_stmts(
     stmts: &mut [Stmt],
     gate: Option<&GateSpec>,
     commit: Option<&PublishedCommitSpec>,
-    producer: bool,
-    produce: Option<&PublishedImport>,
+    rewrite: &ProducerRewrite<'_>,
     next_local: &mut usize,
     report: &mut PatchReport,
 ) -> Result<(), ParseError> {
@@ -2518,10 +2680,13 @@ fn patch_stmts(
                         // continuation below, and no completion consumer
                         // observes it.
                         if let Expr::Block { expr, .. } = closure.body.as_mut() {
-                            **expr = Expr::Bool(true);
+                            // The false-return arm keeps the source `return true`.
+                            // Only this compiled target result becomes `Bool(false)`,
+                            // so the parent can tell that slot from a host `true`.
+                            **expr = Expr::Bool(!rewrite.callback_false);
                         }
                     }
-                    Some(ALTERNATE_LABEL) if producer => {
+                    Some(ALTERNATE_LABEL) if rewrite.enabled => {
                         // The before-read replacement is a second real
                         // zero-capture closure with the same exact schema and
                         // its own execution marker. It is only declared on
@@ -2542,13 +2707,13 @@ fn patch_stmts(
                 if closure.param_slots.len() == PARENT_PARAMS
                     || closure.param_slots.len() == PUBLISHED_PARENT_PARAMS
                 {
-                    patch_parent(closure, gate, commit, producer, produce, next_local, report)?;
+                    patch_parent(closure, gate, commit, rewrite, next_local, report)?;
                 }
             }
             Stmt::Expr {
                 expr: Expr::Block { stmts, .. },
                 ..
-            } => patch_stmts(stmts, gate, commit, producer, produce, next_local, report)?,
+            } => patch_stmts(stmts, gate, commit, rewrite, next_local, report)?,
             _ => {}
         }
     }
@@ -2590,12 +2755,172 @@ fn reads_completion(expr: &Expr, completion: LocalSlot) -> bool {
         && matches!(second, Expr::Int(0)))
 }
 
+/// Inserts the exact zero-argument exit import after `parent-after` and
+/// before the parent return. The call runs in the same parent frame that
+/// borrowed A. The omission arm never receives this import.
+fn insert_retire_after_parent_mark(
+    tail: &mut Expr,
+    retire: &PublishedImport,
+    next_local: &mut usize,
+) -> Result<(), ParseError> {
+    let Expr::Block { stmts, .. } = tail else {
+        return Err(patch_error("the call continuation is not a block"));
+    };
+    let mark_at = stmts.iter().position(is_parent_after_mark).ok_or_else(|| {
+        patch_error("the continuation has no parent-after mark before the exit import")
+    })?;
+    let slot = LocalSlot::try_from(*next_local)
+        .map_err(|_| patch_error("the exit-import result local overflows a slot"))?;
+    *next_local = next_local
+        .checked_add(1)
+        .ok_or_else(|| patch_error("the exit-import result local overflows"))?;
+    stmts.insert(
+        mark_at + 1,
+        Stmt::Let {
+            index: slot,
+            declared_schema: None,
+            expr: Expr::Call(
+                retire.import_index,
+                Vec::new(),
+                Vec::new(),
+                Some(Box::new(retire.resolution.clone())),
+                None,
+            ),
+            line: 0,
+        },
+    );
+    Ok(())
+}
+
+fn is_done_mark(stmt: &Stmt) -> bool {
+    let Stmt::Let {
+        expr: Expr::Call(_, _, args, Some(resolution), _),
+        ..
+    } = stmt
+    else {
+        return false;
+    };
+    resolution.name == "mark" && matches!(args.as_slice(), [Expr::String(label)] if label == "done")
+}
+
+fn insert_sweep_before_done(
+    stmts: &mut [Stmt],
+    sweep: &PublishedImport,
+    next_local: &mut usize,
+) -> Result<bool, ParseError> {
+    for stmt in stmts {
+        if insert_sweep_in_stmt(stmt, sweep, next_local)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn insert_sweep_in_stmt(
+    stmt: &mut Stmt,
+    sweep: &PublishedImport,
+    next_local: &mut usize,
+) -> Result<bool, ParseError> {
+    match stmt {
+        Stmt::Expr { expr, .. } | Stmt::Let { expr, .. } => {
+            insert_sweep_in_expr(expr, sweep, next_local)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn insert_sweep_in_expr(
+    expr: &mut Expr,
+    sweep: &PublishedImport,
+    next_local: &mut usize,
+) -> Result<bool, ParseError> {
+    match expr {
+        Expr::Block { stmts, expr } => {
+            if let Some(index) = stmts.iter().position(is_done_mark) {
+                let slot = LocalSlot::try_from(*next_local).map_err(|_| {
+                    patch_error("the guest-collection result local overflows a slot")
+                })?;
+                *next_local = next_local
+                    .checked_add(1)
+                    .ok_or_else(|| patch_error("the guest-collection result local overflows"))?;
+                stmts.insert(
+                    index,
+                    Stmt::Let {
+                        index: slot,
+                        declared_schema: None,
+                        expr: Expr::Call(
+                            sweep.import_index,
+                            Vec::new(),
+                            Vec::new(),
+                            Some(Box::new(sweep.resolution.clone())),
+                            None,
+                        ),
+                        line: 0,
+                    },
+                );
+                return Ok(true);
+            }
+            for stmt in stmts.iter_mut() {
+                if insert_sweep_in_stmt(stmt, sweep, next_local)? {
+                    return Ok(true);
+                }
+            }
+            insert_sweep_in_expr(expr, sweep, next_local)
+        }
+        Expr::IfElse {
+            then_expr,
+            else_expr,
+            ..
+        } => {
+            if insert_sweep_in_expr(then_expr, sweep, next_local)? {
+                return Ok(true);
+            }
+            insert_sweep_in_expr(else_expr, sweep, next_local)
+        }
+        Expr::Closure(closure) => insert_sweep_in_expr(&mut closure.body, sweep, next_local),
+        _ => Ok(false),
+    }
+}
+
+fn consume_call_result(tail: &mut Expr, slot: LocalSlot) -> bool {
+    let expr = match tail {
+        Expr::Block { expr, .. } => expr.as_mut(),
+        other => other,
+    };
+    replace_returned_value(expr, slot)
+}
+
+fn replace_returned_value(expr: &mut Expr, slot: LocalSlot) -> bool {
+    let Expr::Call(_, _, args, _, _) = expr else {
+        return false;
+    };
+    let Some(last) = args.last_mut() else {
+        return false;
+    };
+    if matches!(last, Expr::Bool(_)) {
+        *last = Expr::Var(slot);
+        return true;
+    }
+    replace_returned_value(last, slot)
+}
+
+fn is_parent_after_mark(stmt: &Stmt) -> bool {
+    let Stmt::Let {
+        expr: Expr::Call(_, _, args, Some(resolution), _),
+        ..
+    } = stmt
+    else {
+        return false;
+    };
+    resolution.name == "mark"
+        && matches!(args.as_slice(), [Expr::String(label)] if label == "parent-after")
+}
+
 fn patch_parent(
     closure: &mut ClosureExpr,
     gate: Option<&GateSpec>,
     commit: Option<&PublishedCommitSpec>,
-    producer: bool,
-    produce: Option<&PublishedImport>,
+    rewrite: &ProducerRewrite<'_>,
     next_local: &mut usize,
     report: &mut PatchReport,
 ) -> Result<(), ParseError> {
@@ -2637,7 +2962,7 @@ fn patch_parent(
                 "the parent declares two typed candidate locals",
             ));
         }
-        if !producer {
+        if !rewrite.enabled {
             *declared_schema = Some(userdata_callable_schema());
         }
         note_local = Some(*index);
@@ -2646,7 +2971,7 @@ fn patch_parent(
     let Some(note_position) = note_position else {
         return Err(patch_error("the parent has no typed candidate local"));
     };
-    let typed_local = if let Some(produce) = produce {
+    let typed_local = if let Some(produce) = rewrite.produce {
         let produced = LocalSlot::try_from(*next_local)
             .map_err(|_| patch_error("the producer result local overflows a slot"))?;
         *next_local = next_local
@@ -2744,13 +3069,28 @@ fn patch_parent(
         ));
     }
     *tail = then_expr;
+    if let Some(retire) = rewrite.retire {
+        insert_retire_after_parent_mark(tail, retire, next_local)?;
+    }
+    if rewrite.observe_call {
+        let slot = report
+            .call
+            .as_ref()
+            .map(|call| call.completion_slot)
+            .ok_or_else(|| patch_error("the observed call has no completion slot"))?;
+        if !consume_call_result(tail, slot) {
+            return Err(patch_error(
+                "the parent return does not consume the call result",
+            ));
+        }
+    }
     report.continuation_rewritten = true;
 
     if let Some(gate) = gate {
         let Some(position) = call_position else {
             return Err(patch_error("the parent has no admitted dynamic call"));
         };
-        let admit_position = if produce.is_some() {
+        let admit_position = if rewrite.produce.is_some() {
             note_position + 2
         } else if commit.is_some() {
             note_position + 1
@@ -3043,6 +3383,11 @@ fn run_arm(arm: Arm) -> ArmRun {
 
 fn run_compiled(compiled: CompiledArm) -> ArmRun {
     let arm = compiled.arm;
+    let call_result_slot = if arm.observes_call_result() {
+        compiled_call_result_slot(&compiled.program)
+    } else {
+        None
+    };
     let mut runtime = Vm::new_with_jit_config(
         compiled.program,
         JitConfig {
@@ -3051,13 +3396,14 @@ fn run_compiled(compiled: CompiledArm) -> ArmRun {
             max_trace_len: 256,
         },
     );
-    bind_hosts(&mut runtime)
+    bind_hosts_for(&mut runtime, arm.observes_call_result())
         .unwrap_or_else(|error| panic!("{}: bind failed: {error}", arm.label()));
     {
         let mut host = runtime.host_context();
         host.scope_state_or_insert_with(|| RunScope {
             select: arm.select(),
             witness: Witness::default(),
+            call_result_slot,
         })
         .unwrap_or_else(|error| panic!("{}: run scope: {error:?}", arm.label()));
     }
