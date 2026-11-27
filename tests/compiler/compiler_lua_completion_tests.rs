@@ -35,6 +35,9 @@ mod active_finalizer;
 #[path = "compiler_lua_completion_tests/callable_carrier.rs"]
 mod callable_carrier;
 
+#[path = "compiler_lua_completion_tests/callable_raw_call.rs"]
+mod callable_raw_call;
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
