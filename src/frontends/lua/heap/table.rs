@@ -15,7 +15,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use vm::{HostContextError, Value};
 
 use super::handle::{ClosureRef, HandleKind, TableRef, UpvalueRef, UserdataRef};
-use super::{PendingFinalizerAction, PendingFinalizerNotCallable, TakenPendingFinalizer};
+use super::{
+    PendingFinalizerAction, PendingFinalizerNotCallable, TakenPendingFinalizer,
+    pending_finalizer_scalar_reject,
+};
 
 #[path = "table/mark.rs"]
 mod mark;
@@ -1095,6 +1098,16 @@ pub(super) struct PendingFinalizer {
     pub(super) slot: u32,
     pub(super) generation: u32,
     pub(super) raw: u64,
+}
+
+/// The one-layer raw `__call` result on one receiver's own current instance
+/// metatable. A table-valued `__call` is `NotClosure`; this slice never
+/// dispatches it again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CurrentRawCall {
+    WithoutCall,
+    NotClosure,
+    Closure(ClosureRef),
 }
 
 mod pending_queue {
@@ -3021,7 +3034,8 @@ impl LuaHeap {
     /// A missing key returns `None`; a stored `Value::Null` gap still returns a
     /// value record, so the caller can tell an absent field from a true
     /// stored-nil gap. This does not consult `__index`, a metatable, or the
-    /// selection cache, and it does not construct a key.
+    /// selection cache, and it does not construct a key. The owner-chain walk
+    /// is linear in that owner's stored edge count.
     fn raw_named_value(&self, owner: u32, name: &str) -> Option<&EdgeValue> {
         let index = self.find_matching(owner, |key| key.matches_name(name))?;
         self.edge_slots
@@ -3956,6 +3970,8 @@ impl LuaHeap {
         frame: RootFrameId,
         slot: u32,
     ) -> Result<usize, HeapError> {
+        // `frame` walks the open-frame stack, so this lookup is linear in the
+        // number of open frames and reads no queue record.
         let found = self.frame(frame)?;
         if slot >= found.width {
             return Err(HeapError::StaleFrame);
@@ -3974,11 +3990,16 @@ impl LuaHeap {
 
     /// Resolves the concrete root positions for one dequeue plan.
     ///
-    /// `slots[0]` receives the userdata. A direct closure adds `slots[1]`; the
-    /// table form adds the closure at `slots[1]` and the original receiver at
-    /// `slots[2]`. Only the first `needed` positions are read. They must be
-    /// distinct, inside one open frame, present, and empty. A short plan or a
-    /// duplicate is refused before any queue, root, or slot write.
+    /// `slots[0]` receives the userdata. A direct closure adds `slots[1]`; a
+    /// table call or an independent userdata receiver adds the closure at
+    /// `slots[1]` and the original receiver at `slots[2]`. A self-receiver
+    /// userdata call needs only the first two positions. Only the first
+    /// `needed` positions are read. They must be distinct, inside one open
+    /// frame, present, and empty. A short plan or a duplicate is refused before
+    /// any queue, root, or slot write. Each position locates its frame by
+    /// walking the open-frame stack, so this plan is linear in the number of
+    /// open frames and the number of required positions; it does not read the
+    /// queue, any edge chain, or the root vector beyond the checked entries.
     fn pending_finalizer_root_indices(
         &self,
         frame: RootFrameId,
@@ -4034,12 +4055,16 @@ impl LuaHeap {
     /// The current raw finalizer action for one live pending userdata.
     ///
     /// This is the dequeue-time re-read: the userdata's current metatable is
-    /// read again, then its raw `__gc` field, and for a table value only that
-    /// receiver's own current metatable and its raw `__call` field. It does
-    /// not reuse the selection cache, does not follow `__index`, does not walk
-    /// an inherited metatable, and does not dispatch a table-valued `__call` a
-    /// second time. Nothing is written.
-    fn pending_finalizer_action(&self, userdata: UserdataRef) -> PendingFinalizerAction {
+    /// read again, then its raw `__gc` field. A boolean, number, or string
+    /// keeps only its Lua type tag; a stored nil stays `Skip`. A live table or
+    /// a live userdata adds exactly one raw `__call` lookup on that receiver's
+    /// own current instance metatable through [`Self::current_metatable_raw_call`].
+    /// It does not reuse the selection cache, does not follow `__index`, does
+    /// not walk an inherited metatable, and does not dispatch a table-valued
+    /// `__call` a second time. Each raw field lookup walks one owner chain, so
+    /// the cost is linear in the receiver metatable's stored edge count. Nothing
+    /// is written.
+    pub(super) fn pending_finalizer_action(&self, userdata: UserdataRef) -> PendingFinalizerAction {
         let Some(slot) = self.slots.get(userdata.slot() as usize) else {
             return PendingFinalizerAction::Skip;
         };
@@ -4053,12 +4078,28 @@ impl LuaHeap {
             return PendingFinalizerAction::Skip;
         };
         match value {
-            EdgeValue::Scalar(Value::Null) => PendingFinalizerAction::Skip,
-            EdgeValue::Scalar(_) => {
-                PendingFinalizerAction::NonCallable(PendingFinalizerNotCallable::Scalar)
-            }
-            EdgeValue::Userdata { .. } => {
-                PendingFinalizerAction::NonCallable(PendingFinalizerNotCallable::Userdata)
+            EdgeValue::Scalar(value) => match pending_finalizer_scalar_reject(value) {
+                Some(reject) => PendingFinalizerAction::NonCallable(reject),
+                None => PendingFinalizerAction::Skip,
+            },
+            EdgeValue::Userdata { slot, generation } => {
+                if !self.slot_matches(*slot, *generation, HandleKind::Userdata) {
+                    return PendingFinalizerAction::NonCallable(
+                        PendingFinalizerNotCallable::Detached,
+                    );
+                }
+                let receiver = UserdataRef::userdata(self.domain, *slot, *generation);
+                match self.current_metatable_raw_call(*slot) {
+                    CurrentRawCall::WithoutCall => PendingFinalizerAction::NonCallable(
+                        PendingFinalizerNotCallable::UserdataWithoutCall(receiver),
+                    ),
+                    CurrentRawCall::NotClosure => PendingFinalizerAction::NonCallable(
+                        PendingFinalizerNotCallable::UserdataCallNotClosure(receiver),
+                    ),
+                    CurrentRawCall::Closure(call) => {
+                        PendingFinalizerAction::UserdataCall { receiver, call }
+                    }
+                }
             }
             EdgeValue::Upvalue { .. } => {
                 PendingFinalizerAction::NonCallable(PendingFinalizerNotCallable::Upvalue)
@@ -4081,42 +4122,48 @@ impl LuaHeap {
                     );
                 }
                 let receiver = TableRef::table(self.domain, *slot, *generation);
-                let Some((call_metatable, call_metatable_generation)) =
-                    self.slots[*slot as usize].metatable
-                else {
-                    return PendingFinalizerAction::NonCallable(
-                        PendingFinalizerNotCallable::TableWithoutCall(receiver),
-                    );
-                };
-                if !self.slot_matches(call_metatable, call_metatable_generation, HandleKind::Table)
-                {
-                    return PendingFinalizerAction::NonCallable(
-                        PendingFinalizerNotCallable::TableWithoutCall(receiver),
-                    );
-                }
-                let Some(call) = self.raw_named_value(call_metatable, "__call") else {
-                    return PendingFinalizerAction::NonCallable(
-                        PendingFinalizerNotCallable::TableWithoutCall(receiver),
-                    );
-                };
-                match call {
-                    EdgeValue::Scalar(Value::Null) => PendingFinalizerAction::NonCallable(
+                match self.current_metatable_raw_call(*slot) {
+                    CurrentRawCall::WithoutCall => PendingFinalizerAction::NonCallable(
                         PendingFinalizerNotCallable::TableWithoutCall(receiver),
                     ),
-                    EdgeValue::Closure {
-                        slot: call_slot,
-                        generation: call_generation,
-                    } if self.slot_matches(*call_slot, *call_generation, HandleKind::Closure) => {
-                        PendingFinalizerAction::TableCall {
-                            receiver,
-                            call: ClosureRef::closure(self.domain, *call_slot, *call_generation),
-                        }
-                    }
-                    _ => PendingFinalizerAction::NonCallable(
+                    CurrentRawCall::NotClosure => PendingFinalizerAction::NonCallable(
                         PendingFinalizerNotCallable::TableCallNotClosure(receiver),
                     ),
+                    CurrentRawCall::Closure(call) => {
+                        PendingFinalizerAction::TableCall { receiver, call }
+                    }
                 }
             }
+        }
+    }
+
+    /// One raw `__call` lookup on a receiver's own current instance metatable.
+    ///
+    /// This is exactly one layer: the receiver slot's current metatable is
+    /// read, then its raw `__call` record. `__index` and the metatable's own
+    /// metatable are never followed, and a table-valued `__call` is not
+    /// dispatched again. The owner-chain lookup is linear in that metatable's
+    /// stored edge count and reads no selection cache. Nothing is written.
+    fn current_metatable_raw_call(&self, receiver_slot: u32) -> CurrentRawCall {
+        let Some((metatable_slot, metatable_generation)) =
+            self.slots[receiver_slot as usize].metatable
+        else {
+            return CurrentRawCall::WithoutCall;
+        };
+        if !self.slot_matches(metatable_slot, metatable_generation, HandleKind::Table) {
+            return CurrentRawCall::WithoutCall;
+        }
+        let Some(call) = self.raw_named_value(metatable_slot, "__call") else {
+            return CurrentRawCall::WithoutCall;
+        };
+        match call {
+            EdgeValue::Scalar(Value::Null) => CurrentRawCall::WithoutCall,
+            EdgeValue::Closure { slot, generation }
+                if self.slot_matches(*slot, *generation, HandleKind::Closure) =>
+            {
+                CurrentRawCall::Closure(ClosureRef::closure(self.domain, *slot, *generation))
+            }
+            _ => CurrentRawCall::NotClosure,
         }
     }
 
@@ -4179,28 +4226,40 @@ impl LuaHeap {
     /// The queue record is not trusted for callability: after the shared
     /// identity preflight, the userdata's current metatable and its raw
     /// `__gc` are read again in this same exclusive borrow, before any write.
-    /// A table value adds one raw `__call` read on that receiver's own current
+    /// `prepared` is the fixed-size action whose independent userdata receiver
+    /// already passed the typed owner check in the caller; this method
+    /// re-resolves the action and refuses any identity change
+    /// ([`HeapError::StaleHandle`]) before the pop. A table or userdata value
+    /// adds one raw `__call` read on that receiver's own current instance
     /// metatable. An inherited or table-valued `__call` is a typed reject, not
     /// a second dispatch, and the reject keeps the exact original receiver.
     /// `slots[0]` always receives the userdata; a direct closure adds
-    /// `slots[1]`; the table form adds the closure at `slots[1]` and the
-    /// original receiver at `slots[2]`. Only that required prefix is validated
-    /// and written, and its positions must be distinct. A skip or a reject
-    /// retires exactly once with only the userdata root. No guest code is
-    /// called and no Core handle is copied.
+    /// `slots[1]`; a table call or an independent userdata receiver adds the
+    /// closure at `slots[1]` and the original receiver at `slots[2]`. A
+    /// userdata call whose receiver is the pending object itself adds only
+    /// `slots[1]`, because `slots[0]` already roots that receiver. Only that
+    /// required prefix is validated and written, and its positions must be
+    /// distinct. A skip or a reject retires exactly once with only the
+    /// userdata root. No guest code is called and no Core handle is copied.
     pub(super) fn take_published_finalizer_action_into_roots(
         &mut self,
         frame: RootFrameId,
         slots: &[u32],
         head: PendingFinalizer,
+        prepared: PendingFinalizerAction,
     ) -> Result<TakenPendingFinalizer, HeapError> {
         self.deny_unbarriered()?;
         let userdata = self.pending_finalizer_head_identity(head)?;
         let action = self.pending_finalizer_action(userdata);
+        if action != prepared {
+            return Err(HeapError::StaleHandle);
+        }
         let needed = match &action {
             PendingFinalizerAction::Skip | PendingFinalizerAction::NonCallable(_) => 1,
             PendingFinalizerAction::Closure(_) => 2,
             PendingFinalizerAction::TableCall { .. } => 3,
+            PendingFinalizerAction::UserdataCall { receiver, .. } if *receiver == userdata => 2,
+            PendingFinalizerAction::UserdataCall { .. } => 3,
         };
         let indices = self.pending_finalizer_root_indices(frame, slots, needed)?;
         match action {
@@ -4231,6 +4290,28 @@ impl LuaHeap {
                         (indices[2], Rooted::Table(receiver)),
                     ],
                 )?;
+            }
+            PendingFinalizerAction::UserdataCall { receiver, call } => {
+                if receiver == userdata {
+                    self.commit_published_finalizer(
+                        head,
+                        userdata,
+                        &[
+                            (indices[0], Rooted::Userdata(userdata)),
+                            (indices[1], Rooted::Closure(call)),
+                        ],
+                    )?;
+                } else {
+                    self.commit_published_finalizer(
+                        head,
+                        userdata,
+                        &[
+                            (indices[0], Rooted::Userdata(userdata)),
+                            (indices[1], Rooted::Closure(call)),
+                            (indices[2], Rooted::Userdata(receiver)),
+                        ],
+                    )?;
+                }
             }
         }
         Ok(TakenPendingFinalizer {

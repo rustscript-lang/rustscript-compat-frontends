@@ -68,14 +68,20 @@
 //! borrow that pops it, so a change made between two dequeues is observed. It
 //! never reuses the selection cache and never pre-parses a batch. A missing
 //! metatable, a missing field, or a true stored-nil gap is `Skip`; a present
-//! non-callable value is a typed reject; a live closure is the direct action;
-//! a live table adds only its own current metatable's raw `__call` closure,
-//! with the original table kept as the receiver. The table form does not
-//! inherit `__call` and does not dispatch a table-valued `__call` again. The
-//! commit roots the userdata, the actual closure, and when needed the original
-//! receiver in caller-supplied empty, distinct slots, then settles once.
-//! `Skip` and a typed reject retire exactly once with only the userdata root.
-//! No guest callback, diagnostic text, or Core handle copy is produced here.
+//! non-callable value keeps only its original Lua type tag, never the scalar
+//! bytes; a live closure is the direct action; a live table or a live
+//! userdata adds only its own current instance metatable's raw `__call`
+//! closure, with the original object kept as the receiver. Neither receiver
+//! form inherits `__call` and neither dispatches a table-valued `__call`
+//! again. The commit roots the userdata, the actual closure, and every
+//! independent receiver in caller-supplied empty, distinct slots, then settles
+//! once; a userdata receiver that is the pending object itself is already
+//! rooted as that object and needs no second slot. `Skip` and a typed reject
+//! retire exactly once with only the userdata root. An independent userdata
+//! receiver is checked through the same typed `lua.userdata` owner contract as
+//! the head before the pop, and the commit re-resolves the action in its own
+//! exclusive borrow and requires that exact identity. No guest callback,
+//! diagnostic text, or Core handle copy is produced here.
 //!
 //! Borrowed from the ES5 heap at `3e348a010bc8d84baa5b7d1169a5f50aeb4e46ec`
 //! `src/javascript/heap.rs`: slot plus generation handles, explicit root
@@ -846,9 +852,10 @@ pub(crate) fn take_published_pending_finalizer(
 ///
 /// This is a private dispatch plan, not a guest callable. It is recomputed at
 /// dequeue time from the userdata's current metatable, so a modifier that ran
-/// earlier in the same batch is observed. A `Closure` or the `call` inside
-/// `TableCall` is an actual closure identity; the table form also keeps the
-/// original receiver instead of replacing it with the callable.
+/// earlier in the same batch is observed. A `Closure`, the `call` inside
+/// `TableCall`, or the `call` inside `UserdataCall` is an actual closure
+/// identity; a receiver form also keeps the original object instead of
+/// replacing it with the callable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PendingFinalizerAction {
     /// No live metatable, no raw `__gc` record, or a true stored-nil gap.
@@ -864,28 +871,73 @@ pub(crate) enum PendingFinalizerAction {
         receiver: TableRef,
         call: ClosureRef,
     },
+    /// The raw `__gc` is a live userdata whose own current metatable stores a
+    /// raw `__call` closure. The receiver is that original userdata.
+    UserdataCall {
+        receiver: UserdataRef,
+        call: ClosureRef,
+    },
 }
 
-/// Why a present raw `__gc` value is not callable here.
+/// The original Lua type tag of a present raw `__gc` value that is not
+/// callable in this slice.
 ///
-/// The table reasons keep the exact original receiver identity, so a later
-/// diagnostic can name the original called type (a table) instead of the
-/// invalid `__call` value. This slice emits no diagnostic text.
+/// These tags carry no scalar payload: a boolean, number, or string keeps only
+/// its type, never its bytes. A table or userdata reason keeps the exact
+/// original receiver identity, so a later diagnostic can name the original
+/// called type instead of the invalid `__call` value. This slice emits no
+/// diagnostic text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PendingFinalizerNotCallable {
-    /// `false`, `true`, a number, a string, or bytes.
-    Scalar,
-    /// A bare userdata value.
-    Userdata,
-    /// A shared upvalue value.
+    /// The original value was a boolean.
+    Boolean,
+    /// The original value was a number (`Int` or `Float`).
+    Number,
+    /// The original value was a Lua string (`String` or byte string).
+    String,
+    /// An internal upvalue carrier from the existing `EdgeValue` contract. No
+    /// named-field writer stores it; it is not a guest Lua value.
     Upvalue,
+    /// A live userdata receiver with no live own metatable or no raw `__call`
+    /// field.
+    UserdataWithoutCall(UserdataRef),
+    /// A live userdata receiver whose raw `__call` exists but is not a live
+    /// closure. Another table is refused here: this slice does not dispatch
+    /// twice.
+    UserdataCallNotClosure(UserdataRef),
     /// A table receiver with no live metatable or no raw `__call` field.
     TableWithoutCall(TableRef),
     /// A table receiver whose raw `__call` exists but is not a live closure.
     /// Another table is refused here: this slice does not dispatch twice.
     TableCallNotClosure(TableRef),
-    /// A stored object target no longer names a live node of its kind.
+    /// A stored object target no longer names a live node of its kind, or a
+    /// scalar carrier outside the named-field writer contract.
     Detached,
+}
+
+/// The no-allocation reject tag for one stored scalar, or `None` for a stored
+/// nil.
+///
+/// The private named-field writers can store a boolean or a Lua string
+/// directly under `__gc`; a binary64 number remains limited to the reserved
+/// `__mode` field and a byte string has no named-field writer. This helper is
+/// therefore the narrowest complete classification: it maps `Int`/`Float` to
+/// [`PendingFinalizerNotCallable::Number`] and `String`/`Bytes` to
+/// [`PendingFinalizerNotCallable::String`] without copying either payload.
+/// `Array`, `Map`, and `Callable` are outside this heap's named-field scalar
+/// contract and are reported as `Detached`, not as a new guest tag.
+pub(crate) fn pending_finalizer_scalar_reject(
+    value: &Value,
+) -> Option<PendingFinalizerNotCallable> {
+    match value {
+        Value::Null => None,
+        Value::Bool(_) => Some(PendingFinalizerNotCallable::Boolean),
+        Value::Int(_) | Value::Float(_) => Some(PendingFinalizerNotCallable::Number),
+        Value::String(_) | Value::Bytes(_) => Some(PendingFinalizerNotCallable::String),
+        Value::Array(_) | Value::Map(_) | Value::Callable(_) => {
+            Some(PendingFinalizerNotCallable::Detached)
+        }
+    }
 }
 
 /// One committed private action handoff.
@@ -898,8 +950,9 @@ pub(crate) struct TakenPendingFinalizer {
     pub userdata: UserdataRef,
     /// The current raw decision that this same commit rooted.
     pub action: PendingFinalizerAction,
-    /// Root slots written from the caller's plan: one for the userdata, two
-    /// for a direct closure, three for the table form.
+    /// Root slots written from the caller's plan: one for a skip or typed
+    /// reject, two for a direct closure or a self-receiver userdata call, and
+    /// three for a table call or an independent userdata receiver.
     pub roots_written: u32,
 }
 
@@ -915,18 +968,26 @@ pub(crate) struct TakenPendingFinalizer {
 /// ([`HeapError::TokenMismatch`] otherwise). Every one of those checks happens
 /// before the first queue, root, or slot write.
 ///
-/// The current raw `__gc` is then read again in the same exclusive borrow that
-/// pops the head. `slots[0]` must be an open, empty root slot for the
-/// userdata. A direct closure adds an empty distinct `slots[1]`; the table
-/// form adds the closure at `slots[1]` and the original receiver at an empty
-/// distinct `slots[2]`. A short plan, an overlapping plan, a stale frame, an
-/// occupied slot, or an out-of-range position is refused before any write, so
-/// the head and every existing root stay. A `Skip` or typed reject needs only
-/// `slots[0]`, is returned as its typed result, and is settled exactly once;
-/// it is never re-queued. The commit pops one `VecDeque` front record, writes
-/// the required roots together, and settles that generation. The returned
-/// action and rooted identities are private; the raw Core token is not copied
-/// into a guest value.
+/// The current raw `__gc` is resolved after the head checks. When it is a live
+/// userdata receiver different from the head, that receiver must still own a
+/// real typed `lua.userdata` token naming it (the same checked owner contract
+/// as the head); a payload for another object is [`HeapError::TokenMismatch`].
+/// The commit then re-resolves the action in the same exclusive borrow that
+/// pops the head and requires the exact prepared identity, so no fallible
+/// action or owner check remains after the pop. `slots[0]` must be an open,
+/// empty root slot for the userdata. A direct closure adds an empty distinct
+/// `slots[1]`; the table form and an independent userdata receiver add the
+/// closure at `slots[1]` and the original receiver at an empty distinct
+/// `slots[2]`. A userdata receiver that is the pending object itself is
+/// already rooted at `slots[0]`, so its call needs only two positions. A short
+/// plan, an overlapping plan, a stale frame, an occupied slot, or an
+/// out-of-range position is refused before any write, so the head and every
+/// existing root stay. A `Skip` or typed reject needs only `slots[0]`, is
+/// returned as its typed result, and is settled exactly once; it is never
+/// re-queued. The commit pops one `VecDeque` front record, writes the required
+/// roots together, and settles that generation. The returned action and rooted
+/// identities are private; the raw Core token is not copied into a guest
+/// value.
 pub(crate) fn take_published_pending_finalizer_action(
     host: &mut HostContext,
     frame: RootFrameId,
@@ -955,9 +1016,47 @@ pub(crate) fn take_published_pending_finalizer_action(
         return Err(HeapError::TokenMismatch);
     }
     drop(borrowed);
+    // One fixed-size prepared action: the independent receiver's typed owner is
+    // checked before the commit borrow. The commit re-resolves the same action
+    // in its own exclusive borrow and refuses any identity change before the
+    // pop, so the root set always matches the checked receiver.
+    let action = with_heap(host, |heap| Ok(heap.pending_finalizer_action(userdata)))?;
+    verify_pending_finalizer_receiver(host, userdata, action)?;
     with_heap(host, |heap| {
-        heap.take_published_finalizer_action_into_roots(frame, slots, head)
+        heap.take_published_finalizer_action_into_roots(frame, slots, head, action)
     })
+}
+
+/// Checks that one independent userdata receiver still owns a real typed
+/// `lua.userdata` token naming that same object.
+///
+/// A receiver that is the pending object itself is already covered by the head
+/// payload check and is not borrowed twice; the commit roots it at `slots[0]`.
+/// This is one slot token read and one checked Core borrow with a payload
+/// identity comparison. It reads no queue record and writes nothing.
+fn verify_pending_finalizer_receiver(
+    host: &HostContext,
+    userdata: UserdataRef,
+    action: PendingFinalizerAction,
+) -> Result<(), HeapError> {
+    let PendingFinalizerAction::UserdataCall { receiver, .. } = action else {
+        return Ok(());
+    };
+    if receiver == userdata {
+        return Ok(());
+    }
+    let Some(heap) = host.scope_state::<LuaHeap>() else {
+        return Err(HeapError::SweepDenied);
+    };
+    let raw = heap.published_userdata_token(receiver)?;
+    let handle = vm::ResourceHandle::from_raw(raw).map_err(|_| HeapError::CarrierOutOfRange)?;
+    let borrowed = host
+        .borrow_resource_with_key::<LuaUserdataResource>(handle, &LuaUserdataResource::key())
+        .map_err(HeapError::from_scope)?;
+    if borrowed.get().userdata() != receiver {
+        return Err(HeapError::TokenMismatch);
+    }
+    Ok(())
 }
 
 /// Number of pending records in the published prefix. Test-only header read;

@@ -36,6 +36,19 @@ fn bound_raw(host: &mut vm::HostContext<'_>, userdata: UserdataRef) -> u64 {
         .expect("bound userdata token")
 }
 
+/// Test-only: replaces the typed payload of an existing `lua.userdata` token
+/// while keeping the raw handle and every heap binding unchanged. The caller
+/// restores the original payload through the same path. This creates the
+/// "queue raw == slot raw but the Core payload names another object" shape
+/// without a fake token, a second binding, or a production shortcut.
+fn overwrite_userdata_payload(host: &mut vm::HostContext<'_>, raw: u64, payload: UserdataRef) {
+    let handle = resource_handle(raw);
+    let mut borrowed = host
+        .borrow_resource_mut_with_key::<LuaUserdataResource>(handle, &LuaUserdataResource::key())
+        .expect("mutable typed userdata token");
+    *borrowed.get() = LuaUserdataResource::new(payload);
+}
+
 fn userdata_token_open(host: &vm::HostContext<'_>, raw: u64) -> bool {
     host.typed_resource_with_key::<LuaUserdataResource>(
         resource_handle(raw),
@@ -4920,42 +4933,126 @@ fn handoff_refuses_a_saved_mark_before_reading_the_queue() {
 // Private action dequeue: current raw `__gc` and one-layer raw `__call`
 // ---------------------------------------------------------------------------
 
-struct TableFormEligible {
+/// The receiver form of one real raw `__gc` value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReceiverForm {
+    Table,
+    Userdata,
+}
+
+/// The exact original receiver identity stored under raw `__gc`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Receiver {
+    Table(TableRef),
+    Userdata(UserdataRef),
+}
+
+impl Receiver {
+    fn without_call(self) -> PendingFinalizerNotCallable {
+        match self {
+            Self::Table(receiver) => PendingFinalizerNotCallable::TableWithoutCall(receiver),
+            Self::Userdata(receiver) => PendingFinalizerNotCallable::UserdataWithoutCall(receiver),
+        }
+    }
+
+    fn call_not_closure(self) -> PendingFinalizerNotCallable {
+        match self {
+            Self::Table(receiver) => PendingFinalizerNotCallable::TableCallNotClosure(receiver),
+            Self::Userdata(receiver) => {
+                PendingFinalizerNotCallable::UserdataCallNotClosure(receiver)
+            }
+        }
+    }
+
+    fn table(self) -> TableRef {
+        match self {
+            Self::Table(receiver) => receiver,
+            Self::Userdata(_) => panic!("the receiver is a table"),
+        }
+    }
+
+    fn userdata(self) -> UserdataRef {
+        match self {
+            Self::Userdata(receiver) => receiver,
+            Self::Table(_) => panic!("the receiver is a userdata"),
+        }
+    }
+}
+
+struct ReceiverEligible {
     userdata: UserdataRef,
     raw: u64,
     metatable: TableRef,
-    receiver: TableRef,
+    receiver: Receiver,
     receiver_metatable: TableRef,
+    receiver_raw: Option<u64>,
     call: ClosureRef,
+    capture: TableRef,
 }
 
-/// One real typed userdata whose metatable stores a raw `__gc` table. That
-/// receiver's own metatable stores a raw `__call` closure. Nothing here is
-/// rooted; the private pending selection marks the userdata and follows the
-/// same strong graph.
-fn publish_table_form_eligible(host: &mut vm::HostContext<'_>) -> TableFormEligible {
-    let userdata = heap::publish_userdata(host).expect("table-form userdata");
+/// One real typed userdata whose metatable stores a raw `__gc` table or
+/// userdata receiver. That receiver's own current metatable stores a raw
+/// `__call` closure which holds one captured table through an upvalue.
+/// Nothing here is rooted; the private pending selection marks the userdata
+/// and follows the same strong graph.
+fn publish_receiver_eligible(
+    host: &mut vm::HostContext<'_>,
+    form: ReceiverForm,
+) -> ReceiverEligible {
+    let userdata = heap::publish_userdata(host).expect("receiver-form userdata");
     let raw = bound_raw(host, userdata);
-    let (metatable, receiver, receiver_metatable, call) = heap::with_heap(host, |heap| {
+    let receiver_userdata = match form {
+        ReceiverForm::Table => None,
+        ReceiverForm::Userdata => Some(heap::publish_userdata(host).expect("receiver userdata")),
+    };
+    let receiver_raw = receiver_userdata.map(|receiver| bound_raw(host, receiver));
+    let (metatable, receiver, receiver_metatable, call, capture) = heap::with_heap(host, |heap| {
         let metatable = heap.alloc()?;
-        let receiver = heap.alloc()?;
         let receiver_metatable = heap.alloc()?;
         let call = heap.alloc_closure()?;
+        let capture_cell = heap.alloc_upvalue()?;
+        let capture = heap.alloc()?;
+        heap.set_upvalue_edge(call, capture_cell)?;
+        heap.write_upvalue(capture_cell, capture)?;
         heap.set_named_closure(receiver_metatable, "__call", call)?;
-        heap.set_metatable(receiver, Some(receiver_metatable))?;
-        heap.set_named_edge(metatable, "__gc", receiver)?;
+        let receiver = match form {
+            ReceiverForm::Table => {
+                let receiver = heap.alloc()?;
+                heap.set_metatable(receiver, Some(receiver_metatable))?;
+                heap.set_named_edge(metatable, "__gc", receiver)?;
+                Receiver::Table(receiver)
+            }
+            ReceiverForm::Userdata => {
+                let receiver = receiver_userdata.expect("published receiver");
+                heap.set_userdata_metatable(receiver, Some(receiver_metatable))?;
+                heap.set_named_userdata(metatable, "__gc", receiver)?;
+                Receiver::Userdata(receiver)
+            }
+        };
         heap.set_userdata_metatable(userdata, Some(metatable))?;
-        Ok((metatable, receiver, receiver_metatable, call))
+        Ok((metatable, receiver, receiver_metatable, call, capture))
     })
-    .expect("table-form lattice");
-    TableFormEligible {
+    .expect("receiver-form lattice");
+    ReceiverEligible {
         userdata,
         raw,
         metatable,
         receiver,
         receiver_metatable,
+        receiver_raw,
         call,
+        capture,
     }
+}
+
+/// Detaches the original `__gc` and `__call` source edges so only the dequeue
+/// roots can keep the receiver, the call closure, and its capture alive.
+fn detach_receiver_source_edges(
+    heap: &mut heap::LuaHeap,
+    head: &ReceiverEligible,
+) -> Result<(), HeapError> {
+    heap.set_named_scalar(head.metatable, "__gc", Value::Null)?;
+    heap.set_named_scalar(head.receiver_metatable, "__call", Value::Null)
 }
 
 /// Publishes two real eligible userdata in one selecting pass and finishes the
@@ -5043,7 +5140,7 @@ fn published_action_re_reads_replaced_sibling_gc_and_roots_the_new_closure() {
         assert_eq!(first_taken.userdata, first.userdata);
         assert_eq!(
             first_taken.action,
-            PendingFinalizerAction::NonCallable(PendingFinalizerNotCallable::Scalar),
+            PendingFinalizerAction::NonCallable(PendingFinalizerNotCallable::Boolean),
             "the selection-time false is still the current raw value"
         );
         assert_eq!(first_taken.roots_written, 1);
@@ -5152,7 +5249,7 @@ fn published_action_skip_arms_delete_gap_and_no_metatable_retire_once() {
             assert_eq!(taken.userdata, first.userdata);
             assert_eq!(
                 taken.action,
-                PendingFinalizerAction::NonCallable(PendingFinalizerNotCallable::Scalar)
+                PendingFinalizerAction::NonCallable(PendingFinalizerNotCallable::Boolean)
             );
 
             heap::with_heap(&mut host, |heap| match arm {
@@ -5235,6 +5332,24 @@ enum GcRejectArm {
 /// closure afterwards does not enqueue the settled generation again.
 #[test]
 fn published_action_non_callable_values_are_typed_rejects_and_retire_once() {
+    // The real named writer stores a boolean or Lua string under `__gc`; a
+    // number cannot occupy an arbitrary named field (Float is reserved for
+    // field 0 `__mode`) and no named writer stores Bytes. The number and byte
+    // string tags are therefore pinned at the narrow classification boundary
+    // instead of widening the guest writer.
+    assert_eq!(
+        heap::pending_finalizer_scalar_reject(&Value::Int(3)),
+        Some(PendingFinalizerNotCallable::Number)
+    );
+    assert_eq!(
+        heap::pending_finalizer_scalar_reject(&Value::Float(3.25)),
+        Some(PendingFinalizerNotCallable::Number)
+    );
+    assert_eq!(
+        heap::pending_finalizer_scalar_reject(&Value::bytes(vec![0xff_u8])),
+        Some(PendingFinalizerNotCallable::String)
+    );
+    assert_eq!(heap::pending_finalizer_scalar_reject(&Value::Null), None);
     for arm in [
         GcRejectArm::False,
         GcRejectArm::True,
@@ -5279,10 +5394,17 @@ fn published_action_non_callable_values_are_typed_rejects_and_retire_once() {
                 .expect("second published head");
             assert_eq!(taken.userdata, second.userdata);
             let expected = match arm {
-                GcRejectArm::Userdata => {
-                    PendingFinalizerAction::NonCallable(PendingFinalizerNotCallable::Userdata)
+                GcRejectArm::Userdata => PendingFinalizerAction::NonCallable(
+                    PendingFinalizerNotCallable::UserdataWithoutCall(
+                        other_userdata.expect("userdata arm value"),
+                    ),
+                ),
+                GcRejectArm::False | GcRejectArm::True => {
+                    PendingFinalizerAction::NonCallable(PendingFinalizerNotCallable::Boolean)
                 }
-                _ => PendingFinalizerAction::NonCallable(PendingFinalizerNotCallable::Scalar),
+                GcRejectArm::String => {
+                    PendingFinalizerAction::NonCallable(PendingFinalizerNotCallable::String)
+                }
             };
             assert_eq!(taken.action, expected, "arm {arm:?}");
             assert_eq!(taken.roots_written, 1, "arm {arm:?}");
@@ -5325,76 +5447,452 @@ fn published_action_non_callable_values_are_typed_rejects_and_retire_once() {
 
 /// The raw `__gc` table is called through its own current metatable's raw
 /// `__call` closure. The original receiver is kept (not replaced by the
-/// callable) and both identities are rooted. After the source field edge is
-/// removed, only those roots keep the pair alive; clearing them releases both.
+/// callable) and all three identities are rooted. Both original source edges
+/// (`__gc` and `__call`) are removed before a real collection, so only the
+/// roots keep the receiver, the real closure, and its captured table alive.
+/// Clearing the closure root first kills the closure and its capture but not
+/// the receiver; clearing the receiver root first kills the receiver but not
+/// the closure. The two roots cannot substitute for each other, and only then
+/// is the pending userdata root removed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RootDropOrder {
+    ClosureFirst,
+    ReceiverFirst,
+}
+
 #[test]
 fn published_action_table_form_roots_the_exact_receiver_and_call_closure() {
+    for order in [RootDropOrder::ClosureFirst, RootDropOrder::ReceiverFirst] {
+        crate::support::with_idle_vm(|vm| {
+            let mut host = vm.host_context();
+            heap::install(&mut host, limits()).expect("install");
+            let head = publish_receiver_eligible(&mut host, ReceiverForm::Table);
+            let receiver = head.receiver.table();
+            let frame = heap::with_heap(&mut host, |heap| heap.enter_roots(4)).expect("roots");
+            let boundary = publish_boundary(&mut host);
+            assert!(matches!(boundary, PublishedBoundary::Published { .. }));
+            assert_eq!(published_count(&mut host), 1);
+            finish_release(&mut host);
+
+            let taken = heap::take_published_pending_finalizer_action(&mut host, frame, &[0, 1, 2])
+                .expect("table-form published head");
+            assert_eq!(taken.userdata, head.userdata);
+            assert_eq!(
+                taken.action,
+                PendingFinalizerAction::TableCall {
+                    receiver,
+                    call: head.call,
+                }
+            );
+            assert_eq!(taken.roots_written, 3);
+            assert_eq!(rooted_userdata(&mut host, frame, 0), Some(head.userdata));
+            assert_eq!(rooted_closure(&mut host, frame, 1), Some(head.call));
+            assert_eq!(rooted_table(&mut host, frame, 2), Some(receiver));
+            assert!(pending_records(&mut host).is_empty());
+            assert_eq!(published_count(&mut host), 0);
+            assert!(finalizer_settled(&mut host, head.userdata));
+
+            // Remove both original strong edges. From here the receiver is
+            // reachable only through root 2, and the real call closure (with
+            // its capture) only through root 1.
+            heap::with_heap(&mut host, |heap| detach_receiver_source_edges(heap, &head))
+                .expect("remove source __gc and __call edges");
+            let (orphan, orphan_weak) = weak_orphan(&mut host);
+            heap::with_heap(&mut host, |heap| heap.write_root(frame, 3, orphan_weak))
+                .expect("weak orphan root");
+            let _ = heap::collect(&mut host).expect("ordinary collect");
+
+            assert!(userdata_alive(&mut host, head.userdata));
+            assert!(
+                closure_alive(&mut host, head.call),
+                "the closure root keeps the real call closure"
+            );
+            assert!(
+                alive(&mut host, head.capture),
+                "the closure root keeps its necessary capture"
+            );
+            assert!(
+                alive(&mut host, receiver),
+                "the receiver root keeps the table"
+            );
+            assert!(
+                !alive(&mut host, orphan),
+                "the independent orphan is reclaimed"
+            );
+            assert_eq!(
+                slot_generation(&mut host, orphan.slot()),
+                orphan.generation() + 1
+            );
+
+            match order {
+                RootDropOrder::ClosureFirst => {
+                    heap::with_heap(&mut host, |heap| heap.clear_root(frame, 1))
+                        .expect("clear closure root");
+                    let _ = heap::collect(&mut host).expect("collect without the closure root");
+                    assert!(
+                        !closure_alive(&mut host, head.call),
+                        "the receiver root cannot keep the call closure"
+                    );
+                    assert!(!alive(&mut host, head.capture));
+                    assert!(alive(&mut host, receiver));
+                    assert!(userdata_alive(&mut host, head.userdata));
+
+                    heap::with_heap(&mut host, |heap| heap.clear_root(frame, 2))
+                        .expect("clear receiver root");
+                    let _ = heap::collect(&mut host).expect("collect without the receiver root");
+                    assert!(!alive(&mut host, receiver));
+                    assert!(
+                        !alive(&mut host, head.receiver_metatable),
+                        "the receiver's own metatable dies with it"
+                    );
+                    assert!(userdata_alive(&mut host, head.userdata));
+                }
+                RootDropOrder::ReceiverFirst => {
+                    heap::with_heap(&mut host, |heap| heap.clear_root(frame, 2))
+                        .expect("clear receiver root");
+                    let _ = heap::collect(&mut host).expect("collect without the receiver root");
+                    assert!(!alive(&mut host, receiver));
+                    assert!(!alive(&mut host, head.receiver_metatable));
+                    assert!(
+                        closure_alive(&mut host, head.call),
+                        "the closure root cannot be replaced by the receiver root"
+                    );
+                    assert!(alive(&mut host, head.capture));
+                    assert!(userdata_alive(&mut host, head.userdata));
+
+                    heap::with_heap(&mut host, |heap| heap.clear_root(frame, 1))
+                        .expect("clear closure root");
+                    let _ = heap::collect(&mut host).expect("collect without the closure root");
+                    assert!(!closure_alive(&mut host, head.call));
+                    assert!(!alive(&mut host, head.capture));
+                    assert!(userdata_alive(&mut host, head.userdata));
+                }
+            }
+
+            heap::with_heap(&mut host, |heap| heap.clear_root(frame, 0))
+                .expect("clear userdata root");
+            let _ = heap::collect(&mut host).expect("collect after clearing the userdata root");
+            assert!(!userdata_alive(&mut host, head.userdata));
+            assert!(!userdata_token_open(&host, head.raw));
+            assert_eq!(
+                slot_generation(&mut host, head.userdata.slot()),
+                head.userdata.generation() + 1
+            );
+            heap::with_heap(&mut host, |heap| heap.leave_roots(frame)).expect("leave roots");
+        });
+    }
+}
+
+/// The raw `__gc` userdata is called through its own current metatable's raw
+/// `__call` closure. The independent receiver is a second real typed userdata,
+/// not the pending object. All three identities are rooted; both original
+/// source edges are removed before a real collection. Clearing either the
+/// closure root or the receiver root only releases its own identity, so the
+/// two roots cannot substitute for each other. The receiver's real typed token
+/// closes and its generation advances only after its root is removed; the
+/// pending userdata token closes only after its own root is removed.
+#[test]
+fn published_action_userdata_form_roots_the_independent_receiver_and_call_closure() {
+    for order in [RootDropOrder::ClosureFirst, RootDropOrder::ReceiverFirst] {
+        crate::support::with_idle_vm(|vm| {
+            let mut host = vm.host_context();
+            heap::install(&mut host, limits()).expect("install");
+            let head = publish_receiver_eligible(&mut host, ReceiverForm::Userdata);
+            let receiver = head.receiver.userdata();
+            let receiver_raw = head.receiver_raw.expect("published receiver token");
+            let frame = heap::with_heap(&mut host, |heap| heap.enter_roots(4)).expect("roots");
+            let boundary = publish_boundary(&mut host);
+            assert!(matches!(boundary, PublishedBoundary::Published { .. }));
+            assert_eq!(published_count(&mut host), 1);
+            finish_release(&mut host);
+
+            let _ = heap::take_scan_meter(&mut host);
+            let taken = heap::take_published_pending_finalizer_action(&mut host, frame, &[0, 1, 2])
+                .expect("userdata-form published head");
+            let meter = heap::take_scan_meter(&mut host).expect("userdata action meter");
+            assert_eq!(
+                meter.pending_release_queue_reads, 2,
+                "the userdata form still reads only the published head, twice"
+            );
+            assert_eq!(
+                meter.pending_queue_storage_moves, 1,
+                "the userdata form still performs one VecDeque front pop"
+            );
+            assert_eq!(taken.userdata, head.userdata);
+            assert_eq!(
+                taken.action,
+                PendingFinalizerAction::UserdataCall {
+                    receiver,
+                    call: head.call,
+                }
+            );
+            assert_eq!(taken.roots_written, 3);
+            assert_eq!(rooted_userdata(&mut host, frame, 0), Some(head.userdata));
+            assert_eq!(rooted_closure(&mut host, frame, 1), Some(head.call));
+            assert_eq!(rooted_userdata(&mut host, frame, 2), Some(receiver));
+            assert!(pending_records(&mut host).is_empty());
+            assert_eq!(published_count(&mut host), 0);
+            assert!(finalizer_settled(&mut host, head.userdata));
+
+            heap::with_heap(&mut host, |heap| detach_receiver_source_edges(heap, &head))
+                .expect("remove source __gc and __call edges");
+            let (orphan, orphan_weak) = weak_orphan(&mut host);
+            heap::with_heap(&mut host, |heap| heap.write_root(frame, 3, orphan_weak))
+                .expect("weak orphan root");
+            let _ = heap::collect(&mut host).expect("ordinary collect");
+
+            assert!(userdata_alive(&mut host, head.userdata));
+            assert!(userdata_alive(&mut host, receiver));
+            assert!(closure_alive(&mut host, head.call));
+            assert!(alive(&mut host, head.capture));
+            assert!(!alive(&mut host, orphan));
+            assert_eq!(
+                slot_generation(&mut host, orphan.slot()),
+                orphan.generation() + 1
+            );
+
+            match order {
+                RootDropOrder::ClosureFirst => {
+                    heap::with_heap(&mut host, |heap| heap.clear_root(frame, 1))
+                        .expect("clear closure root");
+                    let _ = heap::collect(&mut host).expect("collect without the closure root");
+                    assert!(!closure_alive(&mut host, head.call));
+                    assert!(!alive(&mut host, head.capture));
+                    assert!(userdata_alive(&mut host, receiver));
+                    assert!(userdata_alive(&mut host, head.userdata));
+
+                    heap::with_heap(&mut host, |heap| heap.clear_root(frame, 2))
+                        .expect("clear receiver root");
+                    let _ = heap::collect(&mut host).expect("collect without the receiver root");
+                    assert!(!userdata_alive(&mut host, receiver));
+                    assert!(!userdata_token_open(&host, receiver_raw));
+                    assert_eq!(
+                        slot_generation(&mut host, receiver.slot()),
+                        receiver.generation() + 1,
+                        "the independent receiver token closes and its generation advances"
+                    );
+                    assert!(!alive(&mut host, head.receiver_metatable));
+                    assert!(userdata_alive(&mut host, head.userdata));
+                }
+                RootDropOrder::ReceiverFirst => {
+                    heap::with_heap(&mut host, |heap| heap.clear_root(frame, 2))
+                        .expect("clear receiver root");
+                    let _ = heap::collect(&mut host).expect("collect without the receiver root");
+                    assert!(!userdata_alive(&mut host, receiver));
+                    assert!(!userdata_token_open(&host, receiver_raw));
+                    assert_eq!(
+                        slot_generation(&mut host, receiver.slot()),
+                        receiver.generation() + 1
+                    );
+                    assert!(!alive(&mut host, head.receiver_metatable));
+                    assert!(closure_alive(&mut host, head.call));
+                    assert!(alive(&mut host, head.capture));
+                    assert!(userdata_alive(&mut host, head.userdata));
+
+                    heap::with_heap(&mut host, |heap| heap.clear_root(frame, 1))
+                        .expect("clear closure root");
+                    let _ = heap::collect(&mut host).expect("collect without the closure root");
+                    assert!(!closure_alive(&mut host, head.call));
+                    assert!(!alive(&mut host, head.capture));
+                    assert!(userdata_alive(&mut host, head.userdata));
+                }
+            }
+
+            heap::with_heap(&mut host, |heap| heap.clear_root(frame, 0))
+                .expect("clear userdata root");
+            let _ = heap::collect(&mut host).expect("collect after clearing the userdata root");
+            assert!(!userdata_alive(&mut host, head.userdata));
+            assert!(!userdata_token_open(&host, head.raw));
+            assert_eq!(
+                slot_generation(&mut host, head.userdata.slot()),
+                head.userdata.generation() + 1
+            );
+            heap::with_heap(&mut host, |heap| heap.leave_roots(frame)).expect("leave roots");
+        });
+    }
+}
+
+/// The independent userdata receiver uses the same typed `lua.userdata` owner
+/// check as the pending head. The queue raw and the head slot raw stay equal;
+/// only the receiver token's Core payload is temporarily rewritten to another
+/// real userdata. The dequeue is refused before the pop, without a root, queue,
+/// token close, settlement, or generation change. Restoring that payload lets
+/// the same context dequeue successfully.
+#[test]
+fn published_action_userdata_receiver_payload_mismatch_refuses_before_any_write() {
     crate::support::with_idle_vm(|vm| {
         let mut host = vm.host_context();
         heap::install(&mut host, limits()).expect("install");
-        let head = publish_table_form_eligible(&mut host);
+        let head = publish_receiver_eligible(&mut host, ReceiverForm::Userdata);
+        let receiver = head.receiver.userdata();
+        let receiver_raw = head.receiver_raw.expect("published receiver token");
         let frame = heap::with_heap(&mut host, |heap| heap.enter_roots(4)).expect("roots");
         let boundary = publish_boundary(&mut host);
         assert!(matches!(boundary, PublishedBoundary::Published { .. }));
         assert_eq!(published_count(&mut host), 1);
         finish_release(&mut host);
 
+        let records_before = pending_records(&mut host);
+        assert_eq!(records_before[0].0, head.raw);
+        assert_eq!(
+            records_before[0].0,
+            bound_raw(&mut host, head.userdata),
+            "the queue raw and the head slot raw are equal"
+        );
+        assert_eq!(
+            receiver_raw,
+            bound_raw(&mut host, receiver),
+            "the receiver slot raw is the real typed token"
+        );
+        let receiver_generation = slot_generation(&mut host, receiver.slot());
+
+        let decoy = heap::publish_userdata(&mut host).expect("decoy userdata");
+        overwrite_userdata_payload(&mut host, receiver_raw, decoy);
+        let refused = heap::take_published_pending_finalizer_action(&mut host, frame, &[0, 1, 2])
+            .expect_err("receiver payload belongs to another userdata");
+        assert_eq!(refused, HeapError::TokenMismatch);
+        assert_eq!(pending_records(&mut host), records_before);
+        assert_eq!(published_count(&mut host), 1);
+        assert_eq!(rooted_userdata(&mut host, frame, 0), None);
+        assert_eq!(rooted_closure(&mut host, frame, 1), None);
+        assert_eq!(rooted_userdata(&mut host, frame, 2), None);
+        assert!(pending_flag(&mut host, head.userdata));
+        assert!(!finalizer_settled(&mut host, head.userdata));
+        assert!(userdata_token_open(&host, head.raw));
+        assert!(
+            userdata_token_open(&host, receiver_raw),
+            "the receiver payload refusal closes no token"
+        );
+        assert_eq!(
+            slot_generation(&mut host, receiver.slot()),
+            receiver_generation
+        );
+
+        overwrite_userdata_payload(&mut host, receiver_raw, receiver);
         let taken = heap::take_published_pending_finalizer_action(&mut host, frame, &[0, 1, 2])
-            .expect("table-form published head");
-        assert_eq!(taken.userdata, head.userdata);
+            .expect("repaired receiver payload");
         assert_eq!(
             taken.action,
-            PendingFinalizerAction::TableCall {
-                receiver: head.receiver,
+            PendingFinalizerAction::UserdataCall {
+                receiver,
                 call: head.call,
             }
         );
         assert_eq!(taken.roots_written, 3);
         assert_eq!(rooted_userdata(&mut host, frame, 0), Some(head.userdata));
         assert_eq!(rooted_closure(&mut host, frame, 1), Some(head.call));
-        assert_eq!(rooted_table(&mut host, frame, 2), Some(head.receiver));
+        assert_eq!(rooted_userdata(&mut host, frame, 2), Some(receiver));
+        assert!(pending_records(&mut host).is_empty());
+        assert_eq!(published_count(&mut host), 0);
+        assert!(finalizer_settled(&mut host, head.userdata));
+        heap::with_heap(&mut host, |heap| heap.leave_roots(frame)).expect("leave roots");
+    });
+}
+
+struct SelfReceiverEligible {
+    userdata: UserdataRef,
+    raw: u64,
+    metatable: TableRef,
+    call: ClosureRef,
+    capture: TableRef,
+}
+
+/// One real typed userdata whose metatable stores `__gc` naming that same
+/// userdata and a raw `__call` closure. The self receiver is already rooted as
+/// `slots[0]` when the action commits, so it must not require a third slot.
+fn publish_self_receiver_eligible(host: &mut vm::HostContext<'_>) -> SelfReceiverEligible {
+    let userdata = heap::publish_userdata(host).expect("self-receiver userdata");
+    let raw = bound_raw(host, userdata);
+    let (metatable, call, capture) = heap::with_heap(host, |heap| {
+        let metatable = heap.alloc()?;
+        let call = heap.alloc_closure()?;
+        let capture_cell = heap.alloc_upvalue()?;
+        let capture = heap.alloc()?;
+        heap.set_upvalue_edge(call, capture_cell)?;
+        heap.write_upvalue(capture_cell, capture)?;
+        heap.set_named_closure(metatable, "__call", call)?;
+        heap.set_named_userdata(metatable, "__gc", userdata)?;
+        heap.set_userdata_metatable(userdata, Some(metatable))?;
+        Ok((metatable, call, capture))
+    })
+    .expect("self-receiver lattice");
+    SelfReceiverEligible {
+        userdata,
+        raw,
+        metatable,
+        call,
+        capture,
+    }
+}
+
+/// A callable userdata receiver that is the pending object itself adds only
+/// the object and closure roots: the object root already mounts the receiver.
+/// The archived LuaJIT differential fixes the guest arguments and identity for
+/// this shape (both positions are the same object); it does not prescribe an
+/// internal root-slot count. The two-root plan below is this private heap's own
+/// mount contract. The third plan position stays empty, and the closure root
+/// remains the only thing that keeps the real closure and its capture alive
+/// after both source edges are removed.
+#[test]
+fn published_action_userdata_self_receiver_roots_the_object_and_closure_once() {
+    crate::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(&mut host, limits()).expect("install");
+        let head = publish_self_receiver_eligible(&mut host);
+        let frame = heap::with_heap(&mut host, |heap| heap.enter_roots(3)).expect("roots");
+        let boundary = publish_boundary(&mut host);
+        assert!(matches!(boundary, PublishedBoundary::Published { .. }));
+        assert_eq!(published_count(&mut host), 1);
+        finish_release(&mut host);
+
+        let taken = heap::take_published_pending_finalizer_action(&mut host, frame, &[0, 1, 2])
+            .expect("self-receiver published head");
+        assert_eq!(taken.userdata, head.userdata);
+        assert_eq!(
+            taken.action,
+            PendingFinalizerAction::UserdataCall {
+                receiver: head.userdata,
+                call: head.call,
+            }
+        );
+        assert_eq!(
+            taken.roots_written, 2,
+            "the self receiver needs no third root"
+        );
+        assert_eq!(rooted_userdata(&mut host, frame, 0), Some(head.userdata));
+        assert_eq!(rooted_closure(&mut host, frame, 1), Some(head.call));
+        assert_eq!(
+            rooted_userdata(&mut host, frame, 2),
+            None,
+            "the self receiver mounts on the existing object root"
+        );
         assert!(pending_records(&mut host).is_empty());
         assert_eq!(published_count(&mut host), 0);
         assert!(finalizer_settled(&mut host, head.userdata));
 
-        // Remove the original `__gc` edge: the receiver and its closure are
-        // reachable only through the new roots.
         heap::with_heap(&mut host, |heap| {
-            heap.set_named_scalar(head.metatable, "__gc", Value::Null)
+            heap.set_named_scalar(head.metatable, "__gc", Value::Null)?;
+            heap.set_named_scalar(head.metatable, "__call", Value::Null)
         })
-        .expect("remove source __gc edge");
+        .expect("remove source __gc and __call edges");
         let (orphan, orphan_weak) = weak_orphan(&mut host);
-        heap::with_heap(&mut host, |heap| heap.write_root(frame, 3, orphan_weak))
+        heap::with_heap(&mut host, |heap| heap.write_root(frame, 2, orphan_weak))
             .expect("weak orphan root");
         let _ = heap::collect(&mut host).expect("ordinary collect");
 
         assert!(userdata_alive(&mut host, head.userdata));
-        assert!(
-            closure_alive(&mut host, head.call),
-            "the closure root alone keeps the callable"
-        );
-        assert!(
-            alive(&mut host, head.receiver),
-            "the receiver root keeps the table"
-        );
-        assert!(
-            !alive(&mut host, orphan),
-            "the independent orphan is reclaimed"
-        );
+        assert!(closure_alive(&mut host, head.call));
+        assert!(alive(&mut host, head.capture));
+        assert!(!alive(&mut host, orphan));
         assert_eq!(
             slot_generation(&mut host, orphan.slot()),
             orphan.generation() + 1
         );
 
         heap::with_heap(&mut host, |heap| heap.clear_root(frame, 1)).expect("clear closure root");
-        heap::with_heap(&mut host, |heap| heap.clear_root(frame, 2)).expect("clear receiver root");
-        let _ = heap::collect(&mut host).expect("collect after clearing both roots");
+        let _ = heap::collect(&mut host).expect("collect without the closure root");
         assert!(!closure_alive(&mut host, head.call));
-        assert!(!alive(&mut host, head.receiver));
-        assert!(
-            !alive(&mut host, head.receiver_metatable),
-            "the receiver's own metatable dies with it"
-        );
+        assert!(!alive(&mut host, head.capture));
         assert!(userdata_alive(&mut host, head.userdata));
 
         heap::with_heap(&mut host, |heap| heap.clear_root(frame, 0)).expect("clear userdata root");
@@ -5436,7 +5934,8 @@ fn published_action_table_call_relookup_observes_sibling_call_changes() {
             let mut host = vm.host_context();
             heap::install(&mut host, limits()).expect("install");
             let first = publish_eligible(&mut host);
-            let head = publish_table_form_eligible(&mut host);
+            let head = publish_receiver_eligible(&mut host, ReceiverForm::Table);
+            let receiver = head.receiver.table();
             assert!(first.userdata.slot() < head.userdata.slot());
             let frame = heap::with_heap(&mut host, |heap| heap.enter_roots(4)).expect("roots");
             let boundary = publish_boundary(&mut host);
@@ -5471,7 +5970,7 @@ fn published_action_table_call_relookup_observes_sibling_call_changes() {
                         "__call",
                         new_call.expect("replacement call closure"),
                     )?;
-                    heap.set_metatable(head.receiver, Some(metatable))
+                    heap.set_metatable(receiver, Some(metatable))
                 }
                 CallRelookupArm::DeleteField => {
                     heap.set_named_scalar(head.receiver_metatable, "__call", Value::Null)
@@ -5490,7 +5989,7 @@ fn published_action_table_call_relookup_observes_sibling_call_changes() {
                     assert_eq!(
                         taken.action,
                         PendingFinalizerAction::TableCall {
-                            receiver: head.receiver,
+                            receiver,
                             call: head.call,
                         },
                         "keep keeps the original closure"
@@ -5500,7 +5999,7 @@ fn published_action_table_call_relookup_observes_sibling_call_changes() {
                     assert_eq!(
                         taken.action,
                         PendingFinalizerAction::TableCall {
-                            receiver: head.receiver,
+                            receiver,
                             call: new_call.expect("new closure identity"),
                         },
                         "arm {arm:?}: only the current raw __call is used"
@@ -5510,7 +6009,7 @@ fn published_action_table_call_relookup_observes_sibling_call_changes() {
                     assert_eq!(
                         taken.action,
                         PendingFinalizerAction::NonCallable(
-                            PendingFinalizerNotCallable::TableWithoutCall(head.receiver)
+                            PendingFinalizerNotCallable::TableWithoutCall(receiver)
                         ),
                         "a missing __call keeps the original table receiver"
                     );
@@ -5519,7 +6018,7 @@ fn published_action_table_call_relookup_observes_sibling_call_changes() {
                     assert_eq!(
                         taken.action,
                         PendingFinalizerAction::NonCallable(
-                            PendingFinalizerNotCallable::TableCallNotClosure(head.receiver)
+                            PendingFinalizerNotCallable::TableCallNotClosure(receiver)
                         ),
                         "false __call keeps the original table receiver"
                     );
@@ -5538,7 +6037,7 @@ fn published_action_table_call_relookup_observes_sibling_call_changes() {
                         rooted_closure(&mut host, frame, 2),
                         Some(new_call.unwrap_or(head.call))
                     );
-                    assert_eq!(rooted_table(&mut host, frame, 3), Some(head.receiver));
+                    assert_eq!(rooted_table(&mut host, frame, 3), Some(receiver));
                 }
                 CallRelookupArm::DeleteField | CallRelookupArm::FalseField => {
                     assert_eq!(taken.roots_written, 1);
@@ -5589,7 +6088,8 @@ fn published_action_refuses_roots_and_saved_state_before_any_write() {
     crate::support::with_idle_vm(|vm| {
         let mut host = vm.host_context();
         heap::install(&mut host, limits()).expect("install");
-        let head = publish_table_form_eligible(&mut host);
+        let head = publish_receiver_eligible(&mut host, ReceiverForm::Table);
+        let receiver = head.receiver.table();
         let (frame, anchor) = heap::with_heap(&mut host, |heap| {
             let frame = heap.enter_roots(5)?;
             let anchor = heap.alloc()?;
@@ -5687,6 +6187,41 @@ fn published_action_refuses_roots_and_saved_state_before_any_write() {
         })
         .expect("restore the head binding");
 
+        // Queue raw and slot raw are equal here; only the Core payload names
+        // another real userdata. This is refused by the typed payload check,
+        // not by the raw-binding check above, and the same context recovers
+        // after the payload is restored.
+        assert_eq!(
+            pending_records(&mut host)[0].0,
+            heap::with_heap(&mut host, |heap| heap
+                .published_userdata_token(head.userdata))
+            .expect("slot raw is still bound"),
+            "the queue raw and the slot raw are equal in this arm"
+        );
+        let generation_before = slot_generation(&mut host, head.userdata.slot());
+        overwrite_userdata_payload(&mut host, head.raw, decoy);
+        let refused = heap::take_published_pending_finalizer_action(&mut host, frame, &[1, 2, 3])
+            .expect_err("typed payload belongs to another userdata");
+        assert_eq!(refused, HeapError::TokenMismatch);
+        assert_eq!(pending_records(&mut host), records_before);
+        assert_eq!(published_count(&mut host), 1);
+        assert_eq!(rooted_userdata(&mut host, frame, 1), None);
+        assert_eq!(rooted_closure(&mut host, frame, 2), None);
+        assert_eq!(rooted_table(&mut host, frame, 3), None);
+        assert!(pending_flag(&mut host, head.userdata));
+        assert!(!finalizer_settled(&mut host, head.userdata));
+        assert!(
+            userdata_token_open(&host, head.raw),
+            "the payload refusal closes no token"
+        );
+        assert_eq!(
+            slot_generation(&mut host, head.userdata.slot()),
+            generation_before,
+            "the payload refusal advances no generation"
+        );
+        overwrite_userdata_payload(&mut host, head.raw, head.userdata);
+        assert!(pending_flag(&mut host, head.userdata));
+
         // A saved mark owns the graph even without a Release tail. Dropping
         // that parked mark with an ordinary collection keeps the pending head
         // (host-retained edge) and lets the same context retry.
@@ -5717,14 +6252,14 @@ fn published_action_refuses_roots_and_saved_state_before_any_write() {
         assert_eq!(
             taken.action,
             PendingFinalizerAction::TableCall {
-                receiver: head.receiver,
+                receiver,
                 call: head.call,
             }
         );
         assert_eq!(taken.roots_written, 3);
         assert_eq!(rooted_userdata(&mut host, frame, 1), Some(head.userdata));
         assert_eq!(rooted_closure(&mut host, frame, 2), Some(head.call));
-        assert_eq!(rooted_table(&mut host, frame, 3), Some(head.receiver));
+        assert_eq!(rooted_table(&mut host, frame, 3), Some(receiver));
         assert!(pending_records(&mut host).is_empty());
         assert_eq!(published_count(&mut host), 0);
         assert_eq!(
@@ -5739,106 +6274,120 @@ fn published_action_refuses_roots_and_saved_state_before_any_write() {
         assert_not_published(refused);
         assert_eq!(rooted_userdata(&mut host, frame, 1), Some(head.userdata));
         assert_eq!(rooted_closure(&mut host, frame, 2), Some(head.call));
-        assert_eq!(rooted_table(&mut host, frame, 3), Some(head.receiver));
+        assert_eq!(rooted_table(&mut host, frame, 3), Some(receiver));
         heap::with_heap(&mut host, |heap| heap.leave_roots(frame)).expect("leave roots");
     });
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TableRejectArm {
+enum ReceiverRejectArm {
     NoMetatable,
     MissingCall,
     TableCall,
     InheritedCall,
 }
 
-/// A table-valued `__gc` without a callable direct `__call` keeps the original
-/// receiver in its typed reject. A table-valued `__call` is not dispatched a
-/// second time, and a `__call` stored only on the receiver's metatable's
-/// metatable is not inherited. No closure or receiver root is written for any
-/// reject.
+/// A table or userdata receiver without a callable direct raw `__call` keeps
+/// the exact original receiver type in its typed reject. A table-valued
+/// `__call` is not dispatched a second time, and a `__call` stored only on the
+/// receiver metatable's metatable is not inherited. No closure or receiver
+/// root is written for any reject.
 #[test]
-fn published_action_table_rejects_missing_nested_and_inherited_call() {
-    for arm in [
-        TableRejectArm::NoMetatable,
-        TableRejectArm::MissingCall,
-        TableRejectArm::TableCall,
-        TableRejectArm::InheritedCall,
-    ] {
-        crate::support::with_idle_vm(|vm| {
-            let mut host = vm.host_context();
-            heap::install(&mut host, limits()).expect("install");
-            let head = publish_table_form_eligible(&mut host);
-            let mut nested_call = None;
-            heap::with_heap(&mut host, |heap| match arm {
-                TableRejectArm::NoMetatable => heap.set_metatable(head.receiver, None),
-                TableRejectArm::MissingCall => {
-                    heap.set_named_scalar(head.receiver_metatable, "__call", Value::Null)
-                }
-                TableRejectArm::TableCall => {
-                    let nested_metatable = heap.alloc()?;
-                    let call = heap.alloc_closure()?;
-                    heap.set_named_closure(nested_metatable, "__call", call)?;
-                    let nested = heap.alloc()?;
-                    heap.set_metatable(nested, Some(nested_metatable))?;
-                    heap.set_named_edge(head.receiver_metatable, "__call", nested)?;
-                    nested_call = Some(call);
-                    Ok(())
-                }
-                TableRejectArm::InheritedCall => {
-                    let outer = heap.alloc()?;
-                    let call = heap.alloc_closure()?;
-                    heap.set_named_closure(outer, "__call", call)?;
-                    heap.set_metatable(head.receiver_metatable, Some(outer))?;
-                    heap.set_named_scalar(head.receiver_metatable, "__call", Value::Null)?;
-                    nested_call = Some(call);
-                    Ok(())
-                }
-            })
-            .expect("table rejection lattice");
-            let frame = heap::with_heap(&mut host, |heap| heap.enter_roots(3)).expect("roots");
-            let boundary = publish_boundary(&mut host);
-            assert!(matches!(boundary, PublishedBoundary::Published { .. }));
-            assert_eq!(published_count(&mut host), 1);
-            finish_release(&mut host);
+fn published_action_receiver_rejects_missing_nested_and_inherited_call() {
+    for form in [ReceiverForm::Table, ReceiverForm::Userdata] {
+        for arm in [
+            ReceiverRejectArm::NoMetatable,
+            ReceiverRejectArm::MissingCall,
+            ReceiverRejectArm::TableCall,
+            ReceiverRejectArm::InheritedCall,
+        ] {
+            crate::support::with_idle_vm(|vm| {
+                let mut host = vm.host_context();
+                heap::install(&mut host, limits()).expect("install");
+                let head = publish_receiver_eligible(&mut host, form);
+                let mut nested_call = None;
+                heap::with_heap(&mut host, |heap| match arm {
+                    ReceiverRejectArm::NoMetatable => match head.receiver {
+                        Receiver::Table(receiver) => heap.set_metatable(receiver, None),
+                        Receiver::Userdata(receiver) => heap.set_userdata_metatable(receiver, None),
+                    },
+                    ReceiverRejectArm::MissingCall => {
+                        heap.set_named_scalar(head.receiver_metatable, "__call", Value::Null)
+                    }
+                    ReceiverRejectArm::TableCall => {
+                        let nested_metatable = heap.alloc()?;
+                        let call = heap.alloc_closure()?;
+                        heap.set_named_closure(nested_metatable, "__call", call)?;
+                        let nested = heap.alloc()?;
+                        heap.set_metatable(nested, Some(nested_metatable))?;
+                        heap.set_named_edge(head.receiver_metatable, "__call", nested)?;
+                        nested_call = Some(call);
+                        Ok(())
+                    }
+                    ReceiverRejectArm::InheritedCall => {
+                        let outer = heap.alloc()?;
+                        let call = heap.alloc_closure()?;
+                        heap.set_named_closure(outer, "__call", call)?;
+                        heap.set_metatable(head.receiver_metatable, Some(outer))?;
+                        heap.set_named_scalar(head.receiver_metatable, "__call", Value::Null)?;
+                        nested_call = Some(call);
+                        Ok(())
+                    }
+                })
+                .expect("receiver rejection lattice");
+                let frame = heap::with_heap(&mut host, |heap| heap.enter_roots(3)).expect("roots");
+                let boundary = publish_boundary(&mut host);
+                assert!(matches!(boundary, PublishedBoundary::Published { .. }));
+                assert_eq!(published_count(&mut host), 1);
+                finish_release(&mut host);
 
-            let taken = heap::take_published_pending_finalizer_action(&mut host, frame, &[0])
-                .expect("table reject published head");
-            assert_eq!(taken.userdata, head.userdata);
-            let expected = match arm {
-                TableRejectArm::NoMetatable
-                | TableRejectArm::MissingCall
-                | TableRejectArm::InheritedCall => {
-                    PendingFinalizerNotCallable::TableWithoutCall(head.receiver)
-                }
-                TableRejectArm::TableCall => {
-                    PendingFinalizerNotCallable::TableCallNotClosure(head.receiver)
-                }
-            };
-            assert_eq!(
-                taken.action,
-                PendingFinalizerAction::NonCallable(expected),
-                "arm {arm:?}"
-            );
-            assert_eq!(taken.roots_written, 1, "arm {arm:?}");
-            assert_eq!(rooted_userdata(&mut host, frame, 0), Some(head.userdata));
-            assert_eq!(rooted_closure(&mut host, frame, 1), None, "arm {arm:?}");
-            assert_eq!(rooted_table(&mut host, frame, 2), None, "arm {arm:?}");
-            assert!(pending_records(&mut host).is_empty());
-            assert_eq!(published_count(&mut host), 0);
-            assert!(finalizer_settled(&mut host, head.userdata));
-            if let Some(call) = nested_call {
-                assert!(
-                    closure_alive(&mut host, call),
-                    "arm {arm:?}: the unused nested closure is still live here"
+                let taken = heap::take_published_pending_finalizer_action(&mut host, frame, &[0])
+                    .expect("receiver reject published head");
+                assert_eq!(taken.userdata, head.userdata);
+                let expected = match arm {
+                    ReceiverRejectArm::NoMetatable
+                    | ReceiverRejectArm::MissingCall
+                    | ReceiverRejectArm::InheritedCall => head.receiver.without_call(),
+                    ReceiverRejectArm::TableCall => head.receiver.call_not_closure(),
+                };
+                assert_eq!(
+                    taken.action,
+                    PendingFinalizerAction::NonCallable(expected),
+                    "form {form:?} arm {arm:?}"
                 );
+                assert_eq!(taken.roots_written, 1, "form {form:?} arm {arm:?}");
+                assert_eq!(rooted_userdata(&mut host, frame, 0), Some(head.userdata));
                 assert_eq!(
                     rooted_closure(&mut host, frame, 1),
                     None,
-                    "arm {arm:?}: an unused closure is never rooted"
+                    "form {form:?} arm {arm:?}"
                 );
-            }
-            heap::with_heap(&mut host, |heap| heap.leave_roots(frame)).expect("leave roots");
-        });
+                assert_eq!(
+                    rooted_table(&mut host, frame, 2),
+                    None,
+                    "form {form:?} arm {arm:?}"
+                );
+                assert_eq!(
+                    rooted_userdata(&mut host, frame, 2),
+                    None,
+                    "form {form:?} arm {arm:?}"
+                );
+                assert!(pending_records(&mut host).is_empty());
+                assert_eq!(published_count(&mut host), 0);
+                assert!(finalizer_settled(&mut host, head.userdata));
+                if let Some(call) = nested_call {
+                    assert!(
+                        closure_alive(&mut host, call),
+                        "form {form:?} arm {arm:?}: the unused nested closure is still live here"
+                    );
+                    assert_eq!(
+                        rooted_closure(&mut host, frame, 1),
+                        None,
+                        "form {form:?} arm {arm:?}: an unused closure is never rooted"
+                    );
+                }
+                heap::with_heap(&mut host, |heap| heap.leave_roots(frame)).expect("leave roots");
+            });
+        }
     }
 }
