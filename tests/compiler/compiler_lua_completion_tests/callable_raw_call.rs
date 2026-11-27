@@ -23,9 +23,37 @@
 //! real collector, and checks the old generation becomes stale while the new
 //! generation stays alive. It then removes the last edge and checks that the
 //! slot releases exactly its one Arc.
+//!
+//! A second witness in this file joins that raw field to the private published
+//! pending-finalizer queue in one VM. Two real typed userdata share one
+//! metatable whose raw `__gc` is the same issued receiver table; one private
+//! collection selects both in allocation-reversed cohort order and publishes
+//! them, with an independent weak-value orphan as the real weak-clearance
+//! witness. The saved Release tail is observed and finished before the first
+//! dequeue. The actual published head is taken through the action handoff and
+//! roots the exact userdata, the existing closure generation, and the original
+//! receiver. The second head stays published; a real guest helper invoked in
+//! the same halted VM calls the same `note(owner, target)` import against the
+//! same metatable and replaces `__call` with the second original zero-capture
+//! closure. The second dequeue then re-reads that live edge. Each take writes
+//! exactly three real roots. After both takes the source edges and the
+//! dequeue roots are withdrawn, a real collection retires both typed userdata
+//! tokens and advances their old generations, while an independent external
+//! receiver root and an unrelated sentinel stay readable. That outer root is
+//! then withdrawn and another real collection reclaims the receiver. The
+//! pre-replacement edge is recorded as the omission control, and the second
+//! take is required not to return the old original Arc.
+//!
+//! A third test runs those two fixtures in two real VMs on two threads. The
+//! first VM parks in a test-only mark gate after its owner tick and first
+//! picture; the second runs its whole file entry and takes its witness while
+//! the first is parked. Each witness lives in its own VM execution scope, so
+//! the first keeps its complete arm sequence, its own heap domain, its own
+//! owner and ready rows, and its own Core Arcs.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use vm::compiler::HostCallResolver;
 use vm::{
@@ -36,9 +64,13 @@ use vm::{
 };
 
 use super::{FUEL_BUDGET, FUEL_CHECK_INTERVAL, lower};
-use crate::heap::{self, GuestClass, HandleKind, HeapError, HeapStats, LuaHeap, TableRef};
+use crate::heap::{
+    self, ClosureRef, GuestClass, HandleKind, HeapError, HeapStats, LuaHeap, LuaUserdataResource,
+    PendingFinalizerAction, RootFrameId, TableRef, UserdataRef,
+};
 
 const FIXTURE: &str = "callable_raw_call.lua";
+const PUBLISHED_DEQUEUE_FIXTURE: &str = "callable_raw_call_published_dequeue.lua";
 const RAW_CALL_FIELD: &str = "__call";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -70,15 +102,82 @@ struct Witness {
     pictures: Vec<(String, Picture)>,
 }
 
-static WITNESS: Mutex<Witness> = Mutex::new(Witness {
-    owners: Vec::new(),
-    positive_owner: None,
-    pictures: Vec::new(),
-});
+/// The witness lives in the execution scope of exactly the VM that produced
+/// it. A second VM's clear or take cannot reach it, and no process-global lock
+/// serializes independent runs.
+fn with_witness<T>(vm: &mut Vm, body: impl FnOnce(&mut Witness) -> T) -> T {
+    let mut host = vm.host_context();
+    let witness = host
+        .scope_state_mut::<Witness>()
+        .expect("raw call field: this VM has no file-entry witness");
+    body(witness)
+}
 
-fn with_witness<T>(body: impl FnOnce(&mut Witness) -> T) -> T {
-    let mut guard = WITNESS.lock().expect("raw call field witness");
-    body(&mut guard)
+/// One test-only ordering gate for the two-VM witness isolation test. The
+/// first VM parks inside `host_mark` after it has issued its owner and pushed
+/// its `first-before` picture; the second VM runs its whole fixture (clear,
+/// observations, take) while the first is parked. The gate is observation
+/// ordering only: no witness lock is held at either wait.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InterleaveRole {
+    FirstVm,
+}
+
+struct InterleaveGate {
+    reached: Mutex<bool>,
+    reached_signal: Condvar,
+    released: Mutex<bool>,
+    released_signal: Condvar,
+}
+
+static INTERLEAVE_GATE: OnceLock<InterleaveGate> = OnceLock::new();
+
+thread_local! {
+    static INTERLEAVE_ROLE: std::cell::Cell<Option<InterleaveRole>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn interleave_gate() -> &'static InterleaveGate {
+    INTERLEAVE_GATE.get_or_init(|| InterleaveGate {
+        reached: Mutex::new(false),
+        reached_signal: Condvar::new(),
+        released: Mutex::new(false),
+        released_signal: Condvar::new(),
+    })
+}
+
+fn interleave_pause(label: &str) {
+    if INTERLEAVE_ROLE.with(|role| role.get()) != Some(InterleaveRole::FirstVm)
+        || label != "first-after"
+    {
+        return;
+    }
+    let gate = interleave_gate();
+    *gate
+        .reached
+        .lock()
+        .expect("raw call field: interleave reached") = true;
+    gate.reached_signal.notify_all();
+    let mut released = gate
+        .released
+        .lock()
+        .expect("raw call field: interleave released");
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !*released {
+        let now = Instant::now();
+        assert!(
+            now < deadline,
+            "raw call field: the first VM was not released by the second VM"
+        );
+        let wait = deadline
+            .saturating_duration_since(now)
+            .min(Duration::from_millis(100));
+        let (guard, _) = gate
+            .released_signal
+            .wait_timeout(released, wait)
+            .expect("raw call field: interleave released wait");
+        released = guard;
+    }
 }
 
 impl Witness {
@@ -174,7 +273,8 @@ fn host_mark(vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
         return Err(host_fault("mark expects one string label"));
     };
     let label = label.as_str().to_string();
-    let owners: Vec<(String, TableRef, TableRef)> = with_witness(|witness| {
+    interleave_pause(&label);
+    let owners: Vec<(String, TableRef, TableRef)> = with_witness(vm, |witness| {
         witness
             .owners
             .iter()
@@ -201,7 +301,7 @@ fn host_mark(vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
         })
         .map_err(heap_fault)?
     };
-    with_witness(|witness| witness.pictures.push((label, picture)));
+    with_witness(vm, |witness| witness.pictures.push((label, picture)));
     Ok(CallOutcome::Return(CallReturn::one(Value::Int(0))))
 }
 
@@ -214,7 +314,7 @@ fn host_tick(vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
     };
     let label = label.as_str().to_string();
     if label == "owner-slot" || label == "owner-generation" {
-        let owner = with_witness(|witness| {
+        let owner = with_witness(vm, |witness| {
             witness
                 .positive_owner
                 .expect("the owner tick must run before a slot field")
@@ -261,7 +361,7 @@ fn host_tick(vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
         }
         (issued, owner, metatable, metatable_value)
     };
-    with_witness(|witness| {
+    with_witness(vm, |witness| {
         if label == "owner" {
             witness.positive_owner = Some(owner);
         }
@@ -298,13 +398,13 @@ impl SourcePlugin for RawCallPlugin {
     }
 }
 
-fn fixture_path() -> PathBuf {
+fn named_fixture_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures")
         .join("luajit")
         .join("finalizer")
-        .join(FIXTURE)
+        .join(name)
 }
 
 struct RawCallRun {
@@ -316,12 +416,14 @@ struct RawCallRun {
 }
 
 fn run_fixture() -> RawCallRun {
-    *WITNESS.lock().expect("raw call field witness") = Witness::default();
+    run_fixture_named(FIXTURE)
+}
 
+fn run_fixture_named(fixture: &str) -> RawCallRun {
     let options = CompileSourceFileOptions::new()
         .with_source_plugin(&RAW_CALL_PLUGIN)
         .with_host_api_catalog(Arc::clone(raw_call_catalog()));
-    let compiled = vm::compile_source_file_with_options(fixture_path(), options)
+    let compiled = vm::compile_source_file_with_options(named_fixture_path(fixture), options)
         .unwrap_or_else(|error| panic!("raw call field: compile failed: {error:?}"));
 
     let mut runtime = Vm::new_with_jit_config(
@@ -333,6 +435,11 @@ fn run_fixture() -> RawCallRun {
         },
     );
     bind_hosts(&mut runtime).unwrap_or_else(|error| panic!("raw call field: bind failed: {error}"));
+    {
+        let mut host = runtime.host_context();
+        host.scope_state_or_insert_with(Witness::default)
+            .unwrap_or_else(|error| panic!("raw call field: witness scope: {error:?}"));
+    }
     runtime
         .set_fuel_check_interval(FUEL_CHECK_INTERVAL)
         .unwrap_or_else(|error| panic!("raw call field: fuel interval: {error}"));
@@ -345,7 +452,11 @@ fn run_fixture() -> RawCallRun {
         .checked_sub(remaining)
         .unwrap_or_else(|| panic!("raw call field: fuel increased"));
     let stack = runtime.stack().to_vec();
-    let witness = std::mem::take(&mut *WITNESS.lock().expect("raw call field witness"));
+    let witness = {
+        let mut host = runtime.host_context();
+        host.take_scope_state::<Witness>()
+            .expect("raw call field: this VM keeps its file-entry witness")
+    };
     RawCallRun {
         vm: runtime,
         status,
@@ -872,5 +983,1057 @@ fn raw_call_edge_receives_two_guest_closures_and_releases_the_old_generation() {
         Arc::strong_count(&captured),
         captured_count,
         "raw call field: no collection may change the refused captured Arc ownership"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Published dequeue: the live raw `__call` edge after a real guest replacement
+// ---------------------------------------------------------------------------
+
+fn publish_userdata(vm: &mut Vm) -> (UserdataRef, u64) {
+    let mut host = vm.host_context();
+    let userdata = heap::publish_userdata(&mut host)
+        .unwrap_or_else(|error| panic!("raw call dequeue: publish userdata: {error:?}"));
+    let raw = heap::with_heap(&mut host, |heap| heap.published_userdata_token(userdata))
+        .unwrap_or_else(|error| panic!("raw call dequeue: published userdata token: {error:?}"));
+    (userdata, raw)
+}
+
+fn publish_orphan_table(vm: &mut Vm) -> (TableRef, Value) {
+    let mut host = vm.host_context();
+    let value = heap::publish_guest(&mut host)
+        .unwrap_or_else(|error| panic!("raw call dequeue: publish weak orphan: {error:?}"));
+    let class = heap::with_heap(&mut host, |heap| Ok(heap.guest_class(&value)))
+        .unwrap_or_else(|error| panic!("raw call dequeue: weak orphan class: {error:?}"));
+    let GuestClass::Table(table) = class else {
+        panic!("raw call dequeue: the weak orphan must be an issued table");
+    };
+    (table, value)
+}
+
+fn userdata_from_token(vm: &mut Vm, raw: u64) -> UserdataRef {
+    let host = vm.host_context();
+    let handle = vm::ResourceHandle::from_raw(raw)
+        .unwrap_or_else(|error| panic!("raw call dequeue: invalid userdata handle {raw}: {error}"));
+    let borrowed = host
+        .borrow_resource_with_key::<LuaUserdataResource>(handle, &LuaUserdataResource::key())
+        .unwrap_or_else(|error| panic!("raw call dequeue: typed lua.userdata borrow: {error:?}"));
+    let payload = borrowed.get().userdata();
+    assert_eq!(
+        payload.kind(),
+        HandleKind::Userdata,
+        "raw call dequeue: the typed payload names a userdata"
+    );
+    payload
+}
+
+fn userdata_token_open(vm: &mut Vm, raw: u64) -> bool {
+    let Ok(handle) = vm::ResourceHandle::from_raw(raw) else {
+        return false;
+    };
+    let host = vm.host_context();
+    host.typed_resource_with_key::<LuaUserdataResource>(handle, &LuaUserdataResource::key())
+        .is_ok()
+}
+
+fn borrow_published_userdata(vm: &mut Vm, userdata: UserdataRef) -> Result<UserdataRef, HeapError> {
+    let host = vm.host_context();
+    heap::borrow_published_userdata(&host, userdata)
+}
+
+fn pending_records(vm: &mut Vm) -> Vec<(u64, u32, u32)> {
+    heap_with(vm, |heap| Ok(heap.pending_finalizer_records()))
+}
+
+fn published_count(vm: &mut Vm) -> usize {
+    let mut host = vm.host_context();
+    heap::pending_finalizer_published_count(&mut host)
+        .unwrap_or_else(|error| panic!("raw call dequeue: published count: {error:?}"))
+}
+
+fn slot_generation(vm: &mut Vm, slot: u32) -> u32 {
+    heap_with(vm, |heap| Ok(heap.slot_generation(slot)))
+        .unwrap_or_else(|| panic!("raw call dequeue: slot {slot} stays in the vector"))
+}
+
+fn pending_flag(vm: &mut Vm, userdata: UserdataRef) -> bool {
+    heap_with(vm, |heap| heap.slot_pending_finalizer(userdata))
+}
+
+fn settled_flag(vm: &mut Vm, userdata: UserdataRef) -> bool {
+    heap_with(vm, |heap| heap.slot_finalizer_settled(userdata))
+}
+
+fn closure_alive(vm: &mut Vm, closure: ClosureRef) -> bool {
+    heap_with(vm, |heap| Ok(heap.closure_alive(closure)))
+}
+
+fn saved_tail(vm: &mut Vm) -> Option<heap::SavedTailState> {
+    let mut host = vm.host_context();
+    heap::saved_tail_state(&mut host)
+        .unwrap_or_else(|error| panic!("raw call dequeue: saved tail state: {error:?}"))
+}
+
+fn finish_published_tail(vm: &mut Vm) -> heap::CollectReport {
+    let mut host = vm.host_context();
+    match heap::resume_published_sweep(&mut host, u64::MAX)
+        .unwrap_or_else(|error| panic!("raw call dequeue: resume tail: {error:?}"))
+    {
+        heap::PublishedResume::Completed(report) => report,
+        heap::PublishedResume::Paused => {
+            panic!("raw call dequeue: an unbounded budget finishes the Release tail")
+        }
+    }
+}
+
+fn take_published_action(
+    vm: &mut Vm,
+    frame: RootFrameId,
+    slots: &[u32],
+) -> Result<crate::heap::TakenPendingFinalizer, HeapError> {
+    let mut host = vm.host_context();
+    heap::take_published_pending_finalizer_action(&mut host, frame, slots)
+}
+
+fn assert_empty_roots(vm: &mut Vm, frame: RootFrameId, slots: &[u32]) {
+    let mut host = vm.host_context();
+    for slot in slots {
+        assert_eq!(
+            heap::rooted_userdata(&mut host, frame, *slot),
+            Ok(None),
+            "raw call dequeue: root slot {slot} has no written userdata"
+        );
+        assert_eq!(
+            heap::rooted_closure(&mut host, frame, *slot),
+            Ok(None),
+            "raw call dequeue: root slot {slot} has no written closure"
+        );
+        assert_eq!(
+            heap::rooted_table(&mut host, frame, *slot),
+            Ok(None),
+            "raw call dequeue: root slot {slot} has no written table"
+        );
+    }
+}
+
+/// Checks the exact three-slot action plan: userdata, call closure, receiver.
+/// Each slot must hold that one kind and no other kind.
+fn assert_table_call_roots(
+    vm: &mut Vm,
+    frame: RootFrameId,
+    slots: &[u32],
+    userdata: UserdataRef,
+    closure: ClosureRef,
+    receiver: TableRef,
+) {
+    assert_eq!(slots.len(), 3);
+    let mut host = vm.host_context();
+    assert_eq!(
+        heap::rooted_userdata(&mut host, frame, slots[0]),
+        Ok(Some(userdata))
+    );
+    assert_eq!(
+        heap::rooted_closure(&mut host, frame, slots[0]),
+        Err(HeapError::StaleHandle)
+    );
+    assert_eq!(
+        heap::rooted_table(&mut host, frame, slots[0]),
+        Err(HeapError::StaleHandle)
+    );
+    assert_eq!(
+        heap::rooted_userdata(&mut host, frame, slots[1]),
+        Err(HeapError::StaleHandle)
+    );
+    assert_eq!(
+        heap::rooted_closure(&mut host, frame, slots[1]),
+        Ok(Some(closure))
+    );
+    assert_eq!(
+        heap::rooted_table(&mut host, frame, slots[1]),
+        Err(HeapError::StaleHandle)
+    );
+    assert_eq!(
+        heap::rooted_userdata(&mut host, frame, slots[2]),
+        Err(HeapError::StaleHandle)
+    );
+    assert_eq!(
+        heap::rooted_closure(&mut host, frame, slots[2]),
+        Err(HeapError::StaleHandle)
+    );
+    assert_eq!(
+        heap::rooted_table(&mut host, frame, slots[2]),
+        Ok(Some(receiver))
+    );
+}
+
+/// Joins one real guest-written raw `__call` to the private published
+/// pending-finalizer prefix. Two real typed userdata in this same VM carry one
+/// shared metatable whose raw `__gc` is the issued receiver table. The real
+/// private collector selects both in allocation-reversed cohort order and
+/// publishes them after one real weak-value orphan is cleared. The saved
+/// Release tail refuses a dequeue until it is finished; a saved mark also
+/// refuses. The first actual head is taken and roots the exact userdata, the
+/// existing guest closure generation, and the original receiver. The second
+/// head stays published while a real guest helper, invoked in the same halted
+/// VM, runs the same `note(owner, target)` import and rewrites the same raw
+/// `__call` edge. The second take re-reads that live edge.
+///
+/// The pre-replacement edge is recorded as the omission control: if the guest
+/// replacement were omitted, the second take would have to name the first
+/// original Arc. The second take is also required not to name that old Arc.
+/// The helper invocation is ordinary guest execution used only to reach the
+/// existing `note` import; it is not a `__gc` or `__call` callback.
+/// Withdrawing the two dequeue root triples and both source edges lets a real
+/// collection retire both typed tokens and old generations, while an
+/// independent external receiver root and an unrelated sentinel remain
+/// readable. Withdrawing that outer root and collecting again reclaims the
+/// receiver and its metatable.
+#[test]
+fn raw_call_published_dequeue_keeps_fifo_and_relooks_the_live_guest_call() {
+    let mut run = run_fixture_named(PUBLISHED_DEQUEUE_FIXTURE);
+    assert!(
+        matches!(run.status, Ok(VmStatus::Halted)),
+        "raw call dequeue: the fixture must halt, got {:?}",
+        run.status
+    );
+    assert!(
+        run.fuel_consumed > 0 && run.fuel_consumed < FUEL_BUDGET,
+        "raw call dequeue: expected real fuel use, saw {}",
+        run.fuel_consumed
+    );
+
+    let items = exit_items(&run.stack);
+    assert_eq!(
+        items.len(),
+        6,
+        "raw call dequeue: [true] plus five returned values"
+    );
+    assert_eq!(items[0], Value::Bool(true));
+    let receiver_value = &items[1];
+    let first = callable_item(&items[2]);
+    let second = callable_item(&items[3]);
+    let replace_call = items[4].clone();
+    let first_ok = match &items[5] {
+        Value::Bool(ok) => *ok,
+        other => panic!("raw call dequeue: expected the first note result, got {other:?}"),
+    };
+    assert!(
+        first_ok,
+        "raw call dequeue: the first note must install the first original closure"
+    );
+    assert!(
+        matches!(replace_call, Value::Callable(_)),
+        "raw call dequeue: the guest helper must remain a real callable"
+    );
+    assert!(
+        !same_callable(&items[2], &items[3]),
+        "raw call dequeue: the two original guest closures are distinct Core Arcs"
+    );
+    assert_eq!(
+        prototype_captures(&run.vm, &first),
+        0,
+        "raw call dequeue: the first target has no captures"
+    );
+    assert_eq!(
+        prototype_captures(&run.vm, &second),
+        0,
+        "raw call dequeue: the second target has no captures"
+    );
+
+    let (receiver, metatable) = {
+        let record = run.witness.record("owner");
+        (record.owner, record.metatable)
+    };
+    let issued_receiver = heap_with(&mut run.vm, |heap| heap.issued_value(receiver));
+    assert!(
+        same_array(&issued_receiver, receiver_value),
+        "raw call dequeue: the receiver is the exact issued table carrier"
+    );
+    assert_eq!(
+        heap_with(&mut run.vm, |heap| heap.metatable(receiver)),
+        Some(metatable),
+        "raw call dequeue: the receiver keeps its one issued metatable"
+    );
+
+    let first_closure = heap_try(&mut run.vm, |heap| {
+        heap.named_closure_edge(metatable, RAW_CALL_FIELD)
+    })
+    .expect("raw call dequeue: the first note must create a raw closure edge");
+    assert_eq!(
+        first_closure.domain(),
+        receiver.domain(),
+        "raw call dequeue: the closure is in the receiver's heap domain"
+    );
+    assert_eq!(first_closure.kind(), HandleKind::Closure);
+    let first_stored = heap_with(&mut run.vm, |heap| heap.closure_callable(first_closure));
+    assert!(
+        Arc::ptr_eq(&first_stored, &first),
+        "raw call dequeue: the first raw edge names the exact first guest Arc"
+    );
+    assert_eq!(
+        heap_with(&mut run.vm, |heap| Ok(heap
+            .guest_callable_admissions()
+            .to_vec())),
+        vec![first_closure],
+        "raw call dequeue: only the first note has allocated a generation"
+    );
+
+    let (ready_tag, ready_admissions) = {
+        let ready = run.witness.picture("ready");
+        let ready_row = ready
+            .rows
+            .iter()
+            .find(|row| row.label == "owner")
+            .expect("raw call dequeue: the ready picture has the receiver row");
+        (ready_row.raw_call.clone(), ready.admissions)
+    };
+    assert_eq!(
+        ready_tag,
+        closure_tag(first_closure),
+        "raw call dequeue: the guest run reaches the ready point with the first generation"
+    );
+    assert_eq!(
+        ready_admissions, 1,
+        "raw call dequeue: the guest run admits exactly one closure generation"
+    );
+
+    // B is allocated before A, so the live-userdata chain head and the
+    // published FIFO head are A, followed by B.
+    let (b, b_raw) = publish_userdata(&mut run.vm);
+    let (a, a_raw) = publish_userdata(&mut run.vm);
+    assert!(
+        a.slot() > b.slot(),
+        "raw call dequeue: the later allocation is the live-chain head"
+    );
+    assert_eq!(a.domain(), b.domain());
+    assert_eq!(a.kind(), HandleKind::Userdata);
+    assert_eq!(b.kind(), HandleKind::Userdata);
+    assert_ne!(
+        a.slot(),
+        b.slot(),
+        "raw call dequeue: A and B occupy distinct slots"
+    );
+    assert_eq!(
+        userdata_from_token(&mut run.vm, a_raw),
+        a,
+        "raw call dequeue: A's real typed token names A"
+    );
+    assert_eq!(
+        userdata_from_token(&mut run.vm, b_raw),
+        b,
+        "raw call dequeue: B's real typed token names B"
+    );
+    assert!(
+        userdata_token_open(&mut run.vm, a_raw) && userdata_token_open(&mut run.vm, b_raw),
+        "raw call dequeue: both typed tokens start open"
+    );
+    assert_eq!(
+        slot_generation(&mut run.vm, a.slot()),
+        a.generation(),
+        "raw call dequeue: A starts at its exact generation"
+    );
+    assert_eq!(
+        slot_generation(&mut run.vm, b.slot()),
+        b.generation(),
+        "raw call dequeue: B starts at its exact generation"
+    );
+
+    // One real metatable with a raw `__gc` table value for both candidates.
+    let finalizer_metatable = heap_with(&mut run.vm, |heap| heap.alloc());
+    heap_with(&mut run.vm, |heap| {
+        heap.set_named_edge(finalizer_metatable, "__gc", receiver)
+    });
+    heap_with(&mut run.vm, |heap| {
+        heap.set_userdata_metatable(a, Some(finalizer_metatable))
+    });
+    heap_with(&mut run.vm, |heap| {
+        heap.set_userdata_metatable(b, Some(finalizer_metatable))
+    });
+    assert_eq!(
+        heap_with(&mut run.vm, |heap| heap.userdata_metatable(a)),
+        Some(finalizer_metatable),
+        "raw call dequeue: A's own metatable stores the shared finalizer record"
+    );
+    assert_eq!(
+        heap_with(&mut run.vm, |heap| heap.userdata_metatable(b)),
+        Some(finalizer_metatable),
+        "raw call dequeue: B's own metatable stores the shared finalizer record"
+    );
+    assert!(
+        same_array(
+            &heap_with(&mut run.vm, |heap| {
+                heap.named_value(finalizer_metatable, "__gc")
+            }),
+            receiver_value,
+        ),
+        "raw call dequeue: both userdata share a raw __gc that names the receiver table"
+    );
+
+    // The independent weak-value orphan is the real weak-clearance witness.
+    // It is an issued table so the pre-collection weak read can name the same
+    // guest identity that the real weak publication later clears.
+    let (orphan, orphan_value) = publish_orphan_table(&mut run.vm);
+    heap_with(&mut run.vm, |heap| heap.set_edge(orphan, 1, orphan));
+    let weak = heap_with(&mut run.vm, |heap| {
+        let weak = heap.alloc()?;
+        let mode = heap.alloc()?;
+        heap.set_mode_scalar(mode, Value::string("v"))?;
+        heap.set_metatable(weak, Some(mode))?;
+        heap.set_number_edge(weak, 1.0, orphan)?;
+        Ok(weak)
+    });
+    let sentinel = heap_with(&mut run.vm, |heap| heap.alloc());
+    let frame = heap_with(&mut run.vm, |heap| heap.enter_roots(9));
+    heap_with(&mut run.vm, |heap| heap.write_root(frame, 0, weak));
+    heap_with(&mut run.vm, |heap| heap.write_root(frame, 1, receiver));
+    heap_with(&mut run.vm, |heap| heap.write_root(frame, 2, sentinel));
+    let weak_before = heap_with(&mut run.vm, |heap| heap.number_value(weak, 1.0));
+    assert!(
+        same_array(&weak_before, &orphan_value),
+        "raw call dequeue: the weak orphan is readable before the real collection"
+    );
+
+    let boundary = {
+        let mut host = run.vm.host_context();
+        heap::collect_pending_finalizers(&mut host)
+            .unwrap_or_else(|error| panic!("raw call dequeue: publish boundary: {error:?}"))
+    };
+    assert!(
+        matches!(boundary, heap::PublishedBoundary::Published { .. }),
+        "raw call dequeue: the real collection must save a Release tail"
+    );
+    assert_eq!(
+        pending_records(&mut run.vm),
+        vec![
+            (a_raw, a.slot(), a.generation()),
+            (b_raw, b.slot(), b.generation()),
+        ],
+        "raw call dequeue: publication preserves the selection-time FIFO A then B"
+    );
+    assert_eq!(
+        published_count(&mut run.vm),
+        2,
+        "raw call dequeue: both selected candidates are a consumable prefix"
+    );
+    let tail = saved_tail(&mut run.vm).expect("raw call dequeue: the Release tail is saved");
+    assert_eq!(
+        tail.phase,
+        heap::SavedTailPhase::Release,
+        "raw call dequeue: publication stops at the Release phase"
+    );
+    assert_eq!(
+        heap_with(&mut run.vm, |heap| heap.number_value(weak, 1.0)),
+        Value::Null,
+        "raw call dequeue: the independent weak orphan is cleared at real publication"
+    );
+    assert!(
+        heap_with(&mut run.vm, |heap| Ok(heap.userdata_alive(a)))
+            && heap_with(&mut run.vm, |heap| Ok(heap.userdata_alive(b))),
+        "raw call dequeue: selection retains both typed userdata"
+    );
+    assert!(
+        userdata_token_open(&mut run.vm, a_raw) && userdata_token_open(&mut run.vm, b_raw),
+        "raw call dequeue: publication closes neither selected token"
+    );
+    assert!(
+        closure_alive(&mut run.vm, first_closure),
+        "raw call dequeue: the selected metatable keeps the first generation alive"
+    );
+
+    // The saved Release tail owns the graph and refuses before any write.
+    let refused = take_published_action(&mut run.vm, frame, &[3, 4, 5])
+        .expect_err("raw call dequeue: a saved Release tail must refuse");
+    assert_eq!(refused, HeapError::SweepPending);
+    assert_empty_roots(&mut run.vm, frame, &[3, 4, 5]);
+    assert_eq!(pending_records(&mut run.vm).len(), 2);
+
+    let report = finish_published_tail(&mut run.vm);
+    assert!(
+        report.live_nodes > 0,
+        "raw call dequeue: finishing the tail records a real report"
+    );
+    assert_eq!(
+        saved_tail(&mut run.vm),
+        None,
+        "raw call dequeue: the saved tail is gone after the real resume"
+    );
+    assert!(
+        !heap_with(&mut run.vm, |heap| Ok(heap.alive(orphan))),
+        "raw call dequeue: the independent weak orphan is released by the real tail"
+    );
+    assert_eq!(
+        slot_generation(&mut run.vm, orphan.slot()),
+        orphan.generation() + 1,
+        "raw call dequeue: the released orphan slot advances its generation"
+    );
+
+    // A parked mark also refuses before any root or queue write. The ordinary
+    // collection drops it and keeps the published prefix intact.
+    {
+        let mut host = run.vm.host_context();
+        heap::open_saved_mark_for_test(&mut host).expect("raw call dequeue: open one saved mark");
+    }
+    let refused = take_published_action(&mut run.vm, frame, &[3, 4, 5])
+        .expect_err("raw call dequeue: a saved mark must refuse");
+    assert_eq!(refused, HeapError::MarkActive);
+    assert_empty_roots(&mut run.vm, frame, &[3, 4, 5]);
+    assert_eq!(
+        pending_records(&mut run.vm),
+        vec![
+            (a_raw, a.slot(), a.generation()),
+            (b_raw, b.slot(), b.generation()),
+        ],
+        "raw call dequeue: neither refusal consumes a record"
+    );
+    {
+        let mut host = run.vm.host_context();
+        let _ =
+            heap::collect(&mut host).expect("raw call dequeue: ordinary collect drops the mark");
+    }
+    assert_eq!(
+        pending_records(&mut run.vm).len(),
+        2,
+        "raw call dequeue: the ordinary collection keeps the published prefix"
+    );
+    assert_eq!(published_count(&mut run.vm), 2);
+
+    // Take the actual published head A. It roots exactly A, the current first
+    // closure generation, and the original table receiver.
+    let a_taken = take_published_action(&mut run.vm, frame, &[3, 4, 5])
+        .expect("raw call dequeue: the first published head");
+    assert_eq!(a_taken.userdata, a);
+    assert_eq!(
+        a_taken.action,
+        PendingFinalizerAction::TableCall {
+            receiver,
+            call: first_closure,
+        },
+        "raw call dequeue: A names the same receiver and the existing first closure"
+    );
+    assert_eq!(a_taken.roots_written, 3);
+    assert_table_call_roots(&mut run.vm, frame, &[3, 4, 5], a, first_closure, receiver);
+    assert_eq!(
+        pending_records(&mut run.vm),
+        vec![(b_raw, b.slot(), b.generation())],
+        "raw call dequeue: B remains the published head after A leaves"
+    );
+    assert_eq!(published_count(&mut run.vm), 1);
+    assert!(
+        settled_flag(&mut run.vm, a) && !pending_flag(&mut run.vm, a),
+        "raw call dequeue: A is settled exactly once"
+    );
+    assert!(
+        pending_flag(&mut run.vm, b),
+        "raw call dequeue: B is still pending and published"
+    );
+    assert!(
+        userdata_token_open(&mut run.vm, a_raw),
+        "raw call dequeue: A's token stays open while its root exists"
+    );
+    assert_eq!(
+        slot_generation(&mut run.vm, a.slot()),
+        a.generation(),
+        "raw call dequeue: taking A does not advance its generation"
+    );
+    let a_stored = heap_with(&mut run.vm, |heap| heap.closure_callable(first_closure));
+    assert!(
+        Arc::ptr_eq(&a_stored, &first_stored),
+        "raw call dequeue: A's action still resolves the exact first Arc"
+    );
+
+    // Omission control: before the guest replacement, the same raw edge still
+    // names the first original Arc. If `note` were omitted below, the second
+    // take could only produce this old identity.
+    let before_replacement = heap_try(&mut run.vm, |heap| {
+        heap.named_closure_edge(metatable, RAW_CALL_FIELD)
+    })
+    .expect("raw call dequeue: the pre-replacement edge exists");
+    assert_eq!(before_replacement, first_closure);
+    assert!(
+        Arc::ptr_eq(
+            &heap_with(&mut run.vm, |heap| heap
+                .closure_callable(before_replacement)),
+            &first
+        ),
+        "raw call dequeue: the omission control is the old original Arc"
+    );
+
+    // The real guest helper runs in this same halted VM and calls the same
+    // note(owner, target) import on the same receiver and metatable.
+    let replaced = run
+        .vm
+        .invoke_callable(replace_call, &[])
+        .unwrap_or_else(|error| panic!("raw call dequeue: guest replacement: {error}"));
+    let Value::Array(replacement_completion) = &replaced else {
+        panic!("raw call dequeue: the guest helper must return its completion, got {replaced:?}");
+    };
+    assert_eq!(
+        replacement_completion.as_slice().first(),
+        Some(&Value::Bool(true)),
+        "raw call dequeue: the guest helper returns normally"
+    );
+    assert_eq!(
+        replacement_completion.as_slice().get(1),
+        Some(&Value::Bool(true)),
+        "raw call dequeue: the same note import accepts the second original closure"
+    );
+
+    let second_closure = heap_try(&mut run.vm, |heap| {
+        heap.named_closure_edge(metatable, RAW_CALL_FIELD)
+    })
+    .expect("raw call dequeue: the replacement must create the new raw edge");
+    assert_ne!(
+        second_closure, first_closure,
+        "raw call dequeue: the guest replacement allocates a new closure generation"
+    );
+    assert_eq!(
+        heap_with(&mut run.vm, |heap| Ok(heap
+            .guest_callable_admissions()
+            .to_vec())),
+        vec![first_closure, second_closure],
+        "raw call dequeue: the two guest imports admit exactly two generations"
+    );
+    let second_stored = heap_with(&mut run.vm, |heap| heap.closure_callable(second_closure));
+    assert!(
+        Arc::ptr_eq(&second_stored, &second),
+        "raw call dequeue: the replaced raw edge names the exact second guest Arc"
+    );
+    assert!(
+        !Arc::ptr_eq(&second_stored, &first),
+        "raw call dequeue: the replacement does not reuse the first guest Arc"
+    );
+    assert_eq!(
+        heap_with(&mut run.vm, |heap| Ok(raw_call_tag(heap, metatable))),
+        closure_tag(second_closure),
+        "raw call dequeue: the same metatable now stores the second generation"
+    );
+    assert!(
+        closure_alive(&mut run.vm, first_closure),
+        "raw call dequeue: the old generation is still a live, distinct Arc before GC"
+    );
+
+    // Take B through the same action handoff. The re-read current raw edge is
+    // the replacement, not the selection-time or pre-replacement identity.
+    let b_taken = take_published_action(&mut run.vm, frame, &[6, 7, 8])
+        .expect("raw call dequeue: the second published head");
+    assert_eq!(b_taken.userdata, b);
+    assert_eq!(
+        b_taken.action,
+        PendingFinalizerAction::TableCall {
+            receiver,
+            call: second_closure,
+        },
+        "raw call dequeue: B re-reads the guest-replaced __call on the same receiver"
+    );
+    assert_eq!(b_taken.roots_written, 3);
+    assert_table_call_roots(&mut run.vm, frame, &[6, 7, 8], b, second_closure, receiver);
+    assert!(pending_records(&mut run.vm).is_empty());
+    assert_eq!(published_count(&mut run.vm), 0);
+    assert!(
+        settled_flag(&mut run.vm, b) && !pending_flag(&mut run.vm, b),
+        "raw call dequeue: B is settled exactly once"
+    );
+    assert!(
+        Arc::ptr_eq(&second_stored, &second) && !Arc::ptr_eq(&second_stored, &first),
+        "raw call dequeue: the single old-Arc mis-selection control is refuted"
+    );
+    assert_eq!(
+        slot_generation(&mut run.vm, b.slot()),
+        b.generation(),
+        "raw call dequeue: taking B does not advance its generation"
+    );
+
+    // Withdraw both dequeue triples and the two source edges. The outer frame
+    // still roots the receiver and the unrelated sentinel.
+    for slot in [3, 4, 5, 6, 7, 8] {
+        heap_with(&mut run.vm, |heap| heap.clear_root(frame, slot));
+    }
+    heap_with(&mut run.vm, |heap| {
+        heap.set_named_scalar(finalizer_metatable, "__gc", Value::Null)
+    });
+    heap_with(&mut run.vm, |heap| {
+        heap.set_named_scalar(metatable, RAW_CALL_FIELD, Value::Null)
+    });
+    {
+        let mut host = run.vm.host_context();
+        let _ = heap::collect(&mut host)
+            .expect("raw call dequeue: real collection after withdrawing the roots");
+    }
+
+    for (label, userdata, raw) in [("A", a, a_raw), ("B", b, b_raw)] {
+        assert!(
+            !heap_with(&mut run.vm, |heap| Ok(heap.userdata_alive(userdata))),
+            "raw call dequeue: {label}'s old generation is collected"
+        );
+        assert!(
+            !userdata_token_open(&mut run.vm, raw),
+            "raw call dequeue: {label}'s typed token is retired"
+        );
+        assert_eq!(
+            slot_generation(&mut run.vm, userdata.slot()),
+            userdata.generation() + 1,
+            "raw call dequeue: {label}'s slot advances exactly one generation"
+        );
+        assert!(
+            matches!(
+                borrow_published_userdata(&mut run.vm, userdata),
+                Err(HeapError::StaleHandle)
+            ),
+            "raw call dequeue: {label}'s old handle is refused after retirement"
+        );
+    }
+    assert!(
+        !closure_alive(&mut run.vm, first_closure),
+        "raw call dequeue: the old closure generation dies without its dequeue root"
+    );
+    assert!(
+        !closure_alive(&mut run.vm, second_closure),
+        "raw call dequeue: the replacement closure dies after the source edge is removed"
+    );
+    for closure in [first_closure, second_closure] {
+        assert!(
+            matches!(
+                heap_try(&mut run.vm, |heap| heap.closure_callable(closure)),
+                Err(HeapError::StaleHandle)
+            ),
+            "raw call dequeue: the collected closure handle is refused"
+        );
+    }
+    assert!(
+        heap_with(&mut run.vm, |heap| Ok(heap.alive(receiver))),
+        "raw call dequeue: the external receiver root keeps the receiver readable"
+    );
+    assert_eq!(
+        heap_with(&mut run.vm, |heap| heap.metatable(receiver)),
+        Some(metatable),
+        "raw call dequeue: the externally rooted receiver keeps its metatable"
+    );
+    assert!(
+        !heap_with(&mut run.vm, |heap| Ok(heap.alive(finalizer_metatable))),
+        "raw call dequeue: the shared finalizer metatable dies with both userdata"
+    );
+    assert!(
+        heap_with(&mut run.vm, |heap| Ok(heap.alive(sentinel))),
+        "raw call dequeue: the unrelated external sentinel stays readable"
+    );
+
+    // Withdraw the outer roots and collect once more: the receiver and its
+    // metatable are reclaimed only now.
+    for slot in [0, 1, 2] {
+        heap_with(&mut run.vm, |heap| heap.clear_root(frame, slot));
+    }
+    {
+        let mut host = run.vm.host_context();
+        let _ = heap::collect(&mut host)
+            .expect("raw call dequeue: real collection after withdrawing the outer roots");
+    }
+    heap_with(&mut run.vm, |heap| heap.leave_roots(frame));
+    assert!(
+        !heap_with(&mut run.vm, |heap| Ok(heap.alive(receiver))),
+        "raw call dequeue: the receiver is reclaimed after its external root is withdrawn"
+    );
+    assert!(
+        !heap_with(&mut run.vm, |heap| Ok(heap.alive(metatable))),
+        "raw call dequeue: the receiver's metatable dies with it"
+    );
+    assert!(
+        !heap_with(&mut run.vm, |heap| Ok(heap.alive(sentinel))),
+        "raw call dequeue: the sentinel is reclaimed after its external root is withdrawn"
+    );
+    assert!(
+        !heap_with(&mut run.vm, |heap| Ok(heap.alive(weak))),
+        "raw call dequeue: the weak witness table is reclaimed with its final root"
+    );
+}
+
+/// The observation witness of one file-entry run belongs to that VM. Two real
+/// VMs run the two existing fixtures on two threads. The first VM parks in a
+/// guest mark after it has issued its owner and recorded `first-before`; the
+/// second VM runs its complete witness window, including its own clear and
+/// take, while the first is parked. Each returned witness must contain only
+/// its own fixture labels, only its own owner/ready row with its own heap
+/// domain, and only its own Core Arcs.
+#[test]
+fn raw_call_witness_is_isolated_between_two_concurrent_vms() {
+    let gate = interleave_gate();
+    let first = std::thread::spawn(|| {
+        INTERLEAVE_ROLE.with(|role| role.set(Some(InterleaveRole::FirstVm)));
+        let run = run_fixture_named(FIXTURE);
+        INTERLEAVE_ROLE.with(|role| role.set(None));
+        run
+    });
+
+    {
+        let mut reached = gate
+            .reached
+            .lock()
+            .expect("raw call witness isolation: reached");
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while !*reached {
+            assert!(
+                !first.is_finished(),
+                "raw call witness isolation: the first VM ended before its interleave point"
+            );
+            let now = Instant::now();
+            assert!(
+                now < deadline,
+                "raw call witness isolation: the first VM did not reach its interleave point"
+            );
+            let wait = deadline
+                .saturating_duration_since(now)
+                .min(Duration::from_millis(100));
+            let (guard, _) = gate
+                .reached_signal
+                .wait_timeout(reached, wait)
+                .expect("raw call witness isolation: reached wait");
+            reached = guard;
+        }
+    }
+
+    let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_fixture_named(PUBLISHED_DEQUEUE_FIXTURE)
+    }));
+    *gate
+        .released
+        .lock()
+        .expect("raw call witness isolation: released") = true;
+    gate.released_signal.notify_all();
+    let first = first.join();
+    let mut second = match second {
+        Ok(run) => run,
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
+    let mut first = match first {
+        Ok(run) => run,
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
+
+    for (name, run) in [("first", &first), ("second", &second)] {
+        assert!(
+            matches!(run.status, Ok(VmStatus::Halted)),
+            "raw call witness isolation: the {name} VM must halt, got {:?}",
+            run.status
+        );
+        assert!(
+            run.fuel_consumed > 0 && run.fuel_consumed < FUEL_BUDGET,
+            "raw call witness isolation: the {name} VM must use real fuel, saw {}",
+            run.fuel_consumed
+        );
+    }
+
+    let first_labels: Vec<String> = first
+        .witness
+        .pictures
+        .iter()
+        .map(|(label, _)| label.clone())
+        .collect();
+    assert_eq!(
+        first_labels,
+        vec![
+            "first-before",
+            "first-after",
+            "second-after",
+            "capture-before",
+            "capture-after",
+            "unissued-before",
+            "unissued-after",
+            "missing-before",
+            "missing-after",
+            "true-before",
+            "true-after",
+            "gap-before",
+            "gap-after",
+            "done",
+        ],
+        "raw call witness isolation: the first VM must observe its own complete arm sequence"
+    );
+    let second_labels: Vec<String> = second
+        .witness
+        .pictures
+        .iter()
+        .map(|(label, _)| label.clone())
+        .collect();
+    assert_eq!(
+        second_labels,
+        vec!["ready"],
+        "raw call witness isolation: the second VM must observe only its own arm"
+    );
+
+    let first_record = first.witness.record("owner");
+    let second_record = second.witness.record("owner");
+    assert_ne!(
+        first_record.owner.domain(),
+        second_record.owner.domain(),
+        "raw call witness isolation: the two VMs own distinct heap domains"
+    );
+    assert_eq!(
+        first_record.metatable.domain(),
+        first_record.owner.domain(),
+        "raw call witness isolation: the first owner and its metatable share one heap"
+    );
+    assert_eq!(
+        second_record.metatable.domain(),
+        second_record.owner.domain(),
+        "raw call witness isolation: the second owner and its metatable share one heap"
+    );
+    let first_metatable = heap_with(&mut first.vm, |heap| heap.metatable(first_record.owner))
+        .expect("raw call witness isolation: first VM metatable");
+    let second_metatable = heap_with(&mut second.vm, |heap| heap.metatable(second_record.owner))
+        .expect("raw call witness isolation: second VM metatable");
+    assert_eq!(first_metatable, first_record.metatable);
+    assert_eq!(second_metatable, second_record.metatable);
+    assert_eq!(
+        heap_with(&mut first.vm, |heap| heap.metatable(first_record.owner)),
+        Some(first_record.metatable),
+        "raw call witness isolation: the first record must come from the first live heap"
+    );
+    assert_eq!(
+        heap_with(&mut second.vm, |heap| heap.metatable(second_record.owner)),
+        Some(second_record.metatable),
+        "raw call witness isolation: the second record must come from the second live heap"
+    );
+    assert!(
+        same_array(
+            &heap_with(&mut first.vm, |heap| heap.issued_value(first_metatable)),
+            &first_record.metatable_value,
+        ),
+        "raw call witness isolation: the first metatable carrier belongs to the first heap"
+    );
+    assert!(
+        same_array(
+            &heap_with(&mut second.vm, |heap| heap.issued_value(second_metatable)),
+            &second_record.metatable_value,
+        ),
+        "raw call witness isolation: the second metatable carrier belongs to the second heap"
+    );
+
+    let first_items = exit_items(&first.stack);
+    let second_items = exit_items(&second.stack);
+    let first_owner_class = heap_with(&mut first.vm, |heap| Ok(heap.guest_class(&first_items[1])));
+    let second_owner_class =
+        heap_with(
+            &mut second.vm,
+            |heap| Ok(heap.guest_class(&second_items[1])),
+        );
+    assert_eq!(
+        first_owner_class,
+        GuestClass::Table(first_record.owner),
+        "raw call witness isolation: the first guest returned the first witness owner"
+    );
+    assert_eq!(
+        second_owner_class,
+        GuestClass::Table(second_record.owner),
+        "raw call witness isolation: the second guest returned the second witness owner"
+    );
+
+    let first_edge = heap_try(&mut first.vm, |heap| {
+        heap.named_closure_edge(first_metatable, RAW_CALL_FIELD)
+    })
+    .expect("raw call witness isolation: first raw edge");
+    let second_edge = heap_try(&mut second.vm, |heap| {
+        heap.named_closure_edge(second_metatable, RAW_CALL_FIELD)
+    })
+    .expect("raw call witness isolation: second raw edge");
+    assert_eq!(first_edge.domain(), first_record.owner.domain());
+    assert_eq!(second_edge.domain(), second_record.owner.domain());
+    assert_ne!(
+        first_edge.domain(),
+        second_edge.domain(),
+        "raw call witness isolation: the two raw edges live in distinct heap domains"
+    );
+
+    let first_done = first.witness.picture("done");
+    let first_row = first_done
+        .rows
+        .iter()
+        .find(|row| row.label == "owner")
+        .expect("raw call witness isolation: first done owner row");
+    assert_eq!(
+        first_row.raw_call,
+        closure_tag(first_edge),
+        "raw call witness isolation: the first witness must name only its own raw closure"
+    );
+    let second_ready = second.witness.picture("ready");
+    let second_row = second_ready
+        .rows
+        .iter()
+        .find(|row| row.label == "owner")
+        .expect("raw call witness isolation: second ready owner row");
+    assert_eq!(
+        second_row.raw_call,
+        closure_tag(second_edge),
+        "raw call witness isolation: the second witness must name only its own raw closure"
+    );
+    let first_domain_tag = format!("closure({},", first_record.owner.domain());
+    let second_domain_tag = format!("closure({},", second_record.owner.domain());
+    assert!(
+        first_row.raw_call.contains(&first_domain_tag),
+        "raw call witness isolation: the first raw row names the first domain"
+    );
+    assert!(
+        second_row.raw_call.contains(&second_domain_tag),
+        "raw call witness isolation: the second raw row names the second domain"
+    );
+    assert!(
+        !first_row.raw_call.contains(&second_domain_tag),
+        "raw call witness isolation: the first raw row must not name the second domain"
+    );
+    assert!(
+        !second_row.raw_call.contains(&first_domain_tag),
+        "raw call witness isolation: the second raw row must not name the first domain"
+    );
+    assert_eq!(
+        first_done
+            .rows
+            .iter()
+            .map(|row| row.label.as_str())
+            .collect::<Vec<_>>(),
+        vec!["owner", "missing", "true", "gap"],
+        "raw call witness isolation: the first witness keeps its own four owner rows"
+    );
+    assert_eq!(
+        second_ready
+            .rows
+            .iter()
+            .map(|row| row.label.as_str())
+            .collect::<Vec<_>>(),
+        vec!["owner"],
+        "raw call witness isolation: the second witness keeps its own one owner row"
+    );
+
+    let first_first = callable_item(&first_items[2]);
+    let first_second = callable_item(&first_items[3]);
+    let second_first = callable_item(&second_items[2]);
+    let second_second = callable_item(&second_items[3]);
+    assert!(
+        !Arc::ptr_eq(&first_first, &second_first),
+        "raw call witness isolation: the two VMs' first Arcs must not cross"
+    );
+    assert!(
+        !Arc::ptr_eq(&first_first, &second_second),
+        "raw call witness isolation: the first VM's first Arc is not the second VM's second"
+    );
+    assert!(
+        !Arc::ptr_eq(&first_second, &second_first),
+        "raw call witness isolation: the first VM's second Arc is not the second VM's first"
+    );
+    assert!(
+        !Arc::ptr_eq(&first_second, &second_second),
+        "raw call witness isolation: the two VMs' second Arcs must not cross"
+    );
+    assert!(
+        first_done.admissions == 2 && second_ready.admissions == 1,
+        "raw call witness isolation: each witness counts only its own admissions, saw {} and {}",
+        first_done.admissions,
+        second_ready.admissions
+    );
+    eprintln!(
+        "LUA_RAW_CALL_WITNESS_ISOLATION first_domain={} second_domain={} first_edge={} second_edge={} first_labels={} second_labels={}",
+        first_record.owner.domain(),
+        second_record.owner.domain(),
+        closure_tag(first_edge),
+        closure_tag(second_edge),
+        first_labels.len(),
+        second_labels.len()
     );
 }

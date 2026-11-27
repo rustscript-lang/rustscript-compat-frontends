@@ -940,12 +940,16 @@ fn assert_root_slot_occupied(error: HeapError) {
     }
 }
 
-/// A previous-cycle record, a new candidate verified before the failing item,
-/// and a same-type misbinding. The private selection must remove only this
-/// batch's new flags and records, leaving the earlier record and every raw
-/// generation untouched. While the bad binding remains, an ordinary entry must
-/// not retain or weakly publish from a fake record. Restoring the exact raw and
-/// retrying in the same context selects the real finalizer and publishes.
+/// A previous-cycle record, a legitimate new candidate C verified before the
+/// same-round same-type misbound A, and a real retry. C is allocated after A
+/// but reuses a lower freed slot, so the live chain selects C before A while
+/// the independent ascending pending-close enumeration still closes C's token
+/// before it reaches A's failing binding. The private selection must remove
+/// only this batch's new flags and records, leaving the earlier record and
+/// every raw generation untouched. While the bad binding remains, an ordinary
+/// entry must not retain or weakly publish from a fake record. Restoring the
+/// exact raw and retrying in the same context selects the real finalizer and
+/// publishes.
 #[test]
 fn owner_verification_failure_rolls_back_the_new_batch_and_recovers() {
     crate::support::with_idle_vm(|vm| {
@@ -972,18 +976,44 @@ fn owner_verification_failure_rolls_back_the_new_batch_and_recovers() {
             )]
         );
 
-        // This batch: A is the live chain head and is selected first; its
-        // slot is temporarily bound to B's real same-type token. C is selected
-        // after A. Both new records must be rolled back while the earlier
-        // record stays.
-        let b = heap::publish_userdata(&mut host).expect("rooted B");
-        let b_raw = bound_raw(&mut host, b);
-        let c = publish_eligible(&mut host);
+        // This batch: A is a real raw-`__gc` candidate allocated first. Its
+        // slot is temporarily bound to B's real same-type token. C is
+        // allocated later, so it is the live chain head and is verified
+        // before A fails. C reuses the lower slot freed below A, so the
+        // ascending ordinary close reaches C's real token before A's
+        // misbinding refuses.
+        let sacrificial =
+            heap::with_heap(&mut host, |heap| heap.alloc_userdata()).expect("sacrificial");
+        let sacrificial_generation = slot_generation(&mut host, sacrificial.slot());
         let a = publish_eligible(&mut host);
+        let a_transient_frame = heap::with_heap(&mut host, |heap| {
+            let frame = heap.enter_roots(2)?;
+            heap.write_userdata_root(frame, 0, a.userdata)?;
+            heap.write_root(frame, 1, a.weak_values)?;
+            Ok(frame)
+        })
+        .expect("A transient roots");
+        let _ = heap::collect(&mut host).expect("free the lower sacrificial slot");
+        assert_eq!(
+            slot_generation(&mut host, sacrificial.slot()),
+            sacrificial_generation + 1,
+            "the sacrificial userdata was really released"
+        );
+        heap::with_heap(&mut host, |heap| heap.leave_roots(a_transient_frame))
+            .expect("leave A transient roots");
+        let c = publish_eligible(&mut host);
+        assert_eq!(
+            c.userdata.slot(),
+            sacrificial.slot(),
+            "C reuses the real freed slot"
+        );
+        assert_eq!(c.userdata.generation(), sacrificial_generation + 1);
         assert!(
             c.userdata.slot() < a.userdata.slot(),
-            "A is allocated after C and is the live chain head"
+            "C is the newer chain head but sits in the lower doomed slot"
         );
+        let b = heap::publish_userdata(&mut host).expect("rooted B");
+        let b_raw = bound_raw(&mut host, b);
         let orphan = heap::with_heap(&mut host, |heap| heap.alloc()).expect("orphan table");
         let (_orphan_weak, frame) = heap::with_heap(&mut host, |heap| {
             let orphan_weak = weak_table(heap, "v")?;
@@ -1008,6 +1038,11 @@ fn owner_verification_failure_rolls_back_the_new_batch_and_recovers() {
             heap.bind_userdata_token(a.userdata, b_raw)
         })
         .expect("same-type misbind");
+        heap::with_heap(&mut host, |heap| {
+            heap.clear_owner_verification_trace();
+            Ok(())
+        })
+        .expect("clear owner-verification trace");
 
         let _ = heap::take_scan_meter(&mut host);
         let error = heap::collect_pending_finalizers(&mut host).expect_err("foreign owner");
@@ -1019,6 +1054,25 @@ fn owner_verification_failure_rolls_back_the_new_batch_and_recovers() {
             "both new candidates were selected before the failing verification"
         );
         assert_eq!(meter.token_closes, 0, "verification fails before close");
+        let (successes, verified) = heap::with_heap(&mut host, |heap| {
+            Ok((
+                heap.owner_verification_successes(),
+                heap.owner_verification_trace(),
+            ))
+        })
+        .expect("owner-verification successes");
+        assert_eq!(
+            successes, 2,
+            "the old published record and legitimate C passed the real owner check"
+        );
+        assert_eq!(
+            verified,
+            vec![
+                (prior.userdata.slot(), prior.userdata.generation()),
+                (c.userdata.slot(), c.userdata.generation()),
+            ],
+            "C's real identity is verified before A's misbinding is refused"
+        );
 
         // The whole new batch is gone; the earlier record is untouched.
         assert_eq!(
@@ -1066,9 +1120,14 @@ fn owner_verification_failure_rolls_back_the_new_batch_and_recovers() {
 
         // Ordinary entry while the bad binding is still present: the real
         // close verifier refuses the foreign owner, so no fake record can
-        // retain A or C and no weak edge is published.
+        // retain A or C and no weak edge is published. C's lower slot is
+        // closed first, proving the close really happened before A failed.
         let control = heap::collect(&mut host).expect_err("ordinary close rejects the misbind");
         assert_eq!(control, HeapError::TokenMismatch);
+        assert!(
+            !userdata_token_open(&host, c.raw),
+            "C's real token closed before A's misbinding was refused"
+        );
         assert_eq!(
             heap::with_heap(&mut host, |heap| heap.number_userdata(a.weak_values, 1.0))
                 .expect("A weak value after control"),
@@ -1147,12 +1206,62 @@ fn owner_verification_failure_rolls_back_the_new_batch_and_recovers() {
     });
 }
 
+/// Which ordinary dead slot a Release probe creates. Both variants share the
+/// same pending cohort, weak root, publish boundary, and one-unit resume.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReleaseProbe {
+    Table,
+    Userdata,
+}
+
+#[derive(Clone, Copy)]
+enum ReleaseDead {
+    Table(TableRef),
+    Userdata(UserdataRef),
+}
+
+impl ReleaseDead {
+    fn slot(self) -> u32 {
+        match self {
+            Self::Table(dead) => dead.slot(),
+            Self::Userdata(dead) => dead.slot(),
+        }
+    }
+
+    fn generation(self) -> u32 {
+        match self {
+            Self::Table(dead) => dead.generation(),
+            Self::Userdata(dead) => dead.generation(),
+        }
+    }
+}
+
+struct ReleaseQueueReceipt {
+    reads: u64,
+    pending_before: usize,
+    pending_after: usize,
+    dead_slot: u32,
+    dead_generation: u32,
+    released_generation: u32,
+    chain_before: Vec<(u32, u32)>,
+    chain_after: Vec<(u32, u32)>,
+    phase_before: heap::SavedTailPhase,
+    cursor_before: usize,
+    dead_len_before: usize,
+    phase_after: heap::SavedTailPhase,
+    cursor_after: usize,
+    token_closes: u64,
+    dead_alive_after: bool,
+}
+
 /// Release one ordinary dead slot from a real published tail while several
 /// genuine pending records exist. The only measured work is the release path
-/// itself; the returned count is the real number of pending-queue records the
-/// old per-dead-slot loop visited.
-fn release_queue_reads_for(pending_count: usize) -> u64 {
-    let mut reads = None;
+/// itself; `reads` is the real number of pending-queue records the old
+/// per-dead-slot loop visited. The table and userdata variants use this one
+/// construction, so their zero-read results, non-empty queue lengths, and
+/// Release windows are directly comparable.
+fn release_queue_reads_for(pending_count: usize, probe: ReleaseProbe) -> ReleaseQueueReceipt {
+    let mut out = None;
     crate::support::with_idle_vm(|vm| {
         let mut host = vm.host_context();
         heap::install(&mut host, limits()).expect("install");
@@ -1173,19 +1282,37 @@ fn release_queue_reads_for(pending_count: usize) -> u64 {
         finish_release(&mut host);
         assert_eq!(pending_records(&mut host).len(), pending_count);
 
-        let dead = heap::with_heap(&mut host, |heap| heap.alloc()).expect("dead table");
-        let _dead_weak = heap::with_heap(&mut host, |heap| {
+        let dead = match probe {
+            ReleaseProbe::Table => ReleaseDead::Table(
+                heap::with_heap(&mut host, |heap| heap.alloc()).expect("dead table"),
+            ),
+            ReleaseProbe::Userdata => ReleaseDead::Userdata(
+                heap::with_heap(&mut host, |heap| heap.alloc_userdata()).expect("dead userdata"),
+            ),
+        };
+        let dead_slot = dead.slot();
+        let dead_generation = dead.generation();
+        heap::with_heap(&mut host, |heap| {
             let weak = weak_table(heap, "v")?;
-            heap.set_number_edge(weak, 1.0, dead)?;
+            match dead {
+                ReleaseDead::Table(dead) => heap.set_number_edge(weak, 1.0, dead)?,
+                ReleaseDead::Userdata(dead) => heap.set_number_userdata(weak, 1.0, dead)?,
+            }
             heap.write_root(frame, pending_count as u32, weak)?;
-            Ok(weak)
+            Ok(())
         })
         .expect("dead weak table");
-        let dead_generation = slot_generation(&mut host, dead.slot());
         let pending_generations: Vec<u32> = eligible
             .iter()
             .map(|item| slot_generation(&mut host, item.userdata.slot()))
             .collect();
+        let pending_before = pending_records(&mut host).len();
+        assert_eq!(
+            pending_before, pending_count,
+            "both probes start with a non-empty pending queue"
+        );
+        let chain_before = heap::with_heap(&mut host, |heap| Ok(heap.live_userdata_chain()))
+            .expect("live chain before release");
 
         let boundary = publish_boundary(&mut host);
         assert!(matches!(boundary, PublishedBoundary::Published { .. }));
@@ -1208,11 +1335,20 @@ fn release_queue_reads_for(pending_count: usize) -> u64 {
             .expect("release tail");
         assert_eq!(after.phase, heap::SavedTailPhase::Release);
         assert_eq!(after.cursor, 1, "exactly one release unit was spent");
+        let released_generation = slot_generation(&mut host, dead_slot);
         assert_eq!(
-            slot_generation(&mut host, dead.slot()),
+            released_generation,
             dead_generation + 1,
             "the ordinary dead slot advances exactly one generation"
         );
+        let dead_alive_after = match dead {
+            ReleaseDead::Table(dead) => alive(&mut host, dead),
+            ReleaseDead::Userdata(dead) => {
+                heap::with_heap(&mut host, |heap| Ok(heap.userdata_alive(dead)))
+                    .expect("dead userdata liveness")
+            }
+        };
+        assert!(!dead_alive_after, "the ordinary dead slot is released");
         for (item, generation) in eligible.iter().zip(pending_generations) {
             assert_eq!(
                 slot_generation(&mut host, item.userdata.slot()),
@@ -1221,22 +1357,117 @@ fn release_queue_reads_for(pending_count: usize) -> u64 {
             );
             assert!(pending_flag(&mut host, item.userdata));
         }
-        assert_eq!(pending_records(&mut host).len(), pending_count);
-        assert!(!alive(&mut host, dead));
-        reads = Some(meter.pending_release_queue_reads);
+        let pending_after = pending_records(&mut host).len();
+        assert_eq!(pending_after, pending_count);
+        let chain_after = heap::with_heap(&mut host, |heap| Ok(heap.live_userdata_chain()))
+            .expect("live chain after release");
+        out = Some(ReleaseQueueReceipt {
+            reads: meter.pending_release_queue_reads,
+            pending_before,
+            pending_after,
+            dead_slot,
+            dead_generation,
+            released_generation,
+            chain_before,
+            chain_after,
+            phase_before: before.phase,
+            cursor_before: before.cursor,
+            dead_len_before: before.dead_len,
+            phase_after: after.phase,
+            cursor_after: after.cursor,
+            token_closes: meter.token_closes,
+            dead_alive_after,
+        });
     });
-    reads.expect("release arm")
+    out.expect("release arm")
 }
 
 #[test]
 fn release_of_an_ordinary_dead_slot_reads_no_pending_queue() {
-    let two = release_queue_reads_for(2);
-    let five = release_queue_reads_for(5);
+    let two = release_queue_reads_for(2, ReleaseProbe::Table);
+    let five = release_queue_reads_for(5, ReleaseProbe::Table);
     assert_eq!(
-        (two, five),
+        (two.reads, five.reads),
         (0, 0),
         "Release must not traverse the pending queue per dead slot; the count grew with the queue"
     );
+    assert!(
+        two.pending_before > 0 && five.pending_before > 0,
+        "the table control keeps a non-empty pending queue in both arms"
+    );
+    assert_eq!(two.pending_after, two.pending_before);
+    assert_eq!(five.pending_after, five.pending_before);
+}
+
+/// The direct table control and a real ordinary dead userdata share the same
+/// pending cohort construction. The userdata arm must read zero pending-queue
+/// records, advance its exact old generation, unlink its identity from the
+/// live chain, and spend the Release window on a non-empty queue without a
+/// token close.
+#[test]
+fn release_of_an_ordinary_dead_userdata_reads_no_pending_queue() {
+    let table = release_queue_reads_for(2, ReleaseProbe::Table);
+    let userdata = release_queue_reads_for(2, ReleaseProbe::Userdata);
+    assert_eq!(
+        (table.reads, userdata.reads),
+        (0, 0),
+        "the table and userdata Release arms must both avoid the pending queue"
+    );
+    assert!(
+        table.pending_before > 0 && userdata.pending_before > 0,
+        "both direct-comparison arms keep a non-empty pending queue"
+    );
+    assert_eq!(table.pending_after, table.pending_before);
+    assert_eq!(userdata.pending_after, userdata.pending_before);
+
+    assert!(
+        !userdata.dead_alive_after,
+        "the exact userdata generation is gone after Release"
+    );
+    assert_eq!(
+        userdata.released_generation,
+        userdata.dead_generation + 1,
+        "Release advances the specific userdata's old generation exactly once"
+    );
+    assert_eq!(
+        userdata.chain_before.first(),
+        Some(&(userdata.dead_slot, userdata.dead_generation)),
+        "the probe userdata is the real live-chain head before Release"
+    );
+    assert!(
+        !userdata
+            .chain_after
+            .contains(&(userdata.dead_slot, userdata.dead_generation)),
+        "the old userdata identity is unlinked from the live chain"
+    );
+    let mut expected_chain = userdata.chain_before.clone();
+    expected_chain.retain(|identity| *identity != (userdata.dead_slot, userdata.dead_generation));
+    assert_eq!(
+        userdata.chain_after, expected_chain,
+        "Release removes only the dead userdata's own chain node"
+    );
+    assert_eq!(
+        table.chain_after, table.chain_before,
+        "the table control leaves every live-userdata chain node in place"
+    );
+
+    assert_eq!(
+        userdata.phase_before,
+        heap::SavedTailPhase::Release,
+        "the userdata probe starts in the Release window, not a token close or an empty step"
+    );
+    assert_eq!(userdata.cursor_before, 0);
+    assert_eq!(userdata.dead_len_before, 1);
+    assert_eq!(userdata.phase_after, heap::SavedTailPhase::Release);
+    assert_eq!(userdata.cursor_after, 1);
+    assert_eq!(
+        userdata.token_closes, 0,
+        "the ordinary dead userdata carries no bound token to close"
+    );
+    assert_eq!(table.phase_before, heap::SavedTailPhase::Release);
+    assert_eq!(table.cursor_before, 0);
+    assert_eq!(table.dead_len_before, 1);
+    assert_eq!(table.cursor_after, 1);
 }
 
 #[test]
@@ -1539,6 +1770,9 @@ fn shared_metatable_raw_gc_chain_is_read_once_for_multiple_candidates() {
 /// `edges` is the delta between the cumulative pending-`__gc` edge meter
 /// before and after this one call. The before/after values are kept so a
 /// failure shows the real access boundary, not only a sum after a drain.
+/// `live_reads` is the delta of the real live-userdata chain-read trace for
+/// this exact pulse, so it is the chain cursor's identity sequence, not a
+/// scan-slot or selected-record count.
 struct PulseStep {
     finished: bool,
     before_edges: u64,
@@ -1549,17 +1783,19 @@ struct PulseStep {
     selected: u64,
     owner_heads: u64,
     outgoing_edges: u64,
+    live_reads: Vec<(u32, u32)>,
 }
 
 /// Drives the private selecting mark one charged unit at a time. Each call
-/// records the real edge meter at its own start and end.
+/// records the real edge meter and the real live-chain trace delta at its own
+/// start and end.
 fn pulse_steps(heap: &mut heap::LuaHeap, limit: usize) -> (Vec<PulseStep>, ScanMeter) {
     let mut session = heap::SelectingPendingMark::start(heap);
     let mut previous = session.meter();
     let mut steps = Vec::new();
     for _ in 0..limit {
         let before = previous;
-        let (finished, after) = session.pulse(1);
+        let (finished, after, live_reads) = session.pulse_with_live_trace(1);
         steps.push(PulseStep {
             finished,
             before_edges: before.pending_finalizer_gc_edge_checks,
@@ -1570,6 +1806,7 @@ fn pulse_steps(heap: &mut heap::LuaHeap, limit: usize) -> (Vec<PulseStep>, ScanM
             selected: after.pending_finalizers_selected - before.pending_finalizers_selected,
             owner_heads: after.owner_head_checks - before.owner_head_checks,
             outgoing_edges: after.outgoing_edge_checks - before.outgoing_edge_checks,
+            live_reads,
         });
         previous = after;
         if finished {
@@ -6914,9 +7151,22 @@ fn pulse_cohort_arm(padding: usize) -> PulseCohortReceipt {
 fn live_userdata_selection_reads_one_chain_node_per_pulse_ignoring_non_userdata() {
     for padding in [0usize, 11usize] {
         let receipt = pulse_cohort_arm(padding);
+        let mut per_pulse = Vec::new();
+        for (index, step) in receipt.steps.iter().enumerate() {
+            assert!(
+                step.live_reads.len() <= 1,
+                "padding {padding}: pulse {index} advanced the live chain cursor {} nodes; one pulse spends one unit",
+                step.live_reads.len()
+            );
+            per_pulse.extend_from_slice(&step.live_reads);
+        }
+        assert_eq!(
+            per_pulse, receipt.expected_trace,
+            "padding {padding}: the per-pulse trace deltas name the exact live userdata identity order"
+        );
         assert_eq!(
             receipt.trace, receipt.expected_trace,
-            "padding {padding}: each real selection pulse reads one live userdata node"
+            "padding {padding}: the cumulative real trace matches the per-pulse deltas"
         );
         assert_eq!(
             receipt.records, receipt.expected_records,
@@ -6924,7 +7174,7 @@ fn live_userdata_selection_reads_one_chain_node_per_pulse_ignoring_non_userdata(
         );
         assert_eq!(
             receipt.meter.pending_finalizer_scan_slots, 3,
-            "padding {padding}: only the three live userdata nodes are read"
+            "padding {padding}: only the three live chain nodes were read; this is not a bound on total slot visits"
         );
         assert!(
             receipt.steps.iter().all(|step| step.scan_slots <= 1),
@@ -6934,10 +7184,10 @@ fn live_userdata_selection_reads_one_chain_node_per_pulse_ignoring_non_userdata(
             receipt
                 .steps
                 .iter()
-                .filter(|step| step.scan_slots == 1)
+                .filter(|step| step.live_reads.len() == 1)
                 .count(),
             3,
-            "padding {padding}: three pulses perform the three real node reads"
+            "padding {padding}: three pulses carry the three real chain reads"
         );
         assert!(
             receipt.node_slots > 3,
@@ -7059,6 +7309,680 @@ fn live_userdata_registration_rollback_unlinks_and_reheads_the_same_slot() {
                 chain_stamp(second),
                 chain_stamp(first)
             ]
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Slot-linked pending queue: storage boundary, checkpoint rollback, and
+// generation/raw snapshots
+// ---------------------------------------------------------------------------
+
+/// The queue's real storage boundary for one ordinary sequence.
+///
+/// A real private publication appends one record per selected candidate; the
+/// append writes the new slot and, when non-empty, the old tail, plus one
+/// header boundary. The owner preflight reads every stored record once. A
+/// front pop reads the old head record (its successor identity comes from that
+/// same record), writes the old head slot and one header, and transfers one
+/// record. No `VecDeque` move is reported because the slot-linked storage never
+/// relocates a stored record.
+#[test]
+fn pending_queue_publication_and_pop_charge_their_own_storage_boundary() {
+    crate::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(
+            &mut host,
+            HeapLimits {
+                nodes: 32,
+                roots: 8,
+                edges: 64,
+                max_generation: 8,
+            },
+        )
+        .expect("install");
+        let first = publish_eligible(&mut host);
+        let second = publish_eligible(&mut host);
+        let frame = heap::with_heap(&mut host, |heap| {
+            let frame = heap.enter_roots(3)?;
+            heap.write_root(frame, 0, first.weak_values)?;
+            heap.write_root(frame, 1, second.weak_values)?;
+            Ok(frame)
+        })
+        .expect("roots");
+
+        let _ = heap::take_scan_meter(&mut host);
+        let boundary = publish_boundary(&mut host);
+        assert!(matches!(boundary, PublishedBoundary::Published { .. }));
+        let meter = heap::take_scan_meter(&mut host).expect("publish boundary meter");
+        assert_eq!(
+            meter.pending_queue_slot_writes, 3,
+            "two appends write the new slot and the old tail once each"
+        );
+        assert_eq!(
+            meter.pending_queue_header_writes, 3,
+            "two appends and one publication are three header boundaries"
+        );
+        assert_eq!(
+            meter.pending_release_queue_reads, 2,
+            "the whole-queue owner preflight reads both records once"
+        );
+        assert_eq!(
+            meter.pending_queue_storage_moves, 0,
+            "an append and a publication transfer no stored record"
+        );
+        assert_eq!(pending_records(&mut host).len(), 2);
+        assert_eq!(published_count(&mut host), 2);
+        finish_release(&mut host);
+        let _ = heap::with_heap(&mut host, |heap| Ok(heap.take_pending_queue_write_trace()))
+            .expect("drain the publish write trace");
+
+        let head = pending_records(&mut host)[0];
+        let _ = heap::take_scan_meter(&mut host);
+        let taken =
+            heap::take_published_pending_finalizer(&mut host, frame, 2).expect("published front");
+        assert_eq!(
+            (taken.slot(), taken.generation()),
+            (head.1, head.2),
+            "the pop consumes the published FIFO head"
+        );
+        let meter = heap::take_scan_meter(&mut host).expect("front-pop boundary meter");
+        assert_eq!(
+            meter.pending_release_queue_reads, 2,
+            "the handoff reads the head record once and the pop once"
+        );
+        assert_eq!(
+            meter.pending_queue_slot_writes, 1,
+            "the pop writes only the old head slot"
+        );
+        assert_eq!(
+            meter.pending_queue_header_writes, 1,
+            "the pop has one header boundary"
+        );
+        assert_eq!(
+            meter.pending_queue_storage_moves, 1,
+            "the pop transfers its one record"
+        );
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| Ok(heap.take_pending_queue_write_trace()))
+                .expect("pop write trace"),
+            vec![head.1],
+            "the pop writes only the old head slot"
+        );
+        assert_eq!(pending_records(&mut host).len(), 1);
+        assert_eq!(published_count(&mut host), 1);
+        heap::with_heap(&mut host, |heap| heap.leave_roots(frame)).expect("leave roots");
+    });
+}
+
+/// One real Roots offer per pulse, cursor carried by identity.
+///
+/// Every Root offer pulse must read exactly one queue record and write none;
+/// the offer sequence must be the exact FIFO identity order, so the cursor
+/// follows the successor stored on the record it just read and never searches
+/// from the head. The selection append reads no queue record and writes the
+/// new slot plus the old tail, with one header boundary. No pulse reads more
+/// than one queue record.
+#[test]
+fn pending_queue_offer_cursor_reads_one_record_per_pulse_and_appends_locally() {
+    crate::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(
+            &mut host,
+            HeapLimits {
+                nodes: 128,
+                roots: 64,
+                edges: 512,
+                max_generation: 8,
+            },
+        )
+        .expect("install");
+        let count = 11usize;
+        let mut eligible = Vec::new();
+        for _ in 0..count {
+            eligible.push(publish_eligible(&mut host));
+        }
+        let frame = heap::with_heap(&mut host, |heap| {
+            let frame = heap.enter_roots((count + 2) as u32)?;
+            for (index, item) in eligible.iter().enumerate() {
+                heap.write_root(frame, index as u32, item.weak_values)?;
+            }
+            Ok(frame)
+        })
+        .expect("roots");
+        let boundary = publish_boundary(&mut host);
+        assert!(matches!(boundary, PublishedBoundary::Published { .. }));
+        finish_release(&mut host);
+        let _ = heap::with_heap(&mut host, |heap| Ok(heap.take_pending_queue_write_trace()))
+            .expect("drain the earlier append trace");
+
+        let records = pending_records(&mut host);
+        let mut expected_order = Vec::new();
+        for item in eligible.iter().rev() {
+            expected_order.push((item.raw, item.userdata.slot(), item.userdata.generation()));
+        }
+        assert_eq!(
+            records, expected_order,
+            "one cohort is stored newest allocation first"
+        );
+        let expected_offers: Vec<(u32, u32)> = records
+            .iter()
+            .map(|(_, slot, generation)| (*slot, *generation))
+            .collect();
+        let old_tail_slot = records.last().expect("the queue has a tail").1;
+
+        let fresh = publish_eligible(&mut host);
+        heap::with_heap(&mut host, |heap| {
+            heap.write_root(frame, count as u32, fresh.weak_values)
+        })
+        .expect("fresh weak root");
+
+        let (initial_counts, final_counts, offers_seen, selected_total, append_trace) =
+            heap::with_heap(&mut host, |heap| {
+                let mut session = heap::SelectingPendingMark::start(heap);
+                let initial = session.pending_queue_counts();
+                let mut previous = initial;
+                let mut previous_meter = session.meter();
+                let mut offers_seen = Vec::new();
+                let mut selected_total = 0u64;
+                let mut append_trace = Vec::new();
+                let mut finished = false;
+                for _ in 0..20_000 {
+                    let before_selected = previous_meter.pending_finalizers_selected;
+                    let (done, after_meter, counts, offers) = session.pulse_with_queue_meter(1);
+                    let writes = session.take_pending_queue_write_trace();
+                    let reads = counts.0 - previous.0;
+                    let slot_writes = counts.1 - previous.1;
+                    let header_writes = counts.2 - previous.2;
+                    let transfers = counts.3 - previous.3;
+                    assert!(reads <= 1, "one pulse read {reads} pending-queue records");
+                    assert_eq!(
+                        slot_writes,
+                        writes.len() as u64,
+                        "the write counter and the real slot-write trace disagree"
+                    );
+                    if !offers.is_empty() {
+                        assert_eq!(offers.len(), 1, "one Roots pulse offers one record");
+                        assert_eq!(
+                            (reads, slot_writes, header_writes, transfers),
+                            (1, 0, 0, 0),
+                            "a Roots offer reads one record and writes nothing"
+                        );
+                        offers_seen.push(offers[0]);
+                    } else if slot_writes > 0 {
+                        assert_eq!(reads, 0, "the append reads no queue record");
+                        assert_eq!(
+                            (slot_writes, header_writes, transfers),
+                            (2, 1, 0),
+                            "the append writes the new slot and old tail, one header, no transfer"
+                        );
+                        assert!(append_trace.is_empty(), "one append pulse only");
+                        append_trace = writes;
+                    } else {
+                        assert_eq!((reads, header_writes, transfers), (0, 0, 0));
+                        assert!(writes.is_empty(), "only the append writes a slot");
+                    }
+                    let selected = after_meter.pending_finalizers_selected - before_selected;
+                    selected_total += selected;
+                    previous = counts;
+                    previous_meter = after_meter;
+                    if done {
+                        finished = true;
+                        break;
+                    }
+                }
+                assert!(finished, "the selecting mark finished");
+                Ok((
+                    initial,
+                    session.pending_queue_counts(),
+                    offers_seen,
+                    selected_total,
+                    append_trace,
+                ))
+            })
+            .expect("queue boundary mark");
+
+        assert_eq!(
+            final_counts.0 - initial_counts.0,
+            count as u64,
+            "the whole mark reads exactly one record per Roots offer"
+        );
+        assert_eq!(
+            final_counts.1 - initial_counts.1,
+            2,
+            "the single append writes two slot records"
+        );
+        assert_eq!(final_counts.2 - initial_counts.2, 1);
+        assert_eq!(final_counts.3 - initial_counts.3, 0);
+        assert_eq!(
+            offers_seen, expected_offers,
+            "the cursor follows the exact stored successor identities"
+        );
+        assert_eq!(selected_total, 1, "exactly the fresh candidate is appended");
+        assert_eq!(
+            append_trace,
+            vec![fresh.userdata.slot(), old_tail_slot],
+            "the append touches the new slot and the old tail only"
+        );
+        let records = pending_records(&mut host);
+        assert_eq!(records.len(), count + 1);
+        assert_eq!(
+            records.last().copied(),
+            Some((
+                fresh.raw,
+                fresh.userdata.slot(),
+                fresh.userdata.generation()
+            ))
+        );
+        assert_eq!(
+            heap::pending_finalizer_count(&mut host).expect("queue count"),
+            count + 1
+        );
+        heap::with_heap(&mut host, |heap| heap.leave_roots(frame)).expect("leave roots");
+    });
+}
+
+/// A real same-context three-segment queue: one record from the published
+/// prefix, one valid but unpublished record left by an earlier real doomed-close
+/// failure, and the current pass's new tail. The current pass adds a valid
+/// candidate and then fails the real typed-owner check on a same-type misbound
+/// candidate. Rollback must restore the round-start checkpoint: the published
+/// prefix and the earlier unpublished segment stay queued and keep their
+/// FIFO identities; only the current segment is removed. Repairing both real
+/// bindings and retrying in the same context publishes every remaining record,
+/// and the first handoff still consumes the oldest published record.
+#[test]
+fn owner_rejection_restores_the_round_start_queue_not_the_published_prefix() {
+    crate::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(
+            &mut host,
+            HeapLimits {
+                nodes: 128,
+                roots: 64,
+                edges: 512,
+                max_generation: 8,
+            },
+        )
+        .expect("install");
+
+        // Segment 1: a genuinely published record.
+        let prior = publish_eligible(&mut host);
+        let frame = heap::with_heap(&mut host, |heap| {
+            let frame = heap.enter_roots(8)?;
+            heap.write_root(frame, 0, prior.weak_values)?;
+            Ok(frame)
+        })
+        .expect("prior roots");
+        let boundary = publish_boundary(&mut host);
+        assert!(matches!(boundary, PublishedBoundary::Published { .. }));
+        finish_release(&mut host);
+        let prior_record = (
+            prior.raw,
+            prior.userdata.slot(),
+            prior.userdata.generation(),
+        );
+        assert_eq!(pending_records(&mut host), vec![prior_record]);
+        assert_eq!(published_count(&mut host), 1);
+
+        // Segment 2: a valid candidate retained by a real doomed-close failure.
+        // The doomed slot is bound to the fresh candidate's token, so the close
+        // verifier refuses after selection and before weak publication.
+        let fresh = publish_eligible(&mut host);
+        heap::with_heap(&mut host, |heap| {
+            heap.write_root(frame, 1, fresh.weak_values)
+        })
+        .expect("fresh weak root");
+        let doomed = heap::publish_userdata(&mut host).expect("doomed userdata");
+        let doomed_raw = bound_raw(&mut host, doomed);
+        heap::with_heap(&mut host, |heap| {
+            heap.unbind_userdata_token(doomed)?;
+            heap.bind_userdata_token(doomed, fresh.raw)
+        })
+        .expect("doomed same-type misbind");
+        let error = heap::collect_pending_finalizers(&mut host).expect_err("doomed close");
+        assert_eq!(error, HeapError::TokenMismatch);
+        let fresh_record = (
+            fresh.raw,
+            fresh.userdata.slot(),
+            fresh.userdata.generation(),
+        );
+        assert_eq!(
+            pending_records(&mut host),
+            vec![prior_record, fresh_record],
+            "the valid unpublished record survives the close failure"
+        );
+        assert_eq!(
+            published_count(&mut host),
+            1,
+            "only the prior record is in the published prefix"
+        );
+        assert!(pending_flag(&mut host, fresh.userdata));
+        assert!(userdata_token_open(&host, fresh.raw));
+        assert!(userdata_token_open(&host, doomed_raw));
+        assert!(!heap::saved_sweep_tail(&mut host).expect("no tail"));
+
+        // Segment 3: the current pass. A is allocated first, so the live chain
+        // selects V before A. Both have a raw `__gc`; A's real binding is
+        // replaced by B's same-type token, so the owner preflight accepts the
+        // prior, the unpublished fresh record, and V, then refuses A.
+        let a = publish_eligible(&mut host);
+        let v = publish_eligible(&mut host);
+        assert!(
+            a.userdata.slot() < v.userdata.slot(),
+            "V is the newer live-chain head"
+        );
+        let b = heap::publish_userdata(&mut host).expect("token owner B");
+        let b_raw = bound_raw(&mut host, b);
+        heap::with_heap(&mut host, |heap| {
+            heap.write_userdata_root(frame, 2, b)?;
+            heap.write_root(frame, 3, a.weak_values)?;
+            heap.write_root(frame, 4, v.weak_values)
+        })
+        .expect("segment roots");
+        heap::with_heap(&mut host, |heap| {
+            heap.unbind_userdata_token(a.userdata)?;
+            heap.bind_userdata_token(a.userdata, b_raw)
+        })
+        .expect("same-type misbind on the new candidate");
+        heap::with_heap(&mut host, |heap| {
+            heap.clear_owner_verification_trace();
+            Ok(())
+        })
+        .expect("clear owner-verification trace");
+
+        let _ = heap::take_scan_meter(&mut host);
+        let error = heap::collect_pending_finalizers(&mut host).expect_err("foreign owner");
+        assert_eq!(error, HeapError::TokenMismatch);
+        let meter = heap::take_scan_meter(&mut host).expect("refusal meter");
+        assert_eq!(
+            meter.pending_finalizer_offers, 2,
+            "Roots offers only the two pre-existing records"
+        );
+        assert_eq!(
+            meter.pending_finalizers_selected, 2,
+            "V and A were both selected before the failing verification"
+        );
+        assert_eq!(meter.token_closes, 0, "verification fails before close");
+        let (successes, verified) = heap::with_heap(&mut host, |heap| {
+            Ok((
+                heap.owner_verification_successes(),
+                heap.owner_verification_trace(),
+            ))
+        })
+        .expect("owner-verification successes");
+        assert_eq!(successes, 3, "the prior, fresh, and V pass before A");
+        assert_eq!(
+            verified,
+            vec![
+                (prior.userdata.slot(), prior.userdata.generation()),
+                (fresh.userdata.slot(), fresh.userdata.generation()),
+                (v.userdata.slot(), v.userdata.generation()),
+            ],
+            "the earlier unpublished segment is verified before the current failure"
+        );
+
+        // The current segment is gone; the published prefix and the earlier
+        // unpublished segment remain in FIFO order. This assertion is the
+        // direct anti-control against a rollback that uses the published
+        // length (1) instead of the round-start checkpoint (2).
+        assert_eq!(
+            pending_records(&mut host),
+            vec![prior_record, fresh_record],
+            "only the current segment is removed"
+        );
+        assert_eq!(published_count(&mut host), 1);
+        assert_eq!(
+            heap::pending_finalizer_count(&mut host).expect("queue count"),
+            2
+        );
+        assert!(pending_flag(&mut host, prior.userdata));
+        assert!(pending_flag(&mut host, fresh.userdata));
+        assert!(!pending_flag(&mut host, v.userdata));
+        assert!(!pending_flag(&mut host, a.userdata));
+        assert!(alive(&mut host, a.metatable));
+        assert!(alive(&mut host, v.metatable));
+        assert!(userdata_token_open(&host, fresh.raw));
+        assert!(userdata_token_open(&host, v.raw));
+        assert!(userdata_token_open(&host, a.raw));
+        assert!(userdata_token_open(&host, b_raw));
+        assert!(!heap::saved_sweep_tail(&mut host).expect("no tail after refusal"));
+
+        // Repair both real bindings and retry in this same context.
+        heap::with_heap(&mut host, |heap| {
+            heap.unbind_userdata_token(a.userdata)?;
+            heap.bind_userdata_token(a.userdata, a.raw)?;
+            heap.unbind_userdata_token(doomed)?;
+            heap.bind_userdata_token(doomed, doomed_raw)
+        })
+        .expect("restore real bindings");
+        let _ = heap::take_scan_meter(&mut host);
+        let boundary = publish_boundary(&mut host);
+        assert!(matches!(boundary, PublishedBoundary::Published { .. }));
+        let sensor = pending_records(&mut host);
+        assert_eq!(
+            sensor,
+            vec![
+                prior_record,
+                fresh_record,
+                (v.raw, v.userdata.slot(), v.userdata.generation()),
+                (a.raw, a.userdata.slot(), a.userdata.generation()),
+            ],
+            "the retry appends V then A after the preserved segments"
+        );
+        assert_eq!(published_count(&mut host), 4);
+        assert_eq!(
+            weak_value(&mut host, fresh.weak_values, 1.0),
+            None,
+            "the successful retry clear the earlier unpublished weak value"
+        );
+        assert_eq!(weak_value(&mut host, v.weak_values, 1.0), None);
+        assert_eq!(weak_value(&mut host, a.weak_values, 1.0), None);
+        assert!(pending_flag(&mut host, a.userdata));
+        assert!(pending_flag(&mut host, v.userdata));
+        finish_release(&mut host);
+
+        // Published FIFO: the oldest published record is the first handoff.
+        let handoff =
+            heap::with_heap(&mut host, |heap| heap.enter_roots(1)).expect("handoff frame");
+        let taken = heap::take_published_pending_finalizer(&mut host, handoff, 0)
+            .expect("oldest published head");
+        assert_eq!(taken, prior.userdata);
+        assert_eq!(
+            pending_records(&mut host),
+            vec![
+                fresh_record,
+                (v.raw, v.userdata.slot(), v.userdata.generation()),
+                (a.raw, a.userdata.slot(), a.userdata.generation()),
+            ]
+        );
+        assert_eq!(published_count(&mut host), 3);
+        for open in [handoff, frame] {
+            heap::with_heap(&mut host, |heap| heap.leave_roots(open)).expect("leave roots");
+        }
+    });
+}
+
+/// Exact snapshots, test-only middle removal, and refusals.
+///
+/// The queue stores the generation and raw handle captured at append time; a
+/// later same-generation rebind does not rewrite the record. Ordinary Roots
+/// offers still skip that rebound record and continue to its successor. The
+/// test retirement control may search linearly for a middle predecessor, but
+/// a saved mark or a Release tail refuses it before any queue write. After a
+/// real ordinary collection advances a settled generation, the old identity is
+/// not in the queue.
+#[test]
+fn pending_queue_keeps_its_snapshot_and_refuses_retirement_under_saved_state() {
+    crate::support::with_idle_vm(|vm| {
+        let mut host = vm.host_context();
+        heap::install(
+            &mut host,
+            HeapLimits {
+                nodes: 64,
+                roots: 16,
+                edges: 128,
+                max_generation: 8,
+            },
+        )
+        .expect("install");
+        let a = publish_eligible(&mut host);
+        let b = publish_eligible(&mut host);
+        let c = publish_eligible(&mut host);
+        let frame = heap::with_heap(&mut host, |heap| {
+            let frame = heap.enter_roots(4)?;
+            heap.write_root(frame, 0, a.weak_values)?;
+            heap.write_root(frame, 1, b.weak_values)?;
+            heap.write_root(frame, 2, c.weak_values)?;
+            Ok(frame)
+        })
+        .expect("roots");
+        let boundary = publish_boundary(&mut host);
+        assert!(matches!(boundary, PublishedBoundary::Published { .. }));
+        finish_release(&mut host);
+        assert_eq!(
+            pending_records(&mut host),
+            vec![
+                (c.raw, c.userdata.slot(), c.userdata.generation()),
+                (b.raw, b.userdata.slot(), b.userdata.generation()),
+                (a.raw, a.userdata.slot(), a.userdata.generation()),
+            ],
+            "the cohort is newest allocation first"
+        );
+
+        // The middle record (B) is found by a real predecessor search.
+        let _ = heap::take_scan_meter(&mut host);
+        let _ = heap::with_heap(&mut host, |heap| Ok(heap.take_pending_queue_write_trace()))
+            .expect("drain the earlier append trace");
+        heap::retire_pending_finalizer_test_control(&mut host, b.userdata)
+            .expect("retire middle record");
+        let meter = heap::take_scan_meter(&mut host).expect("middle retirement meter");
+        assert_eq!(
+            meter.pending_release_queue_reads, 2,
+            "the predecessor search reads C, then B"
+        );
+        assert_eq!(
+            meter.pending_queue_slot_writes, 2,
+            "the predecessor link and the removed slot are two slot writes"
+        );
+        assert_eq!(meter.pending_queue_header_writes, 1);
+        assert_eq!(meter.pending_queue_storage_moves, 1);
+        assert_eq!(
+            heap::with_heap(&mut host, |heap| Ok(heap.take_pending_queue_write_trace()))
+                .expect("middle retirement write trace"),
+            vec![c.userdata.slot(), b.userdata.slot()],
+            "only the predecessor and the removed record are written"
+        );
+        assert_eq!(
+            pending_records(&mut host),
+            vec![
+                (c.raw, c.userdata.slot(), c.userdata.generation()),
+                (a.raw, a.userdata.slot(), a.userdata.generation()),
+            ]
+        );
+        assert_eq!(published_count(&mut host), 2);
+        assert!(!pending_flag(&mut host, b.userdata));
+        assert!(finalizer_settled(&mut host, b.userdata));
+
+        // A same-generation raw rebind does not rewrite the stored snapshot.
+        let decoy = heap::publish_userdata(&mut host).expect("decoy userdata");
+        let decoy_raw = bound_raw(&mut host, decoy);
+        heap::with_heap(&mut host, |heap| {
+            heap.unbind_userdata_token(c.userdata)?;
+            heap.bind_userdata_token(c.userdata, decoy_raw)
+        })
+        .expect("same-generation rebind");
+        assert_eq!(
+            pending_records(&mut host),
+            vec![
+                (c.raw, c.userdata.slot(), c.userdata.generation()),
+                (a.raw, a.userdata.slot(), a.userdata.generation()),
+            ],
+            "the stored raw snapshot is not rebuilt from the current token"
+        );
+        let (offers, offer_trace) = heap::with_heap(&mut host, |heap| {
+            let mut session = heap::SelectingPendingMark::start(heap);
+            let mut trace = Vec::new();
+            for _ in 0..10_000 {
+                let (finished, _meter, _counts, offers) = session.pulse_with_queue_meter(1);
+                trace.extend_from_slice(&offers);
+                if finished {
+                    break;
+                }
+            }
+            Ok((trace.len(), trace))
+        })
+        .expect("offer mark with a rebound head");
+        assert_eq!(
+            offers, 2,
+            "the rebound head and its successor are both offered"
+        );
+        assert_eq!(
+            offer_trace,
+            vec![
+                (c.userdata.slot(), c.userdata.generation()),
+                (a.userdata.slot(), a.userdata.generation()),
+            ],
+            "the raw mismatch skips retention but does not stop the identity cursor"
+        );
+        heap::with_heap(&mut host, |heap| {
+            heap.unbind_userdata_token(c.userdata)?;
+            heap.bind_userdata_token(c.userdata, c.raw)
+        })
+        .expect("restore C binding");
+
+        // Retire A, then a real ordinary collection closes its token and
+        // advances the generation. The old identity is no longer queued.
+        let a_generation = slot_generation(&mut host, a.userdata.slot());
+        heap::retire_pending_finalizer_test_control(&mut host, a.userdata).expect("retire A");
+        let _ = heap::collect(&mut host).expect("ordinary collection closes A");
+        assert_eq!(
+            slot_generation(&mut host, a.userdata.slot()),
+            a_generation + 1,
+            "the ordinary collection really advanced the released slot"
+        );
+        assert_eq!(
+            pending_records(&mut host),
+            vec![(c.raw, c.userdata.slot(), c.userdata.generation())],
+            "the old generation is not in the queue"
+        );
+        assert!(pending_flag(&mut host, c.userdata));
+
+        // A Release tail refuses the retirement control before any queue write.
+        let orphan = heap::with_heap(&mut host, |heap| heap.alloc()).expect("orphan table");
+        heap::with_heap(&mut host, |heap| {
+            let weak = weak_table(heap, "v")?;
+            heap.set_number_edge(weak, 1.0, orphan)?;
+            heap.write_root(frame, 3, weak)
+        })
+        .expect("orphan weak root");
+        let boundary = publish_boundary(&mut host);
+        assert!(matches!(boundary, PublishedBoundary::Published { .. }));
+        let before = heap::with_heap(&mut host, |heap| Ok(heap.pending_queue_counts()))
+            .expect("queue counts");
+        let refused = heap::retire_pending_finalizer_test_control(&mut host, c.userdata)
+            .expect_err("saved release tail");
+        assert_eq!(refused, HeapError::SweepPending);
+        let after = heap::with_heap(&mut host, |heap| Ok(heap.pending_queue_counts()))
+            .expect("queue counts");
+        assert_eq!(
+            before, after,
+            "a refused retirement writes no queue storage"
+        );
+        finish_release(&mut host);
+
+        // A saved mark refuses the same entry with no queue write.
+        heap::open_saved_mark_for_test(&mut host).expect("saved mark");
+        let before = heap::with_heap(&mut host, |heap| Ok(heap.pending_queue_counts()))
+            .expect("queue counts");
+        let refused = heap::retire_pending_finalizer_test_control(&mut host, c.userdata)
+            .expect_err("saved mark");
+        assert_eq!(refused, HeapError::MarkDenied);
+        let after = heap::with_heap(&mut host, |heap| Ok(heap.pending_queue_counts()))
+            .expect("queue counts");
+        assert_eq!(
+            before, after,
+            "a saved mark refusal writes no queue storage"
         );
     });
 }

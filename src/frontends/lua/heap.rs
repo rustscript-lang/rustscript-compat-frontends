@@ -27,9 +27,10 @@
 //! bound token instead of skipping it.
 //!
 //! The private pending-finalizer slice has one selecting entry,
-//! [`collect_pending_finalizers`]. After the ordinary mark converges it scans
-//! every slot once, retains live unmarked typed userdata whose metatable has a
-//! raw non-nil `__gc` field, and marks the userdata so the ordinary gray pass
+//! [`collect_pending_finalizers`]. After the ordinary mark converges it walks
+//! the live-userdata chain from its head, one real chain node per selection
+//! unit, retains live unmarked typed userdata whose metatable has a raw
+//! non-nil `__gc` field, and marks the userdata so the ordinary gray pass
 //! follows its userdata-to-metatable strong edge and the metatable's own
 //! strong entries. A retained userdata keeps its original generation, typed
 //! payload, and Core token. A white candidate whose raw `__gc` is missing, nil,
@@ -52,16 +53,18 @@
 //! A successful private collection records the queue length it published as a
 //! consumable prefix only after the real weak publication finished. The
 //! private real handoff [`take_published_pending_finalizer`] then pops exactly
-//! that front record with one `VecDeque` front removal, verifies the exact
+//! that front record with one published-front pop from the slot-linked queue,
+//! verifies the exact
 //! live userdata and typed Core token, writes the userdata into one specified
 //! empty root slot, and settles that generation in the same commit. It never
 //! calls guest code. A saved mark or Release tail refuses before any write, and
 //! records retained by a failed or ordinary collection stay outside the ready
-//! prefix. The first-round order is only the selecting scan's offered order
-//! (ascending slots in this representation), not LuaJIT's reverse allocation
-//! order and not a guest callback order. The test-only retirement control
-//! remains a historical fixture with the same prefix invariant. No callback,
-//! resurrection, guest step, or production entry is added here.
+//! prefix. The first-round order is the selecting scan's live-chain order:
+//! reverse allocation inside one cohort, appended after any older published
+//! records; it is not a slot-index sort and not a guest callback order. The
+//! test-only retirement control remains a historical fixture with the same
+//! prefix invariant. No callback, resurrection, guest step, or production
+//! entry is added here.
 //!
 //! The private action handoff [`take_published_pending_finalizer_action`]
 //! resolves the current raw `__gc` of that same published head in the exclusive
@@ -672,8 +675,9 @@ fn close_then_halt_at_publish(
 /// 2. Run one ordinary non-moving mark with the same roots, registered
 ///    reservation offer, and pending-record offers. A parked mark is dropped,
 ///    as in [`collect`].
-/// 3. After the ordinary gray, rescan, and late work empties, scan every slot
-///    once. Select each live, unmarked userdata that binds a typed Core token
+/// 3. After the ordinary gray, rescan, and late work empties, walk the
+///    live-userdata chain from its head, one chain node per selection unit.
+///    Select each live, unmarked userdata that binds a typed Core token
 ///    and whose metatable has a raw non-nil `__gc` field. Mark it through the
 ///    ordinary target follow; the next gray pass follows its metatable edge
 ///    and the metatable's own strong entries. A raw field that is missing,
@@ -718,7 +722,12 @@ pub(crate) fn collect_pending_finalizers(
     if heap.has_saved_mark() {
         return Err(HeapError::MarkActive);
     }
-    let base = with_heap(host, |heap| Ok(heap.pending_finalizer_count()))?;
+    // Capture the queue's own round-start boundary before this pass can
+    // append a record: the exact tail identity and length. A later owner
+    // failure rolls back only the segment appended after this pair; the
+    // published prefix is never substituted for it, and a valid unpublished
+    // segment left by an earlier failed close stays queued.
+    let base = with_heap(host, |heap| Ok(heap.pending_finalizer_checkpoint()))?;
     let marked = with_heap(host, |heap| Ok(heap.mark_and_pending_tokens()))?;
     if let Err(error) = verify_pending_finalizers(host) {
         // This is the owner-verification preflight's own transaction: remove
@@ -772,6 +781,8 @@ fn verify_pending_finalizers(host: &HostContext) -> Result<(), HeapError> {
         {
             return Err(HeapError::TokenMismatch);
         }
+        #[cfg(test)]
+        heap.record_owner_verification_success(slot, generation);
     }
     Ok(())
 }
@@ -808,12 +819,13 @@ pub fn retire_pending_finalizer_test_control(
 /// same userdata ([`HeapError::TokenMismatch`] otherwise). All of those checks
 /// happen before the first queue, root, or slot write.
 ///
-/// On success the head is popped with one `VecDeque` front removal, the exact
+/// On success the head is popped with one published-front removal, the exact
 /// `UserdataRef` is written into the specified root slot, and that generation
 /// is marked settled and no longer pending. The returned handle is the same
 /// typed object the queue verified; the raw Core token is not returned or
-/// copied into a guest value. The order is only the selecting scan's offered
-/// order, not LuaJIT's reverse allocation or callback order.
+/// copied into a guest value. The order is the selecting scan's live-chain
+/// order: reverse allocation inside one cohort, after any older published
+/// records; it is not a callback order.
 pub(crate) fn take_published_pending_finalizer(
     host: &mut HostContext,
     frame: RootFrameId,
@@ -984,7 +996,7 @@ pub(crate) struct TakenPendingFinalizer {
 /// out-of-range position is refused before any write, so the head and every
 /// existing root stay. A `Skip` or typed reject needs only `slots[0]`, is
 /// returned as its typed result, and is settled exactly once; it is never
-/// re-queued. The commit pops one `VecDeque` front record, writes the required
+/// re-queued. The commit pops one published-front record, writes the required
 /// roots together, and settles that generation. The returned action and rooted
 /// identities are private; the raw Core token is not copied into a guest
 /// value.
@@ -1064,6 +1076,13 @@ fn verify_pending_finalizer_receiver(
 #[cfg(test)]
 pub fn pending_finalizer_published_count(host: &mut HostContext) -> Result<usize, HeapError> {
     with_heap(host, |heap| Ok(heap.pending_finalizer_published_count()))
+}
+
+/// Number of stored pending records. Test-only header read; it does not read a
+/// stored record.
+#[cfg(test)]
+pub fn pending_finalizer_count(host: &mut HostContext) -> Result<usize, HeapError> {
+    with_heap(host, |heap| Ok(heap.pending_finalizer_count()))
 }
 
 /// One userdata root slot. Test-only; does not scan or read the queue.
