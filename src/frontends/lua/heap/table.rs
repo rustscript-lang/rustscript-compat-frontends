@@ -1091,8 +1091,17 @@ pub struct LuaHeap {
     /// visit order. Each entry is one real slot-record read and the exact
     /// generation the chain cursor named, so a test can distinguish a real
     /// chain walk from a counter that merely reports the number of candidates.
+    /// The shared handle lets the test-only selecting driver take a per-pulse
+    /// delta while its mark session still borrows the heap.
     #[cfg(test)]
-    pending_live_trace: std::cell::RefCell<Vec<(u32, u32)>>,
+    pending_live_trace: LiveTrace,
+    /// Test-only: pending-finalizer records whose exact typed owner borrow and
+    /// slot/generation check passed in the pre-publication verifier, in record
+    /// order. A refused pass leaves the successes that happened before the
+    /// first mismatch, so a test can prove "C verified, then A failed" without
+    /// substituting an offer, selection, or materialized-record count.
+    #[cfg(test)]
+    owner_verification_trace: std::cell::RefCell<Vec<(u32, u32)>>,
     /// Test-only: identities actually visited by a failed settlement
     /// journal rollback, in visit order. A successful pass and Release leave
     /// it empty, so the trace distinguishes precise cleanup from a drain
@@ -1112,6 +1121,36 @@ pub struct LuaHeap {
     /// edge is published and no release starts.
     #[cfg(test)]
     reclaim_pending_slot: Option<u32>,
+}
+
+/// Test-only shared handle for the live-userdata chain-read trace.
+///
+/// The heap must stay `Send`, so this uses an `Arc<Mutex<_>>` rather than an
+/// `Rc`. The `borrow`/`borrow_mut` names keep the existing internal write site
+/// and accessors unchanged; the selecting driver takes a clone of the handle
+/// before it borrows the heap for a mark session, then reads each pulse delta
+/// without touching the heap.
+#[cfg(test)]
+#[derive(Clone)]
+struct LiveTrace(std::sync::Arc<std::sync::Mutex<Vec<(u32, u32)>>>);
+
+#[cfg(test)]
+impl LiveTrace {
+    fn new() -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())))
+    }
+
+    fn share(&self) -> Self {
+        self.clone()
+    }
+
+    fn borrow(&self) -> std::sync::MutexGuard<'_, Vec<(u32, u32)>> {
+        self.0.lock().expect("live trace lock")
+    }
+
+    fn borrow_mut(&self) -> std::sync::MutexGuard<'_, Vec<(u32, u32)>> {
+        self.0.lock().expect("live trace lock")
+    }
 }
 
 /// One typed userdata retained after the ordinary mark converged.
@@ -1521,7 +1560,9 @@ impl LuaHeap {
             #[cfg(test)]
             pending_gc_edge_trace: std::cell::RefCell::new(Vec::new()),
             #[cfg(test)]
-            pending_live_trace: std::cell::RefCell::new(Vec::new()),
+            pending_live_trace: LiveTrace::new(),
+            #[cfg(test)]
+            owner_verification_trace: std::cell::RefCell::new(Vec::new()),
             #[cfg(test)]
             settlement_journal_trace: std::cell::RefCell::new(Vec::new()),
             #[cfg(test)]
@@ -4982,6 +5023,36 @@ impl LuaHeap {
         self.pending_live_trace.borrow_mut().clear();
     }
 
+    /// Records one pending-finalizer record whose typed owner borrow and
+    /// exact slot/generation check passed. Test-only; the push is the real
+    /// success boundary in the pre-publication verifier.
+    #[cfg(test)]
+    pub(crate) fn record_owner_verification_success(&self, slot: u32, generation: u32) {
+        self.owner_verification_trace
+            .borrow_mut()
+            .push((slot, generation));
+    }
+
+    /// Identities that passed the real pending-finalizer owner check since
+    /// the last clear, in record order. Test-only.
+    #[cfg(test)]
+    pub(crate) fn owner_verification_trace(&self) -> Vec<(u32, u32)> {
+        self.owner_verification_trace.borrow().clone()
+    }
+
+    /// Number of real pending-finalizer owner-check successes since the last
+    /// clear. Test-only; a prefix of a refused pass stays visible.
+    #[cfg(test)]
+    pub(crate) fn owner_verification_successes(&self) -> usize {
+        self.owner_verification_trace.borrow().len()
+    }
+
+    /// Clears the real owner-verification success trace. Test-only.
+    #[cfg(test)]
+    pub(crate) fn clear_owner_verification_trace(&mut self) {
+        self.owner_verification_trace.borrow_mut().clear();
+    }
+
     /// Walks the live-userdata chain head to tail and asserts each link is
     /// internally consistent at its exact generation. Test-only observation
     /// for release, rollback, neighbour, and same-slot successor checks.
@@ -5629,17 +5700,26 @@ fn replaced_table_target(key: &EdgeKey, old_gap: bool, value: &EdgeValue) -> Opt
 ///
 /// The pulse witness drives the real mark one charged unit at a time, so it
 /// can read the real pending-`__gc` edge meter before and after every call.
-/// It does not publish weak edges, close a token, or run a callback.
+/// It also snapshots the real live-userdata chain-read trace after every
+/// pulse, so a caller can assert the exact per-pulse chain cursor delta
+/// without treating a scan-slot counter or a selected-record count as the
+/// walk. It does not publish weak edges, close a token, or run a callback.
 #[cfg(test)]
 pub(crate) struct SelectingPendingMark<'a> {
     session: MarkSession<'a>,
+    live_trace: LiveTrace,
+    live_seen: usize,
 }
 
 #[cfg(test)]
 impl<'a> SelectingPendingMark<'a> {
     pub(crate) fn start(heap: &'a mut LuaHeap) -> Self {
+        let live_trace = heap.pending_live_trace.share();
+        let live_seen = live_trace.borrow().len();
         Self {
             session: MarkSession::start_selecting_pending(heap),
+            live_trace,
+            live_seen,
         }
     }
 
@@ -5648,10 +5728,25 @@ impl<'a> SelectingPendingMark<'a> {
         self.session.meter()
     }
 
+    /// Runs one unit and returns `(finished, cumulative meter, chain reads)`.
+    /// Each `chain reads` element is one real live-userdata chain node read by
+    /// this call, in visit order; the delta never includes an earlier pulse.
+    pub(crate) fn pulse_with_live_trace(
+        &mut self,
+        budget: u64,
+    ) -> (bool, ScanMeter, Vec<(u32, u32)>) {
+        let view = self.session.pulse(budget);
+        let trace = self.live_trace.borrow();
+        let start = self.live_seen.min(trace.len());
+        let live_reads = trace[start..].to_vec();
+        self.live_seen = trace.len();
+        (view.finished, view.meter, live_reads)
+    }
+
     /// Runs one unit and returns `(finished, cumulative meter)`.
     pub(crate) fn pulse(&mut self, budget: u64) -> (bool, ScanMeter) {
-        let view = self.session.pulse(budget);
-        (view.finished, view.meter)
+        let (finished, meter, _live_reads) = self.pulse_with_live_trace(budget);
+        (finished, meter)
     }
 }
 
