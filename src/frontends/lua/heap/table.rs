@@ -12,7 +12,11 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use vm::{CallableValue, HostContextError, Value};
+use vm::{
+    CallOutcome, CallReturn, CallableKind, CallableTarget, CallableValue, HostContextError,
+    HostFunctionRegistry, HostFunctionSchema, HostImportSchema, HostParamSchema, HostTypeSchema,
+    Value, Vm, VmError, VmResult,
+};
 
 use super::handle::{ClosureRef, HandleKind, TableRef, UpvalueRef, UserdataRef};
 
@@ -127,6 +131,73 @@ impl HeapError {
     pub(super) fn from_scope(error: HostContextError) -> Self {
         Self::Scope(error.to_string())
     }
+}
+
+fn guest_import_fault(error: HeapError) -> VmError {
+    VmError::HostError(format!("lua heap: {error:?}"))
+}
+
+/// The only function that admits a guest callable.
+///
+/// It is private and reachable only through the import registered by
+/// [`LuaHeap::register_guest_callable_import`]. The VM dispatch supplies the
+/// guest argument, so the callable is one value this VM's own execution
+/// produced or received; there is no separate `(Arc, VM)` or `(Value, VM)`
+/// entry to call.
+///
+/// The capture count comes from this VM's compiled prototype for
+/// `callable.prototype_id`, not from a caller-supplied number. The container
+/// bit is not used: Core attaches an empty `CallableEnvironment` to every Lua
+/// closure, including a chunk-level function with no captures. A prototype
+/// with a real capture returns `false` and leaves the heap unchanged. A
+/// zero-capture callable is allocated a fresh closure generation and stored
+/// there; `true` reports that admission.
+fn admit_guest_callable(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let [value] = args else {
+        return Err(VmError::HostError(
+            "the guest callable import expects exactly one argument".to_string(),
+        ));
+    };
+    let Value::Callable(callable) = value else {
+        return Err(VmError::HostError(
+            "the guest callable import expects a callable value".to_string(),
+        ));
+    };
+    if callable.kind != CallableKind::Closure {
+        return Err(VmError::HostError(
+            "the guest callable import only admits a Lua closure".to_string(),
+        ));
+    }
+    let prototype = vm
+        .program()
+        .callable_prototypes
+        .get(callable.prototype_id as usize)
+        .ok_or_else(|| {
+            VmError::HostError(format!(
+                "the guest callable names prototype {} outside this VM program",
+                callable.prototype_id
+            ))
+        })?;
+    if prototype.kind != CallableKind::Closure
+        || !matches!(prototype.target, CallableTarget::ScriptFunction(_))
+    {
+        return Err(VmError::HostError(
+            "the guest callable prototype is not a compiled Lua script function".to_string(),
+        ));
+    }
+    let capture_slots = prototype.capture_slots.len();
+    let callable = Arc::clone(callable);
+    if capture_slots != 0 {
+        return Ok(CallOutcome::Return(CallReturn::one(Value::Bool(false))));
+    }
+    let mut host = vm.host_context();
+    let closure =
+        super::with_heap(&mut host, LuaHeap::alloc_closure).map_err(guest_import_fault)?;
+    super::with_heap(&mut host, |heap| {
+        heap.store_guest_callable(closure, callable, capture_slots)
+    })
+    .map_err(guest_import_fault)?;
+    Ok(CallOutcome::Return(CallReturn::one(Value::Bool(true))))
 }
 
 impl fmt::Display for HeapError {
@@ -267,10 +338,12 @@ enum SlotState {
 /// One issued value bound to a slot for its current generation.
 ///
 /// A table slot holds the VM array issued by [`LuaHeap::issue_carrier`]; a
-/// closure slot holds the exact no-capture Core `Value::Callable` Arc a guest
-/// binding handed to the private registration entry. Neither variant is a mark
-/// edge, a root, or a Core resource. [`LuaHeap::release_slot`] clears the
-/// field for the retired generation, and a reused slot starts empty.
+/// closure slot holds the exact no-capture Core `Value::Callable` Arc that the
+/// controlled `.lua` guest registration import admitted. The import derives
+/// the capture count from the same VM's compiled prototype, so no caller can
+/// pass a bare count. Neither variant is a mark edge, a root, or a Core
+/// resource. [`LuaHeap::release_slot`] clears the field for the retired
+/// generation, and a reused slot starts empty.
 ///
 /// Reusing the existing carrier field keeps the one-carrier-per-generation
 /// invariant and prevents a table and a callable from coexisting. The enum is
@@ -1063,6 +1136,13 @@ pub struct LuaHeap {
     /// edge is published and no release starts.
     #[cfg(test)]
     reclaim_pending_slot: Option<u32>,
+    /// Test-only observation: closure handles admitted by the controlled guest
+    /// import, in admission order. Written only after a successful store. The
+    /// vector does not admit, retain, or expose a callable; slot refusal
+    /// tests read it and the file-entry witness uses it to find the exact
+    /// generations. No non-test code can reach the field.
+    #[cfg(test)]
+    admitted_guest_callables: Vec<ClosureRef>,
 }
 
 mod pending_queue {
@@ -1370,6 +1450,8 @@ impl LuaHeap {
             skip_pending_finalizer_metatable: false,
             #[cfg(test)]
             reclaim_pending_slot: None,
+            #[cfg(test)]
+            admitted_guest_callables: Vec::new(),
         }
     }
 
@@ -1660,29 +1742,77 @@ impl LuaHeap {
         Ok(value)
     }
 
-    /// Binds one exact Core script callable to a live closure generation.
+    /// Fixed name of the controlled `.lua` guest callable import.
     ///
-    /// `callable` is the value a guest binding of the same VM handed to the
-    /// private test entry. This entry cannot re-check Core ownership:
-    /// `Vm::owns_callable` is not visible to this crate, so the guest binding
-    /// call is the issuance evidence. `capture_slots` is the exact compiled
-    /// prototype capture count for this callable in the same VM; it is the
-    /// caller's admission evidence for the environment check.
+    /// The completion slice already admits the `note` host name, so the
+    /// heap-owned admission reuses that slot instead of changing the lowerer.
+    /// The test compile catalog declares exactly this import, and its
+    /// dispatch function is private to this module. There is no crate-visible
+    /// entry that takes an `Arc<CallableValue>`, a `Value`, a VM, or a capture
+    /// count.
+    pub(crate) const GUEST_CALLABLE_IMPORT: &'static str = "note";
+
+    /// Declares the schema of the controlled guest callable import.
     ///
-    /// Core attaches an empty `CallableEnvironment` container to every Lua
-    /// `CallableKind::Closure`, including a chunk-level function with no
-    /// captures, so `env.is_some()` alone would refuse every real Lua
-    /// callable. This slice admits only a callable with zero capture slots and
-    /// refuses any environment with captures before the slot changes; it does
-    /// not read or drop a capture graph. A live generation holds at most one
-    /// carrier, so a second bind, including one with a different Arc, is
-    /// refused and the stored Arc stays. A failed bind stores no Arc.
+    /// One untyped guest argument is the callable. The boolean result is
+    /// `true` when a live closure generation now holds the exact Arc and
+    /// `false` when the same VM's compiled prototype declares captures. The
+    /// caller cannot choose the count: [`admit_guest_callable`] reads the
+    /// prototype layout from the VM that invoked the import.
+    pub(crate) fn guest_callable_import_schema() -> HostFunctionSchema {
+        HostFunctionSchema::with_return(
+            Self::GUEST_CALLABLE_IMPORT,
+            vec![HostParamSchema::value("target", HostTypeSchema::Unknown)],
+            HostTypeSchema::Bool,
+        )
+    }
+
+    /// Registers the heap-owned callable import on one host registry.
+    ///
+    /// The caller supplies the schema compiled into its catalog. Only the
+    /// exact controlled shape is accepted. The dispatch function stays
+    /// private, so registering this import is the whole crate-visible
+    /// surface: no API accepts an `Arc<CallableValue>` and a bare count, and
+    /// no API accepts a caller-supplied `Value` together with a VM to mint an
+    /// admission. The import derives the capture count from the VM that
+    /// invokes it and from the value's prototype in that VM.
+    ///
+    /// This is a direct Lua producer, not an arbitrary host injection check.
+    /// Core's `Vm::owns_callable` is not visible here and `CallableValue`
+    /// carries no VM identity, so this entry does not claim that a callable
+    /// returned by some host belongs to this VM. The issuance evidence is the
+    /// guest argument itself.
+    pub(crate) fn register_guest_callable_import(
+        registry: &mut HostFunctionRegistry,
+        schema: HostImportSchema,
+    ) -> VmResult<u16> {
+        if schema.name != Self::GUEST_CALLABLE_IMPORT
+            || schema.params.len() != 1
+            || schema.params[0].name != "target"
+            || schema.params[0].schema != HostTypeSchema::Unknown
+            || schema.params[0].passing != vm::HostParamPassing::Value
+            || schema.return_type != HostTypeSchema::Bool
+        {
+            return Err(VmError::HostError(
+                "the guest callable import schema is not the heap-controlled shape".to_string(),
+            ));
+        }
+        registry.register_exact_static(Self::GUEST_CALLABLE_IMPORT, 1, schema, admit_guest_callable)
+    }
+
+    /// Stores one admitted callable on one live closure generation.
+    ///
+    /// Private to this module. The only non-test caller is
+    /// [`admit_guest_callable`], which derives `capture_slots` from the
+    /// invoking VM's compiled prototype. A live generation holds at most one
+    /// carrier, so a second store, including one with a different Arc, is
+    /// refused and the stored Arc stays. A failed store stores no Arc.
     ///
     /// The callable is one identity carrier like the issued table array: mark
     /// does not read it, it is not a root or an edge, and it does not add scan
     /// work. Release clears it with the slot, and a reused generation starts
     /// empty.
-    pub(crate) fn bind_closure_callable(
+    fn store_guest_callable(
         &mut self,
         closure: ClosureRef,
         callable: Arc<CallableValue>,
@@ -1698,7 +1828,17 @@ impl LuaHeap {
         }
         self.ensure_sweep_open()?;
         self.slots[index].carrier = Some(SlotCarrier::Callable(callable));
+        #[cfg(test)]
+        self.admitted_guest_callables.push(closure);
         Ok(())
+    }
+
+    /// Test-only: closure generations the controlled guest import admitted, in
+    /// admission order. Observation only; the stored Arcs stay private to the
+    /// slot carrier and no test can put a value back into this vector.
+    #[cfg(test)]
+    pub(crate) fn guest_callable_admissions(&self) -> &[ClosureRef] {
+        &self.admitted_guest_callables
     }
 
     /// Returns the exact Arc bound to one live closure generation.
@@ -4812,37 +4952,225 @@ impl<'a> SelectingPendingMark<'a> {
     }
 }
 
-/// Compile-surface guard for the private callable carrier in test binaries
-/// that do not run the file-entry witness. This does not fabricate a
-/// callable: `bind_closure_callable` is referenced by function type only,
-/// while the two handle-level refusals really run.
+/// Slot-level callable-carrier units. The business path (a real `.lua` guest
+/// import) is exercised by the file-entry witness; these units use fabricated
+/// `CallableValue` Arcs only to reach the private store and the generation
+/// mechanics that a guest cannot name directly. That is the narrow test-only
+/// scope for pure slot refusal; no production or dequeue path can call the
+/// store with a bare count.
 #[cfg(test)]
-mod callable_carrier_surface {
+mod callable_carrier_units {
     use super::*;
 
-    type BindFn = fn(&mut LuaHeap, ClosureRef, Arc<CallableValue>, usize) -> Result<(), HeapError>;
-    type GetFn = fn(&LuaHeap, ClosureRef) -> Result<Arc<CallableValue>, HeapError>;
-    type ProbeFn = fn(&LuaHeap, TableRef) -> ClosureRef;
+    fn callable(prototype_id: u32) -> Arc<CallableValue> {
+        Arc::new(CallableValue {
+            prototype_id,
+            kind: CallableKind::Closure,
+            env: None,
+        })
+    }
 
     #[test]
-    fn private_callable_carrier_surface_is_reachable() {
-        let _bind: BindFn = LuaHeap::bind_closure_callable;
-        let _get: GetFn = LuaHeap::closure_callable;
-        let _probe: ProbeFn = LuaHeap::closure_handle_for_table;
-
-        let mut foreign = LuaHeap::new(HeapLimits::production());
-        let foreign_handle = foreign.alloc_closure().expect("foreign closure");
+    fn slot_units_cover_rebind_capture_foreign_wrong_kind_and_table_carrier() {
         let mut heap = LuaHeap::new(HeapLimits::production());
+        let closure = heap.alloc_closure().expect("closure");
+        let first = callable(1);
+        let second = callable(2);
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "the two Arcs are distinct instances"
+        );
+
+        heap.store_guest_callable(closure, Arc::clone(&first), 0)
+            .expect("store first");
+        assert_eq!(
+            heap.guest_callable_admissions(),
+            &[closure],
+            "a successful store is the only thing that records an admission"
+        );
+        assert_eq!(
+            heap.store_guest_callable(closure, Arc::clone(&second), 0),
+            Err(HeapError::CarrierAlreadyBound),
+            "a same-generation rebind is refused"
+        );
+        {
+            let stored = heap.closure_callable(closure).expect("stored first");
+            assert!(
+                Arc::ptr_eq(&stored, &first),
+                "the refused rebind left the original Arc"
+            );
+            assert!(!Arc::ptr_eq(&stored, &second));
+        }
+        assert_eq!(Arc::strong_count(&first), 2, "local and slot");
+        assert_eq!(
+            Arc::strong_count(&second),
+            1,
+            "the refused Arc is not retained"
+        );
+
+        let fresh = heap.alloc_closure().expect("fresh closure");
+        let captured = callable(3);
+        let captured_before = Arc::strong_count(&captured);
+        assert_eq!(
+            heap.store_guest_callable(fresh, Arc::clone(&captured), 1),
+            Err(HeapError::CallableHasEnvironment),
+            "a capture count is refused before the slot changes"
+        );
+        assert_eq!(
+            Arc::strong_count(&captured),
+            captured_before,
+            "the refused store retains no Arc"
+        );
+        assert!(
+            matches!(
+                heap.closure_callable(fresh),
+                Err(HeapError::CarrierNotBound)
+            ),
+            "the refused generation stays unbound"
+        );
+
+        let unbound = heap.alloc_closure().expect("unbound closure");
         assert!(matches!(
-            heap.closure_callable(foreign_handle),
-            Err(HeapError::WrongDomain)
+            heap.closure_callable(unbound),
+            Err(HeapError::CarrierNotBound)
         ));
+
         let table = heap.alloc().expect("table");
         let wrong_kind = heap.closure_handle_for_table(table);
         assert!(matches!(
             heap.closure_callable(wrong_kind),
             Err(HeapError::WrongKind)
         ));
+        assert_eq!(
+            heap.store_guest_callable(wrong_kind, Arc::clone(&second), 0),
+            Err(HeapError::WrongKind)
+        );
+
+        let mut foreign_heap = LuaHeap::new(HeapLimits::production());
+        let foreign = foreign_heap.alloc_closure().expect("foreign closure");
+        assert!(matches!(
+            heap.closure_callable(foreign),
+            Err(HeapError::WrongDomain)
+        ));
+        assert_eq!(
+            heap.store_guest_callable(foreign, Arc::clone(&second), 0),
+            Err(HeapError::WrongDomain)
+        );
+
+        // The existing table carrier path stays one carrier per generation
+        // and is not a callable carrier.
+        let issued = heap.issue_carrier(table).expect("table carrier");
+        assert!(
+            matches!(issued, Value::Array(_)),
+            "the table carrier stays the issued VM array"
+        );
+        assert!(
+            matches!(heap.issue_carrier(table), Err(HeapError::StaleHandle)),
+            "a second issue for the live generation is refused"
+        );
+        assert!(matches!(
+            heap.closure_callable(wrong_kind),
+            Err(HeapError::WrongKind)
+        ));
+    }
+
+    #[test]
+    fn guest_import_schema_is_registered_only_in_the_controlled_shape() {
+        let schema = LuaHeap::guest_callable_import_schema();
+        assert_eq!(schema.name, LuaHeap::GUEST_CALLABLE_IMPORT);
+        assert_eq!(schema.params.len(), 1);
+        assert_eq!(schema.params[0].name, "target");
+        assert_eq!(schema.params[0].ty, HostTypeSchema::Unknown);
+        assert_eq!(schema.params[0].passing, vm::HostParamPassing::Value);
+        assert_eq!(schema.return_type, HostTypeSchema::Bool);
+
+        let mut builder = vm::HostApiBuilder::new();
+        builder.function(schema);
+        let catalog = builder.build().expect("controlled catalog");
+        let function = catalog
+            .function(LuaHeap::GUEST_CALLABLE_IMPORT)
+            .expect("declared function");
+        let import = HostImportSchema::from_function(&catalog, function);
+        let mut registry = HostFunctionRegistry::empty();
+        LuaHeap::register_guest_callable_import(&mut registry, import.clone())
+            .expect("the controlled import registers");
+
+        let mut tampered = import;
+        tampered.return_type = HostTypeSchema::Int;
+        let mut registry = HostFunctionRegistry::empty();
+        assert!(
+            LuaHeap::register_guest_callable_import(&mut registry, tampered).is_err(),
+            "a caller-supplied shape is not accepted as the controlled import"
+        );
+    }
+
+    #[test]
+    fn release_drops_one_arc_and_a_reused_generation_starts_unbound() {
+        let mut heap = LuaHeap::new(HeapLimits::production());
+        let first_slot = heap.alloc_closure().expect("first closure");
+        let first = callable(10);
+        heap.store_guest_callable(first_slot, Arc::clone(&first), 0)
+            .expect("store first");
+        assert_eq!(Arc::strong_count(&first), 2, "local and slot");
+
+        let report = heap.collect();
+        assert_eq!(
+            report.live_nodes, 0,
+            "the unrooted closure must be collected"
+        );
+        assert!(!heap.closure_alive(first_slot));
+        assert!(matches!(
+            heap.closure_callable(first_slot),
+            Err(HeapError::StaleHandle)
+        ));
+        assert_eq!(
+            Arc::strong_count(&first),
+            1,
+            "release dropped exactly the slot's one Arc"
+        );
+        assert_eq!(
+            heap.slot_generation(first_slot.slot()),
+            Some(first_slot.generation() + 1),
+            "release advanced the slot generation"
+        );
+
+        let reused = heap.alloc_closure().expect("reuse the released slot");
+        assert_eq!(reused.slot(), first_slot.slot());
+        assert_eq!(reused.generation(), first_slot.generation() + 1);
+        assert!(
+            matches!(
+                heap.closure_callable(reused),
+                Err(HeapError::CarrierNotBound)
+            ),
+            "a reused generation starts unbound"
+        );
+
+        let second = callable(11);
+        heap.store_guest_callable(reused, Arc::clone(&second), 0)
+            .expect("store on the reused generation");
+        assert_eq!(
+            heap.guest_callable_admissions(),
+            &[first_slot, reused],
+            "each admitted generation is recorded once, in order"
+        );
+        {
+            let stored = heap.closure_callable(reused).expect("stored second");
+            assert!(
+                Arc::ptr_eq(&stored, &second),
+                "the reused generation returns the new Arc"
+            );
+            assert!(
+                !Arc::ptr_eq(&stored, &first),
+                "the reused generation cannot return the old Arc"
+            );
+        }
+        assert!(
+            matches!(
+                heap.closure_callable(first_slot),
+                Err(HeapError::StaleHandle)
+            ),
+            "the old generation stays stale after reuse"
+        );
     }
 }
 

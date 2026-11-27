@@ -3,37 +3,47 @@
 //! One real `.lua` file is fed through the real lexer, parser, resolver and
 //! private completion lowering, compiled through the fixed Core and run in one
 //! interpreter VM with JIT disabled. The fixture writes three real callables
-//! and hands each to the private `note` import as an ordinary guest argument.
-//! That guest binding call is the issuance evidence: the host receives the
-//! exact `SharedCallable` the same VM produced, and this module never builds a
-//! `CallableValue` itself.
+//! and hands each to the heap-owned `note` admission import as an ordinary
+//! guest argument. That guest call is the issuance evidence: the host side
+//! receives the exact `SharedCallable` the same VM produced, and this module
+//! never builds a `CallableValue` itself.
 //!
-//! The host registers the two no-capture chunk-level callables on two live
-//! closure nodes. Core's Lua frontend compiles every function literal as
-//! `CallableKind::Closure` and attaches an empty `CallableEnvironment`
-//! container even when the compiled prototype declares no captures, so the
-//! narrow admission is the exact capture count, not the container bit. The run
-//! log records `env=true captures=0` for both admitted functions and
-//! `captures=1` for the refused captured function; a literal `env.is_none()`
-//! admission has no producer in this frontend. After the single `Vm::run` the
-//! test uses the real heap collector:
+//! The import is not a raw `Arc + count` entry. Its dispatch function is
+//! private to the heap storage module, derives the capture count from this
+//! VM's compiled prototype for the value, and refuses any prototype with a
+//! capture before the heap changes. The test compile catalog only adds the
+//! heap-owned schema and registers the heap-owned import. The test never sees
+//! a function that accepts an `Arc<CallableValue>` and a caller-chosen count,
+//! so the RED that admitted a real captured callable with a bare `0` cannot be
+//! expressed against the final surface.
+//!
+//! Core attaches an empty `CallableEnvironment` container even to a
+//! chunk-level Lua function with no captures, so the narrow admission is the
+//! exact compiled capture count, not the container bit. The run log records
+//! `rooted captures=0 admitted=true`, `unrooted captures=0 admitted=true`, and
+//! `captured captures=1 admitted=false`; a literal `env.is_none()` admission
+//! has no producer in this frontend. After the single `Vm::run` the test uses
+//! the real heap collector:
 //!
 //! - the registered node with an explicit Lua root survives a real collection
 //!   and still returns the exact `Arc`;
 //! - the independently registered node without a root is really collected even
-//!   though the VM and the witness still hold live Arcs to that callable, so
+//!   though the VM stack and the test still hold live Arcs to that callable, so
 //!   the carrier is not a root or a mark edge;
+//! - the captured callable is refused by the import, receives no closure
+//!   generation, and its Arc is never stored;
 //! - clearing the only root and collecting drops exactly the one Arc the slot
-//!   held, measured on the witness Arc without a temporary clone and checked
+//!   held, measured on a local Arc without a temporary clone and checked
 //!   against the cleared slot;
 //! - the next generation of the same slot starts unbound and rejects the old
-//!   handle, then accepts and returns another real Arc.
+//!   handle.
 //!
-//! Direct controls after that run cover a second bind with a different Arc,
-//! an unbound generation, a foreign-domain same-shape handle, a wrong-kind
-//! handle naming a live table slot, and a callable with a real capture. No
-//! later VM run and no fabricated callable is used. The capture graph, real
-//! finalizers, queue dequeue, and production admission are outside this slice.
+//! Pure slot semantics that a guest cannot name directly — same-generation
+//! rebind, store-level capture refusal, foreign-domain store, wrong-kind store,
+//! and the existing table carrier — are units inside the storage module's own
+//! `cfg(test)` scope. Those units use fabricated Arcs only to reach the private
+//! store; they are not a business admission path. No queue dequeue, finalizer,
+//! or production admission is added by this slice.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -47,37 +57,13 @@ use vm::{
 };
 
 use super::{FUEL_BUDGET, FUEL_CHECK_INTERVAL, lower};
-use crate::heap::{self, ClosureRef, HeapError, HeapLimits, LuaHeap};
+use crate::heap::{self, HeapError, HeapLimits, LuaHeap};
 
 const FIXTURE: &str = "callable_carrier.lua";
 
-/// The stage label the last marker host recorded. `note` attaches it to the
-/// registration it is about to perform.
-static STAGE: Mutex<Option<String>> = Mutex::new(None);
-
-/// The observation of the one admitted run. This module runs one test body, so
-/// a process-wide slot carries the same record a per-run handle would.
-static WITNESS: Mutex<Option<Witness>> = Mutex::new(None);
-
-#[derive(Clone, Debug)]
-struct Registration {
-    stage: String,
-    callable: Arc<CallableValue>,
-    /// `Some` only for the two no-capture callables the host registered.
-    handle: Option<ClosureRef>,
-    /// Core's `env` field. The Lua frontend's `CallableKind::Closure` builds an
-    /// empty `CallableEnvironment` even for a chunk-level function with no
-    /// captures, so this is the container bit, not the capture count.
-    environment: bool,
-    /// Exact compiled prototype capture count read from the same VM.
-    captures: usize,
-}
-
-#[derive(Clone, Debug, Default)]
-struct Witness {
-    marks: Vec<String>,
-    registrations: Vec<Registration>,
-}
+/// Stage labels recorded by the test-owned `mark` import. The admission import
+/// is heap-owned; this marker only orders the guest calls that reach it.
+static STAGE: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 fn carrier_catalog() -> &'static Arc<HostApiCatalog> {
     static CATALOG: OnceLock<Arc<HostApiCatalog>> = OnceLock::new();
@@ -88,13 +74,10 @@ fn carrier_catalog() -> &'static Arc<HostApiCatalog> {
             vec![HostParamSchema::value("label", HostTypeSchema::String)],
             HostTypeSchema::Int,
         ));
-        // One ordinary guest-written callable argument. The return is an
-        // integer the fixture ignores; the registration is the observation.
-        builder.function(HostFunctionSchema::with_return(
-            "note",
-            vec![HostParamSchema::value("target", HostTypeSchema::Unknown)],
-            HostTypeSchema::Int,
-        ));
+        // The heap owns this schema and dispatch. The test adds the exact
+        // declared shape to its compile catalog; it does not define the
+        // admission behavior.
+        builder.function(LuaHeap::guest_callable_import_schema());
         Arc::new(builder.build().expect("callable carrier catalog"))
     })
 }
@@ -110,7 +93,10 @@ fn catalog_schema(name: &str) -> HostImportSchema {
 fn bind_hosts(vm: &mut Vm) -> Result<(), VmError> {
     let mut registry = HostFunctionRegistry::empty();
     registry.register_exact_static("mark", 1, catalog_schema("mark"), host_mark)?;
-    registry.register_exact_static("note", 1, catalog_schema("note"), host_note)?;
+    LuaHeap::register_guest_callable_import(
+        &mut registry,
+        catalog_schema(LuaHeap::GUEST_CALLABLE_IMPORT),
+    )?;
     registry.bind_vm_cached(vm)
 }
 
@@ -118,79 +104,16 @@ fn host_fault(message: impl Into<String>) -> VmError {
     VmError::HostError(message.into())
 }
 
-fn heap_fault(error: HeapError) -> VmError {
-    VmError::HostError(format!("lua heap: {error:?}"))
-}
-
-/// Records the stage label. The next `note` attaches it to its registration.
+/// Records the stage label. The next heap-owned admission is ordered after it
+/// by the guest program, not by a shared host slot.
 fn host_mark(_vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
     let [Value::String(label)] = args else {
         return Err(host_fault("mark expects one string label"));
     };
     let label = label.as_str().to_string();
-    *STAGE.lock().expect("callable carrier stage") = Some(label.clone());
-    with_witness(|witness| witness.marks.push(label));
+    eprintln!("LUA_CALLABLE_CARRIER stage={label}");
+    STAGE.lock().expect("callable carrier stage").push(label);
     Ok(CallOutcome::Return(CallReturn::one(Value::Int(0))))
-}
-
-/// Receives one exact guest-written callable. A callable whose compiled
-/// prototype has no capture slots is registered on a fresh closure node
-/// through the private heap entry; a callable with a real capture is recorded
-/// but not allocated, because the narrow refusal is exercised directly after
-/// the run.
-fn host_note(vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
-    let [value] = args else {
-        return Err(host_fault("note expects one callable argument"));
-    };
-    let Value::Callable(callable) = value else {
-        return Err(host_fault(format!(
-            "note expected a guest callable, got {value:?}"
-        )));
-    };
-    let stage = STAGE
-        .lock()
-        .expect("callable carrier stage")
-        .take()
-        .unwrap_or_else(|| "unlabelled".to_string());
-    let environment = callable.env.is_some();
-    let prototype = vm
-        .program()
-        .callable_prototypes
-        .get(callable.prototype_id as usize)
-        .ok_or_else(|| host_fault("the guest callable names no compiled prototype"))?;
-    let captures = prototype.capture_slots.len();
-    eprintln!(
-        "LUA_CALLABLE_CARRIER stage={stage} kind={:?} env={} captures={captures}",
-        callable.kind, environment
-    );
-    let mut handle = None;
-    if captures == 0 {
-        let mut host = vm.host_context();
-        let closure = heap::with_heap(&mut host, LuaHeap::alloc_closure).map_err(heap_fault)?;
-        heap::with_heap(&mut host, |heap| {
-            heap.bind_closure_callable(closure, Arc::clone(callable), captures)
-        })
-        .map_err(heap_fault)?;
-        handle = Some(closure);
-    }
-    with_witness(|witness| {
-        witness.registrations.push(Registration {
-            stage,
-            callable: Arc::clone(callable),
-            handle,
-            environment,
-            captures,
-        });
-    });
-    Ok(CallOutcome::Return(CallReturn::one(Value::Int(0))))
-}
-
-fn with_witness<T>(body: impl FnOnce(&mut Witness) -> T) -> T {
-    let mut guard = WITNESS.lock().expect("callable carrier witness");
-    let witness = guard
-        .as_mut()
-        .expect("the callable carrier witness must be installed before the run");
-    body(witness)
 }
 
 struct CarrierPlugin;
@@ -229,13 +152,12 @@ struct CarrierRun {
     vm: Vm,
     status: Result<VmStatus, VmError>,
     stack: Vec<Value>,
-    witness: Witness,
+    stages: Vec<String>,
     fuel_consumed: u64,
 }
 
 fn run_fixture() -> CarrierRun {
-    *STAGE.lock().expect("callable carrier stage") = None;
-    *WITNESS.lock().expect("callable carrier witness") = Some(Witness::default());
+    STAGE.lock().expect("callable carrier stage").clear();
 
     let options = CompileSourceFileOptions::new()
         .with_source_plugin(&CARRIER_PLUGIN)
@@ -265,21 +187,18 @@ fn run_fixture() -> CarrierRun {
         .checked_sub(remaining)
         .unwrap_or_else(|| panic!("callable carrier: fuel increased"));
     let stack = runtime.stack().to_vec();
-    let witness = WITNESS
-        .lock()
-        .expect("callable carrier witness")
-        .take()
-        .unwrap_or_else(|| panic!("callable carrier: the witness was not installed"));
+    let stages = std::mem::take(&mut *STAGE.lock().expect("callable carrier stage"));
     CarrierRun {
         vm: runtime,
         status,
         stack,
-        witness,
+        stages,
         fuel_consumed,
     }
 }
 
-/// The one completion array of the chunk: `[true, rooted, unrooted, captured]`.
+/// The one completion array of the chunk:
+/// `[true, rooted, unrooted, captured, rooted_ok, unrooted_ok, captured_ok]`.
 fn exit_items(stack: &[Value]) -> &[Value] {
     let [Value::Array(items)] = stack else {
         panic!("callable carrier: expected the one completion array, got {stack:?}");
@@ -287,11 +206,25 @@ fn exit_items(stack: &[Value]) -> &[Value] {
     items.as_slice()
 }
 
-fn same_callable(left: &Value, right: &Arc<CallableValue>) -> bool {
-    match left {
-        Value::Callable(left) => Arc::ptr_eq(left, right),
-        _ => false,
+fn callable_item(value: &Value) -> Arc<CallableValue> {
+    match value {
+        Value::Callable(callable) => Arc::clone(callable),
+        other => panic!("callable carrier: expected a callable, got {other:?}"),
     }
+}
+
+fn prototype_captures(vm: &Vm, callable: &Arc<CallableValue>) -> usize {
+    vm.program()
+        .callable_prototypes
+        .get(callable.prototype_id as usize)
+        .unwrap_or_else(|| {
+            panic!(
+                "callable carrier: prototype {} is outside this VM",
+                callable.prototype_id
+            )
+        })
+        .capture_slots
+        .len()
 }
 
 fn heap_with<T>(vm: &mut Vm, body: impl FnOnce(&mut LuaHeap) -> Result<T, HeapError>) -> T {
@@ -330,109 +263,117 @@ fn core_callable_follows_closure_generation_registration_and_release() {
         run.fuel_consumed
     );
     assert_eq!(
-        run.witness.marks,
-        [
-            "register-rooted",
-            "register-unrooted",
-            "register-environment",
-            "done"
+        run.stages,
+        vec![
+            "register-rooted".to_string(),
+            "register-unrooted".to_string(),
+            "register-environment".to_string(),
+            "done".to_string()
         ],
-        "callable carrier: each real guest binding must reach the host once"
-    );
-    assert_eq!(
-        run.witness.registrations.len(),
-        3,
-        "callable carrier: three guest-written callables must reach the host"
+        "callable carrier: each real guest binding must reach the marker once"
     );
 
-    let mut registrations = run.witness.registrations.into_iter();
-    let rooted = registrations.next().expect("rooted registration");
-    let unrooted = registrations.next().expect("unrooted registration");
-    let environment = registrations.next().expect("environment registration");
+    let (rooted, unrooted, captured, rooted_ok, unrooted_ok, captured_ok) = {
+        let items = exit_items(&run.stack);
+        assert_eq!(
+            items.len(),
+            7,
+            "callable carrier: [true] plus three callables and three admission results"
+        );
+        assert_eq!(items[0], Value::Bool(true));
+        match (&items[4], &items[5], &items[6]) {
+            (Value::Bool(rooted_ok), Value::Bool(unrooted_ok), Value::Bool(captured_ok)) => (
+                callable_item(&items[1]),
+                callable_item(&items[2]),
+                callable_item(&items[3]),
+                *rooted_ok,
+                *unrooted_ok,
+                *captured_ok,
+            ),
+            other => panic!("callable carrier: expected three boolean results, got {other:?}"),
+        }
+    };
     assert!(
-        registrations.next().is_none(),
-        "callable carrier: no extra registration"
-    );
-    assert_eq!(rooted.stage, "register-rooted");
-    assert_eq!(unrooted.stage, "register-unrooted");
-    assert_eq!(environment.stage, "register-environment");
-    assert_eq!(
-        rooted.captures, 0,
-        "the chunk-level function has no captures"
-    );
-    assert_eq!(
-        unrooted.captures, 0,
-        "the chunk-level function has no captures"
-    );
-    assert!(
-        rooted.environment && unrooted.environment,
-        "Core attaches an empty environment container to every Lua closure"
-    );
-    assert!(
-        environment.captures > 0,
-        "the captured nested function must have a real capture"
-    );
-    assert!(environment.environment);
-    assert!(rooted.handle.is_some());
-    assert!(unrooted.handle.is_some());
-    assert!(
-        environment.handle.is_none(),
-        "the environment-bearing value must not be registered during the run"
-    );
-    assert!(
-        !Arc::ptr_eq(&rooted.callable, &unrooted.callable),
+        !Arc::ptr_eq(&rooted, &unrooted),
         "the two chunk-level functions must be distinct Core Arcs"
     );
+    assert!(
+        !Arc::ptr_eq(&rooted, &captured),
+        "the captured function is a third Core Arc"
+    );
+    assert!(
+        rooted_ok && unrooted_ok,
+        "the two zero-capture callables must be admitted"
+    );
+    assert!(
+        !captured_ok,
+        "the captured callable must be refused by the heap-owned import"
+    );
 
-    let items = exit_items(&run.stack);
+    let rooted_captures = prototype_captures(&run.vm, &rooted);
+    let unrooted_captures = prototype_captures(&run.vm, &unrooted);
+    let captured_captures = prototype_captures(&run.vm, &captured);
     assert_eq!(
-        items.len(),
-        4,
-        "callable carrier: [true] plus three callables"
+        rooted_captures, 0,
+        "the chunk-level function has no captures"
     );
-    assert_eq!(items[0], Value::Bool(true));
-    assert!(
-        same_callable(&items[1], &rooted.callable),
-        "the chunk must return the first registered Arc"
+    assert_eq!(
+        unrooted_captures, 0,
+        "the chunk-level function has no captures"
     );
-    assert!(
-        same_callable(&items[2], &unrooted.callable),
-        "the chunk must return the second registered Arc"
+    assert_eq!(
+        captured_captures, 1,
+        "the captured nested function has one real capture"
     );
     assert!(
-        same_callable(&items[3], &environment.callable),
-        "the chunk must return the captured callable"
+        rooted.env.is_some() && unrooted.env.is_some(),
+        "Core attaches an empty environment container even to a zero-capture closure"
+    );
+    assert!(
+        captured.env.is_some(),
+        "the captured callable carries the same container bit"
+    );
+    eprintln!(
+        "LUA_CALLABLE_CARRIER real rooted captures={rooted_captures} admitted={rooted_ok} \
+         unrooted captures={unrooted_captures} admitted={unrooted_ok} \
+         captured captures={captured_captures} admitted={captured_ok}"
     );
 
-    let rooted_handle = rooted.handle.expect("rooted handle");
-    let unrooted_handle = unrooted.handle.expect("unrooted handle");
+    let admissions = heap_with(&mut run.vm, |heap| {
+        Ok(heap.guest_callable_admissions().to_vec())
+    });
+    assert_eq!(
+        admissions.len(),
+        2,
+        "only the two zero-capture guest callables may receive a closure generation"
+    );
+    let rooted_handle = admissions[0];
+    let unrooted_handle = admissions[1];
     assert_eq!(rooted_handle.domain(), unrooted_handle.domain());
     assert_ne!(rooted_handle.slot(), unrooted_handle.slot());
     let unrooted_generation = unrooted_handle.generation();
 
-    // A live generation holds one carrier. A different real Arc must not
-    // replace it, and the original identity must still come back.
-    heap_with(&mut run.vm, |heap| {
-        assert_eq!(
-            heap.bind_closure_callable(
-                unrooted_handle,
-                Arc::clone(&rooted.callable),
-                rooted.captures,
-            ),
-            Err(HeapError::CarrierAlreadyBound)
-        );
-        Ok(())
-    });
+    // The stored identity is exactly the Arc the guest returned, and the
+    // refused captured Arc was never stored on either admitted generation.
     {
-        let stored = heap_with(&mut run.vm, |heap| heap.closure_callable(unrooted_handle));
+        let stored_rooted = heap_with(&mut run.vm, |heap| heap.closure_callable(rooted_handle));
         assert!(
-            Arc::ptr_eq(&stored, &unrooted.callable),
-            "a refused rebind must leave the original Arc"
+            Arc::ptr_eq(&stored_rooted, &rooted),
+            "the rooted generation must return the exact guest Arc"
+        );
+        let stored_unrooted = heap_with(&mut run.vm, |heap| heap.closure_callable(unrooted_handle));
+        assert!(
+            Arc::ptr_eq(&stored_unrooted, &unrooted),
+            "the unrooted generation must return the exact guest Arc"
+        );
+        assert!(
+            !Arc::ptr_eq(&stored_unrooted, &captured),
+            "the captured Arc must not be stored on an admitted generation"
         );
     }
 
     // No temporary clone is alive between these counts and the collections.
-    let unrooted_count_before = Arc::strong_count(&unrooted.callable);
+    let unrooted_count_before = Arc::strong_count(&unrooted);
 
     let frame = heap_with(&mut run.vm, |heap| heap.enter_roots(1));
     heap_with(&mut run.vm, |heap| {
@@ -454,7 +395,7 @@ fn core_callable_follows_closure_generation_registration_and_release() {
     {
         let stored = heap_with(&mut run.vm, |heap| heap.closure_callable(rooted_handle));
         assert!(
-            Arc::ptr_eq(&stored, &rooted.callable),
+            Arc::ptr_eq(&stored, &rooted),
             "the rooted generation must still return the exact Arc"
         );
     }
@@ -469,7 +410,7 @@ fn core_callable_follows_closure_generation_registration_and_release() {
         ),
         "the collected generation must refuse its old handle"
     );
-    let unrooted_count_after = Arc::strong_count(&unrooted.callable);
+    let unrooted_count_after = Arc::strong_count(&unrooted);
     eprintln!(
         "LUA_CALLABLE_CARRIER unrooted strong before={unrooted_count_before} after={unrooted_count_after} live={} marked={}",
         first.live_nodes, first.marked_nodes
@@ -477,7 +418,7 @@ fn core_callable_follows_closure_generation_registration_and_release() {
     assert_eq!(
         unrooted_count_after,
         unrooted_count_before - 1,
-        "the collected slot must release exactly its one Arc; the VM and witness Arcs stay"
+        "the collected slot must release exactly its one Arc; the VM stack and the test Arcs stay"
     );
     assert!(
         unrooted_count_after > 0,
@@ -492,15 +433,15 @@ fn core_callable_follows_closure_generation_registration_and_release() {
     );
 
     // Remove the only Lua root and collect. The slot's one Arc is released
-    // even though the VM stack and the witness still own live Arcs.
-    let rooted_count_before = Arc::strong_count(&rooted.callable);
+    // even though the VM stack and the test still own live Arcs.
+    let rooted_count_before = Arc::strong_count(&rooted);
     heap_with(&mut run.vm, |heap| heap.clear_root(frame, 0));
     let second = heap_collect(&mut run.vm);
     assert_eq!(
         second.live_nodes, 0,
         "both registered generations are unreachable after the only root is cleared"
     );
-    let rooted_count_after = Arc::strong_count(&rooted.callable);
+    let rooted_count_after = Arc::strong_count(&rooted);
     eprintln!(
         "LUA_CALLABLE_CARRIER rooted strong before={rooted_count_before} after={rooted_count_after} live={}",
         second.live_nodes
@@ -528,8 +469,8 @@ fn core_callable_follows_closure_generation_registration_and_release() {
     heap_with(&mut run.vm, |heap| heap.leave_roots(frame));
 
     // Reuse the freed slot at the next generation. It must start unbound, and
-    // only the newly registered Arc may be returned. The old handles stay
-    // stale, so the old Arc cannot be recovered from the new generation.
+    // the old handles stay stale, so the old Arc cannot be recovered from the
+    // new generation.
     let reused = heap_with(&mut run.vm, |heap| heap.alloc_closure());
     assert_eq!(
         reused.slot(),
@@ -548,20 +489,6 @@ fn core_callable_follows_closure_generation_registration_and_release() {
         ),
         "a reused generation must start with no carrier"
     );
-    heap_with(&mut run.vm, |heap| {
-        heap.bind_closure_callable(reused, Arc::clone(&unrooted.callable), unrooted.captures)
-    });
-    {
-        let stored = heap_with(&mut run.vm, |heap| heap.closure_callable(reused));
-        assert!(
-            Arc::ptr_eq(&stored, &unrooted.callable),
-            "the reused generation must return the newly registered real Arc"
-        );
-        assert!(
-            !Arc::ptr_eq(&stored, &rooted.callable),
-            "the reused generation must not return the old Arc"
-        );
-    }
     assert!(
         matches!(
             heap_try(&mut run.vm, |heap| heap.closure_callable(rooted_handle)),
@@ -579,17 +506,14 @@ fn core_callable_follows_closure_generation_registration_and_release() {
 
     // A same-shape closure from another heap is a different domain, and a
     // closure handle naming a live table is the wrong kind. Both are refused
-    // before any carrier is read or written.
+    // before any carrier is read. The store-side refusal for these handles is
+    // covered by the storage module's own unit test.
     let mut foreign_heap = LuaHeap::new(HeapLimits::production());
     let foreign = foreign_heap.alloc_closure().expect("foreign closure");
     heap_with(&mut run.vm, |heap| {
         assert!(
             matches!(heap.closure_callable(foreign), Err(HeapError::WrongDomain)),
             "a foreign-domain handle must be refused"
-        );
-        assert_eq!(
-            heap.bind_closure_callable(foreign, Arc::clone(&unrooted.callable), unrooted.captures),
-            Err(HeapError::WrongDomain)
         );
         Ok(())
     });
@@ -601,43 +525,7 @@ fn core_callable_follows_closure_generation_registration_and_release() {
             matches!(heap.closure_callable(wrong_kind), Err(HeapError::WrongKind)),
             "a closure handle naming a live table must be the wrong kind"
         );
-        assert_eq!(
-            heap.bind_closure_callable(
-                wrong_kind,
-                Arc::clone(&unrooted.callable),
-                unrooted.captures
-            ),
-            Err(HeapError::WrongKind)
-        );
         Ok(())
     });
     heap_with(&mut run.vm, |heap| heap.rollback(table));
-
-    // The environment-bearing callable is a real value from the same file. Its
-    // narrow refusal must leave the fresh generation unbound and hold no Arc.
-    let environment_slot = heap_with(&mut run.vm, |heap| heap.alloc_closure());
-    let environment_count_before = Arc::strong_count(&environment.callable);
-    heap_with(&mut run.vm, |heap| {
-        assert_eq!(
-            heap.bind_closure_callable(
-                environment_slot,
-                Arc::clone(&environment.callable),
-                environment.captures,
-            ),
-            Err(HeapError::CallableHasEnvironment)
-        );
-        Ok(())
-    });
-    assert_eq!(
-        Arc::strong_count(&environment.callable),
-        environment_count_before,
-        "the refused environment bind must not retain an Arc"
-    );
-    assert!(
-        matches!(
-            heap_try(&mut run.vm, |heap| heap.closure_callable(environment_slot)),
-            Err(HeapError::CarrierNotBound)
-        ),
-        "the refused environment bind must leave the generation unbound"
-    );
 }
