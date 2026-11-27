@@ -1,6 +1,18 @@
 mod expr;
 mod support;
 
+// Private syntax modules for the locked LuaJIT 5.2-compat grammar.
+// Production lowering still goes through expr/support until a later phase
+// switches the file entry. These modules are not a second execution entry.
+#[allow(dead_code)]
+mod ast;
+#[allow(dead_code)]
+mod lexer;
+#[allow(dead_code)]
+mod parser;
+#[allow(dead_code)]
+mod resolve;
+
 use expr::{
     LuaDirectLowering, build_lua_unpack_get_expr, parse_lua_direct_expr, parse_lua_direct_expr_top,
 };

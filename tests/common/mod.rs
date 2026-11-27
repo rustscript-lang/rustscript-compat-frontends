@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use vm::{
     Assembler, BytecodeBuilder, CallOutcome, CompileSourceFileOptions, Compiler, Expr,
@@ -173,12 +174,30 @@ fn unwrap_source_error(err: vm::SourcePathError, case: &str) -> vm::SourceError 
 
 const FROZEN_STRINGS_RSS: &str = include_str!("../fixtures/frozen_stdlib/strings.rss");
 
-pub fn staged_example_path(file_name: &str) -> PathBuf {
-    let root = std::env::var_os("CARGO_TARGET_DIR")
+fn claim_staged_example_root() -> PathBuf {
+    let parent = std::env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
-        .join("compat-frontends-staged-examples")
-        .join(file_name);
+        .join("compat-frontends-staged-examples");
+    fs::create_dir_all(&parent).expect("staged examples parent");
+    // pid separates processes and the counter separates threads. create_dir is
+    // the claim: an existing name is skipped, not reused. Do not scan a shared
+    // index from zero, and do not use time as the only name.
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id();
+    loop {
+        let ticket = NEXT.fetch_add(1, Ordering::Relaxed);
+        let root = parent.join(format!("{pid}-{ticket}"));
+        match fs::create_dir(&root) {
+            Ok(()) => return root,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!("claim staged example root: {error}"),
+        }
+    }
+}
+
+pub fn staged_example_path(file_name: &str) -> PathBuf {
+    let root = claim_staged_example_root();
     let examples_dir = root.join("compat").join("examples");
     let stdlib = root
         .join("rustscript")

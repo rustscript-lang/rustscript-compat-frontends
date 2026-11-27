@@ -1,0 +1,1969 @@
+//! Differential syntax checks against a locked LuaJIT 2.1 binary.
+//!
+//! Ordinary Cargo does not spawn LuaJIT. Set LUAJIT_ORACLE to the luajit
+//! built from 96f7b297 with XCFLAGS=-DLUAJIT_ENABLE_LUA52COMPAT to compare
+//! load(source, "@probe", "t"). jit.version is a runtime baseline, not the
+//! source identity. This is not a second public file entry.
+
+#[path = "../../src/frontends/lua/ast.rs"]
+mod ast;
+#[path = "../../src/frontends/lua/lexer.rs"]
+mod lexer;
+#[path = "../../src/frontends/lua/parser.rs"]
+mod parser;
+#[path = "../../src/frontends/lua/resolve.rs"]
+mod resolve;
+
+use std::io::Write;
+use std::process::{Command, Stdio};
+
+use ast::Stmt;
+
+const ORACLE_SHA: &str = "96f7b297326e9fd454b7186c6858b2773f94a0dc";
+const ORACLE_VERSION_BASELINE: &str = "LuaJIT 2.1.1795119671";
+
+const LOAD_DRIVER: &str = "\
+local src = io.read('*a')
+local fn = load(src, '@probe', 't')
+if fn then
+  io.write('ACCEPT\\n')
+else
+  io.write('REJECT\\n')
+end
+";
+
+const BASELINE_DRIVER: &str = "\
+io.write(jit.version, '\\n')
+local g = load('local goto = 1', '@g', 't')
+local b = load('for i=1,2 do break print(i) end', '@b', 't')
+io.write(g and 'BAD_GOTO' or 'GOTO_KW', '\\n')
+io.write(b and 'BREAK_OK' or 'BREAK_BAD', '\\n')
+io.write(type(table.pack), '\\n')
+";
+
+fn configured_oracle() -> Option<String> {
+    std::env::var("LUAJIT_ORACLE").ok()
+}
+
+fn syntax_ok(source: &[u8]) -> bool {
+    match parser::parse_chunk(source) {
+        Ok(chunk) => {
+            let resolution = resolve::resolve(&chunk);
+            resolution.errors.is_empty() && resolution.limits.is_empty()
+        }
+        Err(_) => false,
+    }
+}
+
+fn spawn_oracle(path: &str, args: &[&str], stdin_bytes: Option<&[u8]>) -> std::process::Output {
+    let mut cmd = Command::new(path);
+    // Pin is -joff. Drop Lua startup files so load() sees only the driver.
+    cmd.arg("-joff").args(args);
+    for (key, _) in std::env::vars() {
+        if key.starts_with("LUA") {
+            cmd.env_remove(&key);
+        }
+    }
+    cmd.stdin(if stdin_bytes.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    #[cfg(target_os = "linux")]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(limit_oracle_child);
+    }
+    let mut child = cmd.spawn().unwrap_or_else(|err| {
+        panic!("LUAJIT_ORACLE at {path:?} failed to start: {err}");
+    });
+    if let Some(bytes) = stdin_bytes {
+        let mut input = child
+            .stdin
+            .take()
+            .unwrap_or_else(|| panic!("LUAJIT_ORACLE at {path:?} has no stdin pipe"));
+        input.write_all(bytes).unwrap_or_else(|err| {
+            panic!("LUAJIT_ORACLE at {path:?} rejected stdin: {err}");
+        });
+    }
+    child.wait_with_output().unwrap_or_else(|err| {
+        panic!("LUAJIT_ORACLE at {path:?} failed while waiting: {err}");
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn limit_oracle_child() -> std::io::Result<()> {
+    #[repr(C)]
+    struct RLimit {
+        cur: u64,
+        max: u64,
+    }
+    unsafe extern "C" {
+        fn setrlimit(resource: i32, rlim: *const RLimit) -> i32;
+        fn alarm(seconds: u32) -> u32;
+        fn _exit(code: i32) -> !;
+    }
+    const RLIMIT_CPU: i32 = 0;
+    const RLIMIT_AS: i32 = 9;
+    let cpu = RLimit { cur: 2, max: 2 };
+    let address = RLimit {
+        cur: 128 * 1024 * 1024,
+        max: 128 * 1024 * 1024,
+    };
+    unsafe {
+        if setrlimit(RLIMIT_CPU, &cpu) != 0 || setrlimit(RLIMIT_AS, &address) != 0 {
+            _exit(126);
+        }
+        alarm(5);
+    }
+    Ok(())
+}
+
+fn require_success(path: &str, output: &std::process::Output, what: &str) {
+    if output.status.success() && output.stderr.is_empty() {
+        return;
+    }
+    panic!(
+        "LUAJIT_ORACLE at {path:?} {what} failed: status={} stdout={:?} stderr={:?}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn assert_oracle_baseline(path: &str) {
+    let output = spawn_oracle(path, &["-e", BASELINE_DRIVER], None);
+    require_success(path, &output, "baseline");
+    let text = String::from_utf8_lossy(&output.stdout);
+    let expected = format!("{ORACLE_VERSION_BASELINE}\nGOTO_KW\nBREAK_OK\nfunction\n");
+    assert_eq!(
+        text, expected,
+        "oracle flag/version baseline mismatch; jit.version is not source identity (source commit {ORACLE_SHA})"
+    );
+    eprintln!(
+        "oracle baseline jit.version={ORACLE_VERSION_BASELINE} (version string is not source identity); source commit {ORACLE_SHA}"
+    );
+}
+
+fn oracle_accepts(path: &str, source: &[u8]) -> bool {
+    let output = spawn_oracle(path, &["-e", LOAD_DRIVER], Some(source));
+    require_success(path, &output, "load protocol");
+    match output.stdout.as_slice() {
+        b"ACCEPT\n" => true,
+        b"REJECT\n" => false,
+        other => panic!(
+            "LUAJIT_ORACLE at {path:?} broke the ACCEPT/REJECT protocol: {:?}",
+            String::from_utf8_lossy(other)
+        ),
+    }
+}
+
+#[test]
+fn oracle_config_accepts_52_markers() {
+    let Some(path) = configured_oracle() else {
+        eprintln!("oracle baseline not run: LUAJIT_ORACLE unset; not a differential GREEN");
+        return;
+    };
+    assert_oracle_baseline(&path);
+}
+
+fn cases() -> Vec<(&'static str, &'static [u8])> {
+    vec![
+        ("empty", b""),
+        ("semi", b";;;"),
+        ("return_one", b"return 1"),
+        ("bare_num", b"42"),
+        ("floor_div", b"return 7//2"),
+        ("elif", b"if true then 1 elif false then 2 end"),
+        ("pub_fn", b"pub fn f() end"),
+        ("local_goto", b"local goto = 1"),
+        ("break_mid", b"for i=1,2 do break print(i) end"),
+        ("break_out", b"break"),
+        ("continue_out", b"continue"),
+        ("continue_ok", b"while true do continue end"),
+        ("continue_mid", b"while true do continue print(1) end"),
+        ("continue_name", b"local continue = 1"),
+        ("const_ok", b"const x = 1"),
+        ("const_assign", b"const x = 1\nx = 2"),
+        ("const_shadow", b"const x = 1\ndo local x = 2 end"),
+        ("const_after", b"do const x = 1 end\nlocal x = 2"),
+        ("const_field", b"const t = {}\nt.a = 1"),
+        ("const_up", b"const x = 1\nlocal function f() x = 2 end"),
+        ("const_for", b"const i = 1\nfor i = 1, 2 do end"),
+        ("goto_fwd", b"goto a\nlocal x = 1\n::a::"),
+        ("goto_into", b"goto L\nlocal x = 1\n::L::\nreturn x"),
+        ("goto_back", b"::a::\nlocal x = 1\ngoto a"),
+        ("goto_out", b"::a::\ndo local x = 1 goto a end"),
+        ("dup_label", b"::a::\n::a::"),
+        ("nested_label", b"::a::\ndo ::a:: end"),
+        ("goto_undef", b"goto missing"),
+        ("label_end", b"do ::a:: end"),
+        ("goto_into_do", b"goto a\ndo local x ::a:: end"),
+        (
+            "repeat_into",
+            b"repeat\n  goto a\n  local x = 1\n  ::a::\nuntil true",
+        ),
+        ("vararg_bad", b"function f() return ... end"),
+        ("vararg_ok", b"function f(...) return ... end"),
+        ("dots_main", b"return ..."),
+        ("pow", b"return -2^2"),
+        ("concat", b"return 'a'..'b'..'c'"),
+        ("coal", b"return nil ?? 3"),
+        ("nav", b"return a?.b"),
+        ("nav_index", b"return a?.[1]"),
+        ("nav_call", b"return a?.b()"),
+        ("method_nav", b"return a:b?.()"),
+        ("colon_nav", b"return a?.:b()"),
+        ("nav_assign", b"a?.b = 1"),
+        ("nav_parallel", b"a?.b, c = 1, 2"),
+        ("compound", b"a += 1"),
+        ("compound_space", b"a + = 1"),
+        ("xor_assign", b"a ~= 1"),
+        ("compound_pow", b"a ^= 2"),
+        ("compound_coal", b"a ??= 1"),
+        ("ne_expr", b"return a ~= b"),
+        ("short", b"local f = |x| -> x + 1"),
+        ("short_empty", b"local f = || -> 1"),
+        ("short_do", b"local f = |x| -> do return x end"),
+        ("name_arrow", b"local f = x -> x"),
+        ("arrow_stmt", b"x -> x"),
+        ("ternary", b"return 1 > 0 ? 7 : 8"),
+        ("ternary_method", b"return a ? b:c() : d"),
+        ("ternary_paren", b"return a ? (b:c()) : d"),
+        ("and_or", b"return a or b and c"),
+        ("shl", b"return 1 << 2"),
+        ("sar", b"return 1 ~>> 2"),
+        ("andand", b"return a && b"),
+        ("not_eq", b"return a != b"),
+        ("bang", b"return !a"),
+        ("hexfloat", b"return 0x1.8p1"),
+        ("bin", b"return 0b1010"),
+        ("under", b"return 1_000"),
+        ("ull", b"return 1ULL"),
+        ("ll", b"return -1LL"),
+        ("imag", b"return 1.5i"),
+        ("bad_u", b"return 1u"),
+        ("float_ll", b"return 1.0LL"),
+        ("bad_number", b"return 1e"),
+        ("hex_esc", b"return '\\xFF'"),
+        ("bad_esc", b"return '\\q'"),
+        ("z_esc", b"return 'a\\z  \nb'"),
+        ("u_esc", b"return '\\u{1F600}'"),
+        ("u_bad", b"return '\\u{110000}'"),
+        ("bom_return", b"\xef\xbb\xbfreturn 1"),
+        ("utf8_ident", "local caf\u{00e9} = 1".as_bytes()),
+        ("nonutf8", b"local \xff = 1"),
+        ("shebang", b"#!/usr/bin/env luajit\nreturn 1"),
+        ("line_dir", b"# 10\nreturn 1"),
+        ("slash_comment", b"// comment\nreturn 1"),
+        ("comment_require", b"-- require('nope')\nreturn 1"),
+        ("string_require", b"return \"require('nope')\""),
+        ("require_call", b"require('mod')"),
+        ("require_string", b"require 'mod.sub'"),
+        ("require_field", b"foo.require('mod')"),
+        ("paren_call", b"return (f())"),
+        ("multi_pos", b"return f(), g(), ..."),
+        ("local_multi", b"local a, b = f(), g()"),
+        ("table_multi", b"return {f(), g()}"),
+        ("if_calls", b"if a then b() elseif c then d() else e() end"),
+        ("until_local", b"repeat local x = 1 until x"),
+        ("local_rec", b"local function f() return f end"),
+        ("method", b"function a.b:c() return self end"),
+        ("attr_const", b"local x <const> = 1"),
+        ("empty_table", b"return {}"),
+        ("long_str", b"return [=[a]=]"),
+        ("unclosed", b"return 'abc"),
+        ("extra", b"return 1 end"),
+        ("kw_end", b"local end = 1"),
+        ("soft_const", b"const = 1"),
+        ("local_dup", b"local a, a = 1, 2"),
+        ("const_dup", b"const a, a = 1, 2"),
+        ("dots_short", b"local f = |...| -> ..."),
+        ("dots_short_bad", b"local f = |x| -> ..."),
+        ("table_pack", b"return type(table.pack)"),
+        ("high_call", b"\xff()"),
+        ("crlf", b"local x = 1\r\nreturn x"),
+        ("esc_nl", b"return 'a\\\nb'"),
+        ("comment_between", b"local x --c\n= 1"),
+        ("short_comma", b"local f = || -> 1, 2"),
+        ("label_kw", b"::end::"),
+        ("goto_fn", b"function f() goto a end\n::a::"),
+        ("break_fn", b"function f() break end"),
+        ("continue_semi", b"while true do continue; end"),
+        ("break_semi", b"while true do break; local x end"),
+        ("field_soft", b"return { const = 1, continue = 2 }"),
+        ("assign_index", b"a[1], a.b = 2, 3"),
+        ("compound_index", b"a[1] += 2"),
+        ("nested_wrong", b"return [=[ [==[ ]=]"),
+        ("leading_under", b"return _1"),
+        ("double_under", b"return 1__2"),
+        ("zero_x", b"return 0x"),
+        ("bin_bad", b"return 0b2"),
+        ("u_surrogate", b"return '\\u{D800}'"),
+        ("empty_u", b"return '\\u{}'"),
+        ("ident_digit", b"return 1abc"),
+        ("empty_parens", b"return ()"),
+        ("paren_assign", b"(a) = 1"),
+        ("call_assign", b"f() = 1"),
+        ("for_missing", b"for i do end"),
+        ("hash_mid", b"local x = 1 # 2"),
+        ("only_shebang", b"#!/bin/luajit\n"),
+        ("bom_only", b"\xef\xbb\xbf"),
+        ("bitwise", b"return ~a & b | c ~ d << 1 >> 2"),
+        ("not_chain", b"return not not a"),
+        ("and_call", b"return a and f()"),
+        ("table_call", b"f{1}"),
+        ("string_call", b"f'abc'"),
+        ("method_string", b"a:b'c'"),
+        (
+            "self_inner",
+            b"function o:m() local function n() return self end end",
+        ),
+        (
+            "shadow_param",
+            b"local function f(a) local a = 1 return a end",
+        ),
+        ("goto_same", b"goto a\n::a::"),
+        ("two_gotos", b"goto a\ngoto a\n::a::"),
+        ("inner_goto_out", b"do goto a end\n::a::"),
+        ("label_semi", b"::a::;\ngoto a"),
+        ("const_fn", b"const function f() end\nf = 1"),
+        ("const_fn_ok", b"const function f() return f end"),
+        ("func_missing", b"function f()"),
+        ("bad_long", b"return [=a=]"),
+        ("line_spaces", b"#   4\t\nreturn 1"),
+        ("directive_eof", b"# 9"),
+        ("not_bang_name", b"return not !a"),
+        ("question_only", b"return a ?"),
+        ("arrow_only", b"return -> 1"),
+        ("space_shl", b"a << = 1"),
+        ("imag_ll", b"return 1LLi"),
+        ("hex_ll", b"return 0xFFLL"),
+        ("plus_exp", b"return 1e+2"),
+        ("hex_p", b"return 0x1p-1"),
+        ("dot_num", b"return .5"),
+        ("num_dot", b"return 5."),
+        ("long_nl", b"return [[\nhello]]"),
+        ("mismatch_long", b"return [[a]=]"),
+        ("esc_quote", b"return '\\''"),
+        ("dec_esc", b"return '\\000\\255'"),
+        ("dec_bad", b"return '\\256'"),
+        ("x_short", b"return '\\x4'"),
+        ("unclosed_long", b"return [[abc"),
+        ("long_comment", b"--[[ require('nope') ]]\nreturn 1"),
+        ("eq_comment", b"--[=[ ]=]\nreturn 1"),
+        ("comment_unclosed", b"--[[ abc"),
+        ("repeat_empty", b"repeat until true"),
+        ("while_empty", b"while false do end"),
+        ("if_empty", b"if false then end"),
+        ("do_empty", b"do end"),
+        ("local_none", b"local a, b"),
+        ("local_rhs", b"local a, b = 1"),
+        ("generic_for", b"for k, v in pairs(t) do end"),
+        ("for_step", b"for i=1,10,2 do end"),
+        ("dotted_fn", b"function a.b.c() end"),
+        ("ellipsis_mid", b"function f(..., a) end"),
+        ("trailing_comma_params", b"function f(a,) end"),
+        ("trailing_comma_call", b"f(1,)"),
+        ("return_semi", b"do return 1; end"),
+        ("return_then", b"do return 1 local x end"),
+        (
+            "continue_if",
+            b"while true do if a then continue else break end end",
+        ),
+        ("nested_break", b"while a do while b do break end end"),
+        ("nested_continue", b"while a do while b do continue end end"),
+        ("const_method", b"const function o:m() end"),
+        ("short_ws", b"local f = ||-> 1"),
+        ("nav_bracket_bad", b"return a?[1]"),
+        ("call_nav_stmt", b"a?.b()"),
+        ("call_nav_comma", b"a?.b(), c"),
+        ("field_nav", b"return a.b?.c"),
+        ("table_nav", b"return { a?.b }"),
+        ("name_arrow_call", b"f(x -> x)"),
+        ("local_const_soft", b"local const = 1"),
+        ("const_continue", b"local const = continue"),
+        ("continue_call", b"continue()"),
+        ("high_string", b"return '\xff'"),
+        ("utf8_string", "return '\u{4f60}\u{597d}'".as_bytes()),
+        ("utf8_comment", "local x = 1 -- \u{6ce8}\u{91ca}".as_bytes()),
+        ("ident_stmt", b"abc"),
+        ("call_stmt", b"f()"),
+        ("index_call", b"return a[b](c)"),
+        ("not_call", b"return not f()"),
+        ("len_call", b"return #f()"),
+        ("pow_neg", b"return 2^-2"),
+        ("concat_num", b"return 1 .. 2"),
+        ("and_symbol", b"return a and b && c"),
+        ("or_symbol", b"return a or b || c"),
+        ("nav_space", b"return a ? .b"),
+        ("arrow_space", b"local f = |x| - > x"),
+        ("label_space", b": :a: :"),
+        ("shl_space", b"return 1 < < 2"),
+        ("hash_bang_later", b"local x = 1\n#!/bin/luajit"),
+        ("bad_param", b"function f(1) end"),
+        ("dots_assign", b"... = 1"),
+        ("bitwise_not", b"return ~a"),
+        ("eq_chain", b"return a == b ~= c"),
+        ("cmp_chain", b"return 1 < 2 < 3"),
+        ("unclosed_fn", b"local function f() return 1"),
+        ("until_missing", b"repeat local x = 1"),
+        ("if_missing_then", b"if a b end"),
+        ("goto_missing", b"goto"),
+        ("label_missing", b"::name"),
+        ("double_comma", b"local a,,b = 1"),
+        ("comma_empty", b"return 1,"),
+        ("func_in_assign", b"a = function() return 1 end"),
+        ("if_return", b"if a then return 1 else return 2 end"),
+        (
+            "for_break_continue",
+            b"for i=1,3 do if i == 1 then continue end break end",
+        ),
+        ("assign_up_ok", b"local x = 1\nlocal function f() x = 2 end"),
+        ("global_assign", b"x = 1"),
+        ("method_self", b"function o:m() return self end"),
+        ("empty_return", b"return"),
+        ("semi_return", b"return;"),
+        ("return_after", b"return; local x"),
+        ("do_return", b"do return end"),
+        ("nested_do", b"do do end end"),
+        ("comment_cr", b"-- c\rlocal x = 1"),
+        ("ws_z_crlf", b"return 'a\\z\r\nb'"),
+        ("string_hex", b"return '\\xff'"),
+        ("esc_z_only", b"return '\\z'"),
+        ("esc_backslash", b"return '\\\\'"),
+        ("zero_ll", b"return 0LL"),
+        ("bin_ll", b"return 0b11LL"),
+        ("imag_hex", b"return 0x1p1i"),
+        ("under_suffix", b"return 1_LL"),
+        ("exp_under", b"return 1e_2"),
+        ("u_ascii", b"return '\\u{41}'"),
+        ("u_two", b"return '\\u{80}'"),
+        ("u_four", b"return '\\u{10000}'"),
+        ("cr_nl", b"local x = 1\rreturn x"),
+        ("compound_concat", b"a ..= 'x'"),
+        ("compound_shl", b"a <<= 1"),
+        ("compound_sar", b"a ~>>= 1"),
+        ("compound_mod", b"a %= 2"),
+        ("compound_band", b"a &= 1"),
+        ("compound_bor", b"a |= 1"),
+        ("compound_shr", b"a >>= 1"),
+        ("compound_div", b"a /= 2"),
+        ("compound_mul", b"a *= 2"),
+        ("compound_sub", b"a -= 1"),
+        ("plus_assign_call", b"a.b += f()"),
+        ("short_vararg_bad", b"function f(..., a) end"),
+        ("empty_params_space", b"local f = | | -> 1"),
+        ("bor_short", b"return |x, y| -> x | y"),
+        ("or_or_short", b"return || -> 1"),
+        ("question_question", b"return a ? ? b"),
+        ("tilde_gt", b"return 1 ~> 2"),
+        ("hash_number", b"return 1 #2"),
+        ("directive_bad", b"# abc\nreturn 1"),
+        ("byte_ff_string", b"return '\xff\xfe'"),
+        ("mixed_assign", b"a.b, c[d], e = 1, 2, 3"),
+        (
+            "local_func_params",
+            b"local function f(a, b, ...) return a end",
+        ),
+        ("while_return", b"while a do return 1 end"),
+        ("repeat_continue", b"repeat continue until true"),
+        ("label_before", b"::a::\ngoto a\nlocal x = 1"),
+        ("const_in_for", b"for i=1,2 do const x = i end"),
+        ("const_index", b"const a = {}\na[1] = 2"),
+        ("double_colon_goto", b"::goto::"),
+        ("local_fn_goto", b"local function goto() end"),
+        ("continue_assign", b"continue = 1"),
+        ("keyword_prefix", b"local functionx = 1"),
+        ("name_digit", b"local a1 = 1"),
+        ("true_false", b"return true, false, nil"),
+        (
+            "nested_fn_bad",
+            b"local f = function(a, ...) return function() return a, ... end end",
+        ),
+        ("chunk_fn", b"function f() end\nlocal x = f"),
+        ("table_trailing", b"return {1, a=2, [3]=4,}"),
+        ("field_sep", b"return {1; 2, 3}"),
+        ("index_field", b"return a[b].c"),
+        ("paren_name", b"return (a)"),
+        ("not_name", b"return not a"),
+        ("len_neg", b"return -#a"),
+        ("and_or_coal", b"return a ?? b or c and d"),
+        ("ternary_right", b"return a ? b : c ? d : e"),
+        ("short_or", b"local f = |a, b| -> a or b"),
+        ("label_until", b"repeat ::a:: until false"),
+        ("break_repeat", b"repeat break until false"),
+        ("for_scope", b"for i=1,2 do end\nreturn i"),
+        ("numeric_shadow", b"for i=1,2 do local i = i end"),
+        ("assign_call", b"a, b = f(), g()"),
+        ("multi_arg", b"f(g(), h())"),
+        ("semi_between", b"local x = 1; local y = 2"),
+        ("comment_line", b"-- hi\nlocal x = 1"),
+        ("if_only", b"if a then end"),
+        ("global_fn", b"function f() end"),
+        ("empty_call", b"f()"),
+        ("func_empty", b"function f() end"),
+        ("while_break", b"while a do break end"),
+        ("generic_one", b"for i in a do end"),
+        ("local_no_init", b"local a"),
+        ("return_nil", b"return nil"),
+        ("do_block", b"do local x = 1 end"),
+        ("eqeq", b"return a == b"),
+        ("ge", b"return a >= b"),
+        ("mod", b"return a % b"),
+        ("div", b"return a / b"),
+        ("xor", b"return a ~ b"),
+        ("band", b"return a & b"),
+        ("bor", b"return a | b"),
+        ("hash", b"return #a"),
+        ("method_call", b"a:b(1)"),
+        ("empty_long", b"return [[]]"),
+        ("eq_level", b"return [==[a]==]"),
+        ("esc_x_upper", b"return '\\xFf'"),
+        ("esc_decimal_short", b"return '\\9'"),
+        ("llu", b"return 1LLu"),
+        ("ull_mixed", b"return 1uLl"),
+        ("imag_upper", b"return 2I"),
+        ("nan_ident", b"return inf"),
+        ("zero_b", b"return 0b"),
+        ("hex_under", b"return 0x_ff"),
+        ("paren_expr", b"(f)"),
+        ("last_string_arg", b"return f 'a', g()"),
+        ("nav_field", b"return a?.b.c"),
+        ("nav_then_index", b"return a?.b[1]"),
+        ("short_in_call", b"f(|x| -> x)"),
+        ("short_in_table", b"return { |x| -> x }"),
+        ("ternary_table", b"return { a ? 1 : 2 }"),
+        ("line_then_goto", b"# 40\nlocal goto = 1"),
+        ("require_method", b"foo:require('mod')"),
+        (
+            "require_in_comment_long",
+            b"--[[\nrequire('hidden')\n]]\nreturn 1",
+        ),
+        ("assign_const_name", b"const.x = 1"),
+        ("call_const", b"const()"),
+        (
+            "continue_else",
+            b"while true do if a then else continue end end",
+        ),
+        ("return_in_short", b"local f = || -> do return 1, 2 end"),
+        ("shebang_no_nl", b"#!/bin/luajit"),
+        ("string_long_mismatch", b"return [=[a]]"),
+        ("func_vararg", b"function f(a, ...) end"),
+        ("nested_ternary", b"return a ? b ? c : d : e"),
+        ("field_keyword", b"return { [end] = 1 }"),
+        ("goto_keyword", b"goto end"),
+        ("space_coal_assign", b"a ?? = 1"),
+        ("compound_and", b"a &&= 1"),
+        ("compound_or", b"a ||= 1"),
+        ("short_do_empty", b"local f = || -> do end"),
+        ("func_self_plain", b"local f = function() return self end"),
+        (
+            "dots_in_nested",
+            b"function f(...) return function() return ... end end",
+        ),
+        ("label_in_fn", b"function f() ::a:: goto a end"),
+        ("break_in_if", b"while true do if a then break end end"),
+        ("local_ff", b"local \xff = 1"),
+        ("ident_high", b"\x80\x81"),
+        ("high_byte_src", b"local \x80x = 1"),
+        ("bom_shebang", b"\xef\xbb\xbf#!/bin/luajit\nreturn 1"),
+        ("bom_mid", b"return '\xef\xbb\xbf'"),
+        ("str_crlf", b"return 'a\\\r\nb'"),
+        ("z_ff", b"return 'a\\z\x0cb'"),
+        ("for_const_body", b"for i=1,1 do const i = 2 end"),
+        ("goto_out_fn", b"function f()\ngoto a\nend\n::a::"),
+        ("label_then_local", b"do ::a:: goto a local x = 1 end"),
+        ("missing_rhs", b"a +="),
+        ("multi_label", b"::a:: ::b::\ngoto a\ngoto b"),
+        ("break_label", b"while true do break ::a:: end"),
+        ("nav_call2", b"return a?.b?.c()"),
+        ("assign_compound_field", b"a.b += 2"),
+        ("if_else_bare", b"if a then b elseif c then d else e end"),
+        ("pow2", b"return 2^3^2"),
+        ("and_or_prec", b"return a or b and c"),
+        ("not_and", b"return not a and b"),
+        ("shl_add", b"return 1 + 2 << 3"),
+        ("eq_and", b"return a == b and c"),
+        ("coal_right", b"return a ?? b ?? c"),
+        ("and_right", b"return a and b and c"),
+        ("concat_pow", b"return a .. b ^ c"),
+        ("unclosed_comment_ok_after", b"-- ok\nreturn 1"),
+        (
+            "local_function_const_rec",
+            b"const function f() return f end",
+        ),
+        ("shadow_nonconst", b"local x = 1\ndo local x = 2 end"),
+        ("goto_across_do_local", b"goto a\ndo local x = 1 end\n::a::"),
+        ("inner_label_same", b"::lab:: do ::lab:: end"),
+        ("continue_in_numeric", b"for i=1,3 do continue end"),
+        ("break_in_generic", b"for i in a do break end"),
+        ("const_redecl_fn", b"const x = 1\nlocal function x() end"),
+        (
+            "const_fn_inner",
+            b"const x = 1\nlocal function f()\nlocal x = 2\nend",
+        ),
+        ("assign_method_const", b"const f = 1\nfunction f() end"),
+        ("compound_const", b"const a = 1\na += 2"),
+        ("index_const_ok", b"const a = {}\na.b += 1"),
+        ("short_assign_const", b"const f = 1\nf = || -> 1"),
+        (
+            "vararg_in_short_outer",
+            b"function f(...) return |x| -> ... end",
+        ),
+        ("goto_repeat_out", b"::a::\nrepeat\n  goto a\nuntil false"),
+        (
+            "label_in_until_scope",
+            b"repeat\n  local x = 1\n  ::a::\nuntil false",
+        ),
+    ]
+}
+
+#[test]
+fn differential_matches_locked_luajit() {
+    let Some(path) = configured_oracle() else {
+        eprintln!(
+            "oracle differential not run: LUAJIT_ORACLE unset; cases=0 accept=0 reject=0; not a differential GREEN"
+        );
+        return;
+    };
+    assert_oracle_baseline(&path);
+    let mut mismatches = Vec::new();
+    let mut accept = 0u32;
+    let mut reject = 0u32;
+    let mut compared = 0u32;
+    for (name, source) in cases() {
+        compared += 1;
+        let ours = syntax_ok(source);
+        let theirs = oracle_accepts(&path, source);
+        if theirs {
+            accept += 1;
+        } else {
+            reject += 1;
+        }
+        if ours != theirs {
+            mismatches.push(format!(
+                "{name}: parser={} oracle={}",
+                if ours { "ACCEPT" } else { "REJECT" },
+                if theirs { "ACCEPT" } else { "REJECT" }
+            ));
+        }
+    }
+    let lexical = lexical_limit_samples();
+    let lexical_count = lexical.len() as u32;
+    let mut lexical_accept = 0u32;
+    let mut lexical_reject = 0u32;
+    let mut compare = |name: &str, source: &[u8], lexical_sample: bool| {
+        compared += 1;
+        let ours = syntax_ok(source);
+        let theirs = oracle_accepts(&path, source);
+        if theirs {
+            accept += 1;
+            if lexical_sample {
+                lexical_accept += 1;
+            }
+        } else {
+            reject += 1;
+            if lexical_sample {
+                lexical_reject += 1;
+            }
+        }
+        if ours != theirs {
+            mismatches.push(format!(
+                "{name}: parser={} oracle={}",
+                if ours { "ACCEPT" } else { "REJECT" },
+                if theirs { "ACCEPT" } else { "REJECT" }
+            ));
+        }
+    };
+    for (name, source, _) in boundary_samples() {
+        compare(&name, &source, false);
+    }
+    for (name, source, _) in lexical {
+        compare(&name, &source, true);
+    }
+    eprintln!(
+        "oracle differential cases={compared} accept={accept} reject={reject} lexical={lexical_count} lexical_accept={lexical_accept} lexical_reject={lexical_reject} scope=load(..., \"t\") source={ORACLE_SHA}"
+    );
+    assert!(
+        mismatches.is_empty(),
+        "syntax disagrees with LuaJIT {ORACLE_SHA}:\n{}",
+        mismatches.join("\n")
+    );
+}
+
+#[test]
+fn string_escapes_and_spans_are_consumable() {
+    let source = b"return '\\xFF\\z \n\\u{41}'";
+    let chunk = parser::parse_chunk(source).expect("parse escapes");
+    let Stmt::Return { values, .. } = &chunk.body.stmts[0] else {
+        panic!("return");
+    };
+    let ast::Expr::String { bytes, span, .. } = &values.exprs[0] else {
+        panic!("string, got {:?}", values.exprs[0]);
+    };
+    assert_eq!(bytes, b"\xffA");
+    assert_eq!(span.start, 7);
+    assert!(span.end > span.start);
+}
+
+#[test]
+fn paren_discharges_multiple_return() {
+    let chunk = parser::parse_chunk(b"return (f()), g(), ...").expect("parse");
+    let Stmt::Return { values, .. } = &chunk.body.stmts[0] else {
+        panic!("return");
+    };
+    assert!(!values.exprs[0].is_multi());
+    assert!(matches!(values.exprs[0], ast::Expr::Paren { .. }));
+    assert!(values.exprs[1].is_multi());
+    assert!(values.exprs[2].is_multi());
+    assert!(values.tail_multi());
+}
+
+#[test]
+fn trailing_label_and_jump_into_scope() {
+    let ok = parser::parse_chunk(b"goto a\nlocal x = 1\n::a::").expect("trailing");
+    let resolution = resolve::resolve(&ok);
+    assert!(resolution.errors.is_empty(), "{:?}", resolution.errors);
+    assert!(resolution.labels[0].trailing);
+
+    let bad = parser::parse_chunk(b"goto L\nlocal x = 1\n::L::\nreturn x").expect("parse");
+    let resolution = resolve::resolve(&bad);
+    assert!(
+        resolution.errors.iter().any(|err| matches!(
+            err,
+            resolve::ResolveError::JumpIntoLocal { local_name, .. } if local_name == b"x"
+        )),
+        "{:?}",
+        resolution.errors
+    );
+}
+
+#[test]
+fn const_binding_and_import_discovery() {
+    let chunk = parser::parse_chunk(
+        b"const x = 1\nrequire('mod.sub')\n-- require('hidden')\nreturn \"require('nope')\"",
+    )
+    .expect("parse");
+    let resolution = resolve::resolve(&chunk);
+    assert!(resolution.errors.is_empty(), "{:?}", resolution.errors);
+    assert_eq!(resolution.bindings.len(), 1);
+    assert!(resolution.bindings[0].const_binding);
+    assert_eq!(resolution.bindings[0].name, b"x");
+    assert!(matches!(
+        &chunk.body.stmts[0],
+        ast::Stmt::Local { names, .. } if names[0].name.is("x")
+    ));
+    assert_eq!(resolution.imports.len(), 1);
+    assert_eq!(resolution.imports[0].spec, b"mod.sub");
+
+    let nav = parser::parse_chunk(b"a?.b = 1").expect("nav assign");
+    match &nav.body.stmts[0] {
+        ast::Stmt::Assign { targets, .. } => {
+            assert!(targets[0].has_nav());
+            assert!(targets[0].span().end > targets[0].span().start);
+        }
+        other => panic!("expected assign, got {other:?}"),
+    }
+}
+
+#[test]
+fn bom_is_recorded_and_not_part_of_return() {
+    let chunk = parser::parse_chunk(b"\xef\xbb\xbfreturn 1").expect("bom");
+    assert!(chunk.has_bom);
+    assert!(matches!(chunk.body.stmts[0], ast::Stmt::Return { .. }));
+}
+
+fn nested_do(n: usize) -> Vec<u8> {
+    let mut source = String::new();
+    for _ in 0..n {
+        source.push_str("do ");
+    }
+    for _ in 0..n {
+        source.push_str("end ");
+    }
+    source.into_bytes()
+}
+
+fn joined(prefix: &str, item: &str, sep: &str, count: usize) -> Vec<u8> {
+    let mut source = String::from(prefix);
+    for index in 0..count {
+        if index > 0 {
+            source.push_str(sep);
+        }
+        source.push_str(item);
+    }
+    source.into_bytes()
+}
+
+fn labels(count: usize) -> Vec<u8> {
+    let mut source = String::new();
+    for index in 0..count {
+        if index > 0 {
+            source.push(' ');
+        }
+        source.push_str(&format!("::l{index}::"));
+    }
+    source.into_bytes()
+}
+
+fn assignment(count: usize, wrap_do: bool) -> Vec<u8> {
+    let mut names = String::new();
+    let mut values = String::new();
+    for index in 0..count {
+        if index > 0 {
+            names.push(',');
+            values.push(',');
+        }
+        names.push_str(&format!("a{index}"));
+        values.push('1');
+    }
+    let body = format!("{names} = {values}");
+    if wrap_do {
+        format!("do {body} end").into_bytes()
+    } else {
+        body.into_bytes()
+    }
+}
+
+fn ternary(count: usize) -> Vec<u8> {
+    let mut source = String::from("return ");
+    for _ in 0..count {
+        source.push_str("a?");
+    }
+    source.push('1');
+    for _ in 0..count {
+        source.push_str(":0");
+    }
+    source.into_bytes()
+}
+
+fn bits(prefix: &str, count: usize, suffix: &str) -> Vec<u8> {
+    format!("return {prefix}{}{suffix}", "1".repeat(count)).into_bytes()
+}
+
+/// Boundaries measured against locked LuaJIT 96f7b297 with LUAJIT_ENABLE_LUA52COMPAT.
+/// `expect` is load(..., "t") accept. These samples do not spawn that binary.
+fn boundary_samples() -> Vec<(String, Vec<u8>, bool)> {
+    let mut samples = Vec::new();
+    let mut add = |name: &str, source: Vec<u8>, accept: bool| {
+        samples.push((name.to_string(), source, accept));
+    };
+    add("triple_eq", b"a === 1".to_vec(), false);
+    add("eq_stmt", b"a == 1".to_vec(), false);
+    add("ne_stmt", b"a ~= 1".to_vec(), true);
+    add("ne_expr", b"return a ~= b".to_vec(), true);
+    add("add_assign", b"a += 1".to_vec(), true);
+    add("add_assign_space", b"a + = 1".to_vec(), false);
+    add(
+        "repeat_continue_early",
+        b"repeat do continue end local x = 1 until true".to_vec(),
+        false,
+    );
+    add(
+        "repeat_continue_late",
+        b"repeat local x = 1 do continue end until true".to_vec(),
+        true,
+    );
+    add(
+        "while_continue_early",
+        b"while true do do continue end local x = 1 end".to_vec(),
+        true,
+    );
+    add(
+        "repeat_if_continue_early",
+        b"repeat if true then continue end local x = 1 until true".to_vec(),
+        false,
+    );
+    add(
+        "repeat_if_continue_late",
+        b"repeat local x = 1 if true then continue end until true".to_vec(),
+        true,
+    );
+    add(
+        "repeat_continue_then_second_local",
+        b"repeat local x = 1 do continue end local y = 2 until true".to_vec(),
+        false,
+    );
+    add(
+        "dec_ll_max",
+        b"return 18446744073709551615LL".to_vec(),
+        true,
+    );
+    add(
+        "dec_ll_over",
+        b"return 18446744073709551616LL".to_vec(),
+        false,
+    );
+    add(
+        "dec_ull_max",
+        b"return 18446744073709551615ULL".to_vec(),
+        true,
+    );
+    add(
+        "dec_ull_over",
+        b"return 18446744073709551616ULL".to_vec(),
+        false,
+    );
+    add(
+        "dec_ll_neg_max",
+        b"return -18446744073709551615LL".to_vec(),
+        true,
+    );
+    add(
+        "dec_ll_neg_over",
+        b"return -18446744073709551616LL".to_vec(),
+        false,
+    );
+    add(
+        "dec_ll_leading_zero_max",
+        b"return 00018446744073709551615LL".to_vec(),
+        true,
+    );
+    add(
+        "dec_ll_leading_zero_over",
+        b"return 00018446744073709551616LL".to_vec(),
+        false,
+    );
+    add(
+        "dec_ll_20_under",
+        b"return 10000000000000000000LL".to_vec(),
+        true,
+    );
+    add(
+        "dec_unsuffixed_over",
+        b"return 18446744073709551616".to_vec(),
+        true,
+    );
+    add(
+        "hex_ll_16",
+        format!("return 0x{}LL", "F".repeat(16)).into_bytes(),
+        true,
+    );
+    add(
+        "hex_ll_17",
+        format!("return 0x{}LL", "F".repeat(17)).into_bytes(),
+        false,
+    );
+    add(
+        "hex_ll_leading_zero_16",
+        format!("return 0x0000{}LL", "F".repeat(16)).into_bytes(),
+        true,
+    );
+    add(
+        "hex_ll_leading_zero_17",
+        format!("return 0x0000{}LL", "F".repeat(17)).into_bytes(),
+        false,
+    );
+    add("bin_64", bits("0b", 64, ""), true);
+    add("bin_65", bits("0b", 65, ""), false);
+    add("bin_ll_64", bits("0b", 64, "LL"), true);
+    add("bin_ll_65", bits("0b", 65, "LL"), false);
+    add("bin_ll_leading_zero_64", bits("0b000", 64, "LL"), true);
+    add("bin_ll_leading_zero_65", bits("0b000", 65, "LL"), false);
+    add("do_198", nested_do(198), true);
+    add("do_199", nested_do(199), false);
+    add("add_400", joined("return ", "1", "+", 400), true);
+    add("pow_198", joined("return ", "2", "^", 198), true);
+    add("pow_199", joined("return ", "2", "^", 199), false);
+    add("cat_198", joined("return ", "'a'", "..", 198), true);
+    add("cat_199", joined("return ", "'a'", "..", 199), false);
+    add("tern_197", ternary(197), true);
+    add("tern_198", ternary(198), false);
+    add("lab_199", labels(199), true);
+    add("lab_200", labels(200), false);
+    add(
+        "lab_do_198",
+        format!("do {} end", String::from_utf8(labels(198)).unwrap()).into_bytes(),
+        true,
+    );
+    add(
+        "lab_do_199",
+        format!("do {} end", String::from_utf8(labels(199)).unwrap()).into_bytes(),
+        false,
+    );
+    add("asg_199", assignment(199, false), true);
+    add("asg_200", assignment(200, false), false);
+    add("asg_do_198", assignment(198, true), true);
+    add("asg_do_199", assignment(199, true), false);
+    samples
+}
+
+#[test]
+fn locked_luajit_syntax_boundaries() {
+    let mut failed = Vec::new();
+    for (name, source, expect) in boundary_samples() {
+        let got = syntax_ok(&source);
+        if got != expect {
+            failed.push(format!(
+                "{name}: parser {} expected {}",
+                if got { "ACCEPT" } else { "REJECT" },
+                if expect { "ACCEPT" } else { "REJECT" }
+            ));
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "locked syntax boundary mismatch (no external oracle):\n{}",
+        failed.join("\n")
+    );
+}
+
+fn return_expr(chunk: &ast::Chunk) -> &ast::Expr {
+    let Stmt::Return { values, .. } = &chunk.body.stmts[0] else {
+        panic!("return");
+    };
+    &values.exprs[0]
+}
+
+fn parse_resolve_drop(source: &[u8]) -> ast::Chunk {
+    let chunk = parser::parse_chunk(source).expect("parse");
+    let resolution = resolve::resolve(&chunk);
+    assert!(resolution.errors.is_empty(), "{:?}", resolution.errors);
+    chunk
+}
+
+/// Follow a chain node, not each operand. This does not call `walk_expr` or `Drop`.
+fn binary_chain_nesting(expr: &ast::Expr) -> u32 {
+    let mut depth = 0u32;
+    let mut cursor = expr;
+    loop {
+        match cursor {
+            ast::Expr::BinaryChain { base, .. } => {
+                depth += 1;
+                cursor = base;
+            }
+            _ => return depth,
+        }
+    }
+}
+
+fn suffix_chain_nesting(expr: &ast::Expr) -> u32 {
+    let mut depth = 0u32;
+    let mut cursor = expr;
+    loop {
+        match cursor {
+            ast::Expr::SuffixChain { base, .. } => {
+                depth += 1;
+                cursor = base;
+            }
+            _ => return depth,
+        }
+    }
+}
+
+fn assert_add_chain(expr: &ast::Expr, ops: usize) {
+    assert_eq!(binary_chain_nesting(expr), 1, "add spine is nested");
+    let ast::Expr::BinaryChain { base, steps, .. } = expr else {
+        panic!("expected add chain");
+    };
+    assert!(matches!(base.as_ref(), ast::Expr::Number { .. }));
+    assert_eq!(steps.len(), ops);
+    assert!(steps.iter().all(|step| step.op == ast::BinOp::Add));
+}
+
+fn assert_field_chain(expr: &ast::Expr, ops: usize) {
+    assert_eq!(suffix_chain_nesting(expr), 1, "suffix spine is nested");
+    let ast::Expr::SuffixChain { base, steps, .. } = expr else {
+        panic!("expected field chain");
+    };
+    assert!(matches!(base.as_ref(), ast::Expr::Name { .. }));
+    assert_eq!(steps.len(), ops);
+    assert!(
+        steps
+            .iter()
+            .all(|step| matches!(step, ast::Suffix::Field { nav: false, .. }))
+    );
+}
+
+fn number_raw(expr: &ast::Expr) -> &str {
+    match expr {
+        ast::Expr::Number { raw, .. } => raw,
+        _ => panic!("expected number at {:?}", expr.span()),
+    }
+}
+
+fn name_is(expr: &ast::Expr, text: &str) -> bool {
+    matches!(expr, ast::Expr::Name { name, .. } if name.is(text))
+}
+
+fn expect_syntax_error(source: &[u8], fragment: &str) {
+    let err = parser::parse_chunk(source).expect_err("syntax error");
+    assert!(
+        err.message.contains(fragment),
+        "message {:?} does not contain {fragment}",
+        err.message
+    );
+}
+
+#[test]
+fn left_spine_depth_does_not_grow_with_length() {
+    let short_ops = 4usize;
+    let long_ops = 32usize;
+    let short = parse_resolve_drop(&joined("return ", "1", "+", short_ops + 1));
+    let long = parse_resolve_drop(&joined("return ", "1", "+", long_ops + 1));
+    assert_add_chain(return_expr(&short), short_ops);
+    assert_add_chain(return_expr(&long), long_ops);
+    drop(short);
+    drop(long);
+}
+
+#[test]
+fn suffix_spine_depth_does_not_grow_with_length() {
+    let short_ops = 4usize;
+    let long_ops = 32usize;
+    let short = parse_resolve_drop(&joined("return a", ".b", "", short_ops));
+    let long = parse_resolve_drop(&joined("return a", ".b", "", long_ops));
+    assert_field_chain(return_expr(&short), short_ops);
+    assert_field_chain(return_expr(&long), long_ops);
+    drop(short);
+    drop(long);
+}
+
+#[test]
+fn composite_binary_keeps_precedence_and_order() {
+    let chunk = parse_resolve_drop(b"return 1+2*3-4/5");
+    let ast::Expr::BinaryChain { base, steps, span } = return_expr(&chunk) else {
+        panic!("expected left chain");
+    };
+    assert_eq!(number_raw(base), "1");
+    assert_eq!(span.start, 7);
+    assert_eq!(span.end, 16);
+    assert_eq!(steps.len(), 2);
+    assert_eq!(steps[0].op, ast::BinOp::Add);
+    assert_eq!(steps[1].op, ast::BinOp::Sub);
+    let ast::Expr::BinaryChain {
+        base: mul_base,
+        steps: mul_steps,
+        ..
+    } = &steps[0].expr
+    else {
+        panic!("expected mul chain");
+    };
+    assert_eq!(number_raw(mul_base), "2");
+    assert_eq!(mul_steps.len(), 1);
+    assert_eq!(mul_steps[0].op, ast::BinOp::Mul);
+    assert_eq!(number_raw(&mul_steps[0].expr), "3");
+    let ast::Expr::BinaryChain {
+        base: div_base,
+        steps: div_steps,
+        ..
+    } = &steps[1].expr
+    else {
+        panic!("expected div chain");
+    };
+    assert_eq!(number_raw(div_base), "4");
+    assert_eq!(div_steps[0].op, ast::BinOp::Div);
+    assert_eq!(number_raw(&div_steps[0].expr), "5");
+
+    let powers = parse_resolve_drop(b"return 2^3^2");
+    let ast::Expr::Binary {
+        op, left, right, ..
+    } = return_expr(&powers)
+    else {
+        panic!("power stays right-associative");
+    };
+    assert_eq!(*op, ast::BinOp::Pow);
+    assert_eq!(number_raw(left), "2");
+    let ast::Expr::Binary {
+        op: inner_op,
+        left: inner_left,
+        right: inner_right,
+        ..
+    } = right.as_ref()
+    else {
+        panic!("inner power");
+    };
+    assert_eq!(*inner_op, ast::BinOp::Pow);
+    assert_eq!(number_raw(inner_left), "3");
+    assert_eq!(number_raw(inner_right), "2");
+
+    let logic = parse_resolve_drop(b"return a and b and c");
+    let ast::Expr::BinaryChain { base, steps, .. } = return_expr(&logic) else {
+        panic!("and chain");
+    };
+    assert!(name_is(base, "a"));
+    assert_eq!(steps.len(), 2);
+    assert_eq!(steps[0].op, ast::BinOp::And);
+    assert!(name_is(&steps[0].expr, "b"));
+    assert_eq!(steps[1].op, ast::BinOp::And);
+    assert!(name_is(&steps[1].expr, "c"));
+
+    let mixed = parse_resolve_drop(b"return a and b or c");
+    let ast::Expr::BinaryChain { base, steps, .. } = return_expr(&mixed) else {
+        panic!("or chain");
+    };
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].op, ast::BinOp::Or);
+    assert!(name_is(&steps[0].expr, "c"));
+    let ast::Expr::BinaryChain {
+        base: and_base,
+        steps: and_steps,
+        ..
+    } = base.as_ref()
+    else {
+        panic!("and stays left of or");
+    };
+    assert!(name_is(and_base, "a"));
+    assert_eq!(and_steps[0].op, ast::BinOp::And);
+    assert!(name_is(&and_steps[0].expr, "b"));
+
+    let grouped = parse_resolve_drop(b"return a+(b+c)");
+    let ast::Expr::BinaryChain { steps, .. } = return_expr(&grouped) else {
+        panic!("outer add");
+    };
+    assert_eq!(steps.len(), 1);
+    let ast::Expr::Paren { inner, .. } = &steps[0].expr else {
+        panic!("paren is a boundary");
+    };
+    let ast::Expr::BinaryChain {
+        steps: inner_steps, ..
+    } = inner.as_ref()
+    else {
+        panic!("inner add");
+    };
+    assert_eq!(inner_steps.len(), 1);
+    assert!(name_is(&inner_steps[0].expr, "c"));
+}
+
+#[test]
+fn composite_suffix_keeps_order_and_boundaries() {
+    let chunk = parse_resolve_drop(b"return a.b[1]():m(2)");
+    let expr = return_expr(&chunk);
+    assert!(expr.is_multi());
+    assert_eq!(suffix_chain_nesting(expr), 1);
+    let ast::Expr::SuffixChain { base, steps, span } = expr else {
+        panic!("suffix chain");
+    };
+    assert!(name_is(base, "a"));
+    assert_eq!(span.start, 7);
+    assert_eq!(steps.len(), 4);
+    assert!(matches!(
+        &steps[0],
+        ast::Suffix::Field { name, nav: false, .. } if name.is("b")
+    ));
+    assert!(matches!(&steps[1], ast::Suffix::Index { nav: false, .. }));
+    assert!(matches!(&steps[2], ast::Suffix::Call { nav: false, .. }));
+    assert!(matches!(
+        &steps[3],
+        ast::Suffix::Method { method, receiver_nav: false, method_nav: false, .. }
+            if method.is("m")
+    ));
+    assert_eq!(steps[0].span().end, 10);
+    assert_eq!(steps[3].span(), *span);
+
+    let paren = parse_resolve_drop(b"return (f.g())");
+    let wrapped = return_expr(&paren);
+    assert!(!wrapped.is_multi());
+    assert!(matches!(wrapped, ast::Expr::Paren { .. }));
+
+    let calls = parse_resolve_drop(b"return f()()");
+    assert!(return_expr(&calls).is_multi());
+    assert_eq!(suffix_chain_nesting(return_expr(&calls)), 1);
+
+    let outer_nav = parse_resolve_drop(b"a.b?.c = 1");
+    match &outer_nav.body.stmts[0] {
+        Stmt::Assign { targets, .. } => {
+            assert!(targets[0].has_nav());
+            assert!(matches!(&targets[0], ast::AssignTarget::Field { name, .. } if name.is("c")));
+        }
+        _ => panic!("assign"),
+    }
+    let inner_nav = parse_resolve_drop(b"a?.b.c = 1");
+    match &inner_nav.body.stmts[0] {
+        Stmt::Assign { targets, .. } => assert!(!targets[0].has_nav()),
+        _ => panic!("assign"),
+    }
+
+    let imports = parse_resolve_drop(b"return require('a')+require('b')");
+    let resolution = resolve::resolve(&imports);
+    assert_eq!(resolution.imports.len(), 2);
+    assert_eq!(resolution.imports[0].spec, b"a");
+    assert_eq!(resolution.imports[1].spec, b"b");
+    assert!(resolution.imports[0].call_span.start < resolution.imports[1].call_span.start);
+
+    let method_import = parse_resolve_drop(b"return require('a').b('c')");
+    let resolution = resolve::resolve(&method_import);
+    assert_eq!(resolution.imports.len(), 1);
+    assert_eq!(resolution.imports[0].spec, b"a");
+}
+
+#[test]
+fn chain_syntax_errors_are_ordinary() {
+    expect_syntax_error(b"return 1 +", "expected expression");
+    expect_syntax_error(b"return a.", "expected name");
+    expect_syntax_error(b"a?.b, c = 1", "safe navigation");
+    expect_syntax_error(b"f() = 1", "expected");
+
+    let mut trailing_add = joined("return ", "1", "+", 256);
+    trailing_add.push(b'+');
+    expect_syntax_error(&trailing_add, "expected expression");
+
+    let mut trailing_field = joined("return a", ".b", "", 64);
+    trailing_field.push(b'.');
+    expect_syntax_error(&trailing_field, "expected name");
+}
+
+#[test]
+fn long_flat_chains_finish_on_the_default_test_thread() {
+    // libtest uses the default 2 MiB thread stack. Do not raise it.
+    let operands = 4096usize;
+    let adds = joined("return ", "1", "+", operands);
+    let chunk = parse_resolve_drop(&adds);
+    assert_add_chain(return_expr(&chunk), operands - 1);
+    drop(chunk);
+
+    let fields = joined("return a", ".b", "", operands);
+    let chunk = parse_resolve_drop(&fields);
+    assert_field_chain(return_expr(&chunk), operands);
+    drop(chunk);
+
+    let mut calls = b"return a".to_vec();
+    for _ in 0..operands {
+        calls.extend_from_slice(b"()");
+    }
+    let chunk = parse_resolve_drop(&calls);
+    let expr = return_expr(&chunk);
+    assert!(expr.is_multi());
+    assert_eq!(suffix_chain_nesting(expr), 1);
+    let ast::Expr::SuffixChain { steps, .. } = expr else {
+        panic!("call chain");
+    };
+    assert_eq!(steps.len(), operands);
+    drop(chunk);
+
+    // Locked LuaJIT load() accepts the add, field and call lengths above.
+    // An `and` chain was accepted at 10875 operands and rejected by 11000
+    // as "control structure too long". That is a compiler limit, not a
+    // grammar limit, and is not encoded here.
+    let ands = joined("return ", "a", " and ", 12000);
+    let chunk = parse_resolve_drop(&ands);
+    let ast::Expr::BinaryChain { steps, .. } = return_expr(&chunk) else {
+        panic!("and chain");
+    };
+    assert_eq!(steps.len(), 11999);
+    assert!(steps.iter().all(|step| step.op == ast::BinOp::And));
+    drop(chunk);
+
+    if let Some(path) = configured_oracle() {
+        assert!(
+            oracle_accepts(&path, &adds),
+            "LuaJIT rejected the add chain"
+        );
+        assert!(
+            oracle_accepts(&path, &fields),
+            "LuaJIT rejected the field chain"
+        );
+        assert!(
+            oracle_accepts(&path, &calls),
+            "LuaJIT rejected the call chain"
+        );
+    }
+}
+
+fn numbered(prefix: &str, count: usize) -> String {
+    (1..=count)
+        .map(|index| format!("{prefix}{index}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn local_decl(prefix: &str, count: usize) -> String {
+    format!("local {}", numbered(prefix, count))
+}
+
+fn line_locals(prefix: &str, count: usize) -> String {
+    (1..=count)
+        .map(|index| format!("local {prefix}{index} = {index}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn capture_return(count: usize) -> String {
+    let names = numbered("u", count);
+    format!(
+        "{}\nlocal function f()\nreturn {names}\nend\n",
+        line_locals("u", count)
+    )
+}
+
+fn capture_assign(count: usize) -> String {
+    let writes = (1..=count)
+        .map(|index| format!("u{index} = u{index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "{}\nlocal function f()\n{writes}\nreturn {}\nend\n",
+        line_locals("u", count),
+        numbered("u", count)
+    )
+}
+
+fn const_capture(count: usize) -> String {
+    let decls = (1..=count)
+        .map(|index| format!("const c{index} = {index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "{decls}\nlocal function f()\nreturn {}\nend\n",
+        numbered("c", count)
+    )
+}
+
+fn released_blocks(count: usize) -> String {
+    (1..=count)
+        .map(|index| format!("do local x{index} = 1 end\n"))
+        .collect()
+}
+
+/// Accept/reject matrix measured with pinned LuaJIT `load(..., "t")` at
+/// 96f7b297, `-joff`. 200 active locals and 60 distinct upvalues are the
+/// last accepted counts. Hidden `for` slots and implicit `self` are included.
+/// `...` is not a local slot. A `const` binding is an upvalue when captured.
+/// Literal constants and globals are not.
+fn lexical_limit_samples() -> Vec<(String, Vec<u8>, bool)> {
+    let mut samples = Vec::new();
+    let mut add = |name: &str, source: String, accept: bool| {
+        samples.push((name.to_string(), source.into_bytes(), accept));
+    };
+
+    add("locals_200", local_decl("v", 200), true);
+    add("locals_201", local_decl("v", 201), false);
+    add(
+        "params_200",
+        format!("function f({})\nend\n", numbered("p", 200)),
+        true,
+    );
+    add(
+        "params_201",
+        format!("function f({})\nend\n", numbered("p", 201)),
+        false,
+    );
+    add(
+        "params_200_local",
+        format!("function f({})\nlocal extra = 1\nend\n", numbered("p", 200)),
+        false,
+    );
+    add(
+        "params_199_local",
+        format!("function f({})\nlocal extra = 1\nend\n", numbered("p", 199)),
+        true,
+    );
+    add(
+        "params_200_dots",
+        format!("function f({}, ...)\nend\n", numbered("p", 200)),
+        true,
+    );
+    add(
+        "method_199",
+        format!("function t:m({})\nend\n", numbered("p", 199)),
+        true,
+    );
+    add(
+        "method_200",
+        format!("function t:m({})\nend\n", numbered("p", 200)),
+        false,
+    );
+    add(
+        "method_198_local",
+        format!(
+            "function t:m({})\nlocal extra = 1\nend\n",
+            numbered("p", 198)
+        ),
+        true,
+    );
+    add(
+        "method_199_local",
+        format!(
+            "function t:m({})\nlocal extra = 1\nend\n",
+            numbered("p", 199)
+        ),
+        false,
+    );
+    add("release_202", released_blocks(202), true);
+    add(
+        "nfor_196",
+        format!("{}\nfor i = 1, 2 do end\n", local_decl("v", 196)),
+        true,
+    );
+    add(
+        "nfor_197",
+        format!("{}\nfor overflow = 1, 2 do end\n", local_decl("v", 197)),
+        false,
+    );
+    add(
+        "gfor1_196",
+        format!("{}\nfor i in pairs do end\n", local_decl("v", 196)),
+        true,
+    );
+    add(
+        "gfor1_197",
+        format!("{}\nfor overflow in pairs do end\n", local_decl("v", 197)),
+        false,
+    );
+    add(
+        "gfor2_195",
+        format!("{}\nfor i, j in pairs do end\n", local_decl("v", 195)),
+        true,
+    );
+    add(
+        "gfor2_196",
+        format!(
+            "{}\nfor i, overflow in pairs do end\n",
+            local_decl("v", 196)
+        ),
+        false,
+    );
+    add(
+        "dup_198",
+        format!("{}\nlocal same, same = 1\n", local_decl("v", 198)),
+        true,
+    );
+    add(
+        "dup_199",
+        format!("{}\nlocal same, overflow = 1\n", local_decl("v", 199)),
+        false,
+    );
+    add(
+        "nfor_196_then",
+        format!(
+            "{}\nfor i = 1, 2 do end\nlocal extra = 1\n",
+            local_decl("v", 196)
+        ),
+        true,
+    );
+    add(
+        "do_200_then",
+        format!("do {} end\nlocal extra = 1\n", local_decl("v", 200)),
+        true,
+    );
+    add(
+        "inner_200_parent_199",
+        format!(
+            "local function f()\n{}\nend\n{}\n",
+            local_decl("a", 200),
+            local_decl("b", 199)
+        ),
+        true,
+    );
+    add(
+        "inner_200_parent_200",
+        format!(
+            "local function f()\n{}\nend\n{}\n",
+            local_decl("a", 200),
+            local_decl("b", 200)
+        ),
+        false,
+    );
+    add(
+        "wrapped_inner_200",
+        format!(
+            "do local function f()\n{}\nend end\n{}\n",
+            local_decl("a", 200),
+            local_decl("b", 200)
+        ),
+        true,
+    );
+    add("up_60", capture_return(60), true);
+    add("up_61", capture_return(61), false);
+    add("up_60_rw", capture_assign(60), true);
+    add("up_61_rw", capture_assign(61), false);
+    add(
+        "globals_79",
+        format!("local function f()\nreturn {}\nend\n", numbered("g", 79)),
+        true,
+    );
+    add(
+        "literals_beside_60",
+        format!(
+            "{}\nlocal function g()\nreturn 1, 2, 'abc'\nend\n",
+            capture_return(60)
+        ),
+        true,
+    );
+    add("const_60", const_capture(60), true);
+    add("const_61", const_capture(61), false);
+    add("forward_60", forward_mid(60, false), true);
+    add("forward_60_plus", forward_mid(60, true), false);
+    add("shared_60", shared_mid(60, false), true);
+    add("shared_60_plus", shared_mid(60, true), false);
+    add("func_base_60", func_base(60, false), true);
+    add("func_base_61", func_base(61, false), false);
+    add("method_base_61", func_base(61, true), false);
+    add("short_60", short_capture(60), true);
+    add("short_61", short_capture(61), false);
+    add("bounds_60", for_bounds_capture(60), true);
+    add("body_60", for_body_capture(60), false);
+    add("init_60", initializer_capture(60), true);
+    add("rec_59", recursive_capture(59), true);
+    add("rec_60", recursive_capture(60), false);
+    add(
+        "shadow_60",
+        format!(
+            "{}\nlocal function mid()\n{}\nlocal function inner()\nreturn {}\nend\nend\n",
+            line_locals("u", 60),
+            local_decl("u", 60),
+            numbered("u", 60)
+        ),
+        true,
+    );
+    samples
+}
+
+fn forward_mid(count: usize, extra: bool) -> String {
+    let names = numbered("u", count);
+    let tail = if extra { "\nreturn x\n" } else { "\n" };
+    let marker = if extra { "\nlocal x = 9\n" } else { "\n" };
+    format!(
+        "{}\n{marker}local function mid()\nlocal function inner()\nreturn {names}\nend{tail}end\n",
+        line_locals("u", count)
+    )
+}
+
+fn shared_mid(count: usize, extra: bool) -> String {
+    let names = numbered("u", count);
+    let tail = if extra { "\nreturn x\n" } else { "\n" };
+    let marker = if extra { "\nlocal x = 9\n" } else { "\n" };
+    format!(
+        "{}\n{marker}local function mid()\nlocal function a()\nreturn {names}\nend\nlocal function b()\nreturn {names}\nend{tail}end\n",
+        line_locals("u", count)
+    )
+}
+
+fn func_base(count: usize, method: bool) -> String {
+    let sep = if method { ":" } else { "." };
+    let calls = (1..=count)
+        .map(|index| format!("function a{index}{sep}b() end"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "{}\nlocal function mid()\n{calls}\nend\n",
+        (1..=count)
+            .map(|index| format!("local a{index} = {{}}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
+}
+
+fn short_capture(count: usize) -> String {
+    let bodies = (1..=count)
+        .map(|index| format!("local f{index} = |x| -> u{index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "{}\nlocal function mid()\n{bodies}\nend\n",
+        line_locals("u", count)
+    )
+}
+
+fn for_bounds_capture(count: usize) -> String {
+    format!(
+        "{}\nfor i = (function() return {}, i end)(), 2 do end\n",
+        line_locals("u", count),
+        numbered("u", count)
+    )
+}
+
+fn for_body_capture(count: usize) -> String {
+    format!(
+        "{}\nfor i = 1, 2 do local function f() return {}, i end end\n",
+        line_locals("u", count),
+        numbered("u", count)
+    )
+}
+
+fn initializer_capture(count: usize) -> String {
+    format!(
+        "{}\nlocal fresh = (function() return {}, fresh end)()\n",
+        line_locals("u", count),
+        numbered("u", count)
+    )
+}
+
+fn recursive_capture(count: usize) -> String {
+    format!(
+        "{}\nlocal function f()\nreturn {}, f\nend\n",
+        line_locals("u", count),
+        numbered("u", count)
+    )
+}
+
+#[test]
+fn lexical_limits_follow_pinned_load() {
+    let mut failed = Vec::new();
+    for (name, source, accept) in lexical_limit_samples() {
+        let got = syntax_ok(&source);
+        if got != accept {
+            failed.push(format!(
+                "{name}: parse_chunk+resolve {} expected {}",
+                if got { "ACCEPT" } else { "REJECT" },
+                if accept { "ACCEPT" } else { "REJECT" }
+            ));
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "lexical limits disagree with pinned load(..., \"t\"):\n{}",
+        failed.join("\n")
+    );
+}
+
+fn sample_source(name: &str) -> Vec<u8> {
+    lexical_limit_samples()
+        .into_iter()
+        .find(|(sample, _, _)| sample == name)
+        .map(|(_, source, _)| source)
+        .unwrap_or_else(|| panic!("missing sample {name}"))
+}
+
+fn is_ident_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn ident_spans(source: &[u8], ident: &str) -> Vec<ast::Span> {
+    let needle = ident.as_bytes();
+    let mut spans = Vec::new();
+    let mut offset = 0;
+    while offset + needle.len() <= source.len() {
+        let Some(found) = source[offset..]
+            .windows(needle.len())
+            .position(|window| window == needle)
+        else {
+            break;
+        };
+        let start = offset + found;
+        let end = start + needle.len();
+        let before_ok = start == 0 || !is_ident_byte(source[start - 1]);
+        let after_ok = end == source.len() || !is_ident_byte(source[end]);
+        if before_ok && after_ok {
+            spans.push(ast::Span {
+                start: start as u32,
+                end: end as u32,
+            });
+        }
+        offset = start + 1;
+    }
+    spans
+}
+
+fn resolved(source: &[u8]) -> resolve::Resolution {
+    let chunk = parser::parse_chunk(source).unwrap_or_else(|err| panic!("parse failed: {err:?}"));
+    resolve::resolve(&chunk)
+}
+
+/// `limits.first()` is the frontend walk entry for one diagnostic.
+/// Later entries may repeat. This is not LuaJIT's first error.
+fn assert_first_limit(
+    name: &str,
+    source: &[u8],
+    kind: resolve::LexicalLimitKind,
+    count: u32,
+    span: ast::Span,
+) {
+    let resolution = resolved(source);
+    assert!(
+        resolution.errors.is_empty(),
+        "{name} mixed a syntax error into the limit: {:?}",
+        resolution.errors
+    );
+    let limit = resolution
+        .limits
+        .first()
+        .unwrap_or_else(|| panic!("{name} accepted a pinned overflow"));
+    assert_eq!(limit.kind, kind, "{name} kind");
+    assert_eq!(limit.count, count, "{name} first overflow count");
+    assert_eq!(
+        limit.limit,
+        if kind == resolve::LexicalLimitKind::Locals {
+            200
+        } else {
+            60
+        }
+    );
+    assert_eq!(limit.span, span, "{name} span");
+}
+
+#[test]
+fn lexical_limit_reports_first_overflow() {
+    let locals = sample_source("locals_201");
+    assert_first_limit(
+        "locals_201",
+        &locals,
+        resolve::LexicalLimitKind::Locals,
+        201,
+        ident_spans(&locals, "v201")[0],
+    );
+
+    let params = sample_source("params_200_local");
+    assert_first_limit(
+        "params_200_local",
+        &params,
+        resolve::LexicalLimitKind::Locals,
+        201,
+        ident_spans(&params, "extra")[0],
+    );
+
+    let method = sample_source("method_200");
+    assert_first_limit(
+        "method_200",
+        &method,
+        resolve::LexicalLimitKind::Locals,
+        201,
+        ident_spans(&method, "p200")[0],
+    );
+
+    let numeric = sample_source("nfor_197");
+    assert_first_limit(
+        "nfor_197",
+        &numeric,
+        resolve::LexicalLimitKind::Locals,
+        201,
+        ident_spans(&numeric, "overflow")[0],
+    );
+
+    let hidden = format!("{}\nfor overflow = 1, 2 do end\n", local_decl("v", 198));
+    let hidden_bytes = hidden.as_bytes();
+    assert_first_limit(
+        "nfor_hidden_198",
+        hidden_bytes,
+        resolve::LexicalLimitKind::Locals,
+        201,
+        ident_spans(hidden_bytes, "overflow")[0],
+    );
+    let hidden_resolution = resolved(hidden_bytes);
+    assert_eq!(
+        hidden_resolution
+            .bindings
+            .iter()
+            .filter(|binding| binding.kind == resolve::BindingKind::ForIndex)
+            .count(),
+        1,
+        "hidden for slots must not become guest bindings"
+    );
+
+    let generic = sample_source("gfor2_196");
+    assert_first_limit(
+        "gfor2_196",
+        &generic,
+        resolve::LexicalLimitKind::Locals,
+        201,
+        ident_spans(&generic, "overflow")[0],
+    );
+
+    let duplicate = sample_source("dup_199");
+    assert_first_limit(
+        "dup_199",
+        &duplicate,
+        resolve::LexicalLimitKind::Locals,
+        201,
+        ident_spans(&duplicate, "overflow")[0],
+    );
+    let same = sample_source("dup_198");
+    let same_resolution = resolved(&same);
+    assert!(same_resolution.limits.is_empty());
+    assert_eq!(
+        same_resolution
+            .bindings
+            .iter()
+            .filter(|binding| binding.name == b"same")
+            .count(),
+        2,
+        "repeated names still take two slots"
+    );
+
+    let upvalues = sample_source("up_61");
+    let up_spans = ident_spans(&upvalues, "u61");
+    assert_first_limit(
+        "up_61",
+        &upvalues,
+        resolve::LexicalLimitKind::Upvalues,
+        61,
+        *up_spans.last().expect("u61 use"),
+    );
+
+    let constants = sample_source("const_61");
+    assert_first_limit(
+        "const_61",
+        &constants,
+        resolve::LexicalLimitKind::Upvalues,
+        61,
+        *ident_spans(&constants, "c61").last().expect("c61 use"),
+    );
+
+    let forwarded = sample_source("forward_60_plus");
+    assert_first_limit(
+        "forward_60_plus",
+        &forwarded,
+        resolve::LexicalLimitKind::Upvalues,
+        61,
+        *ident_spans(&forwarded, "x").last().expect("x use"),
+    );
+
+    let shared = sample_source("shared_60_plus");
+    assert_first_limit(
+        "shared_60_plus",
+        &shared,
+        resolve::LexicalLimitKind::Upvalues,
+        61,
+        *ident_spans(&shared, "x").last().expect("x use"),
+    );
+
+    let base = sample_source("func_base_61");
+    assert_first_limit(
+        "func_base_61",
+        &base,
+        resolve::LexicalLimitKind::Upvalues,
+        61,
+        *ident_spans(&base, "a61").last().expect("a61 use"),
+    );
+
+    let method_base = sample_source("method_base_61");
+    assert_first_limit(
+        "method_base_61",
+        &method_base,
+        resolve::LexicalLimitKind::Upvalues,
+        61,
+        *ident_spans(&method_base, "a61").last().expect("a61 use"),
+    );
+
+    let short = sample_source("short_61");
+    assert_first_limit(
+        "short_61",
+        &short,
+        resolve::LexicalLimitKind::Upvalues,
+        61,
+        *ident_spans(&short, "u61").last().expect("u61 use"),
+    );
+
+    let body = sample_source("body_60");
+    assert_first_limit(
+        "body_60",
+        &body,
+        resolve::LexicalLimitKind::Upvalues,
+        61,
+        *ident_spans(&body, "i").last().expect("loop variable use"),
+    );
+
+    let recursive = sample_source("rec_60");
+    assert_first_limit(
+        "rec_60",
+        &recursive,
+        resolve::LexicalLimitKind::Upvalues,
+        61,
+        *ident_spans(&recursive, "f")
+            .last()
+            .expect("function name use"),
+    );
+
+    let goto_source = b"local a = 1\nfor i = 1, 2 do\ngoto L\n::L::\nend\n";
+    let goto_resolution = resolved(goto_source);
+    assert!(goto_resolution.errors.is_empty());
+    assert!(goto_resolution.limits.is_empty());
+    assert_eq!(goto_resolution.bindings.len(), 2);
+    assert_eq!(
+        goto_resolution.gotos[0].active_locals, 2,
+        "hidden for slots must not change goto active locals"
+    );
+}

@@ -28,6 +28,26 @@ fn scratch_root() -> PathBuf {
     root.join("compat-frontends-corpus")
 }
 
+fn exclusive_subroot(owner: &str) -> PathBuf {
+    let parent = scratch_root().join(owner);
+    fs::create_dir_all(&parent).expect("owned scratch parent");
+    let mut index = 0u32;
+    loop {
+        let root = parent.join(index.to_string());
+        match fs::create_dir(&root) {
+            Ok(()) => return root,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                index = index.checked_add(1).expect("owned scratch index");
+            }
+            Err(error) => panic!("create owned scratch {owner}: {error}"),
+        }
+    }
+}
+
+fn diagnostic_scratch() -> PathBuf {
+    exclusive_subroot("diagnostics")
+}
+
 fn rustscript_lock_source() -> String {
     format!("git+{RUSTSCRIPT_GIT}?rev={FROZEN_RUSTSCRIPT_REV}#{FROZEN_RUSTSCRIPT_REV}")
 }
@@ -90,8 +110,8 @@ fn lock_package_source(block: &str) -> Option<&str> {
 }
 
 fn prepare_runnable_corpus() -> PathBuf {
-    let root = scratch_root();
-    let _ = fs::remove_dir_all(&root);
+    // New child only. Do not remove the shared parent: diagnostic probes live beside it.
+    let root = exclusive_subroot("corpus");
     let examples_dir = root.join("compat").join("examples");
     fs::create_dir_all(&examples_dir).expect("corpus examples directory");
     let stdlib = root
@@ -363,9 +383,89 @@ fn lua_map_array_and_callable_semantics_survive_the_frozen_core() {
 }
 
 #[test]
+fn second_diagnostic_probe_does_not_overwrite_the_first() {
+    let first_marker = "print(1)\n";
+    let second_marker = "print(2)\n";
+    assert_ne!(first_marker, second_marker);
+
+    let first = diagnostic_scratch();
+    let first_probe = first.join("probe.py");
+    fs::write(&first_probe, first_marker).expect("write first diagnostic probe");
+    assert_eq!(
+        fs::read_to_string(&first_probe).expect("read first diagnostic probe"),
+        first_marker,
+        "first staging must write the complete probe before the second write"
+    );
+
+    let second = diagnostic_scratch();
+    let second_probe = second.join("probe.py");
+    fs::write(&second_probe, second_marker).expect("write second diagnostic probe");
+
+    assert_eq!(
+        fs::read_to_string(&first_probe).expect("read first diagnostic probe after second write"),
+        first_marker,
+        "second same-name write overwrote {}; second path is {}",
+        first_probe.display(),
+        second_probe.display()
+    );
+    assert_ne!(
+        first_probe, second_probe,
+        "second diagnostic staging reused the first probe path"
+    );
+    assert_eq!(
+        fs::read_to_string(&second_probe).expect("read second diagnostic probe"),
+        second_marker,
+        "second diagnostic probe must keep its own marker"
+    );
+    let diagnostics_parent = scratch_root().join("diagnostics");
+    assert!(
+        first.starts_with(&diagnostics_parent),
+        "first diagnostic root must stay under scratch_root()/diagnostics: {}",
+        first.display()
+    );
+    assert!(
+        second.starts_with(&diagnostics_parent),
+        "second diagnostic root must stay under scratch_root()/diagnostics: {}",
+        second.display()
+    );
+}
+
+#[test]
+fn corpus_staging_preserves_diagnostic_probe_files() {
+    let diagnostics = diagnostic_scratch();
+    let kept = diagnostics.join("kept.txt");
+    fs::write(&kept, "diagnostic-owner\n").expect("write diagnostic marker");
+
+    let examples = prepare_runnable_corpus();
+
+    let python = diagnostics.join("probe.py");
+    fs::write(&python, "print(1)\n").expect("write unsupported source");
+    assert_eq!(
+        fs::read_to_string(&kept).expect("diagnostic marker survives corpus staging"),
+        "diagnostic-owner\n",
+        "corpus staging must keep the diagnostic owner directory"
+    );
+    assert_eq!(
+        fs::read_to_string(&python).expect("diagnostic probe survives corpus staging"),
+        "print(1)\n"
+    );
+    assert!(
+        examples.join("example.lua").is_file(),
+        "staged corpus must survive the diagnostic probe write"
+    );
+    assert!(
+        !examples.starts_with(&diagnostics),
+        "corpus staging must not live inside the diagnostic owner"
+    );
+    assert!(
+        !diagnostics.starts_with(&examples),
+        "diagnostic probes must not live inside the staged corpus"
+    );
+}
+
+#[test]
 fn unsupported_language_and_invalid_sources_produce_portable_diagnostics() {
-    let tmp = scratch_root().join("diagnostics");
-    fs::create_dir_all(&tmp).expect("diagnostics directory");
+    let tmp = diagnostic_scratch();
     let python = tmp.join("probe.py");
     fs::write(&python, "print(1)\n").expect("write unsupported source");
     let error = expect_err(

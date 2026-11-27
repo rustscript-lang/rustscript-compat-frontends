@@ -1,0 +1,32 @@
+// Minimal Core-level protected-call preflight, success arm.
+// Exact RSS guest input. Not compiled or run in this slice.
+//
+// The held value is a real guest script function, not a host callable.
+// `held(t)` must lower to CallValue with argc 1. The callee returns one
+// Core value: the positional transport array [true, x].
+
+fn mark(phase: int) -> int;
+
+fn ok_arm(x: [int]) -> [bool, [int]] {
+    mark(1);
+    [true, x]
+}
+
+fn parent(
+    held: fn([int]) -> [bool, [int]],
+    t: [int],
+    do_call: bool,
+) -> [[bool, [int]], int, int, bool, [int]] {
+    mark(0);
+    let empty: [int] = [0];
+    let r: [bool, [int]] = if do_call => { held(t) } else => { [false, empty] };
+    mark(2);
+    let arity = len(r);
+    let tag = r[0];
+    let marker = if do_call => { 1 } else => { 0 };
+    [r, arity, marker, tag, t]
+}
+
+let t: [int] = [7, 8];
+let held: fn([int]) -> [bool, [int]] = ok_arm;
+parent(held, t, true);

@@ -1,0 +1,22 @@
+// Core pre-close witness: three real exported script callables used after the
+// root frame halts normally. This is exact RSS input for the real Core
+// compiler; no Lua frontend is involved.
+
+fn mark(phase: int) -> int;
+
+pub fn a(x: [int]) -> int {
+    mark(1);
+    x[0]
+}
+
+pub fn b(x: [int]) -> [bool, [int]] {
+    mark(2);
+    [false, x]
+}
+
+pub fn c(x: [int]) -> int {
+    mark(3);
+    x[0]
+}
+
+0;
