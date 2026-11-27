@@ -53,7 +53,8 @@
 //! A successful private collection records the queue length it published as a
 //! consumable prefix only after the real weak publication finished. The
 //! private real handoff [`take_published_pending_finalizer`] then pops exactly
-//! that front record with one `VecDeque` front removal, verifies the exact
+//! that front record with one published-front pop from the slot-linked queue,
+//! verifies the exact
 //! live userdata and typed Core token, writes the userdata into one specified
 //! empty root slot, and settles that generation in the same commit. It never
 //! calls guest code. A saved mark or Release tail refuses before any write, and
@@ -721,7 +722,12 @@ pub(crate) fn collect_pending_finalizers(
     if heap.has_saved_mark() {
         return Err(HeapError::MarkActive);
     }
-    let base = with_heap(host, |heap| Ok(heap.pending_finalizer_count()))?;
+    // Capture the queue's own round-start boundary before this pass can
+    // append a record: the exact tail identity and length. A later owner
+    // failure rolls back only the segment appended after this pair; the
+    // published prefix is never substituted for it, and a valid unpublished
+    // segment left by an earlier failed close stays queued.
+    let base = with_heap(host, |heap| Ok(heap.pending_finalizer_checkpoint()))?;
     let marked = with_heap(host, |heap| Ok(heap.mark_and_pending_tokens()))?;
     if let Err(error) = verify_pending_finalizers(host) {
         // This is the owner-verification preflight's own transaction: remove
@@ -813,7 +819,7 @@ pub fn retire_pending_finalizer_test_control(
 /// same userdata ([`HeapError::TokenMismatch`] otherwise). All of those checks
 /// happen before the first queue, root, or slot write.
 ///
-/// On success the head is popped with one `VecDeque` front removal, the exact
+/// On success the head is popped with one published-front removal, the exact
 /// `UserdataRef` is written into the specified root slot, and that generation
 /// is marked settled and no longer pending. The returned handle is the same
 /// typed object the queue verified; the raw Core token is not returned or
@@ -990,7 +996,7 @@ pub(crate) struct TakenPendingFinalizer {
 /// out-of-range position is refused before any write, so the head and every
 /// existing root stay. A `Skip` or typed reject needs only `slots[0]`, is
 /// returned as its typed result, and is settled exactly once; it is never
-/// re-queued. The commit pops one `VecDeque` front record, writes the required
+/// re-queued. The commit pops one published-front record, writes the required
 /// roots together, and settles that generation. The returned action and rooted
 /// identities are private; the raw Core token is not copied into a guest
 /// value.
@@ -1070,6 +1076,13 @@ fn verify_pending_finalizer_receiver(
 #[cfg(test)]
 pub fn pending_finalizer_published_count(host: &mut HostContext) -> Result<usize, HeapError> {
     with_heap(host, |heap| Ok(heap.pending_finalizer_published_count()))
+}
+
+/// Number of stored pending records. Test-only header read; it does not read a
+/// stored record.
+#[cfg(test)]
+pub fn pending_finalizer_count(host: &mut HostContext) -> Result<usize, HeapError> {
+    with_heap(host, |heap| Ok(heap.pending_finalizer_count()))
 }
 
 /// One userdata root slot. Test-only; does not scan or read the queue.

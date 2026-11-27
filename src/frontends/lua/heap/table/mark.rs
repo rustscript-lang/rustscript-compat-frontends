@@ -115,8 +115,12 @@ pub(super) struct MarkState {
     /// Each step reads at most one metatable edge record and caches the result
     /// for this mark round and exact metatable generation.
     pending_lookup: Option<PendingGcLookup>,
-    /// Next pending record offered as a host-retained edge in Roots.
-    pending_offer: usize,
+    /// Next pending record offered as a host-retained edge in Roots, as the
+    /// exact slot/generation identity. The first record is read from the queue
+    /// header once when the mark starts; every later step follows the successor
+    /// identity stored on the record just read. It never searches from the head
+    /// and reads at most one queue record per pulse unit. `None` ends the offer.
+    pending_offer: Option<(u32, u32)>,
     mode_edge: Option<u32>,
     mode_owner: usize,
     byte_at: usize,
@@ -260,7 +264,7 @@ impl MarkState {
             pending_scan_done: false,
             pending_live: None,
             pending_lookup: None,
-            pending_offer: 0,
+            pending_offer: None,
             mode_edge: None,
             mode_owner: 0,
             byte_at: 0,
@@ -340,7 +344,9 @@ impl<'a> MarkSession<'a> {
             "a published sweep tail and a mark session cannot coexist"
         );
         let rescan_epoch = heap.advance_rescan_epoch();
-        heap.mark = Some(MarkState::new(rescan_epoch));
+        let mut state = MarkState::new(rescan_epoch);
+        state.pending_offer = heap.pending_finalizer_head();
+        heap.mark = Some(state);
         Self { heap }
     }
 
@@ -362,6 +368,26 @@ impl<'a> MarkSession<'a> {
 
     pub(super) fn meter(&self) -> super::ScanMeter {
         self.heap.scan
+    }
+
+    /// Test-only queue boundary counters while this session still borrows the
+    /// heap: `(reads, slot_writes, header_writes, transfers)`.
+    #[cfg(test)]
+    pub(super) fn pending_queue_counts(&self) -> (u64, u64, u64, u64) {
+        self.heap.pending_queue_counts()
+    }
+
+    /// Test-only copy of the Roots offer trace. The caller takes per-pulse
+    /// deltas by length.
+    #[cfg(test)]
+    pub(super) fn pending_offer_trace(&self) -> Vec<(u32, u32)> {
+        self.heap.pending_offer_trace()
+    }
+
+    /// Test-only: drains the queue's actual slot-write trace.
+    #[cfg(test)]
+    pub(super) fn take_pending_queue_write_trace(&mut self) -> Vec<u32> {
+        self.heap.take_pending_queue_write_trace()
     }
 
     pub(super) fn pulse(&mut self, budget: u64) -> MarkView {
@@ -422,7 +448,9 @@ impl<'a> ParkedMark<'a> {
             return Err(HeapError::SweepPending);
         }
         let rescan_epoch = heap.advance_rescan_epoch();
-        heap.mark = Some(MarkState::new(rescan_epoch));
+        let mut state = MarkState::new(rescan_epoch);
+        state.pending_offer = heap.pending_finalizer_head();
+        heap.mark = Some(state);
         Ok(Self {
             heap,
             done: None,
@@ -1889,14 +1917,16 @@ fn step_root(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
         }
         // Pending finalizers are host-retained edges, not guest roots. Each
         // record is offered once, after the explicit roots and the registered
-        // reservation. The record check is one same-slot identity read; a
-        // valid record is marked like a root. A record that no longer names
-        // its exact live generation is skipped without closing anything.
-        if state.pending_offer < heap.pending_finalizer_count() {
-            let index = state.pending_offer;
-            state.pending_offer += 1;
+        // reservation. The cursor names that record's exact slot generation;
+        // one step reads that one record and follows the successor identity it
+        // stores. It never searches from the queue head and never reads the
+        // successor record. A record whose raw handle was rebound is skipped
+        // without closing anything; an exact record is marked like a root.
+        if let Some(cursor) = state.pending_offer {
             heap.scan.pending_finalizer_offers += 1;
-            if let Some((slot, _generation)) = heap.pending_finalizer_retention(index) {
+            let (retained, next) = heap.pending_finalizer_offer(cursor);
+            state.pending_offer = next;
+            if let Some((slot, _generation)) = retained {
                 heap.scan.node_slot_visits += 1;
                 if heap.mark_new(slot) {
                     state.gray.push(slot);

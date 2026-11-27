@@ -274,6 +274,18 @@ struct Slot {
     /// unreachable from guest roots; weak keys keep the entry because the
     /// selected object is retained for the eventual finalizer consumer.
     pending_finalizer: bool,
+    /// Successor of this slot's pending-finalizer record, with the exact
+    /// successor generation. `None` at the queue tail and for a slot that is
+    /// not queued. The queue reader follows this link and does not read the
+    /// successor record.
+    pending_next: Option<(u32, u32)>,
+    /// Raw Core handle captured when this slot's pending record was enqueued.
+    /// The queue never rebuilds this value from the current token, so a later
+    /// rebind leaves the stored record unchanged. `None` when not queued.
+    pending_raw: Option<u64>,
+    /// Slot generation captured when this slot's pending record was enqueued.
+    /// Zero when not queued.
+    pending_generation: u32,
     /// This generation was finalized without a queue record: either the
     /// explicit test retirement control consumed its pending record, or the
     /// selecting white-userdata pass found no raw `__gc` on its metatable.
@@ -885,12 +897,25 @@ pub struct ScanMeter {
     /// ordinary release path reads only the released slot's own fields.
     #[cfg(test)]
     pub pending_release_queue_reads: u64,
-    /// Test-only: stored pending-queue records moved by a queue extraction,
-    /// including the extracted record itself. One front pop charges one moved
-    /// record and displaces no successor; a positional removal charges its
-    /// removed record. This is separate from the record-read count.
+    /// Test-only: stored pending-queue records transferred out by a queue
+    /// extraction, including the extracted record itself. One front pop
+    /// charges one record and reads no successor; an exact removal charges its
+    /// removed record; a rolled-back suffix charges its records. This is
+    /// separate from the record-read count and does not count a tail append,
+    /// a publication, or a checkpoint header restore.
     #[cfg(test)]
     pub pending_queue_storage_moves: u64,
+    /// Test-only: slot records whose pending link fields the queue boundary
+    /// wrote. A tail append charges the new slot and, when non-empty, the old
+    /// tail; a front pop charges the old head; a publication charges none.
+    /// This is a real per-slot write count, not a logical pulse count.
+    #[cfg(test)]
+    pub pending_queue_slot_writes: u64,
+    /// Test-only: header metadata boundaries written by the queue. One append,
+    /// one front pop, one publication, one exact removal, or one checkpoint
+    /// rollback is one header write regardless of the number of fields.
+    #[cfg(test)]
+    pub pending_queue_header_writes: u64,
     pub scratch: ScanScratch,
 }
 
@@ -1095,6 +1120,13 @@ pub struct LuaHeap {
     /// delta while its mark session still borrows the heap.
     #[cfg(test)]
     pending_live_trace: LiveTrace,
+    /// Test-only: exact pending-record identities read by the Roots offer, in
+    /// visit order. One entry is one real queue record read of that cursor,
+    /// including a record whose raw binding no longer matches. A test can take
+    /// a per-pulse delta while the selecting mark session still borrows the
+    /// heap, so the offer cursor is observed without a head search.
+    #[cfg(test)]
+    pending_offer_trace: LiveTrace,
     /// Test-only: pending-finalizer records whose exact typed owner borrow and
     /// slot/generation check passed in the pre-publication verifier, in record
     /// order. A refused pass leaves the successes that happened before the
@@ -1177,45 +1209,94 @@ enum CurrentRawCall {
 }
 
 mod pending_queue {
-    use std::collections::VecDeque;
+    //! Private storage for retained pending-finalizer records.
+    //!
+    //! The queue is a per-slot singly linked FIFO, not a `VecDeque`. Every record
+    //! lives on the exact userdata slot it names; the queue header stores only
+    //! `head`, `tail`, `len`, and the published-prefix length. A tail append writes
+    //! the new slot, at most the old tail slot, and the header, so it cannot
+    //! relocate or copy an old record. A front pop reads the old head record (which
+    //! carries the successor identity) and never reads the successor record. A
+    //! successful private publication only raises the published length.
+    //!
+    //! Each slot keeps the record's exact generation and raw-handle snapshot plus
+    //! the successor's `(slot, generation)` identity. The queue never rebuilds a
+    //! record from the slot's current token, so a later rebind cannot change an
+    //! already stored record. The links use their own fields and never borrow the
+    //! live-userdata chain or the settlement journal.
+    //!
+    //! Every stored-record read goes through one of the accessors below, which is
+    //! the single place where the test-only read meter observes a real queue read.
+    //! The write boundary is separate: `slot_writes` counts slot records whose
+    //! pending link fields the queue wrote, `header_writes` counts header
+    //! boundaries, and `transfers` counts records extracted from the queue
+    //! (including a front pop, an exact removal, and a rolled-back suffix).
+    //! `write_trace` records the actual slot indices written, in order, so a test
+    //! can prove a tail append touches only the new slot and at most the old tail.
+    //! No caller outside this module can index a stored record: no positional
+    //! accessor or raw iterator is exported.
+    //!
+    //! A failed selecting pass rolls back from the round-start checkpoint: the
+    //! queue tail identity and length observed before the pass appended anything.
+    //! It detaches the new tail, walks only that new segment, and restores the
+    //! header to the checkpoint. It never walks or moves the older segment and
+    //! never substitutes the published length for the checkpoint. Middle removal
+    //! (the test retirement control) may search linearly for the predecessor so no
+    //! production reverse link is needed.
 
-    use super::PendingFinalizer;
+    use std::cell::Cell;
 
-    /// Private storage for retained pending-finalizer records.
+    use super::super::HandleKind;
+    use super::{PendingFinalizer, Slot, SlotState};
+
+    /// Exact queued-record identity: the slot index and its generation.
+    pub(crate) type PendingCursor = (u32, u32);
+
+    /// The queue boundary captured before a selecting pass appended anything.
     ///
-    /// The queue is a `VecDeque`. Appending publishes nothing; a successful
-    /// private collection stores `published = len` only after its real weak
-    /// publication completed. The leading `published` records are then
-    /// consumable in the order the selecting scan offered them: the live
-    /// chain walks newest allocation first inside one cohort, and a later
-    /// cohort appends after every retained earlier record. A front pop is O(1)
-    /// in the stored-record count: it reads the head record and moves one
-    /// record, and it neither reads nor shifts a successor.
-    ///
-    /// Every read of a stored record goes through one of the accessors below,
-    /// which is also the single place where the test-only read meter observes
-    /// a real queue read. The move meter is separate: a front pop charges one
-    /// moved record, while a positional removal charges its removed record.
-    /// No caller outside this module can index the vector: the field is
-    /// private here and no iterator over the raw storage is exported.
+    /// `tail` is the exact identity of the last record and `len` is the queue
+    /// length at that moment. The pair, not the published length, is the only
+    /// rollback base for that pass.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(crate) struct PendingCheckpoint {
+        pub(super) tail: Option<PendingCursor>,
+        pub(super) len: usize,
+    }
+
+    /// Header and link accessors for the slot-linked FIFO.
     #[derive(Default)]
     pub(super) struct PendingQueue {
-        records: VecDeque<PendingFinalizer>,
+        head: Option<PendingCursor>,
+        tail: Option<PendingCursor>,
+        len: usize,
         /// Number of leading records a successful private publication made
-        /// consumable. Always at most `records.len()`.
+        /// consumable. Always at most `len`.
         published: usize,
         /// Test-only count of records read through this boundary.
         #[cfg(test)]
-        reads: std::cell::Cell<u64>,
-        /// Test-only count of stored records moved by an extraction. A front
-        /// pop moves its one returned record and displaces no successor.
+        reads: Cell<u64>,
+        /// Test-only count of slot records whose pending link fields this queue
+        /// wrote. One tail append charges the new slot and, when non-empty, the
+        /// old tail; a front pop charges the old head.
         #[cfg(test)]
-        moves: std::cell::Cell<u64>,
+        slot_writes: Cell<u64>,
+        /// Test-only count of header metadata writes. One append, one pop, one
+        /// publication, one exact removal, or one checkpoint rollback is one
+        /// header boundary, regardless of how many header fields change.
+        #[cfg(test)]
+        header_writes: Cell<u64>,
+        /// Test-only count of records extracted from the queue. A front pop, an
+        /// exact removal, and a rolled-back suffix record each count once.
+        #[cfg(test)]
+        transfers: Cell<u64>,
+        /// Test-only actual slot indices written by this queue, in write order.
+        #[cfg(test)]
+        write_trace: std::cell::RefCell<Vec<u32>>,
     }
 
     impl PendingQueue {
         pub(super) fn len(&self) -> usize {
-            self.records.len()
+            self.len
         }
 
         /// The consumable prefix length. This is a header read only.
@@ -1223,235 +1304,448 @@ mod pending_queue {
             self.published
         }
 
-        pub(super) fn push(&mut self, record: PendingFinalizer) {
-            self.records.push_back(record);
+        /// First queued record identity, if any. Header read only.
+        pub(super) fn head(&self) -> Option<PendingCursor> {
+            self.head
         }
 
-        /// One stored record by position. The hit is one queue read.
-        pub(super) fn get(&self, index: usize) -> Option<&PendingFinalizer> {
-            let record = self.records.get(index)?;
-            self.record_read();
-            Some(record)
-        }
-
-        /// Iterates stored records in order. Each yielded record is one read.
-        pub(super) fn iter(&self) -> PendingQueueIter<'_> {
-            PendingQueueIter {
-                queue: self,
-                next: 0,
+        /// Round-start tail identity and length. Header reads only.
+        pub(super) fn checkpoint(&self) -> PendingCheckpoint {
+            PendingCheckpoint {
+                tail: self.tail,
+                len: self.len,
             }
         }
 
-        /// One consumable head record. One record read; does not pop or write.
-        pub(super) fn published_front(&self) -> Option<PendingFinalizer> {
+        /// Appends one record at the tail.
+        ///
+        /// The new slot stores the exact generation/raw snapshot and a `None`
+        /// successor. A non-empty queue also writes the old tail's successor
+        /// identity. No other slot and no old record is read or moved.
+        pub(super) fn push(&mut self, slots: &mut [Slot], record: PendingFinalizer) {
+            let identity = (record.slot, record.generation);
+            {
+                let slot = &mut slots[record.slot as usize];
+                debug_assert!(!slot.pending_finalizer, "a record slot is appended twice");
+                slot.pending_finalizer = true;
+                slot.pending_generation = record.generation;
+                slot.pending_raw = Some(record.raw);
+                slot.pending_next = None;
+            }
+            self.slot_write(record.slot);
+            if let Some((tail_slot, tail_generation)) = self.tail {
+                let tail = &mut slots[tail_slot as usize];
+                debug_assert_eq!(tail.generation, tail_generation);
+                debug_assert_eq!(tail.pending_generation, tail_generation);
+                debug_assert!(tail.pending_finalizer);
+                debug_assert!(tail.pending_next.is_none());
+                tail.pending_next = Some(identity);
+                self.slot_write(tail_slot);
+            } else {
+                self.head = Some(identity);
+            }
+            self.tail = Some(identity);
+            self.len += 1;
+            self.header_write();
+        }
+
+        /// The published head record, if the ready prefix is non-empty.
+        ///
+        /// This reads exactly the head slot record; it does not read a successor.
+        pub(super) fn published_front(&self, slots: &[Slot]) -> Option<PendingFinalizer> {
             if self.published == 0 {
                 return None;
             }
-            let record = self.records.front().copied()?;
-            self.record_read();
+            let (slot_index, generation) = self.head?;
+            let slot = slots.get(slot_index as usize)?;
+            self.read();
+            if slot.generation != generation
+                || !slot.pending_finalizer
+                || slot.pending_generation != generation
+            {
+                return None;
+            }
+            let raw = slot.pending_raw?;
+            Some(PendingFinalizer {
+                slot: slot_index,
+                generation,
+                raw,
+            })
+        }
+
+        /// Pops the expected published front.
+        ///
+        /// One record read returns the snapshotted record and its successor
+        /// identity. The successor record itself is not read: the pop moves the
+        /// head cursor to the identity the old head stored. The expected value is
+        /// the record the caller just read from `published_front`; the identity
+        /// assertion is debug-only because those two calls are adjacent and no
+        /// mutation can intervene.
+        pub(super) fn pop_published_front(
+            &mut self,
+            slots: &mut [Slot],
+            expected: PendingFinalizer,
+        ) -> Option<PendingFinalizer> {
+            if self.published == 0 {
+                return None;
+            }
+            let (slot_index, generation) = self.head?;
+            let slot = slots.get_mut(slot_index as usize)?;
+            self.read();
+            if slot.generation != generation
+                || !slot.pending_finalizer
+                || slot.pending_generation != generation
+            {
+                return None;
+            }
+            let raw = slot.pending_raw?;
+            let record = PendingFinalizer {
+                slot: slot_index,
+                generation,
+                raw,
+            };
+            let next = slot.pending_next;
+            debug_assert_eq!(record, expected);
+            slot.pending_finalizer = false;
+            slot.pending_generation = 0;
+            slot.pending_raw = None;
+            slot.pending_next = None;
+            self.slot_write(slot_index);
+            self.header_write();
+            self.transfer();
+            self.published -= 1;
+            self.len -= 1;
+            self.head = next;
+            if self.len == 0 {
+                debug_assert!(next.is_none());
+                self.tail = None;
+            } else {
+                debug_assert!(next.is_some());
+            }
             Some(record)
+        }
+
+        /// Iterates stored records in queue order. Each yielded record is one read;
+        /// the successor identity comes from the record just read.
+        pub(super) fn iter<'a>(&'a self, slots: &'a [Slot]) -> PendingQueueIter<'a> {
+            PendingQueueIter {
+                queue: self,
+                slots,
+                next: self.head,
+            }
+        }
+
+        /// One queued record read for the host-retained edge offer in Roots.
+        ///
+        /// The cursor's exact slot record is read once. `retained` is the exact
+        /// live userdata identity if that record still names its own pending
+        /// generation and its snapshotted raw handle still matches the slot's
+        /// current token; `next` is the successor identity stored on the same
+        /// record. A record whose generation no longer matches, or whose pending
+        /// flag is gone, ends the offer cursor; a record whose raw handle is
+        /// rebound stays in the queue and is skipped without ending it, which
+        /// preserves the ordinary/parked mark's existing mis-binding behavior.
+        pub(super) fn offer(
+            &self,
+            slots: &[Slot],
+            cursor: PendingCursor,
+        ) -> (Option<(u32, u32)>, Option<PendingCursor>) {
+            let (slot_index, generation) = cursor;
+            let Some(slot) = slots.get(slot_index as usize) else {
+                return (None, None);
+            };
+            self.read();
+            if slot.generation != generation
+                || !slot.pending_finalizer
+                || slot.pending_generation != generation
+            {
+                return (None, None);
+            }
+            let next = slot.pending_next;
+            let exact = slot.kind == HandleKind::Userdata
+                && !slot.finalizer_settled
+                && slot.pending_raw.is_some_and(|raw| slot.token == Some(raw))
+                && matches!(slot.state, SlotState::Live { .. });
+            (exact.then_some((slot_index, generation)), next)
         }
 
         /// Makes every currently stored record consumable. This is one header
         /// write. Records appended afterwards stay unpublished until the next
         /// successful private publication.
         pub(super) fn publish_all(&mut self) {
-            self.published = self.records.len();
+            self.published = self.len;
+            self.header_write();
         }
 
-        /// Pops the expected published front. A hit reads one record, moves one
-        /// stored record, and drops the ready prefix by one. No successor is
-        /// read or displaced. The expected record is the value the caller just
-        /// read from `published_front`; the identity assertion is debug-only
-        /// because those two calls are adjacent and no mutation can intervene.
-        pub(super) fn pop_published_front(
+        /// Removes one exact record by identity (slot, generation, snapshotted
+        /// raw). This is the test-only retirement path: it may walk stored
+        /// records to find the predecessor, so it needs no production reverse
+        /// link. A head removal reads the old head's successor identity and does
+        /// not read the successor record. One record is read for every visited
+        /// position; the removed record is one transfer.
+        #[cfg(test)]
+        pub(super) fn remove_exact(
             &mut self,
-            expected: PendingFinalizer,
+            slots: &mut [Slot],
+            slot_index: u32,
+            generation: u32,
+            raw: u64,
         ) -> Option<PendingFinalizer> {
-            if self.published == 0 {
-                return None;
+            let mut previous: Option<PendingCursor> = None;
+            let mut cursor = self.head;
+            let mut position = 0usize;
+            while let Some((cursor_slot, cursor_generation)) = cursor {
+                let record_slot = slots.get(cursor_slot as usize)?;
+                self.read();
+                if record_slot.generation != cursor_generation
+                    || !record_slot.pending_finalizer
+                    || record_slot.pending_generation != cursor_generation
+                {
+                    return None;
+                }
+                let record_raw = record_slot.pending_raw?;
+                if cursor_slot == slot_index && cursor_generation == generation && record_raw == raw
+                {
+                    let next = record_slot.pending_next;
+                    match previous {
+                        Some((previous_slot, previous_generation)) => {
+                            let predecessor = &mut slots[previous_slot as usize];
+                            debug_assert_eq!(predecessor.generation, previous_generation);
+                            debug_assert!(predecessor.pending_finalizer);
+                            debug_assert_eq!(
+                                predecessor.pending_next,
+                                Some((cursor_slot, cursor_generation))
+                            );
+                            predecessor.pending_next = next;
+                            self.slot_write(previous_slot);
+                        }
+                        None => {
+                            self.head = next;
+                        }
+                    }
+                    if self.tail == Some((cursor_slot, cursor_generation)) {
+                        self.tail = previous;
+                    }
+                    if position < self.published {
+                        self.published -= 1;
+                    }
+                    self.len -= 1;
+                    let removed = &mut slots[cursor_slot as usize];
+                    removed.pending_finalizer = false;
+                    removed.pending_generation = 0;
+                    removed.pending_raw = None;
+                    removed.pending_next = None;
+                    self.slot_write(cursor_slot);
+                    self.header_write();
+                    self.transfer();
+                    return Some(PendingFinalizer {
+                        slot: cursor_slot,
+                        generation: cursor_generation,
+                        raw,
+                    });
+                }
+                previous = Some((cursor_slot, cursor_generation));
+                cursor = record_slot.pending_next;
+                position += 1;
             }
-            let record = self.records.pop_front()?;
-            debug_assert_eq!(record, expected);
-            self.published -= 1;
-            self.record_read();
-            self.record_move();
-            Some(record)
+            None
         }
 
-        /// Removes one record by position. The removed record is one read.
-        /// Removing a published position keeps the remaining prefix ready;
-        /// removing an unpublished position leaves the prefix unchanged.
-        pub(super) fn remove(&mut self, index: usize) -> Option<PendingFinalizer> {
-            if index >= self.records.len() {
-                return None;
-            }
-            let record = self.records.remove(index)?;
-            if index < self.published {
-                self.published -= 1;
-            }
-            self.record_read();
-            self.record_move();
-            Some(record)
-        }
-
-        /// Removes and returns every record from `base` onward.
+        /// Removes and returns every record appended after `base`.
         ///
-        /// The batch is one boundary: a non-empty suffix is accounted once by
-        /// its length in the test meters. The production build has no
-        /// per-record loop here; the returned records are the caller's own
-        /// rollback input. An out-of-range base returns nothing and reads no
-        /// record. The ready prefix is clamped to `base`, so a rollback can
-        /// never make an unpublished record consumable.
-        pub(super) fn split_off_from(&mut self, base: usize) -> Vec<PendingFinalizer> {
-            if base >= self.records.len() {
-                return Vec::new();
+        /// The old tail's successor names the first new record, so the walk starts
+        /// at the new segment and never traverses the older segment. The old tail
+        /// is the only boundary record read (through its own successor field).
+        /// The header is restored to `base`, and the published prefix is clamped
+        /// to it. A checkpoint at or beyond the current length is a no-op.
+        pub(super) fn discard_from_checkpoint(
+            &mut self,
+            slots: &mut [Slot],
+            base: PendingCheckpoint,
+        ) -> Vec<PendingFinalizer> {
+            let mut discarded = Vec::new();
+            if base.len >= self.len {
+                return discarded;
             }
-            let suffix = self.records.split_off(base);
-            self.published = self.published.min(base);
-            let removed: Vec<_> = suffix.into_iter().collect();
-            #[cfg(test)]
-            self.record_reads(removed.len() as u64);
-            #[cfg(test)]
-            self.record_moves(removed.len() as u64);
-            removed
+            let first = match base.tail {
+                Some((tail_slot, tail_generation)) => {
+                    let tail = slots
+                        .get_mut(tail_slot as usize)
+                        .expect("checkpoint tail slot");
+                    debug_assert_eq!(tail.generation, tail_generation);
+                    debug_assert_eq!(tail.pending_generation, tail_generation);
+                    debug_assert!(tail.pending_finalizer);
+                    let first = tail.pending_next;
+                    if first.is_none() {
+                        debug_assert!(false, "a non-empty new segment has a first record");
+                        return discarded;
+                    }
+                    tail.pending_next = None;
+                    self.slot_write(tail_slot);
+                    first
+                }
+                None => {
+                    debug_assert_eq!(base.len, 0);
+                    self.head
+                }
+            };
+            let Some(mut cursor) = first else {
+                debug_assert!(false, "a non-empty new segment has a first record");
+                return discarded;
+            };
+            loop {
+                let (slot_index, generation) = cursor;
+                let Some(record_slot) = slots.get_mut(slot_index as usize) else {
+                    break;
+                };
+                self.read();
+                if record_slot.generation != generation
+                    || !record_slot.pending_finalizer
+                    || record_slot.pending_generation != generation
+                {
+                    break;
+                }
+                let Some(raw) = record_slot.pending_raw else {
+                    break;
+                };
+                let next = record_slot.pending_next;
+                if record_slot.token == Some(raw) {
+                    record_slot.pending_finalizer = false;
+                }
+                record_slot.pending_generation = 0;
+                record_slot.pending_raw = None;
+                record_slot.pending_next = None;
+                self.slot_write(slot_index);
+                discarded.push(PendingFinalizer {
+                    slot: slot_index,
+                    generation,
+                    raw,
+                });
+                self.transfer();
+                match next {
+                    Some(next) => cursor = next,
+                    None => break,
+                }
+            }
+            self.len = base.len;
+            self.tail = base.tail;
+            self.published = self.published.min(base.len);
+            if base.len == 0 {
+                self.head = None;
+            }
+            self.header_write();
+            discarded
+        }
+
+        /// Test-only counts of reads, slot writes, header writes, and transfers
+        /// since construction. This does not clear them and reads no record.
+        #[cfg(test)]
+        pub(super) fn counts(&self) -> (u64, u64, u64, u64) {
+            (
+                self.reads.get(),
+                self.slot_writes.get(),
+                self.header_writes.get(),
+                self.transfers.get(),
+            )
         }
 
         /// Returns the reads since the previous take and clears the count.
         #[cfg(test)]
         pub(super) fn take_reads(&mut self) -> u64 {
-            let reads = self.reads.get();
-            self.reads.set(0);
-            reads
+            self.reads.replace(0)
         }
 
-        /// Returns the stored-record moves since the previous take.
+        /// Returns the slot writes since the previous take and clears the count.
         #[cfg(test)]
-        pub(super) fn take_moves(&mut self) -> u64 {
-            let moves = self.moves.get();
-            self.moves.set(0);
-            moves
+        pub(super) fn take_slot_writes(&mut self) -> u64 {
+            self.slot_writes.replace(0)
+        }
+
+        /// Returns the header writes since the previous take and clears the count.
+        #[cfg(test)]
+        pub(super) fn take_header_writes(&mut self) -> u64 {
+            self.header_writes.replace(0)
+        }
+
+        /// Returns the transferred records since the previous take and clears it.
+        #[cfg(test)]
+        pub(super) fn take_transfers(&mut self) -> u64 {
+            self.transfers.replace(0)
+        }
+
+        /// Returns the actual slot indices written since the previous take.
+        #[cfg(test)]
+        pub(super) fn take_write_trace(&mut self) -> Vec<u32> {
+            std::mem::take(&mut *self.write_trace.borrow_mut())
         }
 
         #[cfg(test)]
-        fn record_read(&self) {
+        fn read(&self) {
             self.reads.set(self.reads.get() + 1);
         }
 
-        /// Accounts a whole batch handed out by one boundary. Test-only.
         #[cfg(test)]
-        fn record_reads(&self, count: u64) {
-            self.reads.set(self.reads.get() + count);
+        fn slot_write(&self, slot: u32) {
+            self.slot_writes.set(self.slot_writes.get() + 1);
+            self.write_trace.borrow_mut().push(slot);
         }
 
         #[cfg(test)]
-        fn record_move(&self) {
-            self.moves.set(self.moves.get() + 1);
+        fn header_write(&self) {
+            self.header_writes.set(self.header_writes.get() + 1);
         }
 
         #[cfg(test)]
-        fn record_moves(&self, count: u64) {
-            self.moves.set(self.moves.get() + count);
+        fn transfer(&self) {
+            self.transfers.set(self.transfers.get() + 1);
         }
 
         #[cfg(not(test))]
-        fn record_read(&self) {}
+        fn read(&self) {}
 
         #[cfg(not(test))]
-        fn record_move(&self) {}
+        fn slot_write(&self, _slot: u32) {}
+
+        #[cfg(not(test))]
+        fn header_write(&self) {}
+
+        #[cfg(not(test))]
+        fn transfer(&self) {}
     }
 
-    /// Counted iterator over the private queue. It yields borrowed records
-    /// only, so the caller never reaches the vector itself.
+    /// Counted iterator over the slot-linked queue. It yields owned records, so
+    /// the caller never reaches the slot link fields directly.
     pub(super) struct PendingQueueIter<'a> {
         queue: &'a PendingQueue,
-        next: usize,
+        slots: &'a [Slot],
+        next: Option<PendingCursor>,
     }
 
-    impl<'a> Iterator for PendingQueueIter<'a> {
-        type Item = &'a PendingFinalizer;
+    impl Iterator for PendingQueueIter<'_> {
+        type Item = PendingFinalizer;
 
         fn next(&mut self) -> Option<Self::Item> {
-            let record = self.queue.records.get(self.next)?;
-            self.next += 1;
-            self.queue.record_read();
-            Some(record)
+            let (slot_index, generation) = self.next?;
+            let slot = self.slots.get(slot_index as usize)?;
+            self.queue.read();
+            if slot.generation != generation
+                || !slot.pending_finalizer
+                || slot.pending_generation != generation
+            {
+                self.next = None;
+                return None;
+            }
+            let raw = slot.pending_raw?;
+            self.next = slot.pending_next;
+            Some(PendingFinalizer {
+                slot: slot_index,
+                generation,
+                raw,
+            })
         }
     }
 }
-use pending_queue::PendingQueue;
-
-/// The batch boundary's own metering witness.
-///
-/// This is an equivalence witness for the boundary result: the split has
-/// always handed back the suffix exactly once. What the fix changes is where
-/// the test meter pays for it: a single test-only `removed.len()` charge
-/// replaces a per-record loop that the production build also compiled. These
-/// assertions pin the boundary contract on both the old and the new source;
-/// they are not a fabricated behavior RED.
-#[cfg(test)]
-mod pending_queue_tests {
-    use super::PendingFinalizer;
-    use super::pending_queue::PendingQueue;
-
-    fn record(slot: u32) -> PendingFinalizer {
-        PendingFinalizer {
-            slot,
-            generation: slot + 1,
-            raw: u64::from(slot) + 10,
-        }
-    }
-
-    #[test]
-    fn split_off_from_accounts_the_suffix_once_and_keeps_the_prefix() {
-        let mut queue = PendingQueue::default();
-        assert!(
-            queue.split_off_from(0).is_empty(),
-            "an empty queue has no suffix"
-        );
-        assert_eq!(queue.take_reads(), 0, "an empty queue reads no record");
-        for slot in 0..3 {
-            queue.push(record(slot));
-        }
-        assert_eq!(queue.take_reads(), 0, "push and len are not record reads");
-
-        let suffix = queue.split_off_from(1);
-        assert_eq!(suffix, vec![record(1), record(2)]);
-        assert_eq!(queue.len(), 1, "only the old prefix stays queued");
-        assert_eq!(
-            queue.take_reads(),
-            2,
-            "a two-record suffix is accounted once by its length"
-        );
-        assert_eq!(
-            queue.get(0),
-            Some(&record(0)),
-            "the untouched prefix keeps its record"
-        );
-        assert_eq!(queue.take_reads(), 1, "the split did not read the prefix");
-
-        assert!(
-            queue.split_off_from(1).is_empty(),
-            "base at the length is an empty suffix"
-        );
-        assert_eq!(queue.take_reads(), 0, "an empty suffix reads no record");
-        assert!(
-            queue.split_off_from(9).is_empty(),
-            "an out-of-range base is an empty suffix"
-        );
-        assert_eq!(
-            queue.take_reads(),
-            0,
-            "an out-of-range base reads no record"
-        );
-
-        assert_eq!(queue.split_off_from(0), vec![record(0)]);
-        assert_eq!(queue.len(), 0);
-        assert_eq!(queue.take_reads(), 1, "the last record is one batch read");
-        assert!(queue.split_off_from(0).is_empty());
-        assert_eq!(queue.take_reads(), 0, "a drained queue reads no record");
-    }
-}
+use pending_queue::{PendingCheckpoint, PendingCursor, PendingQueue};
 
 /// One userdata that passed the slot-local selection checks and whose
 /// metatable's raw `__gc` field still has to be resolved by a metered walk.
@@ -1561,6 +1855,7 @@ impl LuaHeap {
             pending_gc_edge_trace: std::cell::RefCell::new(Vec::new()),
             #[cfg(test)]
             pending_live_trace: LiveTrace::new(),
+            pending_offer_trace: LiveTrace::new(),
             #[cfg(test)]
             owner_verification_trace: std::cell::RefCell::new(Vec::new()),
             #[cfg(test)]
@@ -1584,7 +1879,9 @@ impl LuaHeap {
         let meter = {
             let mut meter = meter;
             meter.pending_release_queue_reads += self.pending_finalizers.take_reads();
-            meter.pending_queue_storage_moves += self.pending_finalizers.take_moves();
+            meter.pending_queue_storage_moves += self.pending_finalizers.take_transfers();
+            meter.pending_queue_slot_writes += self.pending_finalizers.take_slot_writes();
+            meter.pending_queue_header_writes += self.pending_finalizers.take_header_writes();
             meter
         };
         self.scan = ScanMeter::default();
@@ -1659,6 +1956,9 @@ impl LuaHeap {
         slot.carrier = None;
         slot.metatable = None;
         slot.pending_finalizer = false;
+        slot.pending_next = None;
+        slot.pending_raw = None;
+        slot.pending_generation = 0;
         slot.finalizer_settled = false;
         slot.live_userdata_prev = None;
         slot.live_userdata_next = None;
@@ -1710,6 +2010,9 @@ impl LuaHeap {
             carrier: None,
             metatable: None,
             pending_finalizer: false,
+            pending_next: None,
+            pending_raw: None,
+            pending_generation: 0,
             finalizer_settled: false,
             live_userdata_prev: None,
             live_userdata_next: None,
@@ -3884,6 +4187,10 @@ impl LuaHeap {
     /// Commits one metered raw-`__gc`-positive candidate into the pending
     /// record list. Re-checks the exact slot identity before any write, so a
     /// candidate that changed during the walk is not recorded.
+    ///
+    /// The append writes the exact generation and current raw-handle snapshot
+    /// onto that slot and links it after the old tail. It touches no other
+    /// slot record and never relocates an old record.
     pub(super) fn commit_pending_finalizer(&mut self, candidate: &PendingCandidate) -> bool {
         let index = candidate.slot as usize;
         let Some(slot) = self.slots.get(index) else {
@@ -3901,12 +4208,12 @@ impl LuaHeap {
             return false;
         };
         let generation = slot.generation;
-        self.slots[index].pending_finalizer = true;
-        self.pending_finalizers.push(PendingFinalizer {
+        let record = PendingFinalizer {
             slot: candidate.slot,
             generation,
             raw,
-        });
+        };
+        self.pending_finalizers.push(&mut self.slots, record);
         true
     }
 
@@ -4025,9 +4332,11 @@ impl LuaHeap {
     /// them for a later mark, but no successful weak publication has released
     /// them to a consumer yet.
     pub(super) fn pending_finalizer_published_front(&self) -> Result<PendingFinalizer, HeapError> {
-        self.pending_finalizers.published_front().ok_or_else(|| {
-            HeapError::Scope("lua pending finalizer head is not published".to_string())
-        })
+        self.pending_finalizers
+            .published_front(&self.slots)
+            .ok_or_else(|| {
+                HeapError::Scope("lua pending finalizer head is not published".to_string())
+            })
     }
 
     /// Checks one specified root slot can receive the published head.
@@ -4250,17 +4559,22 @@ impl LuaHeap {
     ///
     /// This is the shared commit behind both dequeue entries. Every fallible
     /// check, including the current raw-field resolution and the whole root
-    /// plan, has already finished in this same exclusive borrow. The remaining
-    /// published-front pop reads one record and moves one stored record; it
-    /// happens before the first root or slot write, and a refusal leaves the
-    /// queue and every root unchanged. No guest code is called.
+    /// plan, has already finished in this same exclusive borrow. The published
+    /// front pop reads one record and its successor identity, clears the queued
+    /// slot fields, and moves one record out; it never reads the successor
+    /// record. The pop happens before the first root or slot write, and a
+    /// refusal leaves the queue and every root unchanged. No guest code is
+    /// called.
     fn commit_published_finalizer(
         &mut self,
         head: PendingFinalizer,
         userdata: UserdataRef,
         roots: &[(usize, Rooted)],
     ) -> Result<UserdataRef, HeapError> {
-        let Some(popped) = self.pending_finalizers.pop_published_front(head) else {
+        let Some(popped) = self
+            .pending_finalizers
+            .pop_published_front(&mut self.slots, head)
+        else {
             return Err(HeapError::Scope(
                 "lua pending finalizer head is not published".to_string(),
             ));
@@ -4270,7 +4584,6 @@ impl LuaHeap {
             self.roots[*index] = Some(*rooted);
         }
         let slot_record = &mut self.slots[head.slot as usize];
-        slot_record.pending_finalizer = false;
         slot_record.finalizer_settled = true;
         Ok(userdata)
     }
@@ -4282,7 +4595,7 @@ impl LuaHeap {
     /// a saved mark or tail, an unpublished head, a bad frame or slot, an
     /// occupied root, and a record whose live slot no longer binds the exact
     /// generation, kind, pending flag, and raw handle. The front record is
-    /// then popped with one `VecDeque` front removal, the exact userdata is
+    /// then popped with one published-front pop, the exact userdata is
     /// written into the root slot, and the slot's pending flag is replaced by
     /// its settled flag. It does not call a guest callback and does not read a
     /// raw `__gc` field: this is the retained single-root test path.
@@ -4411,39 +4724,33 @@ impl LuaHeap {
     /// batch: earlier valid records, their slots, tokens, and generations are
     /// not read for mutation. The mark bits left by the failed pass are not
     /// pending state; the next mark resets them.
-    pub(crate) fn discard_pending_finalizers_from(&mut self, base: usize) {
-        if base >= self.pending_finalizers.len() {
-            return;
-        }
-        let discarded: Vec<PendingFinalizer> = self.pending_finalizers.split_off_from(base);
-        for pending in discarded {
-            let Some(slot) = self.slots.get_mut(pending.slot as usize) else {
-                continue;
-            };
-            if slot.generation == pending.generation
-                && slot.pending_finalizer
-                && slot.token == Some(pending.raw)
-            {
-                slot.pending_finalizer = false;
-            }
-        }
+    ///
+    /// `base` is the round-start tail identity and length, never the published
+    /// length. The queue detaches that old tail's link and walks only the new
+    /// segment, so an unpublished older segment and the published prefix stay
+    /// queued and keep their order.
+    pub(crate) fn discard_pending_finalizers_from(&mut self, base: PendingCheckpoint) {
+        let _discarded = self
+            .pending_finalizers
+            .discard_from_checkpoint(&mut self.slots, base);
     }
 
-    /// Exact live userdata named by one pending record, if that record still
-    /// matches the slot, generation, kind, pending flag, live state, and bound
-    /// raw handle. One record read plus one same-slot identity read. This is
-    /// the ordinary mark's host-retained edge offer; it does not close,
-    /// select, or advance the record.
-    pub(super) fn pending_finalizer_retention(&self, index: usize) -> Option<(u32, u32)> {
-        let pending = *self.pending_finalizers.get(index)?;
-        let slot = self.slots.get(pending.slot as usize)?;
-        let exact = slot.generation == pending.generation
-            && slot.kind == HandleKind::Userdata
-            && slot.pending_finalizer
-            && !slot.finalizer_settled
-            && slot.token == Some(pending.raw)
-            && matches!(slot.state, SlotState::Live { .. });
-        exact.then_some((pending.slot, pending.generation))
+    /// One pending record read for the ordinary/parked Roots offer.
+    ///
+    /// `cursor` is the exact slot generation of the record offered now. The
+    /// method reads that one slot record, returns the live identity only if the
+    /// record still names the exact live generation whose snapshotted raw
+    /// handle matches the slot's current token, and returns the successor
+    /// identity stored on the same record. It never searches from the head and
+    /// never reads the successor record.
+    pub(super) fn pending_finalizer_offer(
+        &self,
+        cursor: PendingCursor,
+    ) -> (Option<(u32, u32)>, Option<PendingCursor>) {
+        let offer = self.pending_finalizers.offer(&self.slots, cursor);
+        #[cfg(test)]
+        self.pending_offer_trace.borrow_mut().push(cursor);
+        offer
     }
 
     /// Copies the exact pending records as `(raw, slot, generation)`.
@@ -4455,9 +4762,22 @@ impl LuaHeap {
     /// records that are still queued.
     pub(crate) fn pending_finalizer_records(&self) -> Vec<(u64, u32, u32)> {
         self.pending_finalizers
-            .iter()
+            .iter(&self.slots)
             .map(|pending| (pending.raw, pending.slot, pending.generation))
             .collect()
+    }
+
+    /// Round-start queue tail identity and length. Header reads only; no
+    /// record is read. This is the rollback base one selecting pass captures
+    /// before its selection can append anything.
+    pub(super) fn pending_finalizer_checkpoint(&self) -> PendingCheckpoint {
+        self.pending_finalizers.checkpoint()
+    }
+
+    /// First queued record identity. A header read only, used to seed the mark
+    /// offer cursor once at mark start; it is not a positional search.
+    pub(super) fn pending_finalizer_head(&self) -> Option<PendingCursor> {
+        self.pending_finalizers.head()
     }
 
     /// Test-only explicit retirement control for the eventual finalizer
@@ -4479,17 +4799,43 @@ impl LuaHeap {
         let raw = self.slots[index as usize]
             .token
             .ok_or(HeapError::StaleHandle)?;
-        let Some(position) = self.pending_finalizers.iter().position(|pending| {
-            pending.slot == index
-                && pending.generation == userdata.generation()
-                && pending.raw == raw
-        }) else {
+        let Some(removed) = self.pending_finalizers.remove_exact(
+            &mut self.slots,
+            index,
+            userdata.generation(),
+            raw,
+        ) else {
             return Err(HeapError::StaleHandle);
         };
-        self.pending_finalizers.remove(position);
-        self.slots[index as usize].pending_finalizer = false;
+        debug_assert_eq!(
+            (removed.slot, removed.generation, removed.raw),
+            (index, userdata.generation(), raw)
+        );
         self.slots[index as usize].finalizer_settled = true;
         Ok(())
+    }
+
+    /// Test-only: exact identities read by the Roots pending-record offer, in
+    /// visit order. The vector grows only under `cfg(test)` and is not read by
+    /// production. One entry is one real queue record read.
+    #[cfg(test)]
+    pub(crate) fn pending_offer_trace(&self) -> Vec<(u32, u32)> {
+        self.pending_offer_trace.borrow().clone()
+    }
+
+    /// Test-only: the queue's real boundary counters since construction:
+    /// `(reads, slot_writes, header_writes, transfers)`. It does not clear them
+    /// and reads no record, so a session can take per-pulse deltas.
+    #[cfg(test)]
+    pub(crate) fn pending_queue_counts(&self) -> (u64, u64, u64, u64) {
+        self.pending_finalizers.counts()
+    }
+
+    /// Test-only: actual slot indices written by the queue since the previous
+    /// take, in write order. This is the real per-slot write trace.
+    #[cfg(test)]
+    pub(crate) fn take_pending_queue_write_trace(&mut self) -> Vec<u32> {
+        self.pending_finalizers.take_write_trace()
     }
 
     /// Test-only read of the per-slot pending flag.
@@ -5372,6 +5718,9 @@ impl LuaHeap {
             "a pending finalizer reached release without its retirement"
         );
         self.slots[index as usize].pending_finalizer = false;
+        self.slots[index as usize].pending_next = None;
+        self.slots[index as usize].pending_raw = None;
+        self.slots[index as usize].pending_generation = 0;
         self.slots[index as usize].finalizer_settled = false;
         self.slots[index as usize].pending_gc_generation = 0;
         self.slots[index as usize].pending_gc_round = 0;
@@ -5696,6 +6045,12 @@ fn replaced_table_target(key: &EdgeKey, old_gap: bool, value: &EdgeValue) -> Opt
     }
 }
 
+/// Test-only queue boundary counts: `(reads, slot_writes, header_writes,
+/// transfers)`. The alias keeps the pulse boundary signature readable and is
+/// not part of the production API.
+#[cfg(test)]
+pub(crate) type PendingQueueCounts = (u64, u64, u64, u64);
+
 /// Test-only facade over the private selecting mark.
 ///
 /// The pulse witness drives the real mark one charged unit at a time, so it
@@ -5709,6 +6064,9 @@ pub(crate) struct SelectingPendingMark<'a> {
     session: MarkSession<'a>,
     live_trace: LiveTrace,
     live_seen: usize,
+    /// Number of Roots offer-trace entries already returned by a queue-meter
+    /// pulse. The trace vector lives on the heap and grows monotonically.
+    offer_seen: usize,
 }
 
 #[cfg(test)]
@@ -5716,16 +6074,53 @@ impl<'a> SelectingPendingMark<'a> {
     pub(crate) fn start(heap: &'a mut LuaHeap) -> Self {
         let live_trace = heap.pending_live_trace.share();
         let live_seen = live_trace.borrow().len();
+        let offer_seen = heap.pending_offer_trace().len();
         Self {
             session: MarkSession::start_selecting_pending(heap),
             live_trace,
             live_seen,
+            offer_seen,
         }
     }
 
     /// Copies the cumulative meter without changing mark state.
     pub(crate) fn meter(&self) -> ScanMeter {
         self.session.meter()
+    }
+
+    /// Test-only: queue boundary counters after the last pulse. The alias is
+    /// `(reads, slot_writes, header_writes, transfers)` and is read from the
+    /// queue's real access boundary, not from a logical pulse count.
+    #[cfg(test)]
+    pub(crate) fn pending_queue_counts(&self) -> PendingQueueCounts {
+        self.session.pending_queue_counts()
+    }
+
+    /// Test-only: drains the queue's actual slot-write trace for this session.
+    #[cfg(test)]
+    pub(crate) fn take_pending_queue_write_trace(&mut self) -> Vec<u32> {
+        self.session.take_pending_queue_write_trace()
+    }
+
+    /// Runs one unit and returns `(finished, cumulative meter, queue counts,
+    /// offer-record deltas)`. Each offer delta element is one real queue record
+    /// read by this call through the Roots cursor.
+    #[cfg(test)]
+    pub(crate) fn pulse_with_queue_meter(
+        &mut self,
+        budget: u64,
+    ) -> (bool, ScanMeter, PendingQueueCounts, Vec<(u32, u32)>) {
+        let view = self.session.pulse(budget);
+        let trace = self.session.pending_offer_trace();
+        let start = self.offer_seen.min(trace.len());
+        let offers = trace[start..].to_vec();
+        self.offer_seen = trace.len();
+        (
+            view.finished,
+            view.meter,
+            self.session.pending_queue_counts(),
+            offers,
+        )
     }
 
     /// Runs one unit and returns `(finished, cumulative meter, chain reads)`.
