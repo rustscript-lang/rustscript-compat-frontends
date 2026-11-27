@@ -24,10 +24,10 @@
 //! work, so repeated overwrites of one marked edge do not starve ordinary
 //! Gray steps. The two implementation costs are explicit rather than hidden:
 //! a late parse stores into the record-keyed map, one O(log L) insertion and
-//! one such query per owner head, with L bounded by live metatable slots; a
-//! deferred replay pushes one target into the Gray `Vec`, whose geometric
-//! growth may copy the current length once at a capacity boundary. Those
-//! copies are amortized and total O(live nodes); every ordinary pulse still
+//! one such query per owner head, with L bounded by live metatable slots; the
+//! ordinary Gray work is an intrusive LIFO on the slot records, so a push or
+//! a pop writes a constant number of neighbour links, never allocates, and
+//! never copies or relocates a work vector. Every ordinary pulse still
 //! charges at most one of the listed units.
 //!
 //! A safepoint root batch is not one of those units. `accept_root_batch` is
@@ -80,11 +80,26 @@ struct PendingGcLookup {
 
 pub(super) struct MarkState {
     phase: MarkPhase,
-    gray: Vec<u32>,
+    /// Head and tail of the ordinary Gray LIFO. The head carries the exact
+    /// slot generation that was linked, so a pop never opens a successor
+    /// generation that reused the slot. The node links live on the slots;
+    /// this Vec-free queue never allocates, copies, or relocates.
+    gray_head: Option<(u32, u32)>,
+    gray_tail: Option<(u32, u32)>,
+    gray_len: u32,
+    /// Test-only actual link accesses: one per node read, one per node write,
+    /// and one per head/tail header update. They make the local constant of a
+    /// push, a pop, and a release visible instead of inferred.
+    #[cfg(test)]
+    gray_node_reads: u64,
+    #[cfg(test)]
+    gray_node_writes: u64,
+    #[cfg(test)]
+    gray_header_writes: u64,
     modes: Option<Vec<WeakMode>>,
     /// Marked targets from a deferred replay, linked on their slot records.
-    /// They are scanned after the ordinary Gray `Vec` empties and drained
-    /// last-in-first-out, so a replay never pushes the shared vector and
+    /// They are scanned after the ordinary Gray LIFO empties and drained
+    /// last-in-first-out, so a replay never touches the ordinary chain and
     /// never relocates it. At most one node per slot: a target joins only on
     /// the mark-bit transition.
     late_target_head: Option<u32>,
@@ -254,7 +269,15 @@ impl MarkState {
     fn new(rescan_epoch: u64) -> Self {
         Self {
             phase: MarkPhase::Start,
-            gray: Vec::new(),
+            gray_head: None,
+            gray_tail: None,
+            gray_len: 0,
+            #[cfg(test)]
+            gray_node_reads: 0,
+            #[cfg(test)]
+            gray_node_writes: 0,
+            #[cfg(test)]
+            gray_header_writes: 0,
             modes: None,
             late_target_head: None,
             late_target_tail: None,
@@ -1909,8 +1932,9 @@ fn step_root(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
             state.pending_reservation_checked = true;
             if let Some(slot) = heap.registered_pending_userdata_slot() {
                 heap.scan.node_slot_visits += 1;
+                let generation = heap.slots[slot as usize].generation;
                 if heap.mark_new(slot) {
-                    state.gray.push(slot);
+                    push_ordinary_gray(heap, state, slot, generation);
                 }
                 return true;
             }
@@ -1926,10 +1950,10 @@ fn step_root(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
             heap.scan.pending_finalizer_offers += 1;
             let (retained, next) = heap.pending_finalizer_offer(cursor);
             state.pending_offer = next;
-            if let Some((slot, _generation)) = retained {
+            if let Some((slot, generation)) = retained {
                 heap.scan.node_slot_visits += 1;
                 if heap.mark_new(slot) {
-                    state.gray.push(slot);
+                    push_ordinary_gray(heap, state, slot, generation);
                 }
             }
             return true;
@@ -1946,9 +1970,9 @@ fn step_root(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
     heap.scan.node_slot_visits += 1;
     if heap.rooted_alive(rooted) {
         heap.scan.node_slot_visits += 1;
-        let slot = rooted.slot();
+        let (slot, generation, _kind) = rooted_identity(rooted);
         if heap.mark_new(slot) {
-            state.gray.push(slot);
+            push_ordinary_gray(heap, state, slot, generation);
         }
     }
     true
@@ -1962,13 +1986,17 @@ fn step_gray(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
         state.owner = None;
         return false;
     }
-    if !state.gray.is_empty() {
+    if state.gray_len != 0 {
+        debug_assert!(
+            state.gray_head.is_some(),
+            "ordinary Gray length has no head"
+        );
         return begin_owner(heap, state);
     }
-    // Deferred replay targets come after the ordinary Gray stack. They are
+    // Deferred replay targets come after the ordinary Gray LIFO. They are
     // linked on their slots and drained last-in-first-out, matching the LIFO
-    // order the shared `Vec` had for these pushes; a replay never touches
-    // that `Vec`. Ordinary work is always preferred, so a bounded replay
+    // order the ordinary chain has for these pushes; a replay never touches
+    // that chain. Ordinary work is always preferred, so a bounded replay
     // backlog cannot starve it; one pulse opens at most one owner head here.
     if let Some(slot) = pop_late_target(heap, state) {
         return open_owner(heap, state, slot);
@@ -2142,20 +2170,312 @@ fn step_pending_gc(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
     true
 }
 
+/// Test-only record of one `open_owner` attempt. `live` and `marked` describe
+/// the slot at the instant the saved chain item named it, so an item that
+/// resolves to a reused generation is distinguishable from the original one.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct OpenTrace {
+    pub slot: u32,
+    pub generation: u32,
+    pub live: bool,
+    pub marked: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    static OPEN_TRACE: std::cell::RefCell<Vec<OpenTrace>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn record_open_attempt(slot: u32, generation: u32, live: bool, marked: bool) {
+    OPEN_TRACE.with(|trace| {
+        trace.borrow_mut().push(OpenTrace {
+            slot,
+            generation,
+            live,
+            marked,
+        });
+    });
+}
+
+/// Test-only: clear and read the owner-open trace. It is per thread, so one
+/// test does not observe another test's opens.
+#[cfg(test)]
+pub(super) fn clear_open_trace() {
+    OPEN_TRACE.with(|trace| trace.borrow_mut().clear());
+}
+
+#[cfg(test)]
+pub(super) fn open_trace() -> Vec<OpenTrace> {
+    OPEN_TRACE.with(|trace| trace.borrow().clone())
+}
+
+/// The four link fields of one ordinary Gray node. One `read_gray_link` or
+/// `write_gray_link` is the unit the test-only access counters record, so a
+/// push, a pop, and a release each have a visible local constant.
+#[derive(Clone, Copy)]
+struct GrayLink {
+    epoch: u64,
+    generation: u32,
+    prev: Option<u32>,
+    next: Option<u32>,
+}
+
+fn read_gray_link(slots: &[Slot], state: &mut MarkState, index: u32) -> GrayLink {
+    #[cfg(test)]
+    {
+        state.gray_node_reads += 1;
+    }
+    #[cfg(not(test))]
+    let _ = state;
+    let stored = &slots[index as usize];
+    GrayLink {
+        epoch: stored.gray_epoch,
+        generation: stored.gray_generation,
+        prev: stored.gray_prev,
+        next: stored.gray_next,
+    }
+}
+
+fn write_gray_link(slots: &mut [Slot], state: &mut MarkState, index: u32, link: GrayLink) {
+    #[cfg(test)]
+    {
+        state.gray_node_writes += 1;
+    }
+    #[cfg(not(test))]
+    let _ = state;
+    let stored = &mut slots[index as usize];
+    stored.gray_epoch = link.epoch;
+    stored.gray_generation = link.generation;
+    stored.gray_prev = link.prev;
+    stored.gray_next = link.next;
+}
+
+fn write_gray_prev(slots: &mut [Slot], state: &mut MarkState, index: u32, prev: Option<u32>) {
+    #[cfg(test)]
+    {
+        state.gray_node_writes += 1;
+    }
+    #[cfg(not(test))]
+    let _ = state;
+    slots[index as usize].gray_prev = prev;
+}
+
+fn write_gray_next(slots: &mut [Slot], state: &mut MarkState, index: u32, next: Option<u32>) {
+    #[cfg(test)]
+    {
+        state.gray_node_writes += 1;
+    }
+    #[cfg(not(test))]
+    let _ = state;
+    slots[index as usize].gray_next = next;
+}
+
+fn clear_gray_link(slots: &mut [Slot], state: &mut MarkState, index: u32) {
+    write_gray_link(
+        slots,
+        state,
+        index,
+        GrayLink {
+            epoch: 0,
+            generation: 0,
+            prev: None,
+            next: None,
+        },
+    );
+}
+
+fn clear_gray_slot(stored: &mut Slot) {
+    stored.gray_epoch = 0;
+    stored.gray_generation = 0;
+    stored.gray_prev = None;
+    stored.gray_next = None;
+}
+
+/// Pushes one newly marked slot at the head of the ordinary Gray LIFO. The
+/// old head's predecessor link is updated in place; the node lives in the
+/// slot arena, so this does not allocate or copy a queue. A push happens only
+/// on the white-to-marked transition, so one slot joins at most once per
+/// round.
+fn push_ordinary_gray(heap: &mut LuaHeap, state: &mut MarkState, slot: u32, generation: u32) {
+    let existing = read_gray_link(&heap.slots, state, slot);
+    debug_assert_ne!(
+        existing.epoch, state.rescan_epoch,
+        "a slot joined the ordinary Gray chain twice in one round"
+    );
+    let old_head = state.gray_head;
+    write_gray_link(
+        &mut heap.slots,
+        state,
+        slot,
+        GrayLink {
+            epoch: state.rescan_epoch,
+            generation,
+            prev: None,
+            next: old_head.map(|(head, _)| head),
+        },
+    );
+    match old_head {
+        Some((head, _)) => write_gray_prev(&mut heap.slots, state, head, Some(slot)),
+        None => state.gray_tail = Some((slot, generation)),
+    }
+    state.gray_head = Some((slot, generation));
+    state.gray_len += 1;
+    #[cfg(test)]
+    {
+        state.gray_header_writes += 1;
+    }
+}
+
+/// Pops the exact head of the ordinary Gray LIFO. The stored generation
+/// travels back to the caller so `begin_owner` can refuse to open a successor
+/// generation; the successor becomes the new head with its own recorded
+/// generation. Both neighbour updates are constant work.
+fn pop_ordinary_gray(heap: &mut LuaHeap, state: &mut MarkState) -> Option<(u32, u32)> {
+    let (slot, generation) = state.gray_head?;
+    let link = read_gray_link(&heap.slots, state, slot);
+    debug_assert_eq!(
+        link.epoch, state.rescan_epoch,
+        "ordinary Gray head belongs to an older round"
+    );
+    debug_assert_eq!(
+        link.generation, generation,
+        "ordinary Gray head identity changed"
+    );
+    debug_assert!(link.prev.is_none(), "ordinary Gray head has a predecessor");
+    match link.next {
+        Some(next) => {
+            let next_link = read_gray_link(&heap.slots, state, next);
+            debug_assert_eq!(
+                next_link.prev,
+                Some(slot),
+                "ordinary Gray successor does not link back to the head"
+            );
+            write_gray_prev(&mut heap.slots, state, next, None);
+            state.gray_head = Some((next, next_link.generation));
+        }
+        None => {
+            state.gray_head = None;
+            state.gray_tail = None;
+        }
+    }
+    clear_gray_link(&mut heap.slots, state, slot);
+    state.gray_len -= 1;
+    #[cfg(test)]
+    {
+        state.gray_header_writes += 1;
+    }
+    Some((slot, generation))
+}
+
+/// Removes a released slot from the ordinary Gray LIFO before its generation
+/// advances. The links are on the slot, so this is constant work and never
+/// walks the chain. Removing a middle node stitches its neighbours together,
+/// so the remaining queue stays reachable. A tag from an older round is not
+/// in the current chain, and only the released slot is cleared in that case.
+pub(super) fn release_ordinary_gray(state: Option<&mut MarkState>, slots: &mut [Slot], index: u32) {
+    let Some(state) = state else {
+        if let Some(stored) = slots.get_mut(index as usize) {
+            clear_gray_slot(stored);
+        }
+        return;
+    };
+    let Some(stored) = slots.get(index as usize) else {
+        return;
+    };
+    let linked_generation = stored.generation;
+    let link = read_gray_link(slots, state, index);
+    if link.epoch != state.rescan_epoch || link.generation != linked_generation {
+        if let Some(stored) = slots.get_mut(index as usize) {
+            clear_gray_slot(stored);
+        }
+        return;
+    }
+    let mut header_changed = false;
+    match link.prev {
+        Some(prev) => write_gray_next(slots, state, prev, link.next),
+        None => {
+            debug_assert_eq!(
+                state.gray_head.map(|(head, _)| head),
+                Some(index),
+                "ordinary Gray head does not name the released node"
+            );
+            state.gray_head = match link.next {
+                Some(next) => {
+                    let next_link = read_gray_link(slots, state, next);
+                    Some((next, next_link.generation))
+                }
+                None => None,
+            };
+            header_changed = true;
+        }
+    }
+    match link.next {
+        Some(next) => write_gray_prev(slots, state, next, link.prev),
+        None => {
+            debug_assert_eq!(
+                state.gray_tail.map(|(tail, _)| tail),
+                Some(index),
+                "ordinary Gray tail does not name the released node"
+            );
+            state.gray_tail = match link.prev {
+                Some(prev) => {
+                    let prev_link = read_gray_link(slots, state, prev);
+                    Some((prev, prev_link.generation))
+                }
+                None => None,
+            };
+            header_changed = true;
+        }
+    }
+    clear_gray_link(slots, state, index);
+    state.gray_len = state.gray_len.saturating_sub(1);
+    #[cfg(test)]
+    {
+        if header_changed {
+            state.gray_header_writes += 1;
+        }
+    }
+    #[cfg(not(test))]
+    let _ = header_changed;
+}
+
 fn begin_owner(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
-    let Some(slot) = state.gray.pop() else {
+    let Some((slot, generation)) = pop_ordinary_gray(heap, state) else {
         state.phase = MarkPhase::Done;
         return false;
     };
+    let live_generation = heap.slots.get(slot as usize).is_some_and(|stored| {
+        stored.generation == generation && matches!(stored.state, SlotState::Live { .. })
+    });
+    if !live_generation {
+        // Release unlinks a node before it advances the slot generation, so a
+        // linked item always names a live generation. Keep the defensive
+        // check: a stale item must never open a reused generation, and the
+        // remaining chain is still reachable because the head already moved.
+        debug_assert!(false, "a linked ordinary Gray item lost its identity");
+        return true;
+    }
     open_owner(heap, state, slot)
 }
 
 /// Opens one marked slot as the current owner. One caller unit. Shared by the
-/// ordinary Gray stack and the deferred-replay list.
+/// ordinary Gray LIFO and the deferred-replay list.
 fn open_owner(heap: &mut LuaHeap, state: &mut MarkState, slot: u32) -> bool {
     let Some(stored) = heap.slots.get(slot as usize) else {
+        #[cfg(test)]
+        record_open_attempt(slot, 0, false, false);
         return false;
     };
+    #[cfg(test)]
+    record_open_attempt(
+        slot,
+        stored.generation,
+        matches!(stored.state, SlotState::Live { .. }),
+        matches!(stored.state, SlotState::Live { marked: true }),
+    );
     if !matches!(stored.state, SlotState::Live { .. }) {
         return false;
     }
@@ -2692,7 +3012,7 @@ fn enqueue_barrier_target(
 }
 
 /// Marks one deferred-replay target and links it on its slot record. This is
-/// the replay-only queue: it never pushes the shared Gray `Vec`, so a replay
+/// the replay-only queue: it never pushes the ordinary Gray chain, so a replay
 /// at a capacity boundary does not relocate the stored segment. The same
 /// target checks and meter as [`enqueue_barrier_target`] ride on the one
 /// deferred unit that called this.
@@ -2785,7 +3105,7 @@ fn follow_one(
     }
     heap.scan.node_slot_visits += 1;
     if heap.mark_new(slot) {
-        state.gray.push(slot);
+        push_ordinary_gray(heap, state, slot, generation);
     }
     true
 }
@@ -2823,7 +3143,7 @@ impl LuaHeap {
         let state = self.mark.as_ref()?;
         Some((
             state.phase_name(),
-            !state.gray.is_empty()
+            state.gray_len != 0
                 || state.cursor.is_some()
                 || state.rescan_owner.is_some()
                 || state.rescan_cursor.is_some()
@@ -2839,27 +3159,88 @@ impl LuaHeap {
     #[cfg(test)]
     pub fn saved_mark_watch(&self) -> Option<super::super::SavedMarkWatch> {
         let state = self.mark.as_ref()?;
-        let gray_len = u32::try_from(state.gray.len()).unwrap_or(u32::MAX);
         Some(super::super::SavedMarkWatch {
             phase: state.phase_name(),
-            pending: !state.gray.is_empty()
+            pending: state.gray_len != 0
                 || state.cursor.is_some()
                 || state.late_target_head.is_some()
                 || state.has_late_work(),
             cursor_owner: state.owner,
             cursor_index: state.cursor,
-            gray_len,
+            gray_len: state.gray_len,
         })
     }
 
-    /// Actual Gray stack length and capacity. Test-only: the capacity is not
-    /// part of the production meter, but the tests must show a real boundary
-    /// crossing rather than infer growth from a push count.
+    /// Exact ordinary Gray chain, head to tail, as slot/generation pairs.
+    /// Test-only: the links are read while the saved mark is borrowed and no
+    /// link is written. A chain that does not match its head, tail, or node
+    /// generations is a test failure, not a silent zero.
     #[cfg(test)]
-    pub fn saved_mark_gray_shape(&self) -> Option<(usize, usize)> {
-        self.mark
-            .as_ref()
-            .map(|state| (state.gray.len(), state.gray.capacity()))
+    pub fn saved_mark_gray_snapshot(&self) -> Option<Vec<(u32, u32)>> {
+        let state = self.mark.as_ref()?;
+        let mut nodes = Vec::with_capacity(state.gray_len as usize);
+        let mut cursor = state.gray_head;
+        while let Some((slot, generation)) = cursor {
+            let stored = self
+                .slots
+                .get(slot as usize)
+                .expect("ordinary Gray node names a missing slot");
+            assert_eq!(
+                stored.gray_epoch, state.rescan_epoch,
+                "ordinary Gray node belongs to an older round"
+            );
+            assert_eq!(
+                stored.gray_generation, generation,
+                "ordinary Gray node identity changed"
+            );
+            assert_eq!(
+                stored.generation, generation,
+                "ordinary Gray node names a stale generation"
+            );
+            nodes.push((slot, generation));
+            assert!(
+                nodes.len() <= self.slots.len(),
+                "ordinary Gray chain has a cycle"
+            );
+            cursor = stored.gray_next.map(|next| {
+                let next_slot = self
+                    .slots
+                    .get(next as usize)
+                    .expect("ordinary Gray successor names a missing slot");
+                (next, next_slot.gray_generation)
+            });
+        }
+        assert_eq!(
+            state.gray_tail.map(|(slot, _)| slot),
+            nodes.last().map(|(slot, _)| *slot),
+            "ordinary Gray tail does not match the last node"
+        );
+        assert_eq!(
+            usize::try_from(state.gray_len).expect("chain length fits the arena"),
+            nodes.len(),
+            "ordinary Gray length does not match the chain"
+        );
+        Some(nodes)
+    }
+
+    /// Test-only actual ordinary Gray link accesses:
+    /// `(node reads, node writes, head/tail header writes)`.
+    #[cfg(test)]
+    pub fn saved_mark_gray_access(&self) -> Option<(u64, u64, u64)> {
+        self.mark.as_ref().map(|state| {
+            (
+                state.gray_node_reads,
+                state.gray_node_writes,
+                state.gray_header_writes,
+            )
+        })
+    }
+
+    /// Test-only capacity of the slot arena that stores both the nodes and
+    /// their ordinary Gray links. It is independent of any mark work queue.
+    #[cfg(test)]
+    pub fn saved_mark_gray_arena_capacity(&self) -> Option<usize> {
+        self.mark.as_ref().map(|_| self.slots.capacity())
     }
 
     /// Live marked bit of one table. Does not walk an edge or change the bit.
@@ -2872,13 +3253,37 @@ impl LuaHeap {
         })
     }
 
-    /// Whether this table's slot is already in the saved gray vector.
-    /// Reads that vector only. Does not walk edges or push.
+    /// Whether this table's slot is linked in the saved ordinary Gray chain.
+    /// Reads the chain links only. Compares slots, not generations, so it is
+    /// not generation evidence; `saved_mark_gray_snapshot` carries identity.
     #[cfg(test)]
     pub fn table_in_gray(&self, table: TableRef) -> bool {
-        self.mark
-            .as_ref()
-            .is_some_and(|state| state.gray.contains(&table.slot()))
+        let Some(state) = self.mark.as_ref() else {
+            return false;
+        };
+        let mut cursor = state.gray_head;
+        let mut steps = 0usize;
+        while let Some((slot, generation)) = cursor {
+            if slot == table.slot() {
+                return true;
+            }
+            let Some(stored) = self.slots.get(slot as usize) else {
+                return false;
+            };
+            if stored.gray_epoch != state.rescan_epoch || stored.gray_generation != generation {
+                return false;
+            }
+            cursor = stored.gray_next.and_then(|next| {
+                self.slots
+                    .get(next as usize)
+                    .map(|next_slot| (next, next_slot.gray_generation))
+            });
+            steps += 1;
+            if steps > self.slots.len() {
+                return false;
+            }
+        }
+        false
     }
 
     /// Whether one open frame already roots this table. Empty and non-table

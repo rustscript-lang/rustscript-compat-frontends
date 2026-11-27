@@ -3,6 +3,7 @@
 //! A pulse of one stops on a real pending record, not on a guessed step count.
 //! The bound below is only a harness limit. Sweep stays outside the pulse.
 
+use super::mark::{OpenTrace, clear_open_trace, open_trace};
 use super::{
     ClosureRef, HeapError, HeapLimits, HeapStats, LuaHeap, ParkedMark, PausedOp, PendingScan,
     RootFrameId, ScanMeter, TableRef, UpvalueRef, UserdataRef,
@@ -15020,13 +15021,37 @@ fn late_mode_queue_is_bounded_by_live_sites_and_stores_outside_the_vectors() {
 }
 
 // ---------------------------------------------------------------------------
-// Re-review 0248456: deferred replay Gray capacity movement is measured.
+// Re-review 0248456: deferred replay movement of the ordinary Gray chain is
+// measured.
 // ---------------------------------------------------------------------------
 
-fn gray_shape(parked: &mut ParkedMark<'_>) -> (usize, usize) {
-    parked
-        .with_saved_heap(|heap| heap.saved_mark_gray_shape())
-        .expect("saved mark gray shape")
+struct GrayChain {
+    nodes: Vec<(u32, u32)>,
+    access: (u64, u64, u64),
+    arena_capacity: usize,
+}
+
+/// The exact ordinary Gray chain, the actual link accesses that built it, and
+/// the capacity of the slot arena that stores the nodes. This replaces the old
+/// Vec length/capacity shape: every reading is a real chain node, not a
+/// constant.
+fn gray_chain(parked: &mut ParkedMark<'_>) -> GrayChain {
+    parked.with_saved_heap(|heap| {
+        let nodes = heap
+            .saved_mark_gray_snapshot()
+            .expect("saved mark ordinary Gray chain");
+        let access = heap
+            .saved_mark_gray_access()
+            .expect("saved mark ordinary Gray access");
+        let arena_capacity = heap
+            .saved_mark_gray_arena_capacity()
+            .expect("saved mark ordinary Gray arena");
+        GrayChain {
+            nodes,
+            access,
+            arena_capacity,
+        }
+    })
 }
 
 /// Drive the late byte reader with budget one until one whole mode parse is
@@ -15048,10 +15073,11 @@ fn pulse_until_late_parsed(parked: &mut ParkedMark<'_>) {
     );
 }
 
-/// Consume exactly one deferred owner check. The Gray stack must not move.
+/// Consume exactly one deferred owner check. The ordinary Gray chain must not
+/// move: the replay targets use their own slot-linked queue.
 fn consume_one_deferred(parked: &mut ParkedMark<'_>, label: &str) {
     let before = parked.meter();
-    let shape = gray_shape(parked);
+    let chain = gray_chain(parked);
     let view = parked.pulse(1);
     assert!(!view.finished, "{label}: the gate work remains");
     let now = view.meter;
@@ -15064,16 +15090,20 @@ fn consume_one_deferred(parked: &mut ParkedMark<'_>, label: &str) {
         now.scratch.work_pushed, before.scratch.work_pushed,
         "{label}: an owner check does not push to Gray"
     );
-    assert_eq!(gray_shape(parked), shape, "{label}: Gray did not move");
+    assert_eq!(
+        gray_chain(parked).nodes,
+        chain.nodes,
+        "{label}: the ordinary Gray chain did not move"
+    );
 }
 
-fn fill_gray_to_capacity(parked: &mut ParkedMark<'_>) -> (usize, usize) {
+fn fill_gray_to_len(parked: &mut ParkedMark<'_>, target: usize) -> GrayChain {
     loop {
-        let (len, cap) = gray_shape(parked);
-        if len == cap {
-            return (len, cap);
+        let chain = gray_chain(parked);
+        if chain.nodes.len() >= target {
+            return chain;
         }
-        let need = cap - len;
+        let need = target - chain.nodes.len();
         let mut batch = Vec::with_capacity(need);
         for _ in 0..need {
             let filler = parked
@@ -15083,7 +15113,7 @@ fn fill_gray_to_capacity(parked: &mut ParkedMark<'_>) -> (usize, usize) {
         }
         parked
             .accept_root_batch(&batch)
-            .expect("fill the gray stack to its current capacity");
+            .expect("fill the ordinary Gray chain");
     }
 }
 
@@ -16386,11 +16416,17 @@ fn late_deferred_key_and_value_replay_does_not_move_the_gray_vec_at_a_real_bound
         "the edge event is still queued after the owner check"
     );
 
-    let before_shape = fill_gray_to_capacity(&mut parked);
+    let before_chain = fill_gray_to_len(&mut parked, 6);
     assert_eq!(
-        (before_shape.0, before_shape.1),
-        (before_shape.0, before_shape.0),
-        "the shared Gray Vec is exactly at its capacity before the replay"
+        before_chain.nodes.len(),
+        6,
+        "the ordinary Gray chain holds six real marked nodes before the replay"
+    );
+    assert!(
+        before_chain
+            .nodes
+            .contains(&(fixture.owner.slot(), fixture.owner.generation())),
+        "the pre-replay chain contains the real rooted owner"
     );
     let before = parked.meter();
     let view = parked.pulse(1);
@@ -16416,11 +16452,19 @@ fn late_deferred_key_and_value_replay_does_not_move_the_gray_vec_at_a_real_bound
         value_tag, 0,
         "the replay links the value target on its slot"
     );
-    let after_shape = gray_shape(&mut parked);
+    let after_chain = gray_chain(&mut parked);
     assert_eq!(
-        after_shape, before_shape,
-        "the deferred key+value replay must not push the shared Gray Vec; \
-         a push at len == cap would relocate the stored segment"
+        after_chain.nodes, before_chain.nodes,
+        "the deferred key+value replay must not push or move the ordinary Gray chain; \
+         the replay targets use their own slot links"
+    );
+    assert_eq!(
+        after_chain.access, before_chain.access,
+        "the deferred key+value replay performs no ordinary Gray link access"
+    );
+    assert_eq!(
+        after_chain.arena_capacity, before_chain.arena_capacity,
+        "the deferred key+value replay does not grow the slot arena"
     );
 
     let edges_before = parked.meter().outgoing_edge_checks;
@@ -16753,7 +16797,8 @@ fn late_replay_target_expands_its_out_edge_after_a_peer_is_released() {
         !parked.marked(successor),
         "opening the owner has not charged its out-edge yet"
     );
-    let (gray_len, _) = gray_shape(&mut parked);
+    let chain_before = gray_chain(&mut parked);
+    let gray_len = chain_before.nodes.len();
     let before = parked.meter();
     let view = parked.pulse(1);
     assert!(
@@ -16770,10 +16815,35 @@ fn late_replay_target_expands_its_out_edge_after_a_peer_is_released() {
         1,
         "the white successor is newly marked by that out-edge"
     );
+    let chain_after = gray_chain(&mut parked);
     assert_eq!(
-        gray_shape(&mut parked).0,
+        chain_after.nodes.len(),
         gray_len + 1,
         "the ordinary queue actually expands"
+    );
+    assert_eq!(
+        chain_after.nodes.first(),
+        Some(&(successor.slot(), successor.generation())),
+        "the white successor is pushed at the LIFO head"
+    );
+    assert_eq!(
+        chain_after.access.0 - chain_before.access.0,
+        1,
+        "one push reads exactly one node link"
+    );
+    assert_eq!(
+        chain_after.access.1 - chain_before.access.1,
+        if chain_before.nodes.is_empty() { 1 } else { 2 },
+        "one push writes the new node and, past an old head, one predecessor link"
+    );
+    assert_eq!(
+        chain_after.access.2 - chain_before.access.2,
+        1,
+        "one push updates the head header once"
+    );
+    assert_eq!(
+        chain_after.arena_capacity, chain_before.arena_capacity,
+        "one push does not grow the slot arena"
     );
     assert!(parked.marked(successor));
 
@@ -16790,5 +16860,821 @@ fn late_replay_target_expands_its_out_edge_after_a_peer_is_released() {
         heap.named_edge(target, "next"),
         Ok(Some(successor)),
         "the strong successor edge stays live"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Ordinary Gray LIFO: real pushes at a filled chain, middle and neighbour
+// retirement, and round boundaries.
+// ---------------------------------------------------------------------------
+
+fn trace_position(trace: &[OpenTrace], slot: u32, generation: u32) -> Option<usize> {
+    trace
+        .iter()
+        .position(|entry| entry.slot == slot && entry.generation == generation)
+}
+
+fn assert_unique_chain(chain: &GrayChain, label: &str) {
+    for (index, node) in chain.nodes.iter().enumerate() {
+        assert!(
+            !chain.nodes[index + 1..].contains(node),
+            "{label}: one slot joined the ordinary Gray chain twice: {node:?}"
+        );
+    }
+}
+
+/// A real named strong edge at the head of a filled ordinary chain. The
+/// measured pulse marks one white target and pushes it at the LIFO head with
+/// a fixed number of link accesses; it does not allocate, copy, or relocate a
+/// work vector. The gate owner is open on the record before a scalar
+/// sentinel, so the measured unit is exactly that edge.
+#[test]
+fn ordinary_gray_strong_edge_pushes_without_growing_the_slot_arena() {
+    let mut heap = LuaHeap::new(limits(64, 8, 64));
+    let gate = heap.alloc().expect("chain gate");
+    let target = heap.alloc().expect("chain target");
+    heap.set_named_edge(gate, "strong", target)
+        .expect("gate named strong edge");
+    heap.set_named_scalar(gate, "sentinel", Value::Bool(true))
+        .expect("gate scalar sentinel");
+    let (_, strong_record) = heap
+        .locate_named(gate.slot(), "strong")
+        .expect("named strong record");
+    let (_, sentinel_record) = heap
+        .locate_named(gate.slot(), "sentinel")
+        .expect("scalar sentinel record");
+    assert_eq!(
+        heap.edge_slots[strong_record as usize].next,
+        Some(sentinel_record),
+        "the scalar sentinel is the record after the named strong edge"
+    );
+    let frame = heap.enter_roots(1).expect("chain roots");
+    heap.write_root(frame, 0, gate).expect("root chain gate");
+    let _ = heap.take_scan_meter();
+
+    let mut parked = ParkedMark::start(&mut heap).expect("chain mark");
+    pause_at(&mut parked, gate.slot(), strong_record);
+    assert!(parked.marked(gate));
+    assert!(
+        !parked.marked(target),
+        "the named strong target is white before the measured pulse"
+    );
+    let pending = parked.pending().expect("strong edge is pending");
+    assert_eq!(pending.owner, gate.slot());
+    assert_eq!(pending.cursor, strong_record);
+
+    let filled = fill_gray_to_len(&mut parked, 6);
+    assert_eq!(
+        filled.nodes.len(),
+        6,
+        "six real marked nodes fill the ordinary chain"
+    );
+    assert_unique_chain(&filled, "filled chain");
+    assert!(
+        !filled.nodes.contains(&(target.slot(), target.generation())),
+        "the measured target has not joined the chain yet"
+    );
+    let tail_before = *filled.nodes.last().expect("filled chain has a tail");
+    let before = parked.meter();
+
+    let view = parked.pulse(1);
+    assert!(
+        !view.finished,
+        "the measured pulse stops on the scalar sentinel, not Done"
+    );
+    assert!(
+        parked.marked(target),
+        "the real named strong edge marks the white target"
+    );
+    let pending = parked.pending().expect("the gate cursor is still open");
+    assert_eq!(
+        pending.owner,
+        gate.slot(),
+        "the measured edge keeps the owner"
+    );
+    assert_eq!(
+        pending.cursor, sentinel_record,
+        "one unit moves the cursor from the strong edge to the scalar sentinel"
+    );
+    assert_eq!(
+        view.meter.outgoing_edge_checks - before.outgoing_edge_checks,
+        1,
+        "the named strong edge is exactly one charged outgoing unit"
+    );
+    assert_eq!(
+        view.meter.scratch.work_pushed - before.scratch.work_pushed,
+        1,
+        "the white target is exactly one newly pushed mark target"
+    );
+    assert_eq!(
+        view.meter.owner_head_checks, before.owner_head_checks,
+        "the measured edge does not open another owner head"
+    );
+
+    let after = gray_chain(&mut parked);
+    assert_eq!(
+        after.nodes.len(),
+        7,
+        "the new white target joins the ordinary Gray chain"
+    );
+    assert_eq!(
+        after.nodes.first(),
+        Some(&(target.slot(), target.generation())),
+        "the new target is pushed at the LIFO head"
+    );
+    assert_eq!(
+        after.nodes.last(),
+        Some(&tail_before),
+        "the old tail is not moved or copied by the push"
+    );
+    assert_unique_chain(&after, "measured push");
+    assert_eq!(
+        after.access.0 - filled.access.0,
+        1,
+        "one push reads exactly one node link"
+    );
+    assert_eq!(
+        after.access.1 - filled.access.1,
+        2,
+        "one push writes the new node and the old head's predecessor link"
+    );
+    assert_eq!(
+        after.access.2 - filled.access.2,
+        1,
+        "one push updates the head header once"
+    );
+    assert_eq!(
+        after.arena_capacity, filled.arena_capacity,
+        "one push does not grow the slot arena"
+    );
+
+    let _ = finish(&mut parked);
+    parked.complete().expect("chain sweep");
+    drop(parked);
+    assert!(
+        heap.alive(gate) && heap.alive(target),
+        "the rooted gate and the marked target stay live"
+    );
+}
+
+/// Same `[tail, mid, top, gate]` roots with no rollback. The original middle
+/// item opens normally after `top` and before `tail`.
+fn ordinary_gray_middle_without_rollback_control() {
+    let mut heap = LuaHeap::new(limits(32, 8, 32));
+    let tail = heap.alloc().expect("control tail");
+    let tail_child = heap.alloc().expect("control tail child");
+    heap.set_named_edge(tail, "child", tail_child)
+        .expect("control tail edge");
+    let mid = heap.alloc().expect("control mid");
+    let top = heap.alloc().expect("control top");
+    let gate = heap.alloc().expect("control gate");
+    heap.set_named_scalar(gate, "g0", Value::Bool(true))
+        .expect("control gate scalar");
+    let (_, gate_record) = heap
+        .locate_named(gate.slot(), "g0")
+        .expect("control gate record");
+    let frame = heap.enter_roots(4).expect("control roots");
+    heap.write_root(frame, 0, tail).expect("control root tail");
+    heap.write_root(frame, 1, mid).expect("control root mid");
+    heap.write_root(frame, 2, top).expect("control root top");
+    heap.write_root(frame, 3, gate).expect("control root gate");
+    let _ = heap.take_scan_meter();
+
+    let mut parked = ParkedMark::start(&mut heap).expect("control mark");
+    clear_open_trace();
+    pause_at(&mut parked, gate.slot(), gate_record);
+    assert_eq!(
+        open_trace().len(),
+        1,
+        "only gate opens before its scalar record"
+    );
+    assert!(parked.marked(top) && parked.marked(mid) && parked.marked(tail));
+    assert!(
+        !parked.marked(tail_child),
+        "the tail child is white before the tail opens"
+    );
+
+    for _ in 0..HARNESS_BOUND {
+        if parked.pulse(1).finished {
+            break;
+        }
+    }
+    let trace = open_trace();
+    let top_pos = trace_position(&trace, top.slot(), top.generation()).expect("control top opens");
+    let mid_pos = trace_position(&trace, mid.slot(), mid.generation())
+        .unwrap_or_else(|| panic!("control mid did not open: {trace:?}"));
+    let tail_pos =
+        trace_position(&trace, tail.slot(), tail.generation()).expect("control tail opens");
+    assert!(
+        top_pos < mid_pos && mid_pos < tail_pos,
+        "the no-rollback control opens top, then the original mid, then tail"
+    );
+    assert!(trace[mid_pos].live && trace[mid_pos].marked);
+    assert!(
+        parked.marked(tail_child),
+        "the control tail scan marks its exclusive child"
+    );
+
+    parked.complete().expect("control sweep");
+    drop(parked);
+    assert!(
+        heap.alive(tail) && heap.alive(mid) && heap.alive(top) && heap.alive(gate),
+        "the no-rollback control keeps every original root"
+    );
+    assert!(
+        heap.alive(tail_child),
+        "the no-rollback control keeps the tail child"
+    );
+}
+
+/// Rolling back a middle ordinary Gray item unlinks its exact identity before
+/// the slot generation advances, stitches its neighbours, and never opens the
+/// reused generation. The original tail and its exclusive child still scan.
+#[test]
+fn ordinary_gray_middle_rollback_does_not_open_reused_generation() {
+    ordinary_gray_middle_without_rollback_control();
+
+    let mut heap = LuaHeap::new(limits(32, 8, 32));
+    let tail = heap.alloc().expect("tail");
+    let tail_child = heap.alloc().expect("tail child");
+    heap.set_named_edge(tail, "child", tail_child)
+        .expect("exclusive tail child edge");
+    let mid = heap.alloc().expect("middle Gray item");
+    let top = heap.alloc().expect("top Gray item");
+    let gate = heap.alloc().expect("gate");
+    heap.set_named_scalar(gate, "g0", Value::Bool(true))
+        .expect("gate scalar record");
+    let (_, gate_record) = heap
+        .locate_named(gate.slot(), "g0")
+        .expect("gate record identity");
+    let weak_mt = heap.alloc().expect("weak metatable");
+    heap.set_mode_scalar(weak_mt, Value::string("v"))
+        .expect("weak value mode");
+    let weak_owner = heap.alloc().expect("weak owner");
+    heap.set_metatable(weak_owner, Some(weak_mt))
+        .expect("weak metatable attach");
+    let orphan = heap.alloc().expect("weak orphan");
+    heap.set_named_edge(weak_owner, "dead", orphan)
+        .expect("weak orphan edge");
+
+    let frame = heap.enter_roots(6).expect("rollback roots");
+    heap.write_root(frame, 0, tail).expect("root tail");
+    heap.write_root(frame, 1, mid).expect("root mid");
+    heap.write_root(frame, 2, top).expect("root top");
+    heap.write_root(frame, 3, gate).expect("root gate");
+    heap.write_root(frame, 4, weak_mt)
+        .expect("root weak metatable");
+    heap.write_root(frame, 5, weak_owner)
+        .expect("root weak owner");
+    let _ = heap.take_scan_meter();
+
+    let mut parked = ParkedMark::start(&mut heap).expect("rollback mark");
+    clear_open_trace();
+    pause_at(&mut parked, gate.slot(), gate_record);
+    assert!(parked.marked(top) && parked.marked(mid) && parked.marked(tail));
+    assert!(
+        !parked.marked(tail_child),
+        "the tail child is white before the tail is scanned"
+    );
+    assert!(
+        !parked.marked(orphan),
+        "the weak orphan is white before sweep"
+    );
+    let opened_before = open_trace();
+    assert_eq!(
+        opened_before.len(),
+        3,
+        "weak owner, weak metatable, and gate opened before the scalar"
+    );
+    assert!(
+        !opened_before.iter().any(|entry| {
+            entry.slot == tail.slot() || entry.slot == mid.slot() || entry.slot == top.slot()
+        }),
+        "top, mid, and tail are still unopened on the ordinary chain"
+    );
+    let (top_id, mid_id, tail_id) = (
+        (top.slot(), top.generation()),
+        (mid.slot(), mid.generation()),
+        (tail.slot(), tail.generation()),
+    );
+    let chain_before = gray_chain(&mut parked);
+    assert_eq!(
+        chain_before.nodes,
+        vec![top_id, mid_id, tail_id],
+        "the ordinary chain is head top, middle mid, tail tail"
+    );
+    assert_unique_chain(&chain_before, "middle rollback before");
+
+    let owners = parked.with_saved_heap(|heap| heap.slots.len());
+    let visits_before = parked.with_saved_heap(|heap| heap.rollback_owner_visits());
+    parked
+        .with_saved_heap(|heap| heap.rollback(mid))
+        .expect("real table rollback of the middle Gray item");
+    let visits_after = parked.with_saved_heap(|heap| heap.rollback_owner_visits());
+    assert_eq!(
+        visits_after - visits_before,
+        owners as u64,
+        "the existing rollback walk still visits every owner independently of the chain unlink"
+    );
+    assert!(
+        !parked.with_saved_heap(|heap| heap.alive(mid)),
+        "rollback really releases the middle item"
+    );
+    let chain_after_rollback = gray_chain(&mut parked);
+    assert_eq!(
+        chain_after_rollback.nodes,
+        vec![top_id, tail_id],
+        "the middle item is unlinked and its predecessor now reaches the tail"
+    );
+    assert_eq!(
+        (
+            chain_after_rollback.access.0 - chain_before.access.0,
+            chain_after_rollback.access.1 - chain_before.access.1,
+            chain_after_rollback.access.2 - chain_before.access.2,
+        ),
+        (1, 3, 0),
+        "a middle release reads one node, writes two neighbours plus its own clear, and moves no header"
+    );
+    assert_eq!(
+        chain_after_rollback.arena_capacity, chain_before.arena_capacity,
+        "the middle release does not grow the slot arena"
+    );
+
+    let fresh = parked
+        .with_saved_heap(|heap| heap.alloc())
+        .expect("reuse the released middle slot");
+    assert_eq!(
+        fresh.slot(),
+        mid.slot(),
+        "the new generation reuses the slot"
+    );
+    assert_ne!(
+        fresh.generation(),
+        mid.generation(),
+        "the generation differs"
+    );
+    let probe = parked
+        .with_saved_heap(|heap| heap.alloc())
+        .expect("white probe");
+    parked
+        .with_saved_heap(|heap| heap.set_named_edge(fresh, "child", probe))
+        .expect("the new generation's exclusive white probe edge");
+    assert!(
+        parked.with_saved_heap(|heap| heap.alive(fresh)),
+        "the reused generation is Live"
+    );
+    assert!(
+        !parked.marked(fresh) && !parked.marked(probe),
+        "the reused generation and its probe both start white"
+    );
+    assert!(
+        !parked.with_saved_heap(|heap| heap.table_in_gray(fresh)),
+        "the released middle item no longer names the reused slot"
+    );
+    assert_eq!(
+        gray_chain(&mut parked).nodes,
+        vec![top_id, tail_id],
+        "reuse does not inherit a chain position"
+    );
+
+    let mut pulses = 0u32;
+    let mut trace_seen = opened_before.len();
+    loop {
+        let view = parked.pulse(1);
+        pulses += 1;
+        let trace = open_trace();
+        for entry in &trace[trace_seen..] {
+            assert!(
+                !(entry.slot == fresh.slot() && entry.generation == fresh.generation()),
+                "the ordinary chain must not open the reused generation: {entry:?}"
+            );
+        }
+        trace_seen = trace.len();
+        assert!(
+            !parked.marked(fresh),
+            "the reused white generation never becomes marked"
+        );
+        assert!(
+            !parked.marked(probe),
+            "the white probe is never reached through the released middle item"
+        );
+        if view.finished {
+            break;
+        }
+        let chain = gray_chain(&mut parked);
+        assert!(
+            !chain.nodes.contains(&(fresh.slot(), fresh.generation())),
+            "the reused generation never joins the ordinary chain"
+        );
+        assert!(
+            !chain.nodes.contains(&mid_id),
+            "the released middle identity is gone from the ordinary chain"
+        );
+        assert!(
+            pulses < HARNESS_BOUND,
+            "the business mark did not finish within the harness bound"
+        );
+    }
+
+    let trace = open_trace();
+    let top_pos = trace_position(&trace, top.slot(), top.generation()).expect("top opens");
+    let tail_pos = trace_position(&trace, tail.slot(), tail.generation()).expect("tail opens");
+    assert!(
+        top_pos < tail_pos,
+        "the surviving ordinary chain still opens top before tail: {trace:?}"
+    );
+    assert!(
+        trace_position(&trace, fresh.slot(), fresh.generation()).is_none(),
+        "the reused generation is never opened"
+    );
+    assert!(
+        parked.marked(tail_child),
+        "the original tail and its exclusive child are still scanned"
+    );
+
+    let report = parked.complete().expect("rollback sweep");
+    drop(parked);
+    let fresh_alive = heap.alive(fresh);
+    let probe_alive = heap.alive(probe);
+    let tail_alive = heap.alive(tail);
+    let tail_child_alive = heap.alive(tail_child);
+    let orphan_alive = heap.alive(orphan);
+    let weak_value = heap
+        .named_value(weak_owner, "dead")
+        .expect("weak entry after sweep");
+    eprintln!(
+        "ordinary_gray_middle result report_live={} fresh_alive={fresh_alive} \
+         probe_alive={probe_alive} tail_alive={tail_alive} \
+         tail_child_alive={tail_child_alive} orphan_alive={orphan_alive} \
+         weak_value={weak_value:?} stale_generation={} mid_generation={}",
+        report.live_nodes,
+        fresh.generation(),
+        mid.generation(),
+    );
+
+    assert!(
+        tail_alive && tail_child_alive,
+        "the original chain tail and its exclusive strong child stay reachable"
+    );
+    assert!(
+        !orphan_alive && weak_value == Value::Null,
+        "the independent weak orphan is really cleared"
+    );
+    assert!(
+        !fresh_alive,
+        "the white reused generation is reclaimed in this round"
+    );
+    assert!(
+        !probe_alive,
+        "a white probe reachable only through the rolled-back generation must not be \
+         retained by the stale ordinary Gray item"
+    );
+}
+
+/// Retiring the head and then the tail of the ordinary chain repairs the
+/// neighbour links without walking it; the surviving middle item is still
+/// reached and opened, and the reused slots are not inherited.
+#[test]
+fn ordinary_gray_head_and_tail_retirement_keeps_the_successor_reachable() {
+    let mut heap = LuaHeap::new(limits(32, 8, 32));
+    let tail = heap.alloc().expect("retire tail");
+    let mid = heap.alloc().expect("retire mid");
+    let mid_child = heap.alloc().expect("retire mid child");
+    heap.set_named_edge(mid, "child", mid_child)
+        .expect("mid exclusive child");
+    let top = heap.alloc().expect("retire top");
+    let gate = heap.alloc().expect("retire gate");
+    heap.set_named_scalar(gate, "g0", Value::Bool(true))
+        .expect("retire gate scalar");
+    let (_, gate_record) = heap
+        .locate_named(gate.slot(), "g0")
+        .expect("retire gate record");
+    let frame = heap.enter_roots(4).expect("retire roots");
+    heap.write_root(frame, 0, tail).expect("retire root tail");
+    heap.write_root(frame, 1, mid).expect("retire root mid");
+    heap.write_root(frame, 2, top).expect("retire root top");
+    heap.write_root(frame, 3, gate).expect("retire root gate");
+    let _ = heap.take_scan_meter();
+
+    let mut parked = ParkedMark::start(&mut heap).expect("retire mark");
+    pause_at(&mut parked, gate.slot(), gate_record);
+    let (mid_id, top_id, tail_id) = (
+        (mid.slot(), mid.generation()),
+        (top.slot(), top.generation()),
+        (tail.slot(), tail.generation()),
+    );
+    let chain = gray_chain(&mut parked);
+    assert_eq!(chain.nodes, vec![top_id, mid_id, tail_id]);
+
+    parked
+        .with_saved_heap(|heap| heap.rollback(top))
+        .expect("retire the chain head");
+    let after_head = gray_chain(&mut parked);
+    assert_eq!(
+        after_head.nodes,
+        vec![mid_id, tail_id],
+        "the middle item becomes the head and still reaches the tail"
+    );
+    assert_eq!(
+        (
+            after_head.access.0 - chain.access.0,
+            after_head.access.1 - chain.access.1,
+            after_head.access.2 - chain.access.2,
+        ),
+        (2, 2, 1),
+        "a head release reads the node and its successor and writes two links plus the header"
+    );
+    assert_eq!(
+        after_head.arena_capacity, chain.arena_capacity,
+        "a head release does not grow the slot arena"
+    );
+
+    parked
+        .with_saved_heap(|heap| heap.rollback(tail))
+        .expect("retire the chain tail");
+    let after_tail = gray_chain(&mut parked);
+    assert_eq!(
+        after_tail.nodes,
+        vec![mid_id],
+        "the surviving middle item becomes both head and tail"
+    );
+    assert_eq!(
+        (
+            after_tail.access.0 - after_head.access.0,
+            after_tail.access.1 - after_head.access.1,
+            after_tail.access.2 - after_head.access.2,
+        ),
+        (2, 2, 1),
+        "a tail release reads the node and its predecessor and writes two links plus the header"
+    );
+
+    let fresh_top = parked
+        .with_saved_heap(|heap| heap.alloc())
+        .expect("reuse the retired head slot");
+    let fresh_tail = parked
+        .with_saved_heap(|heap| heap.alloc())
+        .expect("reuse the retired tail slot");
+    assert!(
+        !parked.with_saved_heap(|heap| heap.table_in_gray(fresh_top))
+            && !parked.with_saved_heap(|heap| heap.table_in_gray(fresh_tail)),
+        "the reused slots inherit no chain position"
+    );
+
+    clear_open_trace();
+    let _ = finish(&mut parked);
+    let trace = open_trace();
+    assert!(
+        trace_position(&trace, mid.slot(), mid.generation()).is_some(),
+        "the surviving successor is actually opened: {trace:?}"
+    );
+    assert!(
+        trace_position(&trace, fresh_top.slot(), fresh_top.generation()).is_none()
+            && trace_position(&trace, fresh_tail.slot(), fresh_tail.generation()).is_none(),
+        "the reused slots are never opened"
+    );
+    assert!(
+        parked.marked(mid_child),
+        "the surviving middle item scans its exclusive child"
+    );
+
+    parked.complete().expect("retire sweep");
+    drop(parked);
+    assert!(heap.alive(mid) && heap.alive(mid_child));
+    assert!(!heap.alive(top) && !heap.alive(tail));
+    assert!(
+        !heap.alive(fresh_top) && !heap.alive(fresh_tail),
+        "the unrooted reused generations are reclaimed"
+    );
+}
+
+/// The ordinary Gray pop advances the head by reading the old head and its
+/// successor, clearing the popped node, and writing one predecessor link. It
+/// allocates nothing and leaves the tail untouched.
+#[test]
+fn ordinary_gray_pop_reads_and_writes_a_local_constant() {
+    let mut heap = LuaHeap::new(limits(16, 4, 16));
+    let first = heap.alloc().expect("pop first");
+    let second = heap.alloc().expect("pop second");
+    let gate = heap.alloc().expect("pop gate");
+    heap.set_named_scalar(gate, "g0", Value::Bool(true))
+        .expect("pop gate scalar");
+    let (_, gate_record) = heap
+        .locate_named(gate.slot(), "g0")
+        .expect("pop gate record");
+    let frame = heap.enter_roots(3).expect("pop roots");
+    heap.write_root(frame, 0, first).expect("pop root first");
+    heap.write_root(frame, 1, second).expect("pop root second");
+    heap.write_root(frame, 2, gate).expect("pop root gate");
+    let _ = heap.take_scan_meter();
+
+    let mut parked = ParkedMark::start(&mut heap).expect("pop mark");
+    pause_at(&mut parked, gate.slot(), gate_record);
+    let charging = parked.pulse(1);
+    assert!(!charging.finished, "the gate scalar is charged first");
+    assert!(
+        parked.pending().is_none(),
+        "the gate owner has no record left to charge"
+    );
+    let chain_before = gray_chain(&mut parked);
+    assert_eq!(
+        chain_before.nodes,
+        vec![
+            (second.slot(), second.generation()),
+            (first.slot(), first.generation()),
+        ],
+        "the ordinary chain is head second, tail first"
+    );
+    let tail_before = *chain_before.nodes.last().expect("pop chain has a tail");
+
+    let view = parked.pulse(1);
+    assert!(!view.finished);
+    let chain_after = gray_chain(&mut parked);
+    assert_eq!(
+        chain_after.nodes,
+        vec![(first.slot(), first.generation())],
+        "the pop advances the head to the recorded successor"
+    );
+    assert_eq!(
+        chain_after.nodes.last(),
+        Some(&tail_before),
+        "the pop leaves the tail identity unchanged"
+    );
+    assert_eq!(
+        (
+            chain_after.access.0 - chain_before.access.0,
+            chain_after.access.1 - chain_before.access.1,
+            chain_after.access.2 - chain_before.access.2,
+        ),
+        (2, 2, 1),
+        "one pop reads the head and its successor, writes two links, and moves the header"
+    );
+    assert_eq!(
+        chain_after.arena_capacity, chain_before.arena_capacity,
+        "one pop does not grow the slot arena"
+    );
+    assert!(
+        !parked.with_saved_heap(|heap| heap.table_in_gray(second)),
+        "the popped head is no longer chained"
+    );
+    assert!(
+        parked.with_saved_heap(|heap| heap.table_in_gray(first)),
+        "the recorded successor stays chained"
+    );
+
+    let _ = finish(&mut parked);
+    parked.complete().expect("pop sweep");
+    drop(parked);
+    assert!(heap.alive(first) && heap.alive(second) && heap.alive(gate));
+}
+
+/// The mark round stamp skips zero when it wraps. Old node tags from the
+/// u64::MAX round stay inert in the round that wraps to one.
+#[test]
+fn ordinary_gray_round_stamp_wrap_keeps_old_links_inert() {
+    let mut heap = LuaHeap::new(limits(16, 4, 16));
+    let old = heap.alloc().expect("wrap old");
+    let gate = heap.alloc().expect("wrap gate");
+    heap.set_named_scalar(gate, "g0", Value::Bool(true))
+        .expect("wrap gate scalar");
+    let (_, gate_record) = heap
+        .locate_named(gate.slot(), "g0")
+        .expect("wrap gate record");
+    let frame = heap.enter_roots(2).expect("wrap roots");
+    heap.write_root(frame, 0, old).expect("wrap root old");
+    heap.write_root(frame, 1, gate).expect("wrap root gate");
+    let _ = heap.take_scan_meter();
+
+    heap.rescan_epoch = u64::MAX - 1;
+    {
+        let mut parked = ParkedMark::start(&mut heap).expect("wrap first mark");
+        let epoch = parked.with_saved_heap(|heap| heap.rescan_epoch);
+        assert_ne!(epoch, 0, "a mark round is never stamped zero");
+        pause_at(&mut parked, gate.slot(), gate_record);
+        let chain = gray_chain(&mut parked);
+        assert_eq!(
+            chain.nodes,
+            vec![(old.slot(), old.generation())],
+            "the first round holds the old root"
+        );
+        assert_eq!(chain.nodes[0].1, old.generation());
+    }
+    heap.clear_root(frame, 0).expect("clear the old root");
+
+    let mut parked = ParkedMark::start(&mut heap).expect("wrap next mark");
+    assert_eq!(
+        parked.with_saved_heap(|heap| heap.rescan_epoch),
+        1,
+        "the wrapping stamp skips zero and restarts at one"
+    );
+    clear_open_trace();
+    assert!(
+        gray_chain(&mut parked).nodes.is_empty(),
+        "a tag from the u64::MAX round is inert after the wrap"
+    );
+    for _ in 0..HARNESS_BOUND {
+        let view = parked.pulse(1);
+        assert_eq!(view.meter.sweep_edge_checks, 0);
+        if view.finished {
+            break;
+        }
+    }
+    let trace = open_trace();
+    assert!(
+        trace_position(&trace, old.slot(), old.generation()).is_none(),
+        "the wrapped round does not open the old item"
+    );
+    assert!(
+        trace_position(&trace, gate.slot(), gate.generation()).is_some(),
+        "the live root still opens after the wrap"
+    );
+
+    parked.complete().expect("wrap sweep");
+    drop(parked);
+    assert!(heap.alive(gate));
+    assert!(!heap.alive(old), "the old unrooted item is collected");
+}
+
+/// An abandoned mark drops its head with the saved state. A new round starts
+/// empty, never picks up an old chain item, and the old unrooted roots die.
+#[test]
+fn abandoned_ordinary_gray_links_do_not_cross_into_the_next_round() {
+    let mut heap = LuaHeap::new(limits(32, 8, 32));
+    let first = heap.alloc().expect("abandon first");
+    let second = heap.alloc().expect("abandon second");
+    let third = heap.alloc().expect("abandon third");
+    let gate = heap.alloc().expect("abandon gate");
+    heap.set_named_scalar(gate, "g0", Value::Bool(true))
+        .expect("abandon gate scalar");
+    let (_, gate_record) = heap
+        .locate_named(gate.slot(), "g0")
+        .expect("abandon gate record");
+    let frame = heap.enter_roots(4).expect("abandon roots");
+    heap.write_root(frame, 0, first)
+        .expect("abandon root first");
+    heap.write_root(frame, 1, second)
+        .expect("abandon root second");
+    heap.write_root(frame, 2, third)
+        .expect("abandon root third");
+    heap.write_root(frame, 3, gate).expect("abandon root gate");
+    let _ = heap.take_scan_meter();
+
+    {
+        let mut parked = ParkedMark::start(&mut heap).expect("abandon mark");
+        pause_at(&mut parked, gate.slot(), gate_record);
+        let chain = gray_chain(&mut parked);
+        assert_eq!(
+            chain.nodes,
+            vec![
+                (third.slot(), third.generation()),
+                (second.slot(), second.generation()),
+                (first.slot(), first.generation()),
+            ],
+            "the first round holds third, second, and first in LIFO order"
+        );
+    }
+    assert!(
+        heap.saved_mark_query().is_none(),
+        "dropping the driver abandons the saved mark"
+    );
+
+    for slot in 0..3 {
+        heap.clear_root(frame, slot).expect("clear an old root");
+    }
+
+    let mut parked = ParkedMark::start(&mut heap).expect("next round mark");
+    clear_open_trace();
+    assert!(
+        gray_chain(&mut parked).nodes.is_empty(),
+        "a new round starts with an empty ordinary chain"
+    );
+    for _ in 0..HARNESS_BOUND {
+        let view = parked.pulse(1);
+        assert_eq!(view.meter.sweep_edge_checks, 0, "a pulse must not sweep");
+        assert_eq!(
+            view.meter.mark_passes, 2,
+            "the heap is in its second real mark pass"
+        );
+        if view.finished {
+            break;
+        }
+    }
+    let trace = open_trace();
+    assert!(
+        trace_position(&trace, gate.slot(), gate.generation()).is_some(),
+        "the only remaining root opens in the new round: {trace:?}"
+    );
+    for old in [first, second, third] {
+        assert!(
+            trace_position(&trace, old.slot(), old.generation()).is_none(),
+            "an old chain item is not opened in the next round"
+        );
+    }
+
+    parked.complete().expect("next round sweep");
+    drop(parked);
+    assert!(heap.alive(gate));
+    assert!(
+        !heap.alive(first) && !heap.alive(second) && !heap.alive(third),
+        "the old unrooted items are collected in the next round"
     );
 }
