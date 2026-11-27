@@ -1110,11 +1110,13 @@ fn step_reset(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
     }
     let index = state.index;
     // Every slot the round may reuse loses the ordinary Gray tag, both Gray
-    // neighbour links, and this slot's weak-start/rescan membership tag in the
-    // existing per-slot Reset unit. The stamp can wrap and be reused by a later
-    // round, so flags left by an abandoned mark must never suppress or join
-    // the new round's rescan scheduling. The rescan header and cursor live in
-    // the new state and are not touched here.
+    // neighbour links, this slot's weak-start/rescan membership tag, and any
+    // late-target queue tag in the existing per-slot Reset unit. The stamp can
+    // wrap and be reused by a later round, so flags or links left by an
+    // abandoned mark must never join the new round's rescan scheduling or its
+    // late-target list. The rescan header and cursor and the late-mode,
+    // late-owner, and deferred-edge queues are elsewhere and are not touched
+    // here.
     {
         let stored = &mut heap.slots[index];
         clear_gray_slot(stored);
@@ -1122,6 +1124,9 @@ fn step_reset(heap: &mut LuaHeap, state: &mut MarkState) -> bool {
         stored.rescan_queued = false;
         stored.rescan_prev = None;
         stored.rescan_next = None;
+        stored.late_target_epoch = 0;
+        stored.late_target_prev = None;
+        stored.late_target_next = None;
         if let SlotState::Live { marked } = &mut stored.state {
             *marked = false;
         }
@@ -1686,7 +1691,13 @@ pub(super) fn release_late_slot(state: Option<&mut MarkState>, slots: &mut [Slot
             None => state.late_owner_tail = prev,
         }
     }
-    if target_epoch == epoch {
+    // A target tag from the current stamp is only meaningful once the current
+    // round has opened its target list. Before Reset first publishes work the
+    // header is empty: an abandoned head still carries its old one-stamp link
+    // (with `prev = None`), and accepting it would adopt the old successor as
+    // the new head and rewrite that neighbour. With an empty header, clear
+    // only the released slot.
+    if target_epoch == epoch && state.late_target_head.is_some() {
         let prev = target_prev;
         let next = target_next;
         match prev {

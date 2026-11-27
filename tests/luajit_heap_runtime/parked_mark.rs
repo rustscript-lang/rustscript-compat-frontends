@@ -16864,6 +16864,379 @@ fn late_replay_target_expands_its_out_edge_after_a_peer_is_released() {
 }
 
 // ---------------------------------------------------------------------------
+// Late-target stamp reuse: an abandoned round leaves a real two-node replay
+// list. Only the epoch counter is advanced, so the next mark really takes the
+// same stamp. A released old head with that stamp must not be treated as a
+// current member: the current head and its still-white strong child belong to
+// the new round and must keep their own work.
+// ---------------------------------------------------------------------------
+
+struct AbandonedLateTargets {
+    owner: TableRef,
+    gate: TableRef,
+    gate_record: u32,
+    old_head: TableRef,
+    old_successor: TableRef,
+    old_successor_sentinel: TableRef,
+    weak_owner: TableRef,
+    weak_orphan: TableRef,
+}
+
+/// Round one queues one object key and one table value through a real pending
+/// mode, then abandons after both targets are linked. The value is the real
+/// head and the key is its successor; no link is written by hand. No slot is
+/// released, so both generations survive for the later reuse round. A
+/// separate weak-values owner and orphan are planted for the collection
+/// observation.
+fn plant_abandoned_late_targets() -> (LuaHeap, AbandonedLateTargets) {
+    let mut heap = LuaHeap::new(limits(64, 16, 96));
+    let (boundary, mut parked) = plant_deferred_boundary(&mut heap);
+    pause_at(&mut parked, boundary.gate.slot(), boundary.gate_record);
+    let mt = parked
+        .with_saved_heap(|heap| heap.alloc())
+        .expect("abandoned-round metatable");
+    parked
+        .with_saved_heap(|heap| heap.set_mode_scalar(mt, Value::string("x")))
+        .expect("abandoned-round strong mode");
+    parked
+        .with_saved_heap(|heap| heap.set_metatable(boundary.owner, Some(mt)))
+        .expect("abandoned-round attach");
+    let key = parked
+        .with_saved_heap(|heap| heap.alloc())
+        .expect("abandoned-round object key");
+    let value = parked
+        .with_saved_heap(|heap| heap.alloc())
+        .expect("abandoned-round table value");
+    let sentinel = parked
+        .with_saved_heap(|heap| heap.alloc())
+        .expect("abandoned-round successor sentinel");
+    parked
+        .with_saved_heap(|heap| heap.set_named_edge(key, "sentinel", sentinel))
+        .expect("the old successor's only out-edge");
+    parked
+        .with_saved_heap(|heap| heap.set_object_edge(boundary.owner, key, value))
+        .expect("abandoned-round queued insert");
+    pulse_until_late_parsed(&mut parked);
+    consume_one_deferred(&mut parked, "abandoned-round owner check");
+    let view = parked.pulse(1);
+    assert!(!view.finished, "the abandoned round finished on its replay");
+    assert!(parked.marked(key) && parked.marked(value));
+    assert!(
+        !parked.marked(sentinel),
+        "the old successor's sentinel stays white while key and value are replayed"
+    );
+    let links = parked.with_saved_heap(|heap| {
+        let head = &heap.slots[value.slot() as usize];
+        let successor = &heap.slots[key.slot() as usize];
+        (
+            (
+                head.late_target_epoch,
+                head.late_target_prev,
+                head.late_target_next,
+            ),
+            (
+                successor.late_target_epoch,
+                successor.late_target_prev,
+                successor.late_target_next,
+            ),
+        )
+    });
+    assert_eq!(
+        links.0,
+        (1, None, Some(key.slot())),
+        "the replayed value is a real one-stamp head with the key as its successor"
+    );
+    assert_eq!(
+        links.1,
+        (1, Some(value.slot()), None),
+        "the key is a real one-stamp tail"
+    );
+    drop(parked);
+    assert!(
+        heap.saved_mark_query().is_none(),
+        "dropping without park abandons the first round"
+    );
+
+    let weak_mt = heap.alloc().expect("weak-values metatable");
+    heap.set_mode_scalar(weak_mt, Value::string("v"))
+        .expect("weak-values mode");
+    let weak_owner = heap.alloc().expect("weak-values owner");
+    heap.set_metatable(weak_owner, Some(weak_mt))
+        .expect("weak-values attach");
+    let weak_orphan = heap.alloc().expect("weak-only orphan");
+    heap.set_named_edge(weak_owner, "orphan", weak_orphan)
+        .expect("weak-only orphan edge");
+    let frame = heap.enter_roots(1).expect("weak owner root");
+    heap.write_root(frame, 0, weak_owner)
+        .expect("root the weak owner");
+
+    (
+        heap,
+        AbandonedLateTargets {
+            owner: boundary.owner,
+            gate: boundary.gate,
+            gate_record: boundary.gate_record,
+            old_head: value,
+            old_successor: key,
+            old_successor_sentinel: sentinel,
+            weak_owner,
+            weak_orphan,
+        },
+    )
+}
+
+/// The second round really reuses stamp one. A fresh metatable is attached
+/// while Gray is parked, so the object-key insertion is queued as a real
+/// deferred replay event. Replaying it marks only the key target; the target's
+/// one strong child stays white and no ordinary Gray path carries it. Returns
+/// the parked mark and both tables for the release and collection checks.
+fn plant_second_round_replay<'a>(
+    heap: &'a mut LuaHeap,
+    fixture: &AbandonedLateTargets,
+) -> (ParkedMark<'a>, TableRef, TableRef) {
+    // The meter is heap-cumulative. The abandoned first round already counted
+    // one pass; the reuse round starts a fresh measurement window so the
+    // harness assertions describe this pass only.
+    let _ = heap.take_scan_meter();
+    let mut parked = ParkedMark::start(heap).expect("reused-stamp mark");
+    pause_at(&mut parked, fixture.gate.slot(), fixture.gate_record);
+    let mt = parked
+        .with_saved_heap(|heap| heap.alloc())
+        .expect("reuse-round metatable");
+    parked
+        .with_saved_heap(|heap| heap.set_mode_scalar(mt, Value::string("x")))
+        .expect("reuse-round strong mode");
+    parked
+        .with_saved_heap(|heap| heap.set_metatable(fixture.owner, Some(mt)))
+        .expect("reuse-round attach");
+    let target = parked
+        .with_saved_heap(|heap| heap.alloc())
+        .expect("reuse-round replay target");
+    let child = parked
+        .with_saved_heap(|heap| heap.alloc())
+        .expect("reuse-round strong child");
+    parked
+        .with_saved_heap(|heap| heap.set_named_edge(target, "child", child))
+        .expect("the target's only out-edge");
+    parked
+        .with_saved_heap(|heap| heap.set_object_scalar(fixture.owner, target, Value::string("tag")))
+        .expect("reuse-round queued object key");
+    pulse_until_late_parsed(&mut parked);
+    consume_one_deferred(&mut parked, "reuse-round owner check");
+    let before = parked.meter();
+    let view = parked.pulse(1);
+    assert_eq!(
+        view.meter.mode_late_deferred - before.mode_late_deferred,
+        1,
+        "one deferred edge event is consumed"
+    );
+    assert_eq!(
+        view.meter.scratch.work_pushed - before.scratch.work_pushed,
+        1,
+        "only the object-key target is newly marked"
+    );
+    assert!(parked.marked(target));
+    assert!(!parked.marked(child));
+    (parked, target, child)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LateTargetReleaseArm {
+    StaleHead,
+    NoRelease,
+    DistinctStamp,
+}
+
+struct LateTargetOutcome {
+    target_alive: bool,
+    child_alive: bool,
+    orphan_alive: bool,
+    weak_owner_alive: bool,
+    successor_sentinel_alive: bool,
+    target_links: (u64, Option<u32>, Option<u32>),
+}
+
+fn run_late_target_release(arm: LateTargetReleaseArm) -> LateTargetOutcome {
+    let (mut heap, fixture) = plant_abandoned_late_targets();
+    if arm != LateTargetReleaseArm::DistinctStamp {
+        // A fresh heap starts at zero, so advancing to MAX makes the next real
+        // mark take stamp one again.
+        heap.rescan_epoch = u64::MAX;
+    }
+    let (mut parked, target, child) = plant_second_round_replay(&mut heap, &fixture);
+    let expected_stamp = if arm == LateTargetReleaseArm::DistinctStamp {
+        2
+    } else {
+        1
+    };
+    assert_eq!(
+        parked.with_saved_heap(|heap| heap.rescan_epoch),
+        expected_stamp,
+        "the round really takes the expected stamp"
+    );
+    assert_eq!(
+        parked.with_saved_heap(|heap| heap.slots[target.slot() as usize].late_target_epoch),
+        expected_stamp,
+        "the current replay target carries the current stamp"
+    );
+    assert!(parked.marked(target));
+    assert!(
+        !parked.marked(child),
+        "the current replay target's strong child is still white before release"
+    );
+    assert!(
+        !gray_chain(&mut parked)
+            .nodes
+            .contains(&(target.slot(), target.generation())),
+        "the deferred replay target is not on the ordinary Gray chain"
+    );
+
+    if arm != LateTargetReleaseArm::NoRelease {
+        parked
+            .with_saved_heap(|heap| heap.rollback(fixture.old_head))
+            .expect("release the abandoned-round head");
+    }
+    let after_release = parked.with_saved_heap(|heap| {
+        let target_slot = &heap.slots[target.slot() as usize];
+        (
+            target_slot.late_target_epoch,
+            target_slot.late_target_prev,
+            target_slot.late_target_next,
+        )
+    });
+
+    let _ = finish(&mut parked);
+    parked.complete().expect("sweep the reused-stamp mark");
+    drop(parked);
+    LateTargetOutcome {
+        target_alive: heap.alive(target),
+        child_alive: heap.alive(child),
+        orphan_alive: heap.alive(fixture.weak_orphan),
+        weak_owner_alive: heap.alive(fixture.weak_owner),
+        successor_sentinel_alive: heap.alive(fixture.old_successor_sentinel),
+        target_links: after_release,
+    }
+}
+
+#[test]
+fn late_target_reused_stamp_release_keeps_the_current_replay_head() {
+    let outcome = run_late_target_release(LateTargetReleaseArm::StaleHead);
+    // A stale head with the same stamp is not a member of the current list.
+    // Its release must leave the current head and its successor link alone.
+    // Report every observed value before the first business assertion so a
+    // lost head and a lost child cannot collapse into one indistinguishable
+    // failure.
+    assert!(
+        outcome.child_alive,
+        "the current replay target's exclusive strong child must survive the real collection; \
+         observed target_alive={} child_alive={} orphan_alive={} weak_owner_alive={} \
+         old_successor_sentinel_alive={} target_links={:?}",
+        outcome.target_alive,
+        outcome.child_alive,
+        outcome.orphan_alive,
+        outcome.weak_owner_alive,
+        outcome.successor_sentinel_alive,
+        outcome.target_links,
+    );
+    assert!(
+        outcome.target_alive,
+        "the marked current replay target itself must survive the real collection"
+    );
+    assert!(
+        !outcome.orphan_alive,
+        "an unrelated weak-only value must be cleared by the same collection"
+    );
+    assert!(outcome.weak_owner_alive, "the rooted weak owner survives");
+    assert!(
+        !outcome.successor_sentinel_alive,
+        "releasing the abandoned head must not adopt and scan its old successor"
+    );
+    assert_eq!(
+        outcome.target_links,
+        (1, None, None),
+        "the current target keeps its own stamp and no successor from the old list"
+    );
+}
+
+// The two controls share one body: releasing the abandoned head is what
+// exposes the bug, and reusing stamp one is what makes the stale tag look
+// current. Without either condition the same live graph keeps its child.
+#[test]
+fn late_target_reused_stamp_controls_keep_their_own_outcomes() {
+    let no_release = run_late_target_release(LateTargetReleaseArm::NoRelease);
+    assert!(
+        no_release.child_alive,
+        "without releasing the abandoned head the current child survives"
+    );
+    assert!(no_release.target_alive);
+    assert!(!no_release.orphan_alive);
+
+    let distinct = run_late_target_release(LateTargetReleaseArm::DistinctStamp);
+    assert!(
+        distinct.child_alive,
+        "a different stamp ignores the abandoned head's release"
+    );
+    assert!(distinct.target_alive);
+    assert!(!distinct.orphan_alive);
+}
+
+/// The window before Reset has visited the old slots. The abandoned list is
+/// still linked under the same stamp, but the new round's header is empty.
+/// Releasing the old head there must clear only that slot: no old successor
+/// may be adopted as the head and no old neighbour link may be rewritten.
+#[test]
+fn late_target_reused_stamp_release_before_reset_visit_keeps_the_empty_chain() {
+    let (mut heap, fixture) = plant_abandoned_late_targets();
+    heap.rescan_epoch = u64::MAX;
+    let _ = heap.take_scan_meter();
+    let mut parked = ParkedMark::start(&mut heap).expect("window mark");
+    assert_eq!(
+        parked.with_saved_heap(|heap| heap.rescan_epoch),
+        1,
+        "the window round really reuses stamp one"
+    );
+    let before = parked.with_saved_heap(|heap| {
+        let successor = &heap.slots[fixture.old_successor.slot() as usize];
+        (successor.late_target_prev, successor.late_target_next)
+    });
+    assert_eq!(
+        before,
+        (Some(fixture.old_head.slot()), None),
+        "the abandoned one-stamp successor is really linked before Reset runs"
+    );
+    parked
+        .with_saved_heap(|heap| heap.rollback(fixture.old_head))
+        .expect("release the old head in the empty window");
+    let after = parked.with_saved_heap(|heap| {
+        let successor = &heap.slots[fixture.old_successor.slot() as usize];
+        (successor.late_target_prev, successor.late_target_next)
+    });
+    assert_eq!(
+        after.0,
+        Some(fixture.old_head.slot()),
+        "the released slot's old successor link must not be rewritten; \
+         observed successor_prev={:?} successor_next={:?}",
+        after.0,
+        after.1,
+    );
+    assert_eq!(
+        after.1, None,
+        "the old successor remains a tail and does not gain a successor"
+    );
+    let _ = finish(&mut parked);
+    parked.complete().expect("sweep the window mark");
+    drop(parked);
+    assert!(
+        !heap.alive(fixture.old_successor_sentinel),
+        "an empty current list must not adopt and scan the abandoned successor"
+    );
+    assert!(
+        !heap.alive(fixture.weak_orphan),
+        "the unrelated weak-only value still clears in the window round"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Ordinary Gray LIFO: real pushes at a filled chain, middle and neighbour
 // retirement, and round boundaries.
 // ---------------------------------------------------------------------------
