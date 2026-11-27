@@ -93,18 +93,38 @@
 //! closure bridge. The heap only issues one real table carrier, one real
 //! `lua.userdata` token and one real `lua.table` token; nothing is collected or
 //! closed.
+//!
+//! ## Pre-commit borrow seam
+//!
+//! Two extra arms keep the same real fixture and insert one more exact static
+//! import, `admit`, between the typed local and the parent's own `CallValue(2)`.
+//! The catalog declares it as
+//! `(Borrow<Callable<(Array<Int>, Resource(lua.userdata)) -> Bool>>,
+//! Value<Array<Int>>, Borrow<Resource(lua.userdata)>) -> Bool`, and the plugin
+//! resolves the call with those concrete operand schemas, so the compiled
+//! program carries the complete `HostImportSchema` and catalog fingerprint and
+//! `register_exact_static` binds the static body. The body records the actual
+//! callable Arc, receiver carrier and typed userdata payload, refuses only a
+//! receiver the heap did not issue (with its own `HostError`), and otherwise
+//! returns one fixed `Bool`. The positive arm then runs the same compiled
+//! `CallValue(2)` into the real two-parameter child frame and the parent
+//! continuation with those identical operands; the control arm passes an
+//! equal-valued but never issued array, built at run time from the issued
+//! carrier's two integers, and stops in the static body. Not claimed: a queue
+//! write, dequeue, commit, root plan, generation snapshot, or GC.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use vm::compiler::HostCallResolver;
+use vm::compiler::{HostCallResolver, ResolvedHostCall};
 use vm::vm::VmFrameContinuation;
 use vm::{
-    CallOutcome, CallReturn, ClosureExpr, CompileSourceFileOptions, Expr, FrontendImportSyntax,
-    FrontendIr, HostApiBuilder, HostApiCatalog, HostFunctionRegistry, HostFunctionSchema,
-    HostImport, HostImportSchema, HostParamSchema, HostTypeSchema, JitConfig, LocalSlot,
-    ParseError, ResourceHandle, ResourceTypeSchema, SourceFlavor, SourcePlugin, Stmt, TypeSchema,
-    Value, Vm, VmError, VmStatus,
+    BuiltinFunction, CallOutcome, CallReturn, ClosureExpr, CompileSourceFileOptions, Expr,
+    FrontendImportSyntax, FrontendIr, FunctionDecl, HostApiBuilder, HostApiCatalog,
+    HostFunctionRegistry, HostFunctionSchema, HostImport, HostImportSchema, HostParamPassing,
+    HostParamSchema, HostTypeSchema, JitConfig, LocalSlot, OpCode, ParseError, Program,
+    ResourceHandle, ResourceTypeSchema, SourceFlavor, SourcePlugin, Stmt, TypeSchema, Value, Vm,
+    VmError, VmStatus,
 };
 
 use super::{FUEL_BUDGET, FUEL_CHECK_INTERVAL, decoded_call_sites};
@@ -123,6 +143,14 @@ const PARENT_CALLEE_SLOT: usize = 0;
 const PARENT_RECEIVER_SLOT: usize = 5;
 const PARENT_ARGUMENT_SLOT: usize = 6;
 
+/// The second exact static import this module registers and the exact label of
+/// the raw entry record its static body writes before any fallible check.
+const PRECOMMIT_IMPORT: &str = "admit";
+const PRECOMMIT_ENTRY_LABEL: &str = "precommit-admit-enter";
+/// The static body's own diagnostic kinds; the test host never wraps these.
+const PRECOMMIT_REFUSAL_RECEIVER: &str =
+    "typed precommit seam refused: receiver is not the issued LuaHeap carrier";
+
 /// The first statement of the two declared closures names them.
 const TARGET_LABEL: &str = "target-enter";
 const OTHER_LABEL: &str = "other-enter";
@@ -136,6 +164,11 @@ static WITNESS: Mutex<Option<Witness>> = Mutex::new(None);
 /// The integer the marker host returns and `note` uses as its selection mode.
 static SELECT: AtomicUsize = AtomicUsize::new(0);
 
+/// Which operand the private plugin hands to the second exact static import:
+/// `0` keeps the original arms untouched, `1` passes the issued receiver, `2`
+/// passes an equal-valued array that the heap never issued.
+static GATE_MODE: AtomicUsize = AtomicUsize::new(0);
+
 /// The structural record the plugin produced for the last compile.
 static PATCH: Mutex<Option<PatchReport>> = Mutex::new(None);
 
@@ -144,6 +177,8 @@ enum Arm {
     Positive,
     OtherResourceKey,
     OtherArgumentToken,
+    PrecommitBorrowSeam,
+    PrecommitUnissuedReceiver,
 }
 
 impl Arm {
@@ -152,6 +187,8 @@ impl Arm {
             Arm::Positive => "positive",
             Arm::OtherResourceKey => "other-resource-key",
             Arm::OtherArgumentToken => "other-argument-token",
+            Arm::PrecommitBorrowSeam => "precommit-borrow-seam",
+            Arm::PrecommitUnissuedReceiver => "precommit-unissued-receiver",
         }
     }
 
@@ -165,6 +202,14 @@ impl Arm {
     fn select(self) -> usize {
         match self {
             Arm::OtherResourceKey => 5,
+            _ => 0,
+        }
+    }
+
+    fn gate_mode(self) -> usize {
+        match self {
+            Arm::PrecommitBorrowSeam => 1,
+            Arm::PrecommitUnissuedReceiver => 2,
             _ => 0,
         }
     }
@@ -206,6 +251,33 @@ fn typed_host_callable_schema() -> HostTypeSchema {
     }
 }
 
+/// The second exact static import under test. The callable parameter contains
+/// a resource, so this pin only accepts a reference passing mode for it; the
+/// direct `lua.userdata` token is borrowed too. The receiver keeps the real
+/// `Array<Int>` carrier shape of the issued LuaHeap table.
+fn precommit_import_schema() -> HostFunctionSchema {
+    HostFunctionSchema::with_return(
+        PRECOMMIT_IMPORT,
+        vec![
+            HostParamSchema::with_passing(
+                "target",
+                typed_host_callable_schema(),
+                HostParamPassing::Borrow,
+            ),
+            HostParamSchema::value(
+                "receiver",
+                HostTypeSchema::Array(Box::new(HostTypeSchema::Int)),
+            ),
+            HostParamSchema::with_passing(
+                "token",
+                HostTypeSchema::Resource(LuaUserdataResource::key()),
+                HostParamPassing::Borrow,
+            ),
+        ],
+        HostTypeSchema::Bool,
+    )
+}
+
 fn transport_catalog() -> &'static Arc<HostApiCatalog> {
     static CATALOG: OnceLock<Arc<HostApiCatalog>> = OnceLock::new();
     CATALOG.get_or_init(|| {
@@ -242,6 +314,10 @@ fn transport_catalog() -> &'static Arc<HostApiCatalog> {
             ],
             typed_host_callable_schema(),
         ));
+        // The second exact static import: the typed local (borrowed, it
+        // contains a resource), the original issued receiver carrier and the
+        // actual typed userdata token (borrowed). No `Unknown` parameter.
+        builder.function(precommit_import_schema());
         // One freshly issued LuaHeap table carrier, whose real shape is
         // `Array<Int>`.
         builder.function(HostFunctionSchema::with_return(
@@ -274,6 +350,12 @@ fn bind_hosts(vm: &mut Vm) -> Result<(), VmError> {
     let mut registry = HostFunctionRegistry::empty();
     registry.register_exact_static("mark", 1, catalog_schema("mark"), host_mark)?;
     registry.register_exact_static("note", 6, catalog_schema("note"), host_note)?;
+    registry.register_exact_static(
+        PRECOMMIT_IMPORT,
+        3,
+        catalog_schema(PRECOMMIT_IMPORT),
+        host_precommit,
+    )?;
     registry.register_exact_static("tick", 1, catalog_schema("tick"), host_tick)?;
     registry.register_exact_static("fault", 0, catalog_schema("fault"), host_fault)?;
     registry.bind_vm_cached(vm)
@@ -292,6 +374,20 @@ struct TokenProbe {
 struct TableTokenRecord {
     raw: i64,
     parts: (u64, u32, u32),
+}
+
+/// One observation of the second exact static import, recorded by its static
+/// body from the actual operands and the live VM before any refusal.
+#[derive(Clone, Debug)]
+struct GateRecord {
+    callable: Value,
+    receiver: Value,
+    receiver_class: GuestClass,
+    receiver_is_issued: bool,
+    token_raw: i64,
+    token_parts: Option<(u64, u32, u32)>,
+    token_is_issued: bool,
+    refused: bool,
 }
 
 /// The first observation of one host callback. Recorded before any frame
@@ -363,6 +459,7 @@ struct Witness {
     entries: Vec<EntryRecord>,
     marks: Vec<MarkRecord>,
     picks: Vec<PickRecord>,
+    gates: Vec<GateRecord>,
     issued_table: Option<Value>,
     issued_table_ref: Option<TableRef>,
     issued_userdata: Option<UserdataRef>,
@@ -376,6 +473,27 @@ fn with_witness<T>(body: impl FnOnce(&mut Witness) -> T) -> T {
         .as_mut()
         .expect("the typed resource witness must be installed before the run");
     body(witness)
+}
+
+/// The independent entry record of the active (last) frame, read from the live
+/// frames alone before any host-side probe can fail.
+fn frame_entry(vm: &Vm, label: &str) -> EntryRecord {
+    let frames = vm.execution_frames();
+    let current = frames.last();
+    EntryRecord {
+        label: label.to_string(),
+        frame_len: frames.len(),
+        prototype_id: current.and_then(|frame| frame.prototype_id),
+        return_ip: current.and_then(|frame| match &frame.continuation {
+            VmFrameContinuation::ResumeBytecode { return_ip } => Some(*return_ip),
+            _ => None,
+        }),
+        parent_prototype: frames
+            .iter()
+            .rev()
+            .nth(1)
+            .and_then(|frame| frame.prototype_id),
+    }
 }
 
 fn host_fault_error(message: impl Into<String>) -> VmError {
@@ -438,21 +556,7 @@ fn host_mark(vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
     // fallible frame check, resource probe and error wrapper below, so a
     // probe that fails after the frame really entered still leaves the
     // entered frame's actual prototype, depth and resume address recorded.
-    let entry = {
-        let frames = vm.execution_frames();
-        let current = frames.last();
-        let parent = frames.iter().rev().nth(1);
-        EntryRecord {
-            label: label.clone(),
-            frame_len: frames.len(),
-            prototype_id: current.and_then(|frame| frame.prototype_id),
-            return_ip: current.and_then(|frame| match &frame.continuation {
-                VmFrameContinuation::ResumeBytecode { return_ip } => Some(*return_ip),
-                _ => None,
-            }),
-            parent_prototype: parent.and_then(|frame| frame.prototype_id),
-        }
-    };
+    let entry = frame_entry(vm, &label);
     with_witness(|witness| witness.entries.push(entry));
 
     if label == "chunk-mode" {
@@ -754,6 +858,86 @@ fn host_fault(vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
     Ok(CallOutcome::Return(CallReturn::one(Value::Int(raw))))
 }
 
+/// The second exact static import. It is bound with `register_exact_static`,
+/// so Core hands the actual operands to this body before the parent's own
+/// `CallValue(2)` without an owned-dispatch argument preflight. The body
+/// records the real callable Arc, the heap classification of the receiver and
+/// the borrowed userdata payload, then refuses with its own `HostError` when
+/// the receiver is not the issued carrier. It returns one fixed `Bool` and
+/// writes nothing.
+fn host_precommit(vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
+    // The independent raw entry record comes first: it is taken from the live
+    // frames alone, so a later probe failure cannot erase that this static
+    // body ran in the parent frame.
+    let entry = frame_entry(vm, PRECOMMIT_ENTRY_LABEL);
+    with_witness(|witness| witness.entries.push(entry));
+
+    let [callable, receiver, token] = args else {
+        return Err(host_fault_error(
+            "the precommit static import expects three operands",
+        ));
+    };
+    let Value::Callable(_) = callable else {
+        return Err(host_fault_error(
+            "the precommit static import received a non-callable first operand",
+        ));
+    };
+    let Value::Int(token_raw) = *token else {
+        return Err(host_fault_error(
+            "the precommit static import received a non-handle token operand",
+        ));
+    };
+
+    // The exact static `note` has already selected the callable and the
+    // fixture has already issued the one carrier and the one userdata token.
+    let (issued_table, issued_userdata) = with_witness(|witness| {
+        assert!(
+            !witness.picks.is_empty(),
+            "the exact static note must run before the precommit import"
+        );
+        (witness.issued_table_ref, witness.issued_userdata)
+    });
+
+    let mut host = vm.host_context();
+    let receiver_class =
+        heap::with_heap(&mut host, |heap| Ok(heap.guest_class(receiver))).map_err(heap_fault)?;
+    let receiver_is_issued = match (&receiver_class, issued_table) {
+        (GuestClass::Table(table), Some(issued)) => *table == issued,
+        _ => false,
+    };
+    let payload = {
+        let borrowed = host
+            .borrow_resource_with_key::<LuaUserdataResource>(
+                raw_handle(token_raw)?,
+                &LuaUserdataResource::key(),
+            )
+            .map_err(|error| {
+                host_fault_error(format!("the precommit token borrow was refused: {error}"))
+            })?;
+        borrowed.get().userdata()
+    };
+    let payload_rebound = heap::borrow_published_userdata(&host, payload).map_err(heap_fault)?;
+    let token_is_issued = issued_userdata == Some(payload) && payload == payload_rebound;
+    let token_parts = (payload.domain(), payload.slot(), payload.generation());
+
+    let record = GateRecord {
+        callable: callable.clone(),
+        receiver: receiver.clone(),
+        receiver_class,
+        receiver_is_issued,
+        token_raw,
+        token_parts: Some(token_parts),
+        token_is_issued,
+        refused: !receiver_is_issued,
+    };
+    with_witness(|witness| witness.gates.push(record));
+
+    if !receiver_is_issued {
+        return Err(host_fault_error(PRECOMMIT_REFUSAL_RECEIVER));
+    }
+    Ok(CallOutcome::Return(CallReturn::one(Value::Bool(true))))
+}
+
 // ---- the private plugin: real lowering plus declared schemas --------------
 
 struct TransportPlugin;
@@ -769,11 +953,23 @@ struct CallPatch {
     arg_slots: Vec<LocalSlot>,
 }
 
+/// The inserted pre-commit seam call: the host-import slot, the same typed
+/// local the dynamic call uses, the fresh result local and the exact
+/// resolution the real catalog returned.
+#[derive(Clone, Debug)]
+struct GatePatch {
+    import_index: u16,
+    typed_local: LocalSlot,
+    result_slot: LocalSlot,
+    resolution: ResolvedHostCall,
+}
+
 #[derive(Clone, Debug, Default)]
 struct PatchReport {
     typed_local: Option<LocalSlot>,
     declared_schema: Option<TypeSchema>,
     call: Option<CallPatch>,
+    gate: Option<GatePatch>,
     parent_parameters: Vec<LocalSlot>,
     target_declared: bool,
     other_declared: bool,
@@ -796,7 +992,7 @@ impl SourcePlugin for TransportPlugin {
     fn parse_source(&self, source: &str) -> Result<FrontendIr, ParseError> {
         let resolver = HostCallResolver::new(transport_catalog());
         let mut ir = super::lower::lower_source_with(source, Some(&resolver))?;
-        let report = patch_ir(&mut ir)?;
+        let report = patch_ir(&mut ir, &resolver)?;
         *PATCH.lock().expect("typed resource patch report") = Some(report);
         Ok(ir)
     }
@@ -806,9 +1002,76 @@ fn patch_error(message: impl Into<String>) -> ParseError {
     ParseError::at_line(1, message)
 }
 
-fn patch_ir(ir: &mut FrontendIr) -> Result<PatchReport, ParseError> {
+/// The resolved pre-commit seam the plugin installs, when the current arm asks
+/// for it.
+struct GateSpec {
+    import_index: u16,
+    resolution: ResolvedHostCall,
+    forged_receiver: bool,
+}
+
+fn patch_ir(
+    ir: &mut FrontendIr,
+    resolver: &HostCallResolver<'_>,
+) -> Result<PatchReport, ParseError> {
     let mut report = PatchReport::default();
-    patch_stmts(&mut ir.stmts, &mut report)?;
+    let gate_mode = GATE_MODE.load(Ordering::SeqCst);
+    let gate = if gate_mode == 0 {
+        None
+    } else {
+        let import_index = u16::try_from(ir.functions.len())
+            .map_err(|_| patch_error("too many declared host functions"))?;
+        // Resolve against the real catalog with the concrete operand schemas:
+        // no `Unknown`, no downgraded key, no fabricated token.
+        let resolution = resolver
+            .resolve(
+                PRECOMMIT_IMPORT,
+                &[
+                    userdata_callable_schema(),
+                    TypeSchema::Array(Box::new(TypeSchema::Int)),
+                    TypeSchema::Resource(LuaUserdataResource::key()),
+                ],
+            )
+            .map_err(|error| {
+                patch_error(format!("the precommit import did not resolve: {error}"))
+            })?;
+        let arity = u8::try_from(resolution.params.len())
+            .map_err(|_| patch_error("the precommit import arity overflows a byte"))?;
+        // The resolver maps the catalog return to `Bool`; the compiled import
+        // is asserted against that exact return below.
+        let return_type = vm::ValueType::Bool;
+        // The declaration is built from the resolver output itself: names,
+        // concrete parameter schemas and the return stay the exact selected
+        // catalog identity.
+        ir.functions.push(FunctionDecl {
+            name: PRECOMMIT_IMPORT.to_string(),
+            arity,
+            index: import_index,
+            args: resolution
+                .params
+                .iter()
+                .map(|param| param.name.clone())
+                .collect(),
+            arg_schemas: resolution
+                .params
+                .iter()
+                .map(|param| Some(param.schema.clone()))
+                .collect(),
+            return_schema: Some(resolution.return_type.clone()),
+            type_params: Vec::new(),
+            exported: false,
+            return_type,
+            symbol: None,
+        });
+        Some(GateSpec {
+            import_index,
+            resolution,
+            forged_receiver: gate_mode == 2,
+        })
+    };
+    let mut next_local = ir.locals;
+    patch_stmts(&mut ir.stmts, gate.as_ref(), &mut next_local, &mut report)?;
+    ir.locals = next_local;
     // The private lowerer reads every admitted Lua callable through an
     // explicit `ToOwned` copy. This pin classifies a callable whose schema
     // contains a resource as an owned local and then refuses `.copy()` on it.
@@ -866,7 +1129,12 @@ fn strip_to_owned(expr: &mut Expr) {
     }
 }
 
-fn patch_stmts(stmts: &mut [Stmt], report: &mut PatchReport) -> Result<(), ParseError> {
+fn patch_stmts(
+    stmts: &mut [Stmt],
+    gate: Option<&GateSpec>,
+    next_local: &mut usize,
+    report: &mut PatchReport,
+) -> Result<(), ParseError> {
     for stmt in stmts.iter_mut() {
         match stmt {
             Stmt::Let {
@@ -897,13 +1165,13 @@ fn patch_stmts(stmts: &mut [Stmt], report: &mut PatchReport) -> Result<(), Parse
                     _ => {}
                 }
                 if closure.param_slots.len() == PARENT_PARAMS {
-                    patch_parent(closure, report)?;
+                    patch_parent(closure, gate, next_local, report)?;
                 }
             }
             Stmt::Expr {
                 expr: Expr::Block { stmts, .. },
                 ..
-            } => patch_stmts(stmts, report)?,
+            } => patch_stmts(stmts, gate, next_local, report)?,
             _ => {}
         }
     }
@@ -945,7 +1213,12 @@ fn reads_completion(expr: &Expr, completion: LocalSlot) -> bool {
         && matches!(second, Expr::Int(0)))
 }
 
-fn patch_parent(closure: &mut ClosureExpr, report: &mut PatchReport) -> Result<(), ParseError> {
+fn patch_parent(
+    closure: &mut ClosureExpr,
+    gate: Option<&GateSpec>,
+    next_local: &mut usize,
+    report: &mut PatchReport,
+) -> Result<(), ParseError> {
     let Expr::Block { stmts, expr: tail } = closure.body.as_mut() else {
         return Err(patch_error("the parent body is not a block"));
     };
@@ -1050,7 +1323,84 @@ fn patch_parent(closure: &mut ClosureExpr, report: &mut PatchReport) -> Result<(
     }
     *tail = then_expr;
     report.continuation_rewritten = true;
+
+    if let Some(gate) = gate {
+        let Some(position) = call_position else {
+            return Err(patch_error("the parent has no admitted dynamic call"));
+        };
+        let result_slot = LocalSlot::try_from(*next_local)
+            .map_err(|_| patch_error("the precommit result local overflows a slot"))?;
+        *next_local = next_local
+            .checked_add(1)
+            .ok_or_else(|| patch_error("too many locals for the precommit result"))?;
+        let receiver = if gate.forged_receiver {
+            forged_receiver_expr(parameters[PARENT_RECEIVER_SLOT])
+        } else {
+            Expr::Var(parameters[PARENT_RECEIVER_SLOT])
+        };
+        // The exact operands the following dynamic call will use: the same
+        // typed local, the receiver parameter and the argument parameter.
+        let expr = Expr::Call(
+            gate.import_index,
+            Vec::new(),
+            vec![
+                Expr::Var(typed_local),
+                receiver,
+                Expr::Var(parameters[PARENT_ARGUMENT_SLOT]),
+            ],
+            Some(Box::new(gate.resolution.clone())),
+            None,
+        );
+        stmts.insert(
+            position,
+            Stmt::Let {
+                index: result_slot,
+                declared_schema: None,
+                expr,
+                line: 1,
+            },
+        );
+        report.gate = Some(GatePatch {
+            import_index: gate.import_index,
+            typed_local,
+            result_slot,
+            resolution: gate.resolution.clone(),
+        });
+    }
     Ok(())
+}
+
+/// An array with the same two integers as the issued receiver carrier but a
+/// fresh VM array, never issued by the heap. The reads run against the real
+/// receiver local, so the values are equal at run time; only the Arc identity
+/// differs.
+fn forged_receiver_expr(receiver: LocalSlot) -> Expr {
+    let element = |index: i64| {
+        Expr::Call(
+            BuiltinFunction::Get.call_index(),
+            Vec::new(),
+            vec![Expr::Var(receiver), Expr::Int(index)],
+            None,
+            None,
+        )
+    };
+    let mut array = Expr::Call(
+        BuiltinFunction::ArrayNew.call_index(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        None,
+    );
+    for index in 0..2 {
+        array = Expr::Call(
+            BuiltinFunction::ArrayPush.call_index(),
+            Vec::new(),
+            vec![array, element(index)],
+            None,
+            None,
+        );
+    }
+    array
 }
 
 // ---- one arm --------------------------------------------------------------
@@ -1062,11 +1412,40 @@ struct ArmRun {
     witness: Witness,
     patch: PatchReport,
     call_sites: Vec<super::DecodedCallSite>,
+    host_call_sites: Vec<(usize, u8, Option<u32>)>,
     prototypes: Vec<vm::CallablePrototype>,
     host_imports: Vec<HostImport>,
     host_schemas: Vec<Option<HostImportSchema>>,
     local_schemas: Vec<Option<TypeSchema>>,
     fuel_consumed: u64,
+    bound_functions: usize,
+}
+
+/// Every compiled static host `Call` site for `import`: `(ip, argc, owner)`.
+/// The shared helper decodes only `CallValue`; this seam also needs the static
+/// host-call site to prove where it sits relative to the dynamic call.
+fn decoded_host_calls(program: &Program, import: u16) -> Vec<(usize, u8, Option<u32>)> {
+    let code = &program.code;
+    let mut ip = 0usize;
+    let mut sites = Vec::new();
+    while ip < code.len() {
+        let op = OpCode::try_from(code[ip]).expect("invalid opcode");
+        let next = ip + 1 + op.operand_len();
+        assert!(next <= code.len(), "truncated instruction at {ip}");
+        if op == OpCode::Call && u16::from_le_bytes([code[ip + 1], code[ip + 2]]) == import {
+            let owners: Vec<_> = program
+                .function_regions
+                .iter()
+                .filter(|region| region.start_ip as usize <= ip && next <= region.end_ip as usize)
+                .collect();
+            let [owner] = owners.as_slice() else {
+                panic!("expected a unique caller region for Call at {ip}");
+            };
+            sites.push((ip, code[ip + 3], owner.prototype_id));
+        }
+        ip = next;
+    }
+    sites
 }
 
 fn fixture_path(fixture: &str) -> std::path::PathBuf {
@@ -1081,6 +1460,7 @@ fn fixture_path(fixture: &str) -> std::path::PathBuf {
 fn run_arm(arm: Arm) -> ArmRun {
     *PATCH.lock().expect("typed resource patch report") = None;
     SELECT.store(arm.select(), Ordering::SeqCst);
+    GATE_MODE.store(arm.gate_mode(), Ordering::SeqCst);
     *WITNESS.lock().expect("typed resource witness") = Some(Witness::default());
 
     let options = CompileSourceFileOptions::new()
@@ -1095,6 +1475,11 @@ fn run_arm(arm: Arm) -> ArmRun {
         .clone()
         .unwrap_or_else(|| panic!("{}: the plugin produced no patch report", arm.label()));
     let call_sites = decoded_call_sites(&compiled.program);
+    let host_call_sites = patch
+        .gate
+        .as_ref()
+        .map(|gate| decoded_host_calls(&compiled.program, gate.import_index))
+        .unwrap_or_default();
     let prototypes = compiled.program.callable_prototypes.clone();
     let host_imports = compiled.program.imports.clone();
     let host_schemas = compiled.program.host_import_schemas().to_vec();
@@ -1127,6 +1512,7 @@ fn run_arm(arm: Arm) -> ArmRun {
         .checked_sub(remaining)
         .unwrap_or_else(|| panic!("{}: fuel increased", arm.label()));
     let stack = runtime.stack().to_vec();
+    let bound_functions = runtime.bound_function_count();
     let witness = WITNESS
         .lock()
         .expect("typed resource witness")
@@ -1140,11 +1526,13 @@ fn run_arm(arm: Arm) -> ArmRun {
         witness,
         patch,
         call_sites,
+        host_call_sites,
         prototypes,
         host_imports,
         host_schemas,
         local_schemas,
         fuel_consumed,
+        bound_functions,
     };
     run.report();
     run
@@ -1232,6 +1620,20 @@ impl ArmRun {
                 callable_id(&pick.chosen),
                 target_schema,
                 chosen_schema,
+            );
+        }
+        for gate in &self.witness.gates {
+            eprintln!(
+                "LUA_TYPED_RESOURCE arm={} gate callable={:?} receiver={:?} class={:?} issued={} token_raw={} token_parts={:?} token_issued={} refused={}",
+                self.arm.label(),
+                gate.callable,
+                gate.receiver,
+                gate.receiver_class,
+                gate.receiver_is_issued,
+                gate.token_raw,
+                gate.token_parts,
+                gate.token_is_issued,
+                gate.refused
             );
         }
         if let Some(token) = &self.witness.table_token {
@@ -2167,5 +2569,445 @@ fn assert_other_argument_control(run: &ArmRun) {
     eprintln!(
         "LUA_TYPED_RESOURCE arm=other-argument-token layer=call-boundary compile=ok same_callable=1 same_declaration=1 actual_token={} diagnostic=HostError",
         table.raw
+    );
+}
+
+// ---- the pre-commit borrow seam ------------------------------------------
+
+#[test]
+fn active_parent_precommits_typed_borrow_operands_before_the_call() {
+    let positive = run_arm(Arm::PrecommitBorrowSeam);
+    assert_positive(&positive);
+    assert_precommit_import(&positive);
+    assert_precommit_positive(&positive);
+
+    let control = run_arm(Arm::PrecommitUnissuedReceiver);
+    assert_precommit_import(&control);
+    assert_precommit_unissued_receiver_control(&control);
+}
+
+/// The live catalog install, the program's complete schema and fingerprint,
+/// the resolved `Borrow`/`Value`/`Borrow` call, the binding and the IR slots.
+fn assert_precommit_import(run: &ArmRun) {
+    let label = run.arm.label();
+    let catalog = transport_catalog();
+    let function = catalog
+        .function(PRECOMMIT_IMPORT)
+        .unwrap_or_else(|| panic!("{label}: the catalog is missing '{PRECOMMIT_IMPORT}'"));
+    assert_eq!(
+        function,
+        &precommit_import_schema(),
+        "{label}: the live catalog install"
+    );
+    let expected = HostImportSchema::from_function(catalog, function);
+    assert_eq!(
+        expected.fingerprint,
+        catalog.fingerprint(),
+        "{label}: the catalog fingerprint"
+    );
+
+    let index = run
+        .host_imports
+        .iter()
+        .position(|import| import.name == PRECOMMIT_IMPORT)
+        .unwrap_or_else(|| panic!("{label}: '{PRECOMMIT_IMPORT}' is not a compiled import"));
+    assert_eq!(
+        run.host_imports[index].arity, 3,
+        "{label}: the import arity"
+    );
+    assert_eq!(
+        run.host_imports[index].return_type,
+        vm::ValueType::Bool,
+        "{label}: the import's coarse return"
+    );
+    let schema = run.host_schemas[index]
+        .as_ref()
+        .unwrap_or_else(|| panic!("{label}: the seam import must carry its full schema"));
+    assert_eq!(
+        schema, &expected,
+        "{label}: the program must carry the complete catalog schema and fingerprint"
+    );
+
+    let gate = run
+        .patch
+        .gate
+        .as_ref()
+        .unwrap_or_else(|| panic!("{label}: the precommit seam was not inserted"));
+    assert_eq!(gate.import_index, index as u16, "{label}: the import slot");
+    assert_eq!(
+        gate.resolution.name, PRECOMMIT_IMPORT,
+        "{label}: the resolved name"
+    );
+    assert_eq!(
+        gate.resolution.passing,
+        [
+            HostParamPassing::Borrow,
+            HostParamPassing::Value,
+            HostParamPassing::Borrow,
+        ],
+        "{label}: the resolved passing modes"
+    );
+    assert_eq!(
+        gate.resolution.host_params,
+        [
+            typed_host_callable_schema(),
+            HostTypeSchema::Array(Box::new(HostTypeSchema::Int)),
+            HostTypeSchema::Resource(LuaUserdataResource::key()),
+        ],
+        "{label}: the resolved concrete host schemas"
+    );
+    assert_eq!(
+        gate.resolution.host_return_type,
+        HostTypeSchema::Bool,
+        "{label}: the resolved host return"
+    );
+    assert_eq!(
+        gate.resolution.fingerprint,
+        catalog.fingerprint(),
+        "{label}: the resolution fingerprint"
+    );
+
+    assert_eq!(
+        Some(gate.typed_local),
+        run.patch.typed_local,
+        "{label}: the seam must receive the typed local"
+    );
+    let call = run
+        .patch
+        .call
+        .as_ref()
+        .unwrap_or_else(|| panic!("{label}: the dynamic call was not patched"));
+    assert_eq!(
+        call.typed_callee, gate.typed_local,
+        "{label}: the seam and CallValue must share the typed local"
+    );
+    assert!(
+        gate.result_slot != gate.typed_local
+            && !run.patch.parent_parameters.contains(&gate.result_slot),
+        "{label}: the seam result must land in a fresh local"
+    );
+    assert_eq!(
+        run.bound_functions, 5,
+        "{label}: all five exact static imports must bind"
+    );
+    eprintln!(
+        "{label}: precommit import slot={index} schema={schema:?} resolution_fingerprint={:?} bound={}",
+        gate.resolution.fingerprint, run.bound_functions
+    );
+}
+
+fn gate_record(run: &ArmRun) -> &GateRecord {
+    run.witness
+        .gates
+        .first()
+        .unwrap_or_else(|| panic!("{}: the precommit static body never ran", run.arm.label()))
+}
+
+fn precommit_entries(run: &ArmRun) -> Vec<&EntryRecord> {
+    run.witness
+        .entries
+        .iter()
+        .filter(|entry| entry.label == PRECOMMIT_ENTRY_LABEL)
+        .collect()
+}
+
+/// The parent's compiled static seam `Call` and its one dynamic
+/// `CallValue(2)`, both owned by the active parent prototype.
+fn parent_seam_and_call(run: &ArmRun) -> (usize, usize) {
+    let parent = run
+        .mark("parent-enter")
+        .last_prototype
+        .unwrap_or_else(|| panic!("{}: the parent frame has no prototype", run.arm.label()));
+    let seams: Vec<_> = run
+        .host_call_sites
+        .iter()
+        .filter(|(_, _, owner)| *owner == Some(parent))
+        .collect();
+    assert_eq!(
+        seams.len(),
+        1,
+        "{}: expected exactly one compiled seam Call owned by the parent, saw {:?}",
+        run.arm.label(),
+        run.host_call_sites
+    );
+    let (seam_ip, argc, _) = *seams[0];
+    assert_eq!(
+        argc,
+        3,
+        "{}: the seam Call must carry three operands",
+        run.arm.label()
+    );
+    let calls: Vec<_> = run
+        .call_sites
+        .iter()
+        .filter(|site| site.owner == Some(parent) && site.argc == CALL_ARGC)
+        .collect();
+    assert_eq!(
+        calls.len(),
+        1,
+        "{}: expected exactly one compiled CallValue(2) owned by the parent, saw {:?}",
+        run.arm.label(),
+        run.call_sites
+    );
+    (seam_ip, calls[0].ip)
+}
+
+fn assert_precommit_positive(run: &ArmRun) {
+    let gate = gate_record(run);
+    assert!(
+        !gate.refused,
+        "precommit-borrow-seam: the static body must accept the real operands"
+    );
+    let issued_ref = run
+        .witness
+        .issued_table_ref
+        .expect("precommit-borrow-seam: the fixture issued one table");
+    assert_eq!(
+        gate.receiver_class,
+        GuestClass::Table(issued_ref),
+        "precommit-borrow-seam: the live heap must classify the operand as the issued table"
+    );
+    assert!(
+        gate.receiver_is_issued,
+        "precommit-borrow-seam: the receiver must be the issued LuaHeap carrier"
+    );
+
+    let pick = run.pick();
+    assert!(
+        same_callable(&gate.callable, &pick.chosen),
+        "precommit-borrow-seam: the callable operand must be the exact Arc note returned"
+    );
+    let issued = run
+        .witness
+        .issued_table
+        .as_ref()
+        .expect("precommit-borrow-seam: the fixture issued one table");
+    assert!(
+        same_array(&gate.receiver, issued),
+        "precommit-borrow-seam: the receiver operand must be the issued array"
+    );
+    assert!(
+        gate.token_is_issued,
+        "precommit-borrow-seam: the token payload must be the issued lua.userdata"
+    );
+    let issued_raw = run
+        .witness
+        .issued_userdata_raw
+        .expect("precommit-borrow-seam: the fixture issued one userdata");
+    assert_eq!(
+        gate.token_raw, issued_raw,
+        "precommit-borrow-seam: the seam must receive the issued token handle"
+    );
+    let issued_parts = {
+        let issued = run
+            .witness
+            .issued_userdata
+            .as_ref()
+            .expect("precommit-borrow-seam: the fixture issued one userdata");
+        (issued.domain(), issued.slot(), issued.generation())
+    };
+    assert_eq!(
+        gate.token_parts,
+        Some(issued_parts),
+        "precommit-borrow-seam: the formal borrow must name the issued payload"
+    );
+
+    let parent = run.mark("parent-enter");
+    let entries = precommit_entries(run);
+    assert_eq!(
+        entries.len(),
+        1,
+        "precommit-borrow-seam: exactly one independent seam entry"
+    );
+    let entry = entries[0];
+    assert_eq!(
+        (entry.frame_len, entry.prototype_id, entry.parent_prototype),
+        (
+            parent.frame_len,
+            parent.last_prototype,
+            parent.parent_prototype
+        ),
+        "precommit-borrow-seam: the static body must run in the active parent frame"
+    );
+
+    let (seam_ip, callvalue_ip) = parent_seam_and_call(run);
+    assert!(
+        seam_ip < callvalue_ip,
+        "precommit-borrow-seam: the static seam call must precede CallValue({CALL_ARGC})"
+    );
+    let callee = run
+        .witness
+        .marks
+        .iter()
+        .find_map(|mark| mark.callee.as_ref())
+        .expect("precommit-borrow-seam: the child frame must be observed");
+    assert!(
+        same_callable(
+            &gate.callable,
+            callee
+                .caller_callable
+                .as_ref()
+                .expect("precommit-borrow-seam: the parent cb slot must hold the callable")
+        ),
+        "precommit-borrow-seam: CallValue must reuse the seam's callable Arc"
+    );
+    let child_receiver = callee
+        .parameter_values
+        .first()
+        .cloned()
+        .flatten()
+        .expect("precommit-borrow-seam: the child's receiver slot");
+    assert!(
+        same_array(&gate.receiver, &child_receiver),
+        "precommit-borrow-seam: the child frame must reuse the seam's receiver Arc"
+    );
+    assert_eq!(
+        callee.parameter_values.get(1).cloned().flatten(),
+        Some(Value::Int(gate.token_raw)),
+        "precommit-borrow-seam: the child frame must reuse the seam's token handle"
+    );
+    eprintln!(
+        "LUA_TYPED_RESOURCE arm=precommit-borrow-seam seam_ip={seam_ip} callvalue_ip={callvalue_ip} child_entered=1 parent_continuation=1"
+    );
+}
+
+fn assert_precommit_unissued_receiver_control(run: &ArmRun) {
+    run.assert_fuel();
+    let gate = gate_record(run);
+    assert!(
+        gate.refused,
+        "precommit-unissued-receiver: the static body must refuse the unissued receiver"
+    );
+    assert!(
+        !gate.receiver_is_issued,
+        "precommit-unissued-receiver: the forged receiver must not be issued"
+    );
+    assert_eq!(
+        gate.receiver_class,
+        GuestClass::Unissued,
+        "precommit-unissued-receiver: an equal-valued fresh array must be unissued"
+    );
+
+    let issued = run
+        .witness
+        .issued_table
+        .as_ref()
+        .expect("precommit-unissued-receiver: the fixture issued one table");
+    let Value::Array(issued_items) = issued else {
+        panic!("precommit-unissued-receiver: the issued carrier must be an array");
+    };
+    assert!(
+        matches!(issued_items.as_slice(), [Value::Int(_), Value::Int(_)]),
+        "precommit-unissued-receiver: the issued carrier is a real two-integer array"
+    );
+    let Value::Array(copied_items) = &gate.receiver else {
+        panic!("precommit-unissued-receiver: the receiver operand must be an array");
+    };
+    assert_eq!(
+        copied_items.as_slice(),
+        issued_items.as_slice(),
+        "precommit-unissued-receiver: the copy must have the issued values"
+    );
+    assert!(
+        !same_array(&gate.receiver, issued),
+        "precommit-unissued-receiver: the copy must be a different VM array"
+    );
+
+    let pick = run.pick();
+    assert!(
+        same_callable(&gate.callable, &pick.chosen),
+        "precommit-unissued-receiver: the callable operand must still be the exact note return"
+    );
+    assert!(
+        gate.token_is_issued,
+        "precommit-unissued-receiver: the userdata operand must still be the issued token"
+    );
+    let issued_raw = run
+        .witness
+        .issued_userdata_raw
+        .expect("precommit-unissued-receiver: the fixture issued one userdata");
+    assert_eq!(
+        gate.token_raw, issued_raw,
+        "precommit-unissued-receiver: the token operand is the issued handle"
+    );
+    let issued_parts = {
+        let issued = run
+            .witness
+            .issued_userdata
+            .as_ref()
+            .expect("precommit-unissued-receiver: the fixture issued one userdata");
+        (issued.domain(), issued.slot(), issued.generation())
+    };
+    assert_eq!(
+        gate.token_parts,
+        Some(issued_parts),
+        "precommit-unissued-receiver: the formal borrow names the issued payload"
+    );
+
+    let message = match &run.status {
+        Err(VmError::HostError(message)) => message.clone(),
+        other => panic!(
+            "precommit-unissued-receiver: expected the static body's HostError, got {other:?}"
+        ),
+    };
+    assert_eq!(
+        message, PRECOMMIT_REFUSAL_RECEIVER,
+        "precommit-unissued-receiver: the exact diagnostic must come from the static body"
+    );
+
+    assert_eq!(
+        run.labels(),
+        ["parent-enter"],
+        "precommit-unissued-receiver: the parent must stop at the static seam"
+    );
+    assert_eq!(
+        typed_callback_entries(run).len(),
+        0,
+        "precommit-unissued-receiver: no typed callback frame may start"
+    );
+    assert!(
+        run.witness
+            .marks
+            .iter()
+            .all(|mark| mark.label != "target-enter"
+                && mark.label != "parent-after"
+                && mark.label != "done"),
+        "precommit-unissued-receiver: neither the child frame nor the parent continuation may run"
+    );
+    assert!(
+        run.exit().is_none(),
+        "precommit-unissued-receiver: the refused run must have no chunk completion"
+    );
+    assert_eq!(
+        run.witness.gates.len(),
+        1,
+        "precommit-unissued-receiver: the static body must run exactly once"
+    );
+
+    let parent = run.mark("parent-enter");
+    let entries = precommit_entries(run);
+    assert_eq!(
+        entries.len(),
+        1,
+        "precommit-unissued-receiver: the raw static-body entry must be recorded once"
+    );
+    let entry = entries[0];
+    assert_eq!(
+        (entry.frame_len, entry.prototype_id, entry.parent_prototype),
+        (
+            parent.frame_len,
+            parent.last_prototype,
+            parent.parent_prototype
+        ),
+        "precommit-unissued-receiver: the raw entry must be the parent frame, not a child frame or the continuation"
+    );
+
+    let (seam_ip, callvalue_ip) = parent_seam_and_call(run);
+    assert!(
+        seam_ip < callvalue_ip,
+        "precommit-unissued-receiver: the static seam precedes the dynamic call"
+    );
+    eprintln!(
+        "LUA_TYPED_RESOURCE arm=precommit-unissued-receiver seam_ip={seam_ip} callvalue_ip={callvalue_ip} receiver_class=Unissued equal_values=true child_entered=0"
     );
 }
