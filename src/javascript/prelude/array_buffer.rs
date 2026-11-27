@@ -149,7 +149,7 @@ pub(crate) fn append(
     carrier_schema: &T,
     span: swc_common::Span,
     stmts: &mut Vec<S>,
-    quota_error_host: u16,
+    quota_error_host: Option<u16>,
 ) -> Result<u16, ParseError> {
     let index = super::heap::fresh_index(lower, ir, span)?;
     let heap = lower.heap_ref(span)?.helpers;
@@ -362,18 +362,36 @@ pub(crate) fn append(
     // The per-buffer quota is a fatal host error, separate from the guest
     // RangeError and checked before reserving any backing cells. Leave the
     // frame here because a host error bypasses the constructor epilogue.
-    let quota_sink = e.temp(T::Null, E::Null)?;
-    let quota_failure = vec![
-        e.effect(heap.root_leave, vec![var(c), var(frame)])?,
-        assign(
-            quota_sink,
-            call(
-                quota_error_host,
-                vec![E::String("array buffer length exceeds host quota".to_owned())],
-            ),
-            l,
-        ),
-    ];
+    //
+    // `quota_error_host` is `None` exactly when every reachable construction in
+    // the source was proven to name a literal inside the byte budget: the
+    // branch is then dead, so it keeps the guest RangeError instead of calling
+    // an adapter the host does not provide.
+    let quota_failure = match quota_error_host {
+        Some(quota_error_host) => {
+            let quota_sink = e.temp(T::Null, E::Null)?;
+            vec![
+                e.effect(heap.root_leave, vec![var(c), var(frame)])?,
+                assign(
+                    quota_sink,
+                    call(
+                        quota_error_host,
+                        vec![E::String("array buffer length exceeds host quota".to_owned())],
+                    ),
+                    l,
+                ),
+            ]
+        }
+        None => Vec::new(),
+    };
+    // No adapter means no reachable quota branch, so it answers the same guest
+    // RangeError the domain failure uses instead of asserting. The clone keeps
+    // the domain branch above intact.
+    let overflow = if quota_failure.is_empty() {
+        invalid.clone()
+    } else {
+        quota_failure
+    };
     let numeric = choose(
         tag_is(var(primitive), value::NUMBER),
         num(field(var(primitive), "number")),
@@ -409,7 +427,7 @@ pub(crate) fn append(
             invalid,
             vec![branch(
                 lt(E::Float(layout::BYTES_MAX_LENGTH as f64), var(number)),
-                quota_failure,
+                overflow,
                 make,
                 l,
             )],

@@ -690,22 +690,47 @@ pub(super) fn lower_script_statements(
     lowered
 }
 
+/// Script-wide throw-channel facts from one admitted-AST walk.
+///
+/// `may_guest_throw` drives the adapter install and the Script pending
+/// ownership; `array_buffer_quota_reachable` drives the fatal per-buffer quota
+/// adapter the ArrayBuffer constructor helper calls. Both come from the same
+/// route classification the validation walk and the emitter consume.
+pub(super) struct ScriptThrowFacts {
+    pub may_guest_throw: bool,
+    pub array_buffer_quota_reachable: bool,
+}
+
 /// Every general Call can fail the runtime callability check, even when no
 /// source Throw exists. Calls in deferred function bodies belong to those
 /// activations and do not provision the Script's channel by themselves.
 /// This fact drives both adapter installation and Script pending ownership.
 /// `lower` supplies the binding resolution that decides whether a `new` site
 /// is a builtin construction or a guest-throwing source construction.
-pub(super) fn script_can_receive_callee_throw(
+pub(super) fn script_throw_facts(
     lower: Option<&Lowerer<'_>>,
     statements: &[ast::Stmt],
-) -> bool {
+) -> ScriptThrowFacts {
     let mut scan = SourceScan {
         lower,
         ..SourceScan::default()
     };
     scan.statements(statements, false);
-    scan.may_guest_throw
+    ScriptThrowFacts {
+        may_guest_throw: scan.may_guest_throw,
+        array_buffer_quota_reachable: scan.array_buffer_quota_reachable,
+    }
+}
+
+/// Convenience wrapper for the callers that only ask about the channel. The
+/// frontends themselves consume [`script_throw_facts`]; this spelling stays for
+/// the parser-stage unit tests.
+#[cfg(test)]
+pub(super) fn script_can_receive_callee_throw(
+    lower: Option<&Lowerer<'_>>,
+    statements: &[ast::Stmt],
+) -> bool {
+    script_throw_facts(lower, statements).may_guest_throw
 }
 
 /// Inventory micro shape: `arguments[0]` with numeric index 0 only.
@@ -1130,6 +1155,10 @@ struct SourceScan<'a> {
     /// owns the scope graph; the parser-stage helpers pass `None` and keep the
     /// spelling-only answer because they never decide a Script throw channel.
     lower: Option<&'a Lowerer<'a>>,
+    /// Some `new ArrayBuffer(...)` in this walk names a length the guest cannot
+    /// prove inside the per-buffer byte budget, so the constructor helper's
+    /// fatal quota branch is reachable and needs the scalar adapter.
+    array_buffer_quota_reachable: bool,
 }
 
 /// True when any statement/expression in the source passes the bare
@@ -1176,37 +1205,25 @@ impl SourceScan<'_> {
         }
     }
 
-    /// Whether this `new` lowers through a builtin construction route that
-    /// carries no guest-visible `Err`. The spelling is necessary, not
-    /// sufficient: the callee must still resolve to the intrinsic, exactly as
-    /// `Lowerer::lower_new_expr` / `validate_new_expr` decide it. A source
-    /// binding over the same spelling selects `lower_source_construct`, whose
-    /// failure is a guest throw and therefore needs the pending channel.
-    fn new_is_builtin_construct(&self, callee: &ast::Expr) -> bool {
-        let ast::Expr::Ident(callee) = unwrap_parens(callee) else {
-            return false;
-        };
-        let name = callee.sym.as_str();
-        if !new_spelling_is_builtin_construct(name) {
-            return false;
+    /// Record the throw-channel demand of one `new` site. The route is the one
+    /// classification the validation walk and the emitter consume, so the
+    /// scanner cannot disagree with them about the same source.
+    ///
+    /// A route that can answer the Script with a guest `Err` needs the pending
+    /// channel even when no other Call/Throw/Try spelling appears, and its
+    /// `ArrayBuffer` arm additionally decides whether the fatal per-buffer
+    /// quota adapter can be reached.
+    fn note_construct(&mut self, construct: &ast::NewExpr, deferred: bool) {
+        let route = construct_route(self.lower, construct);
+        let open = route.needs_guest_throw(construct);
+        if matches!(route, ConstructRoute::ArrayBuffer(_)) && open {
+            // The quota branch is a fatal host error raised inside the
+            // constructor helper itself, so a deferred body still needs the
+            // adapter at run time: this fact ignores the channel deferral.
+            self.array_buffer_quota_reachable = true;
         }
-        let Some(lower) = self.lower else {
-            // No scope graph (parser-stage callers): the spelling is all the
-            // information available, and those callers never provision the
-            // Script channel.
-            return true;
-        };
-        match name {
-            "Object" => matches!(resolve(lower, name), NameHit::BuiltinObject),
-            "Error" | "Date" => matches!(resolve(lower, name), NameHit::Missing),
-            "Array" => matches!(resolve(lower, name), NameHit::BuiltinArrayNamespace),
-            "ArrayBuffer" => matches!(resolve(lower, name), NameHit::BuiltinArrayBuffer),
-            "TypeError" => matches!(resolve(lower, name), NameHit::BuiltinTypeError),
-            "RangeError" => matches!(resolve(lower, name), NameHit::BuiltinRangeError),
-            _ => matches!(
-                resolve(lower, name),
-                NameHit::BuiltinOptionalError(_) | NameHit::BuiltinTypedArray(_)
-            ),
+        if !deferred {
+            self.may_guest_throw |= open;
         }
     }
 
@@ -1475,22 +1492,15 @@ impl SourceScan<'_> {
                 if !deferred {
                     self.possible_construct = true;
                 }
-                // A source `new F(...)` keeps the constructor body's throw and
-                // the prototype Get throw as guest-visible Err results, so the
-                // Script needs the pending channel even when no other Call,
-                // Throw or Try spelling appears. Built-in constructions do not
-                // enter that channel: `new Object()`/`new Error("boom")`/...
-                // keep the catalog-free compile they had before. Number/
-                // String/Boolean are the exception because their upstream
-                // construction is a runtime TypeError.
-                //
-                // "Built-in" here follows the binding, not the spelling: the
-                // same resolution `Lowerer::lower_new_expr` and
-                // `validate_new_expr` dispatch on. `var Object=F` makes this a
-                // source construction of F, whose `Err` is a guest throw.
-                if !deferred && !self.new_is_builtin_construct(&construct.callee) {
-                    self.may_guest_throw = true;
-                }
+                // The route, not the spelling, decides the channel: an
+                // `Array`/`ArrayBuffer`/`TypedArray`/source/Number-family
+                // construction can answer the Script with a guest `Err`, and
+                // only proven literals keep that door shut. A source `new F()`
+                // keeps the constructor body's throw and the prototype Get
+                // throw as guest-visible results; a true `new Object()` /
+                // `new Error("boom")` / `new Date(0)` keeps the catalog-free
+                // compile it had before.
+                self.note_construct(construct, deferred);
                 self.expr(&construct.callee, deferred);
                 if let Some(args) = &construct.args {
                     for arg in args {
@@ -6409,14 +6419,263 @@ fn array_constructor_ident(callee: &ast::Expr) -> Option<&ast::Ident> {
     }
 }
 
-/// Builtin spellings whose unshadowed `new` form lowers without the guest
-/// throw channel. `Number`/`String`/`Boolean` are deliberately absent: their
-/// construction is the one upstream runtime TypeError shape.
-fn new_spelling_is_builtin_construct(name: &str) -> bool {
-    match name {
-        "Array" | "ArrayBuffer" | "Object" | "Error" | "TypeError" | "RangeError" | "Date" => true,
-        name => OptionalError::named(name).is_some() || Element::named(name).is_some(),
+/// One `new` site's construction route. The scan, the validation walk and the
+/// emitter all dispatch on this one value, so no stage can disagree about what
+/// a `new` site is.
+///
+/// `Array`/`ArrayBuffer`/`TypedArray` carry the synthesized call expression the
+/// admitted argument/completion path lowers; the caller never re-derives it.
+#[derive(Clone)]
+pub(super) enum ConstructRoute {
+    Array(ast::CallExpr),
+    ArrayBuffer(ast::CallExpr),
+    TypedArray {
+        call: ast::CallExpr,
+        element: Element,
+    },
+    /// `new Object()`, `alias` when a `var X = Object` binding selected it.
+    Object {
+        alias: Option<ConstructorAlias>,
+    },
+    /// `new Error("boom")`.
+    Error,
+    /// `new TypeError()`/`new RangeError()` and their aliases.
+    NativeError {
+        kind: NativeErrorKind,
+        alias: Option<ConstructorAlias>,
+    },
+    /// `new URIError()` and the other optional error spellings.
+    OptionalError(OptionalError),
+    /// `new Date(0)`.
+    Date,
+    /// `new Number/String/Boolean(...)`: the one upstream runtime TypeError.
+    Unsupported,
+    /// `new F(...)` over a source construction.
+    Source,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum NativeErrorKind {
+    TypeError,
+    RangeError,
+}
+
+impl ConstructRoute {
+    /// True when the construction itself can answer the Script with a guest
+    /// `Err`. Only these routes provision `typescript::throw_error`; the closed
+    /// routes (`Object`/`Error`/`NativeError`/`OptionalError`/`Date`) keep the
+    /// catalog-free compile they always had.
+    pub(super) fn may_return_guest_err(&self) -> bool {
+        matches!(
+            self,
+            Self::Array(_)
+                | Self::ArrayBuffer(_)
+                | Self::TypedArray { .. }
+                | Self::Unsupported
+                | Self::Source
+        )
     }
+
+    /// The Script-channel verdict for one site: an open route stays closed
+    /// exactly when every actual is a literal the route cannot reject, so its
+    /// `Err` branch is unreachable. Anything unprovable (variable, expression,
+    /// negative or out-of-range literal) keeps the channel.
+    pub(super) fn needs_guest_throw(&self, construct: &ast::NewExpr) -> bool {
+        self.may_return_guest_err() && !self.actuals_are_proven_safe(construct)
+    }
+
+    /// `取值可证`: which actual shapes prove the construction cannot answer
+    /// `Err`, per route.
+    fn actuals_are_proven_safe(&self, construct: &ast::NewExpr) -> bool {
+        let args = construct.args.as_deref().unwrap_or_default();
+        if args.iter().any(|arg| arg.spread.is_some()) {
+            return false;
+        }
+        match self {
+            // Every actual is an element; a single numeric actual is the
+            // length instead, so one literal bound covers both arms.
+            Self::Array(_) => args.iter().all(|arg| proven_count(&arg.expr).is_some()),
+            // One optional length/index actual.
+            Self::ArrayBuffer(_) | Self::TypedArray { .. } => match args {
+                [] => true,
+                [arg] => proven_count(&arg.expr).is_some(),
+                _ => false,
+            },
+            Self::Object { .. }
+            | Self::Error
+            | Self::NativeError { .. }
+            | Self::OptionalError(_)
+            | Self::Date => true,
+            Self::Unsupported | Self::Source => false,
+        }
+    }
+}
+
+/// The largest element count every guest construction route admits: the Array
+/// length bound (1_073_741_823) and the ArrayBuffer byte budget
+/// (`BYTES_MAX_LENGTH`, 32_768) are both above it, and the widest typed-array
+/// element (Float64, 8 bytes) still fits `4_096 * 8 == 32_768` bytes.
+const PROVEN_COUNT_MAX: f64 = 4_096.0;
+
+/// A parenthesized non-negative integer numeric literal inside every guest
+/// limit. Variables, expressions, negatives, fractions and out-of-range
+/// literals answer `None` and keep the route's channel.
+fn proven_count(expression: &ast::Expr) -> Option<f64> {
+    let ast::Expr::Lit(ast::Lit::Num(number)) = unwrap_parens(expression) else {
+        return None;
+    };
+    let value = number.value;
+    (value.is_finite()
+        && value >= 0.0
+        && value <= PROVEN_COUNT_MAX
+        && value.fract() == 0.0)
+        .then_some(value)
+}
+
+/// The `new` call the admitted argument/completion path lowers for one
+/// construction site. Shared by the route classifier and the three
+/// `*_constructor_call` helpers so the synthesized expression has one shape.
+fn construct_call(construct: &ast::NewExpr) -> ast::CallExpr {
+    ast::CallExpr {
+        span: construct.span,
+        ctxt: construct.ctxt,
+        callee: ast::Callee::Expr(construct.callee.clone()),
+        args: construct.args.clone().unwrap_or_default(),
+        type_args: construct.type_args.clone(),
+    }
+}
+
+/// Parser-stage route: no scope graph, so only the spelling is knowable. These
+/// callers never provision the Script channel; they consume the route's
+/// spelling classification exactly as the old spelling predicate did.
+fn spelling_construct_route(construct: &ast::NewExpr) -> ConstructRoute {
+    let ast::Expr::Ident(callee) = unwrap_parens(&construct.callee) else {
+        return ConstructRoute::Source;
+    };
+    let name = callee.sym.as_str();
+    match name {
+        "Array" => ConstructRoute::Array(construct_call(construct)),
+        "ArrayBuffer" => ConstructRoute::ArrayBuffer(construct_call(construct)),
+        "Object" => ConstructRoute::Object { alias: None },
+        "Error" => ConstructRoute::Error,
+        "TypeError" => ConstructRoute::NativeError {
+            kind: NativeErrorKind::TypeError,
+            alias: None,
+        },
+        "RangeError" => ConstructRoute::NativeError {
+            kind: NativeErrorKind::RangeError,
+            alias: None,
+        },
+        "Date" => ConstructRoute::Date,
+        _ => match (Element::named(name), OptionalError::named(name)) {
+            (Some(element), _) => ConstructRoute::TypedArray {
+                call: construct_call(construct),
+                element,
+            },
+            (None, Some(error)) => ConstructRoute::OptionalError(error),
+            (None, None) => ConstructRoute::Source,
+        },
+    }
+}
+
+/// Resolve one `new` site to its route. This is the single classification the
+/// scan, `validate_new_expr` and `lower_new_expr` share: a builtin spelling is
+/// never "channel-free" by itself, and only the binding decides whether the
+/// spelling still names the intrinsic.
+pub(super) fn construct_route(
+    lower: Option<&Lowerer<'_>>,
+    construct: &ast::NewExpr,
+) -> ConstructRoute {
+    let Some(lower) = lower else {
+        return spelling_construct_route(construct);
+    };
+    let alias = match unwrap_parens(&construct.callee) {
+        ast::Expr::Ident(ident) => construct_alias(lower, ident, construct.span.lo.0),
+        _ => None,
+    };
+    if let Some(call) = array_constructor_call(lower, construct, alias) {
+        return ConstructRoute::Array(call);
+    }
+    if let Some(call) = array_buffer_constructor_call(lower, construct, alias) {
+        return ConstructRoute::ArrayBuffer(call);
+    }
+    if let Some((call, element)) = typed_array_constructor_call(lower, construct, alias) {
+        return ConstructRoute::TypedArray { call, element };
+    }
+    if matches!(alias, Some(ConstructorAlias::Object))
+        || matches!(
+            unwrap_parens(&construct.callee),
+            ast::Expr::Ident(callee) if callee.sym == *"Object"
+        ) && matches!(resolve(lower, "Object"), NameHit::BuiltinObject)
+    {
+        return ConstructRoute::Object { alias };
+    }
+    if let ast::Expr::Ident(callee) = unwrap_parens(&construct.callee)
+        && callee.sym == *"Error"
+        && matches!(resolve(lower, "Error"), NameHit::Missing)
+    {
+        return ConstructRoute::Error;
+    }
+    let native_alias = match alias {
+        Some(ConstructorAlias::TypeError) | Some(ConstructorAlias::RangeError) => alias,
+        _ => None,
+    };
+    let native_kind = match unwrap_parens(&construct.callee) {
+        ast::Expr::Ident(callee) => match resolve(lower, callee.sym.as_str()) {
+            NameHit::BuiltinTypeError => Some(NativeErrorKind::TypeError),
+            NameHit::BuiltinRangeError => Some(NativeErrorKind::RangeError),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(kind) = native_kind {
+        return ConstructRoute::NativeError {
+            kind,
+            alias: native_alias,
+        };
+    }
+    if let Some(ConstructorAlias::TypeError) = native_alias {
+        return ConstructRoute::NativeError {
+            kind: NativeErrorKind::TypeError,
+            alias: native_alias,
+        };
+    }
+    if let Some(ConstructorAlias::RangeError) = native_alias {
+        return ConstructRoute::NativeError {
+            kind: NativeErrorKind::RangeError,
+            alias: native_alias,
+        };
+    }
+    if let ast::Expr::Ident(callee) = unwrap_parens(&construct.callee)
+        && let NameHit::BuiltinOptionalError(error) = resolve(lower, callee.sym.as_str())
+    {
+        return ConstructRoute::OptionalError(error);
+    }
+    // Number/String/Boolean are the only constructors whose upstream `new`
+    // form is a runtime TypeError; every other readable builtin and every
+    // alias keeps or gains a real construction route.
+    let unsupported = match alias {
+        Some(ConstructorAlias::Number | ConstructorAlias::String | ConstructorAlias::Boolean) => true,
+        _ => matches!(
+            unwrap_parens(&construct.callee),
+            ast::Expr::Ident(callee)
+                if matches!(resolve(lower, callee.sym.as_str()),
+                    NameHit::BuiltinNumberNamespace | NameHit::BuiltinStringNamespace | NameHit::BuiltinBoolean)
+        ),
+    };
+    if unsupported {
+        return ConstructRoute::Unsupported;
+    }
+    // `new Date(0)` keeps its one admitted epoch construction; a bound local
+    // Date spelling is an ordinary source construction instead.
+    let builtin_date = matches!(
+        unwrap_parens(&construct.callee),
+        ast::Expr::Ident(ident) if ident.sym == *"Date" && matches!(resolve(lower, "Date"), NameHit::Missing)
+    );
+    if builtin_date {
+        return ConstructRoute::Date;
+    }
+    ConstructRoute::Source
 }
 
 /// The admitted `new Array` form uses the existing call argument and
@@ -6504,94 +6763,45 @@ fn validate_new_expr(
     construct: &ast::NewExpr,
     facts: &mut ProfileFacts,
 ) -> Result<ProfileFact, ParseError> {
-    let alias = match unwrap_parens(&construct.callee) {
-        ast::Expr::Ident(ident) => construct_alias(lower, ident, construct.span.lo.0),
-        _ => None,
-    };
-    if let Some(call) = array_constructor_call(lower, construct, alias)
-        .or_else(|| array_buffer_constructor_call(lower, construct, alias))
-        .or_else(|| typed_array_constructor_call(lower, construct, alias).map(|(call, _)| call))
-    {
-        return validate_expr(lower, &ast::Expr::Call(call), facts);
-    }
-    if matches!(alias, Some(ConstructorAlias::Object))
-        || matches!(
-            unwrap_parens(&construct.callee),
-            ast::Expr::Ident(callee) if callee.sym == *"Object"
-        ) && matches!(resolve(lower, "Object"), NameHit::BuiltinObject)
-    {
-        return validate_new_object(lower, construct);
-    }
-    if let ast::Expr::Ident(callee) = unwrap_parens(&construct.callee)
-        && callee.sym == *"Error"
-        && matches!(resolve(lower, "Error"), NameHit::Missing)
-    {
-        return validate_new_error(lower, construct);
-    }
-    let native_error = match alias {
-        Some(ConstructorAlias::TypeError) => Some("TypeError"),
-        Some(ConstructorAlias::RangeError) => Some("RangeError"),
-        _ => match unwrap_parens(&construct.callee) {
-            ast::Expr::Ident(callee) => match resolve(lower, callee.sym.as_str()) {
-                NameHit::BuiltinTypeError => Some("TypeError"),
-                NameHit::BuiltinRangeError => Some("RangeError"),
-                _ => None,
-            },
-            _ => None,
-        },
-    };
-    if let Some(name) = native_error {
-        let Some(args) = construct.args.as_ref() else {
-            return Err(lower.error(construct.span, "unsupported JavaScript ES5 P0 primitive expression"));
-        };
-        if !args.is_empty() {
-            return Err(lower.error(construct.span, "unsupported JavaScript ES5 P0 primitive expression"));
+    // One route resolution, shared with the scan and the emitter: every arm
+    // below consumes what `construct_route` decided instead of re-deriving the
+    // binding questions.
+    match construct_route(Some(lower), construct) {
+        ConstructRoute::Array(call)
+        | ConstructRoute::ArrayBuffer(call)
+        | ConstructRoute::TypedArray { call, .. } => {
+            validate_expr(lower, &ast::Expr::Call(call), facts)
         }
-        if name == "RangeError" {
-            lower.range_error_used.set(true);
+        ConstructRoute::Object { .. } => validate_new_object(lower, construct),
+        ConstructRoute::Error => validate_new_error(lower, construct),
+        ConstructRoute::NativeError { kind, .. } => {
+            let Some(args) = construct.args.as_ref() else {
+                return Err(lower.error(construct.span, "unsupported JavaScript ES5 P0 primitive expression"));
+            };
+            if !args.is_empty() {
+                return Err(lower.error(construct.span, "unsupported JavaScript ES5 P0 primitive expression"));
+            }
+            if kind == NativeErrorKind::RangeError {
+                lower.range_error_used.set(true);
+            }
+            lower.needs_ordinary_realm.set(true);
+            Ok(ProfileFact::scalar(Kind::Object))
         }
-        lower.needs_ordinary_realm.set(true);
-        return Ok(ProfileFact::scalar(Kind::Object));
+        ConstructRoute::OptionalError(error) => {
+            admit_optional_error_args(lower, construct.args.as_deref().unwrap_or_default(), construct.span)?;
+            note_optional_error(lower, error);
+            Ok(ProfileFact::scalar(Kind::Object))
+        }
+        // Number/String/Boolean are the only constructors whose upstream `new`
+        // form is a runtime TypeError; every other readable builtin and every
+        // alias keeps or gains a real construction route.
+        ConstructRoute::Unsupported => {
+            lower.needs_ordinary_realm.set(true);
+            Ok(ProfileFact::scalar(Kind::Object))
+        }
+        ConstructRoute::Date => validate_new_date(lower, construct),
+        ConstructRoute::Source => validate_source_construct(lower, construct, facts),
     }
-    if let ast::Expr::Ident(callee) = unwrap_parens(&construct.callee)
-        && matches!(
-            resolve(lower, callee.sym.as_str()),
-            NameHit::BuiltinOptionalError(_)
-        )
-    {
-        let NameHit::BuiltinOptionalError(error) = resolve(lower, callee.sym.as_str()) else {
-            unreachable!()
-        };
-        admit_optional_error_args(lower, construct.args.as_deref().unwrap_or_default(), construct.span)?;
-        note_optional_error(lower, error);
-        return Ok(ProfileFact::scalar(Kind::Object));
-    }
-    // Number/String/Boolean are the only constructors whose upstream `new`
-    // form is a runtime TypeError; every other readable builtin and every
-    // alias keeps or gains a real construction route.
-    let unsupported = match alias {
-        Some(ConstructorAlias::Number | ConstructorAlias::String | ConstructorAlias::Boolean) => true,
-        _ => matches!(
-            unwrap_parens(&construct.callee),
-            ast::Expr::Ident(callee)
-                if matches!(resolve(lower, callee.sym.as_str()),
-                    NameHit::BuiltinNumberNamespace | NameHit::BuiltinStringNamespace | NameHit::BuiltinBoolean)
-        ),
-    };
-    if unsupported {
-        lower.needs_ordinary_realm.set(true);
-        return Ok(ProfileFact::scalar(Kind::Object));
-    }
-    // `new Date(0)` keeps its one admitted epoch construction; a bound local
-    // Date spelling is an ordinary source construction instead.
-    let builtin_date = matches!(
-        unwrap_parens(&construct.callee),
-        ast::Expr::Ident(ident) if ident.sym == *"Date" && matches!(resolve(lower, "Date"), NameHit::Missing)
-    );
-    if !builtin_date && let Ok(fact) = validate_source_construct(lower, construct, facts) {
-        return Ok(fact);
-    }
-    validate_new_date(lower, construct)
 }
 
 /// The general `new F(...)` slice: the callee must be a statically known

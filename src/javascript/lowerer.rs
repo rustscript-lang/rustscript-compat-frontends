@@ -5977,116 +5977,58 @@ impl Lowerer<'_> {
     }
 
     fn lower_new_expr(&mut self, construct: &ast::NewExpr) -> Result<Lowered, ParseError> {
-        let alias = match Self::unwrap_parens(&construct.callee) {
-            ast::Expr::Ident(ident) => {
-                reference::construct_alias(self, ident, construct.span.lo.0)
+        // One route resolution, shared with the scan and the validation walk.
+        // Every arm lowers what `construct_route` decided; no arm re-derives
+        // the binding questions from the spelling.
+        match reference::construct_route(Some(self), construct) {
+            reference::ConstructRoute::Array(call) => {
+                // The alias read may not have selected the namespace arm; the
+                // runtime value still dispatches through the Array constructor.
+                self.array_constructor_used.set(true);
+                self.lower_call_expr(&call, CallResultRooting::Temporary)
             }
-            _ => None,
-        };
-        if let Some(call) = reference::array_buffer_constructor_call(self, construct, alias) {
-            let helper = self.intrinsics.and_then(|i| i.array_buffer).expect("ArrayBuffer helper");
-            return self.lower_call_or_intrinsic_construct(&call, CallResultRooting::Temporary, Some((helper, 0)));
+            reference::ConstructRoute::ArrayBuffer(call) => {
+                let helper = self
+                    .intrinsics
+                    .and_then(|i| i.array_buffer)
+                    .expect("ArrayBuffer helper");
+                self.lower_call_or_intrinsic_construct(
+                    &call,
+                    CallResultRooting::Temporary,
+                    Some((helper, 0)),
+                )
+            }
+            reference::ConstructRoute::TypedArray { call, element } => {
+                let helper = self
+                    .intrinsics
+                    .and_then(|i| i.typed_array)
+                    .expect("typed array helper");
+                self.typed_array_elements
+                    .set(self.typed_array_elements.get() | element.bit());
+                self.lower_call_or_intrinsic_construct(
+                    &call,
+                    CallResultRooting::Temporary,
+                    Some((helper, element.construct_mode())),
+                )
+            }
+            reference::ConstructRoute::Object { alias: Some(_) } => {
+                self.lower_new_object_alias(construct)
+            }
+            reference::ConstructRoute::Object { alias: None } => {
+                self.lower_new_object(construct)
+            }
+            reference::ConstructRoute::Error => self.lower_new_error(construct),
+            reference::ConstructRoute::NativeError { alias, .. } => {
+                self.lower_new_native_error(construct, alias)
+            }
+            reference::ConstructRoute::OptionalError(_) => {
+                self.lower_new_native_error(construct, None)
+            }
+            reference::ConstructRoute::Date => self.lower_new_date(construct),
+            reference::ConstructRoute::Unsupported => self.lower_new_unsupported(construct),
+            reference::ConstructRoute::Source => self.lower_source_construct(construct),
         }
-        if let Some((call, element)) = reference::typed_array_constructor_call(self, construct, alias) {
-            let helper = self.intrinsics.and_then(|i| i.typed_array).expect("typed array helper");
-            self.typed_array_elements
-                .set(self.typed_array_elements.get() | element.bit());
-            return self.lower_call_or_intrinsic_construct(
-                &call,
-                CallResultRooting::Temporary,
-                Some((helper, element.construct_mode())),
-            );
-        }
-        if let Some(call) = reference::array_constructor_call(self, construct, alias) {
-            // The alias read may not have selected the namespace arm; the
-            // runtime value still dispatches through the Array constructor.
-            self.array_constructor_used.set(true);
-            return self.lower_call_expr(&call, CallResultRooting::Temporary);
-        }
-        if matches!(alias, Some(scope::ConstructorAlias::Object)) {
-            return self.lower_new_object_alias(construct);
-        }
-        if let ast::Expr::Ident(callee) = Self::unwrap_parens(&construct.callee)
-            && callee.sym == *"Object"
-            && matches!(
-                reference::resolve(self, callee.sym.as_str()),
-                reference::NameHit::BuiltinObject
-            )
-        {
-            return self.lower_new_object(construct);
-        }
-        if let ast::Expr::Ident(callee) = Self::unwrap_parens(&construct.callee)
-            && callee.sym == *"Error"
-            && matches!(
-                reference::resolve(self, callee.sym.as_str()),
-                reference::NameHit::Missing
-            )
-        {
-            return self.lower_new_error(construct);
-        }
-        let native_error = match alias {
-            Some(scope::ConstructorAlias::TypeError)
-            | Some(scope::ConstructorAlias::RangeError) => alias,
-            _ => match Self::unwrap_parens(&construct.callee) {
-                ast::Expr::Ident(callee)
-                    if matches!(
-                        reference::resolve(self, callee.sym.as_str()),
-                        reference::NameHit::BuiltinTypeError
-                            | reference::NameHit::BuiltinRangeError
-                            | reference::NameHit::BuiltinOptionalError(_)
-                    ) =>
-                {
-                    alias
-                }
-                _ => None,
-            },
-        };
-        if native_error.is_some()
-            || matches!(
-                Self::unwrap_parens(&construct.callee),
-                ast::Expr::Ident(callee)
-                    if matches!(
-                        reference::resolve(self, callee.sym.as_str()),
-                        reference::NameHit::BuiltinTypeError
-                            | reference::NameHit::BuiltinRangeError
-                            | reference::NameHit::BuiltinOptionalError(_)
-                    )
-            )
-        {
-            return self.lower_new_native_error(construct, alias);
-        }
-        let unsupported = match alias {
-            Some(scope::ConstructorAlias::Number)
-            | Some(scope::ConstructorAlias::String)
-            | Some(scope::ConstructorAlias::Boolean) => true,
-            _ => matches!(
-                Self::unwrap_parens(&construct.callee),
-                ast::Expr::Ident(callee)
-                    if matches!(
-                        reference::resolve(self, callee.sym.as_str()),
-                        reference::NameHit::BuiltinNumberNamespace
-                            | reference::NameHit::BuiltinStringNamespace
-                            | reference::NameHit::BuiltinBoolean
-                    )
-            ),
-        };
-        if unsupported {
-            return self.lower_new_unsupported(construct);
-        }
-        // Every remaining admitted callee is a source-function value; `Date`
-        // keeps its one admitted epoch construction only while unshadowed.
-        let builtin_date = matches!(
-            Self::unwrap_parens(&construct.callee),
-            ast::Expr::Ident(ident)
-                if ident.sym == *"Date"
-                    && matches!(reference::resolve(self, "Date"), reference::NameHit::Missing)
-        );
-        if !builtin_date {
-            return self.lower_source_construct(construct);
-        }
-        self.lower_new_date(construct)
     }
-
     /// `new` over a builtin-constructor alias: the callee identifier is only a
     /// value read, so the empty-object allocation runs exactly like the direct
     /// `new Object()` spelling.
@@ -8189,10 +8131,16 @@ helper_construct: None,
     // dispatch. Installing the adapter afterwards would race that reserved
     // range and duplicate a host-metadata index when the same source also
     // carries string literals.
-    let catches_callee_throw =
-        reference::script_can_receive_callee_throw(Some(&lower), &script.body);
+    let throw_facts = reference::script_throw_facts(Some(&lower), &script.body);
+    let catches_callee_throw = throw_facts.may_guest_throw;
     let array_buffer_used = lower.array_buffer_used.get();
-    let scalar_error_host = if catches_callee_throw || array_buffer_used {
+    // The ArrayBuffer constructor's per-buffer quota branch is a fatal host
+    // error, so the adapter is required exactly when a construction can reach
+    // it. When every reachable `new ArrayBuffer(...)` is a proven literal the
+    // branch is dead and the catalog-free compile survives; the same adapter
+    // serves the uncaught guest throw when that channel is open.
+    let array_buffer_quota = array_buffer_used && throw_facts.array_buffer_quota_reachable;
+    let scalar_error_host = if catches_callee_throw || array_buffer_quota {
         Some(install_scalar_error_host(
             context,
             &mut base_ir,
@@ -8526,7 +8474,11 @@ helper_construct: None,
                 &carrier_schema,
                 probe_span,
                 &mut statements,
-                scalar_error_host.expect("ArrayBuffer selects the scalar error adapter"),
+                if array_buffer_quota {
+                    scalar_error_host
+                } else {
+                    None
+                },
             )?;
             lower.intrinsics.as_mut().expect("ArrayBuffer realm").array_buffer = Some(helper);
         }
