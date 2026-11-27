@@ -19,6 +19,10 @@ use vm::{
 };
 
 use super::handle::{ClosureRef, HandleKind, TableRef, UpvalueRef, UserdataRef};
+use super::{
+    PendingFinalizerAction, PendingFinalizerNotCallable, TakenPendingFinalizer,
+    pending_finalizer_scalar_reject,
+};
 
 #[path = "table/mark.rs"]
 mod mark;
@@ -378,11 +382,38 @@ struct Slot {
     /// unreachable from guest roots; weak keys keep the entry because the
     /// selected object is retained for the eventual finalizer consumer.
     pending_finalizer: bool,
-    /// The explicit test retirement control consumed this generation's
-    /// pending record. Selection must not pick the object again; the next
-    /// collection treats it as ordinary garbage even if the raw `__gc` field
-    /// is still non-nil. Release and slot reuse clear the flag.
+    /// This generation was finalized without a queue record: either the
+    /// explicit test retirement control consumed its pending record, or the
+    /// selecting white-userdata pass found no raw `__gc` on its metatable.
+    /// Selection must not pick the object again, and a later raw `__gc` on
+    /// the same generation does not queue it. The flag never marks the object
+    /// and never keeps it alive; it only makes a live marked generation
+    /// value-dead for weak-value publication and for a hash value of a
+    /// `k`-only weak table. Release and slot reuse clear the flag.
     finalizer_settled: bool,
+    /// Previous node in this heap's live-userdata chain, with its exact
+    /// generation. `None` at the head and for a slot that is not linked.
+    live_userdata_prev: Option<(u32, u32)>,
+    /// Next node in this heap's live-userdata chain, with its exact
+    /// generation. `None` at the tail and for a slot that is not linked.
+    live_userdata_next: Option<(u32, u32)>,
+    /// This slot is linked in the live-userdata chain at its current
+    /// generation. A new userdata links at the head; a release unlinks in
+    /// constant work before the generation advances. Every other kind is
+    /// false.
+    live_userdata_linked: bool,
+    /// Next slot in the current selecting pass's settlement journal, if this
+    /// slot is a journal node. The links live on the slots, so one settlement
+    /// is a constant number of slot writes and never grows or copies a vector.
+    /// A link left by an earlier pass is unreachable: the head is reset to
+    /// `None` when that pass starts or publishes, and a new append overwrites
+    /// this field before the slot can join the current chain. Release does not
+    /// read the journal; slot reuse clears both fields with the slot record.
+    settlement_next: Option<u32>,
+    /// Exact generation journalled by this node. Together with the slot index
+    /// this is the identity the rollback re-checks before clearing
+    /// `finalizer_settled`; zero means no current journal identity.
+    settlement_generation: u32,
     /// Cached raw `__gc` lookup result when this table slot is a candidate
     /// metatable. Valid only with `pending_gc_generation` and
     /// `pending_gc_round`; a cache hit reads no edge record. A reused slot or
@@ -925,8 +956,10 @@ pub struct ScanMeter {
     /// Deferred owner checks and edge writes consumed after every parse.
     pub mode_late_deferred: u64,
     /// Live slot records read by the private pending-finalizer selection scan.
-    /// One per slot in the separate selection phase; a slot that cannot be
-    /// selected still counts. Not charged by an ordinary collection.
+    /// One per live-userdata chain node in the separate selection phase; a
+    /// node that cannot be selected still counts, while a table, closure,
+    /// cell, free slot, and retired slot is never read by this walk. Not
+    /// charged by an ordinary collection.
     pub pending_finalizer_scan_slots: u64,
     /// Userdata slots newly retained by the private pending-finalizer
     /// selection. One per record appended; an already pending userdata or a
@@ -945,11 +978,27 @@ pub struct ScanMeter {
     /// One per uncached candidate metatable. A cache hit does not increment
     /// this and does not re-walk the chain.
     pub pending_finalizer_gc_lookups: u64,
+    /// Test-only: settlement journal node appends performed by the selecting
+    /// scan. One per settled identity and at most one per `pulse(1)` unit.
+    /// No vector growth or prefix copy participates.
+    #[cfg(test)]
+    pub settlement_journal_appends: u64,
+    /// Test-only: settlement journal nodes actually visited by a failed-pass
+    /// rollback. One per node this pass appended; a successful publication
+    /// and Release visit no node and leave this at zero.
+    #[cfg(test)]
+    pub settlement_journal_visits: u64,
     /// Test-only: pending-queue records visited by Release after a dead-slot
     /// release. The bounded per-slot invariant must keep this at zero; the
     /// ordinary release path reads only the released slot's own fields.
     #[cfg(test)]
     pub pending_release_queue_reads: u64,
+    /// Test-only: stored pending-queue records moved by a queue extraction,
+    /// including the extracted record itself. One front pop charges one moved
+    /// record and displaces no successor; a positional removal charges its
+    /// removed record. This is separate from the record-read count.
+    #[cfg(test)]
+    pub pending_queue_storage_moves: u64,
     pub scratch: ScanScratch,
 }
 
@@ -1106,6 +1155,29 @@ pub struct LuaHeap {
     /// [`PendingQueue`]'s counted boundary, including the test-only release
     /// meter. No call site counts by hand.
     pending_finalizers: PendingQueue,
+    /// Head and tail of the intrusive live-userdata chain, with the exact
+    /// generation of each endpoint. A new userdata links at the head and a
+    /// release unlinks its own node in constant work. The chain is the
+    /// private pending selection order: allocation-reverse inside one cohort
+    /// and no batch sort or vector rebuild. Release reads only the released
+    /// slot's own links; it does not walk this chain.
+    live_userdata_head: Option<(u32, u32)>,
+    live_userdata_tail: Option<(u32, u32)>,
+    /// Head and length of the current selecting pass's settlement journal.
+    ///
+    /// Each node is a live userdata slot whose `settlement_next` links the
+    /// previous head and whose `settlement_generation` names the exact
+    /// identity. An append is one flag write, one link write, one generation
+    /// write, and one head write: a constant upper bound per `pulse(1)`
+    /// settlement unit, with no vector growth or prefix copy. A successful
+    /// publication drops the journal by resetting these fields; it does not
+    /// visit the links, and Release does not read them. A failed pass walks
+    /// exactly its own chain, clears those flags, and stops. That rollback
+    /// work is charged to the failure path, never to the next mark's first
+    /// pulse and never to Release.
+    settlement_head: Option<u32>,
+    #[cfg(test)]
+    settlement_journal_len: u32,
     /// Owner chains opened by the legacy table rollback edge walk.
     /// Test-only observation: an empty userdata reservation rollback must
     /// leave this unchanged, so its work stays independent of the graph size.
@@ -1123,6 +1195,18 @@ pub struct LuaHeap {
     /// adds none. The pairs are `(metatable_slot, edge_record_index)`.
     #[cfg(test)]
     pending_gc_edge_trace: std::cell::RefCell<Vec<(u32, u32)>>,
+    /// Test-only: live-userdata chain nodes read by the private selection, in
+    /// visit order. Each entry is one real slot-record read and the exact
+    /// generation the chain cursor named, so a test can distinguish a real
+    /// chain walk from a counter that merely reports the number of candidates.
+    #[cfg(test)]
+    pending_live_trace: std::cell::RefCell<Vec<(u32, u32)>>,
+    /// Test-only: identities actually visited by a failed settlement
+    /// journal rollback, in visit order. A successful pass and Release leave
+    /// it empty, so the trace distinguishes precise cleanup from a drain
+    /// deferred to the next pulse or to Release.
+    #[cfg(test)]
+    settlement_journal_trace: std::cell::RefCell<Vec<(u32, u32)>>,
     /// Test-only anti-control for the secondary propagation. When armed, a
     /// selected pending userdata is still marked and protected, but its
     /// metatable edge is not followed while its owner head is scanned. This
@@ -1145,39 +1229,64 @@ pub struct LuaHeap {
     admitted_guest_callables: Vec<ClosureRef>,
 }
 
+/// One typed userdata retained after the ordinary mark converged.
+///
+/// `raw` is the exact Core handle still bound in `slot`; the selection and the
+/// host pre-publication check both read that same binding, so a record cannot
+/// name a different object. The record is not a root vector entry, is not a
+/// guest value, and is visible only to this table module and its heap parent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PendingFinalizer {
+    pub(super) slot: u32,
+    pub(super) generation: u32,
+    pub(super) raw: u64,
+}
+
+/// The one-layer raw `__call` result on one receiver's own current instance
+/// metatable. A table-valued `__call` is `NotClosure`; this slice never
+/// dispatches it again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CurrentRawCall {
+    WithoutCall,
+    NotClosure,
+    Closure(ClosureRef),
+}
+
 mod pending_queue {
-    /// One typed userdata retained after the ordinary mark converged.
-    ///
-    /// `raw` is the exact Core handle still bound in `slot`; the selection and
-    /// the host pre-publication check both read that same binding, so a record
-    /// cannot name a different object. The record is not a root vector entry
-    /// and is not a guest value.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(super) struct PendingFinalizer {
-        pub(super) slot: u32,
-        pub(super) generation: u32,
-        pub(super) raw: u64,
-    }
+    use std::collections::VecDeque;
+
+    use super::PendingFinalizer;
 
     /// Private storage for retained pending-finalizer records.
     ///
-    /// The vector is not exposed. Every read of a stored record goes through
-    /// one of the accessors below, which is also the single place where the
-    /// test-only release meter observes a real queue read. No caller outside
-    /// this module can index the vector: the field is private here and no
-    /// iterator over the raw storage is exported.
+    /// The queue is a `VecDeque`. Appending publishes nothing; a successful
+    /// private collection stores `published = len` only after its real weak
+    /// publication completed. The leading `published` records are then
+    /// consumable in the order the selecting scan offered them: the live
+    /// chain walks newest allocation first inside one cohort, and a later
+    /// cohort appends after every retained earlier record. A front pop is O(1)
+    /// in the stored-record count: it reads the head record and moves one
+    /// record, and it neither reads nor shifts a successor.
     ///
-    /// A read is one record handed to the caller: `get` yields one, `iter`
-    /// counts each yielded item, `remove` counts the removed record, and
-    /// `split_off_from` hands back the whole suffix and counts it once by its
-    /// length. `len` touches only the vector header, and `push` writes;
-    /// neither is a record read.
+    /// Every read of a stored record goes through one of the accessors below,
+    /// which is also the single place where the test-only read meter observes
+    /// a real queue read. The move meter is separate: a front pop charges one
+    /// moved record, while a positional removal charges its removed record.
+    /// No caller outside this module can index the vector: the field is
+    /// private here and no iterator over the raw storage is exported.
     #[derive(Default)]
     pub(super) struct PendingQueue {
-        records: Vec<PendingFinalizer>,
+        records: VecDeque<PendingFinalizer>,
+        /// Number of leading records a successful private publication made
+        /// consumable. Always at most `records.len()`.
+        published: usize,
         /// Test-only count of records read through this boundary.
         #[cfg(test)]
         reads: std::cell::Cell<u64>,
+        /// Test-only count of stored records moved by an extraction. A front
+        /// pop moves its one returned record and displaces no successor.
+        #[cfg(test)]
+        moves: std::cell::Cell<u64>,
     }
 
     impl PendingQueue {
@@ -1185,8 +1294,13 @@ mod pending_queue {
             self.records.len()
         }
 
+        /// The consumable prefix length. This is a header read only.
+        pub(super) fn published_len(&self) -> usize {
+            self.published
+        }
+
         pub(super) fn push(&mut self, record: PendingFinalizer) {
-            self.records.push(record);
+            self.records.push_back(record);
         }
 
         /// One stored record by position. The hit is one queue read.
@@ -1204,30 +1318,78 @@ mod pending_queue {
             }
         }
 
+        /// One consumable head record. One record read; does not pop or write.
+        pub(super) fn published_front(&self) -> Option<PendingFinalizer> {
+            if self.published == 0 {
+                return None;
+            }
+            let record = self.records.front().copied()?;
+            self.record_read();
+            Some(record)
+        }
+
+        /// Makes every currently stored record consumable. This is one header
+        /// write. Records appended afterwards stay unpublished until the next
+        /// successful private publication.
+        pub(super) fn publish_all(&mut self) {
+            self.published = self.records.len();
+        }
+
+        /// Pops the expected published front. A hit reads one record, moves one
+        /// stored record, and drops the ready prefix by one. No successor is
+        /// read or displaced. The expected record is the value the caller just
+        /// read from `published_front`; the identity assertion is debug-only
+        /// because those two calls are adjacent and no mutation can intervene.
+        pub(super) fn pop_published_front(
+            &mut self,
+            expected: PendingFinalizer,
+        ) -> Option<PendingFinalizer> {
+            if self.published == 0 {
+                return None;
+            }
+            let record = self.records.pop_front()?;
+            debug_assert_eq!(record, expected);
+            self.published -= 1;
+            self.record_read();
+            self.record_move();
+            Some(record)
+        }
+
         /// Removes one record by position. The removed record is one read.
+        /// Removing a published position keeps the remaining prefix ready;
+        /// removing an unpublished position leaves the prefix unchanged.
         pub(super) fn remove(&mut self, index: usize) -> Option<PendingFinalizer> {
             if index >= self.records.len() {
                 return None;
             }
-            let record = self.records.remove(index);
+            let record = self.records.remove(index)?;
+            if index < self.published {
+                self.published -= 1;
+            }
             self.record_read();
+            self.record_move();
             Some(record)
         }
 
         /// Removes and returns every record from `base` onward.
         ///
         /// The batch is one boundary: a non-empty suffix is accounted once by
-        /// its length in the test meter. The production build has no
+        /// its length in the test meters. The production build has no
         /// per-record loop here; the returned records are the caller's own
         /// rollback input. An out-of-range base returns nothing and reads no
-        /// record.
+        /// record. The ready prefix is clamped to `base`, so a rollback can
+        /// never make an unpublished record consumable.
         pub(super) fn split_off_from(&mut self, base: usize) -> Vec<PendingFinalizer> {
             if base >= self.records.len() {
                 return Vec::new();
             }
-            let removed = self.records.split_off(base);
+            let suffix = self.records.split_off(base);
+            self.published = self.published.min(base);
+            let removed: Vec<_> = suffix.into_iter().collect();
             #[cfg(test)]
-            self.record_reads(removed.len());
+            self.record_reads(removed.len() as u64);
+            #[cfg(test)]
+            self.record_moves(removed.len() as u64);
             removed
         }
 
@@ -1239,6 +1401,14 @@ mod pending_queue {
             reads
         }
 
+        /// Returns the stored-record moves since the previous take.
+        #[cfg(test)]
+        pub(super) fn take_moves(&mut self) -> u64 {
+            let moves = self.moves.get();
+            self.moves.set(0);
+            moves
+        }
+
         #[cfg(test)]
         fn record_read(&self) {
             self.reads.set(self.reads.get() + 1);
@@ -1246,12 +1416,25 @@ mod pending_queue {
 
         /// Accounts a whole batch handed out by one boundary. Test-only.
         #[cfg(test)]
-        fn record_reads(&self, count: usize) {
-            self.reads.set(self.reads.get() + count as u64);
+        fn record_reads(&self, count: u64) {
+            self.reads.set(self.reads.get() + count);
+        }
+
+        #[cfg(test)]
+        fn record_move(&self) {
+            self.moves.set(self.moves.get() + 1);
+        }
+
+        #[cfg(test)]
+        fn record_moves(&self, count: u64) {
+            self.moves.set(self.moves.get() + count);
         }
 
         #[cfg(not(test))]
         fn record_read(&self) {}
+
+        #[cfg(not(test))]
+        fn record_move(&self) {}
     }
 
     /// Counted iterator over the private queue. It yields borrowed records
@@ -1272,7 +1455,7 @@ mod pending_queue {
         }
     }
 }
-use pending_queue::{PendingFinalizer, PendingQueue};
+use pending_queue::PendingQueue;
 
 /// The batch boundary's own metering witness.
 ///
@@ -1284,7 +1467,8 @@ use pending_queue::{PendingFinalizer, PendingQueue};
 /// they are not a fabricated behavior RED.
 #[cfg(test)]
 mod pending_queue_tests {
-    use super::pending_queue::{PendingFinalizer, PendingQueue};
+    use super::PendingFinalizer;
+    use super::pending_queue::PendingQueue;
 
     fn record(slot: u32) -> PendingFinalizer {
         PendingFinalizer {
@@ -1440,12 +1624,21 @@ impl LuaHeap {
             payload_bytes: 0,
             pending_userdata: None,
             pending_finalizers: PendingQueue::default(),
+            live_userdata_head: None,
+            live_userdata_tail: None,
+            settlement_head: None,
+            #[cfg(test)]
+            settlement_journal_len: 0,
             #[cfg(test)]
             rollback_owner_visits: 0,
             #[cfg(test)]
             selection_slot_trace: std::cell::RefCell::new(Vec::new()),
             #[cfg(test)]
             pending_gc_edge_trace: std::cell::RefCell::new(Vec::new()),
+            #[cfg(test)]
+            pending_live_trace: std::cell::RefCell::new(Vec::new()),
+            #[cfg(test)]
+            settlement_journal_trace: std::cell::RefCell::new(Vec::new()),
             #[cfg(test)]
             skip_pending_finalizer_metatable: false,
             #[cfg(test)]
@@ -1467,6 +1660,7 @@ impl LuaHeap {
         let meter = {
             let mut meter = meter;
             meter.pending_release_queue_reads += self.pending_finalizers.take_reads();
+            meter.pending_queue_storage_moves += self.pending_finalizers.take_moves();
             meter
         };
         self.scan = ScanMeter::default();
@@ -1510,6 +1704,7 @@ impl LuaHeap {
             self.deny_unbarriered()?;
         }
         let (index, generation) = self.alloc_slot(HandleKind::Userdata)?;
+        self.link_live_userdata_head(index, generation);
         Ok(UserdataRef::userdata(self.domain, index, generation))
     }
 
@@ -1541,6 +1736,11 @@ impl LuaHeap {
         slot.metatable = None;
         slot.pending_finalizer = false;
         slot.finalizer_settled = false;
+        slot.live_userdata_prev = None;
+        slot.live_userdata_next = None;
+        slot.live_userdata_linked = false;
+        slot.settlement_next = None;
+        slot.settlement_generation = 0;
         slot.pending_gc_generation = 0;
         slot.pending_gc_round = 0;
         slot.pending_gc_non_nil = false;
@@ -1587,6 +1787,11 @@ impl LuaHeap {
             metatable: None,
             pending_finalizer: false,
             finalizer_settled: false,
+            live_userdata_prev: None,
+            live_userdata_next: None,
+            live_userdata_linked: false,
+            settlement_next: None,
+            settlement_generation: 0,
             pending_gc_generation: 0,
             pending_gc_round: 0,
             pending_gc_non_nil: false,
@@ -2232,6 +2437,32 @@ impl LuaHeap {
             from,
             EdgeKey::named(name),
             EdgeValue::Userdata {
+                slot: value.slot(),
+                generation: value.generation(),
+            },
+        )
+    }
+
+    /// Writes one closure under a Lua string key.
+    ///
+    /// This is the private strong-edge form used by the pending-finalizer raw
+    /// `__gc` and `__call` fixtures: a metatable field can name the exact live
+    /// closure generation. The write uses the same record, quota, and mutation
+    /// gates as a table field. It does not issue a guest value and does not
+    /// make that closure a callable.
+    pub fn set_named_closure(
+        &mut self,
+        from: TableRef,
+        name: &str,
+        value: ClosureRef,
+    ) -> Result<(), HeapError> {
+        self.require_live(from)?;
+        self.require_closure(value)?;
+        self.deny_unbarriered()?;
+        self.write_edge(
+            from,
+            EdgeKey::named(name),
+            EdgeValue::Closure {
                 slot: value.slot(),
                 generation: value.generation(),
             },
@@ -3078,6 +3309,22 @@ impl LuaHeap {
             .map(|edge| &edge.value)
     }
 
+    /// One raw stored value under a Lua string key through the owner's chain.
+    ///
+    /// A missing key returns `None`; a stored `Value::Null` gap still returns a
+    /// value record, so the caller can tell an absent field from a true
+    /// stored-nil gap. This does not consult `__index`, a metatable, or the
+    /// selection cache, and it does not construct a key. The owner-chain walk
+    /// is linear in that owner's stored edge count.
+    fn raw_named_value(&self, owner: u32, name: &str) -> Option<&EdgeValue> {
+        let index = self.find_matching(owner, |key| key.matches_name(name))?;
+        self.edge_slots
+            .get(index as usize)?
+            .edge
+            .as_ref()
+            .map(|edge| &edge.value)
+    }
+
     /// One walk of the owner's chain. The predicate selects the stored key.
     /// This does not build another table.
     fn read_edge(
@@ -3753,15 +4000,16 @@ impl LuaHeap {
         }
     }
 
-    /// Examines one slot for the private pending-finalizer selection, without
-    /// reading the metatable edge chain.
+    /// Examines one live-userdata chain node for the private pending-finalizer
+    /// selection, without reading the metatable edge chain.
     ///
     /// A candidate is a live, unmarked userdata that already published a
-    /// typed Core token, is not pending yet, and stores a live table
-    /// metatable at its exact generation. The raw `__gc` lookup is a separate
-    /// metered walk; this function reads one slot record only. A missing
-    /// token, a table owner, an absent metatable, or a dead metatable is not
-    /// a candidate.
+    /// typed Core token, is not pending or settled yet, and stores a live
+    /// table metatable at its exact generation. The raw `__gc` lookup is a
+    /// separate metered walk; this function reads one slot record only. A
+    /// missing token, a table owner, an absent metatable, or a dead metatable
+    /// is not a candidate. A missing or nil raw `__gc` is still a candidate:
+    /// it is the settlement arm, not a non-candidate.
     pub(super) fn pending_finalizer_candidate(&self, index: usize) -> Option<PendingCandidate> {
         let slot = self.slots.get(index)?;
         if !matches!(slot.state, SlotState::Live { marked: false }) {
@@ -3868,10 +4116,500 @@ impl LuaHeap {
         true
     }
 
+    /// Settles one metered raw-`__gc`-negative candidate.
+    ///
+    /// Upstream `lj_gc_separateudata` marks such a white userdata finalized
+    /// without queueing it. This writes the same per-identity state on the
+    /// exact slot generation: no queue record, no mark, and no retention.
+    /// The same call links the identity into this pass's intrusive settlement
+    /// journal, one slot node and one head update, so the rollback record is
+    /// constant work per pulse unit and never grows or copies a vector. The
+    /// live-token, unmarked, userdata, and generation checks mirror
+    /// [`Self::commit_pending_finalizer`]; a candidate that changed during
+    /// the walk is not settled.
+    pub(super) fn settle_pending_finalizer(&mut self, candidate: &PendingCandidate) -> bool {
+        let index = candidate.slot as usize;
+        let Some(slot) = self.slots.get(index) else {
+            return false;
+        };
+        if slot.generation != candidate.generation
+            || !matches!(slot.state, SlotState::Live { marked: false })
+            || slot.kind != HandleKind::Userdata
+            || slot.pending_finalizer
+            || slot.finalizer_settled
+            || slot.token.is_none()
+        {
+            return false;
+        }
+        let generation = candidate.generation;
+        let head = self.settlement_head;
+        let slot = &mut self.slots[index];
+        slot.finalizer_settled = true;
+        slot.settlement_generation = generation;
+        slot.settlement_next = head;
+        self.settlement_head = Some(candidate.slot);
+        #[cfg(test)]
+        {
+            self.settlement_journal_len += 1;
+            self.scan.settlement_journal_appends += 1;
+        }
+        true
+    }
+
+    /// Drops the current journal before a new selecting scan starts, or after
+    /// a successful publication.
+    ///
+    /// This drops the head only. The links and generation stamps stay on the
+    /// slots, but they are unreachable: a later append overwrites the next
+    /// link before the slot can join the new chain, and slot reuse clears both
+    /// fields. A successful pass therefore performs no per-node work here and
+    /// no node visit is charged to Release or to the next mark's first pulse.
+    pub(super) fn clear_selecting_settlements(&mut self) {
+        self.settlement_head = None;
+        #[cfg(test)]
+        {
+            self.settlement_journal_len = 0;
+        }
+    }
+
+    /// Clears exactly the settlement flags named by the current failed pass
+    /// and drops the journal.
+    ///
+    /// The walk follows this pass's intrusive chain, one slot node at a time,
+    /// and touches no other node. Each entry is re-checked against the live
+    /// slot generation and the userdata kind. A slot that changed, was already
+    /// pending, or was settled by an earlier pass is not cleared, so valid
+    /// previous-cycle state and a pending record's flag survive the rollback.
+    /// The journal head and length are dropped before the walk, so a refused
+    /// or interrupted pass cannot leave a partially reachable chain.
+    pub(super) fn discard_settlements(&mut self) {
+        let mut cursor = self.settlement_head.take();
+        #[cfg(test)]
+        {
+            self.settlement_journal_len = 0;
+        }
+        while let Some(index) = cursor {
+            let Some(slot) = self.slots.get_mut(index as usize) else {
+                break;
+            };
+            let next = slot.settlement_next.take();
+            let generation = std::mem::take(&mut slot.settlement_generation);
+            #[cfg(test)]
+            {
+                self.scan.settlement_journal_visits += 1;
+                self.settlement_journal_trace
+                    .borrow_mut()
+                    .push((index, generation));
+            }
+            if slot.generation == generation
+                && slot.kind == HandleKind::Userdata
+                && slot.finalizer_settled
+                && !slot.pending_finalizer
+            {
+                slot.finalizer_settled = false;
+            }
+            cursor = next;
+        }
+    }
+
     /// Number of pending-finalizer records. Does not read the graph or a
     /// stored record; it reads only the queue length.
     pub(super) fn pending_finalizer_count(&self) -> usize {
         self.pending_finalizers.len()
+    }
+
+    /// Number of leading records that a successful private publication made
+    /// consumable. A header read only; no stored record is read.
+    pub(super) fn pending_finalizer_published_count(&self) -> usize {
+        self.pending_finalizers.published_len()
+    }
+
+    /// The published head record, if the ready prefix is non-empty.
+    ///
+    /// This is one queue record read and no write. A queue that has records
+    /// but no published prefix is not consumable: selection may have retained
+    /// them for a later mark, but no successful weak publication has released
+    /// them to a consumer yet.
+    pub(super) fn pending_finalizer_published_front(&self) -> Result<PendingFinalizer, HeapError> {
+        self.pending_finalizers.published_front().ok_or_else(|| {
+            HeapError::Scope("lua pending finalizer head is not published".to_string())
+        })
+    }
+
+    /// Checks one specified root slot can receive the published head.
+    ///
+    /// Any open frame generation is accepted; an unknown or old frame, an
+    /// out-of-range slot, a missing root entry, and an occupied slot are all
+    /// refused before a queue or root write. A valid empty slot is `Ok(())`.
+    pub(super) fn pending_finalizer_root_slot(
+        &self,
+        frame: RootFrameId,
+        slot: u32,
+    ) -> Result<(), HeapError> {
+        self.pending_finalizer_root_index(frame, slot).map(|_| ())
+    }
+
+    fn pending_finalizer_root_index(
+        &self,
+        frame: RootFrameId,
+        slot: u32,
+    ) -> Result<usize, HeapError> {
+        // `frame` walks the open-frame stack, so this lookup is linear in the
+        // number of open frames and reads no queue record.
+        let found = self.frame(frame)?;
+        if slot >= found.width {
+            return Err(HeapError::StaleFrame);
+        }
+        let index = found.start as usize + slot as usize;
+        if self.roots.get(index).is_none() {
+            return Err(HeapError::StaleFrame);
+        }
+        if self.roots[index].is_some() {
+            return Err(HeapError::Scope(
+                "lua pending finalizer root slot is occupied".to_string(),
+            ));
+        }
+        Ok(index)
+    }
+
+    /// Resolves the concrete root positions for one dequeue plan.
+    ///
+    /// `slots[0]` receives the userdata. A direct closure adds `slots[1]`; a
+    /// table call or an independent userdata receiver adds the closure at
+    /// `slots[1]` and the original receiver at `slots[2]`. A self-receiver
+    /// userdata call needs only the first two positions. Only the first
+    /// `needed` positions are read. They must be distinct, inside one open
+    /// frame, present, and empty. A short plan or a duplicate is refused before
+    /// any queue, root, or slot write. Each position locates its frame by
+    /// walking the open-frame stack, so this plan is linear in the number of
+    /// open frames and the number of required positions; it does not read the
+    /// queue, any edge chain, or the root vector beyond the checked entries.
+    fn pending_finalizer_root_indices(
+        &self,
+        frame: RootFrameId,
+        slots: &[u32],
+        needed: usize,
+    ) -> Result<[usize; 3], HeapError> {
+        if needed > 3 || slots.len() < needed {
+            return Err(HeapError::Scope(
+                "lua pending finalizer needs more root slots".to_string(),
+            ));
+        }
+        let mut indices = [0usize; 3];
+        for (offset, slot) in slots[..needed].iter().copied().enumerate() {
+            if slots[..offset].contains(&slot) {
+                return Err(HeapError::Scope(
+                    "lua pending finalizer root slots overlap".to_string(),
+                ));
+            }
+            indices[offset] = self.pending_finalizer_root_index(frame, slot)?;
+        }
+        Ok(indices)
+    }
+
+    /// The exact live userdata a published head record still names.
+    ///
+    /// The record's slot must still bind the same generation, kind, pending
+    /// flag, raw handle, and live state. A successor generation in the same
+    /// slot is refused. This is the shared identity preflight of both dequeue
+    /// entries; it reads one record and writes nothing.
+    fn pending_finalizer_head_identity(
+        &self,
+        head: PendingFinalizer,
+    ) -> Result<UserdataRef, HeapError> {
+        let Some(slot_record) = self.slots.get(head.slot as usize) else {
+            return Err(HeapError::StaleHandle);
+        };
+        if slot_record.generation != head.generation
+            || slot_record.kind != HandleKind::Userdata
+            || !slot_record.pending_finalizer
+            || slot_record.finalizer_settled
+            || slot_record.token != Some(head.raw)
+            || !matches!(slot_record.state, SlotState::Live { .. })
+        {
+            return Err(HeapError::StaleHandle);
+        }
+        Ok(UserdataRef::userdata(
+            self.domain,
+            head.slot,
+            head.generation,
+        ))
+    }
+
+    /// The current raw finalizer action for one live pending userdata.
+    ///
+    /// This is the dequeue-time re-read: the userdata's current metatable is
+    /// read again, then its raw `__gc` field. A boolean, number, or string
+    /// keeps only its Lua type tag; a stored nil stays `Skip`. A live table or
+    /// a live userdata adds exactly one raw `__call` lookup on that receiver's
+    /// own current instance metatable through [`Self::current_metatable_raw_call`].
+    /// It does not reuse the selection cache, does not follow `__index`, does
+    /// not walk an inherited metatable, and does not dispatch a table-valued
+    /// `__call` a second time. Each raw field lookup walks one owner chain, so
+    /// the cost is linear in the receiver metatable's stored edge count. Nothing
+    /// is written.
+    pub(super) fn pending_finalizer_action(&self, userdata: UserdataRef) -> PendingFinalizerAction {
+        let Some(slot) = self.slots.get(userdata.slot() as usize) else {
+            return PendingFinalizerAction::Skip;
+        };
+        let Some((metatable_slot, metatable_generation)) = slot.metatable else {
+            return PendingFinalizerAction::Skip;
+        };
+        if !self.slot_matches(metatable_slot, metatable_generation, HandleKind::Table) {
+            return PendingFinalizerAction::Skip;
+        }
+        let Some(value) = self.raw_named_value(metatable_slot, "__gc") else {
+            return PendingFinalizerAction::Skip;
+        };
+        match value {
+            EdgeValue::Scalar(value) => match pending_finalizer_scalar_reject(value) {
+                Some(reject) => PendingFinalizerAction::NonCallable(reject),
+                None => PendingFinalizerAction::Skip,
+            },
+            EdgeValue::Userdata { slot, generation } => {
+                if !self.slot_matches(*slot, *generation, HandleKind::Userdata) {
+                    return PendingFinalizerAction::NonCallable(
+                        PendingFinalizerNotCallable::Detached,
+                    );
+                }
+                let receiver = UserdataRef::userdata(self.domain, *slot, *generation);
+                match self.current_metatable_raw_call(*slot) {
+                    CurrentRawCall::WithoutCall => PendingFinalizerAction::NonCallable(
+                        PendingFinalizerNotCallable::UserdataWithoutCall(receiver),
+                    ),
+                    CurrentRawCall::NotClosure => PendingFinalizerAction::NonCallable(
+                        PendingFinalizerNotCallable::UserdataCallNotClosure(receiver),
+                    ),
+                    CurrentRawCall::Closure(call) => {
+                        PendingFinalizerAction::UserdataCall { receiver, call }
+                    }
+                }
+            }
+            EdgeValue::Upvalue { .. } => {
+                PendingFinalizerAction::NonCallable(PendingFinalizerNotCallable::Upvalue)
+            }
+            EdgeValue::Closure { slot, generation } => {
+                if self.slot_matches(*slot, *generation, HandleKind::Closure) {
+                    PendingFinalizerAction::Closure(ClosureRef::closure(
+                        self.domain,
+                        *slot,
+                        *generation,
+                    ))
+                } else {
+                    PendingFinalizerAction::NonCallable(PendingFinalizerNotCallable::Detached)
+                }
+            }
+            EdgeValue::Table { slot, generation } => {
+                if !self.slot_matches(*slot, *generation, HandleKind::Table) {
+                    return PendingFinalizerAction::NonCallable(
+                        PendingFinalizerNotCallable::Detached,
+                    );
+                }
+                let receiver = TableRef::table(self.domain, *slot, *generation);
+                match self.current_metatable_raw_call(*slot) {
+                    CurrentRawCall::WithoutCall => PendingFinalizerAction::NonCallable(
+                        PendingFinalizerNotCallable::TableWithoutCall(receiver),
+                    ),
+                    CurrentRawCall::NotClosure => PendingFinalizerAction::NonCallable(
+                        PendingFinalizerNotCallable::TableCallNotClosure(receiver),
+                    ),
+                    CurrentRawCall::Closure(call) => {
+                        PendingFinalizerAction::TableCall { receiver, call }
+                    }
+                }
+            }
+        }
+    }
+
+    /// One raw `__call` lookup on a receiver's own current instance metatable.
+    ///
+    /// This is exactly one layer: the receiver slot's current metatable is
+    /// read, then its raw `__call` record. `__index` and the metatable's own
+    /// metatable are never followed, and a table-valued `__call` is not
+    /// dispatched again. The owner-chain lookup is linear in that metatable's
+    /// stored edge count and reads no selection cache. Nothing is written.
+    fn current_metatable_raw_call(&self, receiver_slot: u32) -> CurrentRawCall {
+        let Some((metatable_slot, metatable_generation)) =
+            self.slots[receiver_slot as usize].metatable
+        else {
+            return CurrentRawCall::WithoutCall;
+        };
+        if !self.slot_matches(metatable_slot, metatable_generation, HandleKind::Table) {
+            return CurrentRawCall::WithoutCall;
+        }
+        let Some(call) = self.raw_named_value(metatable_slot, "__call") else {
+            return CurrentRawCall::WithoutCall;
+        };
+        match call {
+            EdgeValue::Scalar(Value::Null) => CurrentRawCall::WithoutCall,
+            EdgeValue::Closure { slot, generation }
+                if self.slot_matches(*slot, *generation, HandleKind::Closure) =>
+            {
+                CurrentRawCall::Closure(ClosureRef::closure(self.domain, *slot, *generation))
+            }
+            _ => CurrentRawCall::NotClosure,
+        }
+    }
+
+    /// Pops exactly `head`, writes the already validated roots, and settles
+    /// that generation once.
+    ///
+    /// This is the shared commit behind both dequeue entries. Every fallible
+    /// check, including the current raw-field resolution and the whole root
+    /// plan, has already finished in this same exclusive borrow. The remaining
+    /// published-front pop reads one record and moves one stored record; it
+    /// happens before the first root or slot write, and a refusal leaves the
+    /// queue and every root unchanged. No guest code is called.
+    fn commit_published_finalizer(
+        &mut self,
+        head: PendingFinalizer,
+        userdata: UserdataRef,
+        roots: &[(usize, Rooted)],
+    ) -> Result<UserdataRef, HeapError> {
+        let Some(popped) = self.pending_finalizers.pop_published_front(head) else {
+            return Err(HeapError::Scope(
+                "lua pending finalizer head is not published".to_string(),
+            ));
+        };
+        debug_assert_eq!(popped, head);
+        for (index, rooted) in roots {
+            self.roots[*index] = Some(*rooted);
+        }
+        let slot_record = &mut self.slots[head.slot as usize];
+        slot_record.pending_finalizer = false;
+        slot_record.finalizer_settled = true;
+        Ok(userdata)
+    }
+
+    /// Pops the exact published head, roots its typed userdata in the
+    /// specified empty slot, and settles that generation in one commit.
+    ///
+    /// Every refusal is checked before the first queue, root, or slot write:
+    /// a saved mark or tail, an unpublished head, a bad frame or slot, an
+    /// occupied root, and a record whose live slot no longer binds the exact
+    /// generation, kind, pending flag, and raw handle. The front record is
+    /// then popped with one `VecDeque` front removal, the exact userdata is
+    /// written into the root slot, and the slot's pending flag is replaced by
+    /// its settled flag. It does not call a guest callback and does not read a
+    /// raw `__gc` field: this is the retained single-root test path.
+    pub(super) fn take_published_finalizer_into_root(
+        &mut self,
+        frame: RootFrameId,
+        slot: u32,
+        head: PendingFinalizer,
+    ) -> Result<UserdataRef, HeapError> {
+        self.deny_unbarriered()?;
+        let indices = self.pending_finalizer_root_indices(frame, &[slot], 1)?;
+        let userdata = self.pending_finalizer_head_identity(head)?;
+        self.commit_published_finalizer(head, userdata, &[(indices[0], Rooted::Userdata(userdata))])
+    }
+
+    /// Pops one published head with a fresh raw-finalizer decision and roots
+    /// every identity that decision needs.
+    ///
+    /// The queue record is not trusted for callability: after the shared
+    /// identity preflight, the userdata's current metatable and its raw
+    /// `__gc` are read again in this same exclusive borrow, before any write.
+    /// `prepared` is the fixed-size action whose independent userdata receiver
+    /// already passed the typed owner check in the caller; this method
+    /// re-resolves the action and refuses any identity change
+    /// ([`HeapError::StaleHandle`]) before the pop. A table or userdata value
+    /// adds one raw `__call` read on that receiver's own current instance
+    /// metatable. An inherited or table-valued `__call` is a typed reject, not
+    /// a second dispatch, and the reject keeps the exact original receiver.
+    /// `slots[0]` always receives the userdata; a direct closure adds
+    /// `slots[1]`; a table call or an independent userdata receiver adds the
+    /// closure at `slots[1]` and the original receiver at `slots[2]`. A
+    /// userdata call whose receiver is the pending object itself adds only
+    /// `slots[1]`, because `slots[0]` already roots that receiver. Only that
+    /// required prefix is validated and written, and its positions must be
+    /// distinct. A skip or a reject retires exactly once with only the
+    /// userdata root. No guest code is called and no Core handle is copied.
+    pub(super) fn take_published_finalizer_action_into_roots(
+        &mut self,
+        frame: RootFrameId,
+        slots: &[u32],
+        head: PendingFinalizer,
+        prepared: PendingFinalizerAction,
+    ) -> Result<TakenPendingFinalizer, HeapError> {
+        self.deny_unbarriered()?;
+        let userdata = self.pending_finalizer_head_identity(head)?;
+        let action = self.pending_finalizer_action(userdata);
+        if action != prepared {
+            return Err(HeapError::StaleHandle);
+        }
+        let needed = match &action {
+            PendingFinalizerAction::Skip | PendingFinalizerAction::NonCallable(_) => 1,
+            PendingFinalizerAction::Closure(_) => 2,
+            PendingFinalizerAction::TableCall { .. } => 3,
+            PendingFinalizerAction::UserdataCall { receiver, .. } if *receiver == userdata => 2,
+            PendingFinalizerAction::UserdataCall { .. } => 3,
+        };
+        let indices = self.pending_finalizer_root_indices(frame, slots, needed)?;
+        match action {
+            PendingFinalizerAction::Skip | PendingFinalizerAction::NonCallable(_) => {
+                self.commit_published_finalizer(
+                    head,
+                    userdata,
+                    &[(indices[0], Rooted::Userdata(userdata))],
+                )?;
+            }
+            PendingFinalizerAction::Closure(closure) => {
+                self.commit_published_finalizer(
+                    head,
+                    userdata,
+                    &[
+                        (indices[0], Rooted::Userdata(userdata)),
+                        (indices[1], Rooted::Closure(closure)),
+                    ],
+                )?;
+            }
+            PendingFinalizerAction::TableCall { receiver, call } => {
+                self.commit_published_finalizer(
+                    head,
+                    userdata,
+                    &[
+                        (indices[0], Rooted::Userdata(userdata)),
+                        (indices[1], Rooted::Closure(call)),
+                        (indices[2], Rooted::Table(receiver)),
+                    ],
+                )?;
+            }
+            PendingFinalizerAction::UserdataCall { receiver, call } => {
+                if receiver == userdata {
+                    self.commit_published_finalizer(
+                        head,
+                        userdata,
+                        &[
+                            (indices[0], Rooted::Userdata(userdata)),
+                            (indices[1], Rooted::Closure(call)),
+                        ],
+                    )?;
+                } else {
+                    self.commit_published_finalizer(
+                        head,
+                        userdata,
+                        &[
+                            (indices[0], Rooted::Userdata(userdata)),
+                            (indices[1], Rooted::Closure(call)),
+                            (indices[2], Rooted::Userdata(receiver)),
+                        ],
+                    )?;
+                }
+            }
+        }
+        Ok(TakenPendingFinalizer {
+            userdata,
+            action,
+            roots_written: needed as u32,
+        })
+    }
+
+    /// Makes every currently stored pending record consumable after a
+    /// successful private publication. One header write; no record is read,
+    /// moved, or sorted.
+    pub(super) fn publish_pending_finalizer_prefix(&mut self) {
+        self.pending_finalizers.publish_all();
     }
 
     /// Removes only the records appended after `base` and clears their exact
@@ -3918,8 +4656,9 @@ impl LuaHeap {
     ///
     /// The host entry borrows each token with that raw and its concrete
     /// `lua.userdata` key before it closes any doomed token or publishes weak
-    /// edges. Order is the selection order, which is ascending slot order for
-    /// one cycle.
+    /// edges. Order is the live-userdata chain order: newest allocation first
+    /// inside one cohort, with each later cohort stored after the earlier
+    /// records that are still queued.
     pub(crate) fn pending_finalizer_records(&self) -> Vec<(u64, u32, u32)> {
         self.pending_finalizers
             .iter()
@@ -4146,6 +4885,52 @@ impl LuaHeap {
         }
     }
 
+    /// The userdata in one frame slot, if that slot holds a userdata. This is
+    /// a test observation for the private handoff and does not scan.
+    #[cfg(test)]
+    pub(crate) fn rooted_userdata(
+        &self,
+        frame: RootFrameId,
+        slot: u32,
+    ) -> Result<Option<UserdataRef>, HeapError> {
+        let (start, width) = {
+            let found = self.frame(frame)?;
+            (found.start, found.width)
+        };
+        if slot >= width {
+            return Err(HeapError::StaleFrame);
+        }
+        let index = start as usize + slot as usize;
+        match self.roots.get(index).copied().flatten() {
+            None => Ok(None),
+            Some(Rooted::Userdata(userdata)) => Ok(Some(userdata)),
+            Some(_) => Err(HeapError::StaleHandle),
+        }
+    }
+
+    /// The closure in one frame slot, if that slot holds a closure. This is a
+    /// test observation for the private action handoff and does not scan.
+    #[cfg(test)]
+    pub(crate) fn rooted_closure(
+        &self,
+        frame: RootFrameId,
+        slot: u32,
+    ) -> Result<Option<ClosureRef>, HeapError> {
+        let (start, width) = {
+            let found = self.frame(frame)?;
+            (found.start, found.width)
+        };
+        if slot >= width {
+            return Err(HeapError::StaleFrame);
+        }
+        let index = start as usize + slot as usize;
+        match self.roots.get(index).copied().flatten() {
+            None => Ok(None),
+            Some(Rooted::Closure(closure)) => Ok(Some(closure)),
+            Some(_) => Err(HeapError::StaleHandle),
+        }
+    }
+
     /// Domain that issued handles for this heap. Does not read slots.
     pub(super) fn domain(&self) -> u64 {
         self.domain
@@ -4239,12 +5024,15 @@ impl LuaHeap {
     /// selection scan for finalizer-eligible userdata after the gray, rescan,
     /// and late work has emptied, then the usual pending-close enumeration.
     ///
-    /// Selection marks each chosen userdata through the ordinary target
-    /// follow, so `open_owner` follows its metatable edge and the metatable's
-    /// own strong entries are scanned by the ordinary gray loop. The selection
-    /// phase does not run in [`Self::mark_and_doomed_tokens`], so an ordinary
-    /// host collection neither selects new objects nor charges the selection
-    /// units. A second selecting pass skips a slot that is already pending.
+    /// Selection marks each raw-`__gc`-positive userdata through the ordinary
+    /// target follow, so `open_owner` follows its metatable edge and the
+    /// metatable's own strong entries are scanned by the ordinary gray loop.
+    /// A raw-`__gc`-negative candidate is settled instead: it is not marked,
+    /// not queued, and not retained, but a live marked generation is
+    /// value-dead for weak publication. The phase does not run in
+    /// [`Self::mark_and_doomed_tokens`], so an ordinary host collection
+    /// neither selects new objects nor charges the selection units. A second
+    /// selecting pass skips a slot that is already pending or settled.
     pub(super) fn mark_and_pending_tokens(&mut self) -> DoomedMark {
         let modes = self.mark_reachable_selecting_pending();
         self.drain_pending_close(modes)
@@ -4427,6 +5215,78 @@ impl LuaHeap {
         self.pending_gc_edge_trace.borrow_mut().clear();
     }
 
+    /// Live-userdata chain nodes read by the private selection since the last
+    /// clear, as `(slot, generation)` in visit order. Test-only: each entry is
+    /// one real slot-record read, not a selected-record count.
+    #[cfg(test)]
+    pub(crate) fn pending_live_trace(&self) -> Vec<(u32, u32)> {
+        self.pending_live_trace.borrow().clone()
+    }
+
+    /// Clears the live-userdata chain-read trace. Test-only.
+    #[cfg(test)]
+    pub(crate) fn clear_pending_live_trace(&mut self) {
+        self.pending_live_trace.borrow_mut().clear();
+    }
+
+    /// Walks the live-userdata chain head to tail and asserts each link is
+    /// internally consistent at its exact generation. Test-only observation
+    /// for release, rollback, neighbour, and same-slot successor checks.
+    #[cfg(test)]
+    pub(crate) fn live_userdata_chain(&self) -> Vec<(u32, u32)> {
+        let mut chain = Vec::new();
+        let mut previous = None;
+        let mut cursor = self.live_userdata_head;
+        while let Some((index, generation)) = cursor {
+            let slot = self
+                .slots
+                .get(index as usize)
+                .expect("a live-userdata chain node names a slot");
+            assert_eq!(slot.generation, generation, "chain generation");
+            assert_eq!(slot.kind, HandleKind::Userdata, "chain node kind");
+            assert!(slot.live_userdata_linked, "chain node is linked");
+            assert_eq!(slot.live_userdata_prev, previous, "chain back link");
+            chain.push((index, generation));
+            previous = Some((index, generation));
+            cursor = slot.live_userdata_next;
+            assert!(chain.len() <= self.slots.len(), "chain must not cycle");
+        }
+        assert_eq!(previous, self.live_userdata_tail, "chain tail");
+        chain
+    }
+
+    /// Identities currently linked in the settlement journal, from the head.
+    /// Test-only: the walk observes membership and does not count as a
+    /// rollback visit or as a successful-pass drain.
+    #[cfg(test)]
+    pub(crate) fn settlement_journal_members(&self) -> Vec<(u32, u32)> {
+        let mut members = Vec::new();
+        let mut cursor = self.settlement_head;
+        while let Some(index) = cursor {
+            let Some(slot) = self.slots.get(index as usize) else {
+                break;
+            };
+            members.push((index, slot.settlement_generation));
+            cursor = slot.settlement_next;
+        }
+        members
+    }
+
+    /// Number of identities currently linked in the settlement journal.
+    /// Test-only.
+    #[cfg(test)]
+    pub(crate) fn settlement_journal_len(&self) -> u32 {
+        self.settlement_journal_len
+    }
+
+    /// Takes the identities actually visited by a failed-pass journal
+    /// rollback, in visit order. Test-only; a successful pass and Release
+    /// leave the trace empty.
+    #[cfg(test)]
+    pub(crate) fn take_settlement_journal_trace(&mut self) -> Vec<(u32, u32)> {
+        std::mem::take(&mut *self.settlement_journal_trace.borrow_mut())
+    }
+
     /// Current occupancy. Peaks count storage, not only live objects.
     /// Does not collect and does not add scan counts.
     pub fn stats(&self) -> HeapStats {
@@ -4574,7 +5434,97 @@ impl LuaHeap {
         session.into_snapshot()
     }
 
+    /// Links one freshly allocated userdata at the live-chain head.
+    ///
+    /// The caller has already committed the live slot at `generation`. The
+    /// append is four link writes and the two head/tail fields; it grows
+    /// nothing and moves no other node. A slot that is already linked is a
+    /// caller bug.
+    fn link_live_userdata_head(&mut self, index: u32, generation: u32) {
+        debug_assert_eq!(self.slots[index as usize].generation, generation);
+        debug_assert_eq!(self.slots[index as usize].kind, HandleKind::Userdata);
+        debug_assert!(matches!(
+            self.slots[index as usize].state,
+            SlotState::Live { .. }
+        ));
+        debug_assert!(!self.slots[index as usize].live_userdata_linked);
+        let head = self.live_userdata_head;
+        {
+            let slot = &mut self.slots[index as usize];
+            slot.live_userdata_prev = None;
+            slot.live_userdata_next = head;
+            slot.live_userdata_linked = true;
+        }
+        if let Some((head_index, head_generation)) = head {
+            let head_slot = &mut self.slots[head_index as usize];
+            debug_assert_eq!(head_slot.generation, head_generation);
+            debug_assert!(head_slot.live_userdata_linked);
+            debug_assert!(head_slot.live_userdata_prev.is_none());
+            head_slot.live_userdata_prev = Some((index, generation));
+        }
+        self.live_userdata_head = Some((index, generation));
+        if self.live_userdata_tail.is_none() {
+            self.live_userdata_tail = Some((index, generation));
+        }
+    }
+
+    /// Unlinks one live userdata from the chain in constant work.
+    ///
+    /// The links carry the exact generation of each neighbour, so a successor
+    /// generation cannot be reached through an old link. A slot that is not
+    /// linked is left alone: release of a table, closure, or cell does not
+    /// touch this chain. The head and tail updates are the same bounded
+    /// neighbour writes; no node is scanned, moved, or sorted.
+    fn unlink_live_userdata(&mut self, index: u32) {
+        if !self.slots[index as usize].live_userdata_linked {
+            return;
+        }
+        debug_assert_eq!(self.slots[index as usize].kind, HandleKind::Userdata);
+        let identity = (index, self.slots[index as usize].generation);
+        let prev = self.slots[index as usize].live_userdata_prev.take();
+        let next = self.slots[index as usize].live_userdata_next.take();
+        self.slots[index as usize].live_userdata_linked = false;
+        match prev {
+            Some((prev_index, prev_generation)) => {
+                let prev_slot = &mut self.slots[prev_index as usize];
+                debug_assert_eq!(prev_slot.generation, prev_generation);
+                debug_assert!(prev_slot.live_userdata_linked);
+                debug_assert_eq!(prev_slot.live_userdata_next, Some(identity));
+                prev_slot.live_userdata_next = next;
+            }
+            None => {
+                debug_assert_eq!(self.live_userdata_head, Some(identity));
+                self.live_userdata_head = next;
+            }
+        }
+        match next {
+            Some((next_index, next_generation)) => {
+                let next_slot = &mut self.slots[next_index as usize];
+                debug_assert_eq!(next_slot.generation, next_generation);
+                debug_assert!(next_slot.live_userdata_linked);
+                debug_assert_eq!(next_slot.live_userdata_prev, Some(identity));
+                next_slot.live_userdata_prev = prev;
+            }
+            None => {
+                debug_assert_eq!(self.live_userdata_tail, Some(identity));
+                self.live_userdata_tail = prev;
+            }
+        }
+    }
+
     fn release_slot(&mut self, index: u32) {
+        // A live userdata leaves the selection chain before the generation
+        // advances, the state becomes Free/Retired, or any field is cleared.
+        // The unlink is the released slot's own two neighbours and two links,
+        // never a walk of the chain and never a pending-queue read.
+        if self.slots[index as usize].kind == HandleKind::Userdata {
+            self.unlink_live_userdata(index);
+        } else {
+            debug_assert!(
+                !self.slots[index as usize].live_userdata_linked,
+                "a non-userdata slot cannot join the live-userdata chain"
+            );
+        }
         debug_assert!(
             self.slots[index as usize].edge_head.is_none()
                 && self.slots[index as usize].edge_tail.is_none(),

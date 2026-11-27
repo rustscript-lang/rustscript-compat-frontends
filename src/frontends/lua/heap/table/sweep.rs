@@ -18,16 +18,34 @@
 //! readable, and the same Owners walker publishes once when it finishes,
 //! still short of Release. That window's heads and edges are the walk it
 //! actually did. They are not a `pulse(1)` bound. Guest lookup on the entry
-//! rejects a handle already judged dead. A sweep with no dead slot and no
-//! retained pending finalizer never enters Owners and does not invent a
-//! publish window; a retained pending finalizer forces the Owners walk so its
-//! weak values can be cleared even when every retained slot stays live.
+//! rejects a handle already judged dead. A sweep with no dead slot, no
+//! retained pending finalizer, and no live finalized userdata never enters
+//! Owners and does not invent a publish window. A retained pending finalizer
+//! forces the Owners walk so its weak values can be cleared even when every
+//! retained slot stays live. The same is true for a settled (finalized without
+//! a queue record) generation: a weak value that names it is value-dead, so
+//! its weak value is cleared while a weak key keeps the entry. Independently
+//! of the value bit, a `k`-only table clears a pending or settled userdata
+//! value from its string-keyed and object-keyed hash entries, matching the
+//! upstream hash loop. A negative or non-integer numeric key and an integer
+//! above the upstream last possible array index are hash keys; other numeric
+//! keys keep the previous rule because this representation does not carry
+//! the actual array/hash split.
 
 use super::{
     CollectReport, EdgeKey, EdgeValue, GuestClass, HandleKind, HeapError, LuaHeap, MarkSnapshot,
     ScanMeter, SlotState, TableRef, WeakMode,
 };
 use vm::Value;
+
+/// The largest numeric key that the upstream dense array can still hold.
+///
+/// LuaJIT caps the array part at `LJ_MAX_ASIZE = (1 << 27) + 1` slots,
+/// including the zero slot (`lj_def.h:60-61`), and `inarray` accepts an
+/// index only when `index < asize` (`lj_tab.h:79-84`). The largest index
+/// that can ever be an array slot is therefore `2^27`, and every larger
+/// integer key is necessarily a hash key.
+const LAST_POSSIBLE_ARRAY_INDEX: f64 = 134_217_728.0; // (1 << 27)
 
 pub(super) struct SweepSession<'a> {
     heap: &'a mut LuaHeap,
@@ -38,7 +56,13 @@ pub(super) struct SweepSession<'a> {
     snapshot: Vec<SweepSlot>,
     owner: usize,
     owner_open: bool,
+    /// The open owner's parsed value-weak bit. A weak value that is dead is
+    /// published as a cursor gap or dropped.
     owner_weak: bool,
+    /// The open owner's parsed key-weak bit. It keeps the existing weak-key
+    /// mark rule and also arms the upstream finalized-value check on the
+    /// hash entries of a `k`-only table.
+    owner_weak_keys: bool,
     prev: Option<u32>,
     cursor: Option<u32>,
     marked_nodes: u32,
@@ -47,6 +71,11 @@ pub(super) struct SweepSession<'a> {
     /// not dead, but weak values that name it must still be published, so
     /// Select enters Snapshot and Owners even when the dead list is empty.
     pending_present: bool,
+    /// At least one live slot is a settled userdata generation. Settlement
+    /// never marks or retains the object, but a marked settled generation is
+    /// value-dead for weak publication; Owners must run even when no dead
+    /// slot and no pending record exist.
+    settled_present: bool,
     report: Option<CollectReport>,
     pulse_spent: SweepUnits,
 }
@@ -59,6 +88,10 @@ struct SweepSlot {
     /// A weak value in a marked weak table still treats it as value-dead; a
     /// weak key keeps the entry because the slot is retained and marked.
     pending: bool,
+    /// The slot generation was settled without a queue record. A weak value
+    /// in a marked weak table treats it as value-dead; a weak key keeps the
+    /// entry only when the object is actually marked.
+    settled: bool,
     /// Generation whose parsed mode this slot held when the mark finished.
     /// A metatable reused after that parse does not inherit the old mode.
     mode_generation: u32,
@@ -348,11 +381,13 @@ impl<'a> SweepSession<'a> {
             owner: 0,
             owner_open: false,
             owner_weak: false,
+            owner_weak_keys: false,
             prev: None,
             cursor: None,
             marked_nodes: 0,
             live_roots: 0,
             pending_present: false,
+            settled_present: false,
             report: None,
             pulse_spent: SweepUnits::default(),
         }
@@ -488,7 +523,7 @@ impl<'a> SweepSession<'a> {
     fn step_select(&mut self) -> bool {
         if self.index >= self.heap.slots.len() {
             self.index = 0;
-            self.phase = if self.dead.is_empty() && !self.pending_present {
+            self.phase = if self.dead.is_empty() && !self.pending_present && !self.settled_present {
                 SweepPhase::Roots
             } else {
                 SweepPhase::Snapshot
@@ -544,6 +579,9 @@ impl<'a> SweepSession<'a> {
                 if slot.pending_finalizer {
                     self.pending_present = true;
                 }
+                if slot.finalizer_settled {
+                    self.settled_present = true;
+                }
             }
             SlotState::Free | SlotState::Retired => {}
         }
@@ -579,6 +617,7 @@ impl<'a> SweepSession<'a> {
             kind: slot.kind,
             generation: slot.generation,
             pending: slot.pending_finalizer,
+            settled: slot.finalizer_settled,
             mode_generation: slot.mode_generation,
             mode_round: slot.mode_round,
             mode_weak,
@@ -609,7 +648,9 @@ impl<'a> SweepSession<'a> {
     fn open_owner(&mut self) -> bool {
         let owner = self.owner;
         self.heap.scan.owner_head_checks += 1;
-        self.owner_weak = self.weak_values(owner);
+        let mode = self.owner_mode(owner);
+        self.owner_weak = mode.values;
+        self.owner_weak_keys = mode.keys;
         self.prev = None;
         self.cursor = self.heap.slots[owner].edge_head;
         self.owner_open = true;
@@ -617,24 +658,24 @@ impl<'a> SweepSession<'a> {
         true
     }
 
-    fn weak_values(&self, owner: usize) -> bool {
+    fn owner_mode(&self, owner: usize) -> WeakMode {
         let found = &self.snapshot[owner];
         if !found.marked || found.kind != HandleKind::Table {
-            return false;
+            return WeakMode::default();
         }
         let Some((mt_slot, mt_generation)) = self.heap.slots[owner].metatable else {
-            return false;
+            return WeakMode::default();
         };
         let Some(mt) = self.snapshot.get(mt_slot as usize) else {
-            return false;
+            return WeakMode::default();
         };
         if !mt.marked || mt.kind != HandleKind::Table || mt.generation != mt_generation {
-            return false;
+            return WeakMode::default();
         }
         if mt.mode_generation != mt_generation || mt.mode_round != self.modes.round {
-            return false;
+            return WeakMode::default();
         }
-        mt.mode_weak.values
+        mt.mode_weak
     }
 
     fn step_edge(&mut self) -> bool {
@@ -662,7 +703,8 @@ impl<'a> SweepSession<'a> {
             .as_ref()
             .expect("owner chain holds an occupied record");
         let owner_marked = self.is_marked(owner);
-        let weak = self.owner_weak;
+        let weak_values = self.owner_weak;
+        let weak_keys = self.owner_weak_keys;
         let value_dead = match &edge.value {
             EdgeValue::Scalar(_) => false,
             EdgeValue::Table { slot, .. } => !self.is_marked(*slot),
@@ -675,9 +717,51 @@ impl<'a> SweepSession<'a> {
             EdgeValue::Userdata { slot, generation } => {
                 !self.typed(*slot, *generation, HandleKind::Userdata)
                     || self.pending(*slot, *generation)
+                    || self.settled(*slot, *generation)
             }
         };
-        let make_gap = owner_marked && weak && value_dead && self.guest_cursor(&edge.key);
+        // Upstream `gc_clearweak` checks every hash node of a marked weak
+        // table and clears a value when `gc_mayclear(value, 1)` reports a
+        // white value or a finalized userdata (`lj_gc.c:456-470,488-497`).
+        // That hash loop is not gated by `LJ_GC_WEAKVAL`, so a `k`-only table
+        // also drops a finalized userdata value. `isfinalized` covers both a
+        // separated queued finalizer (this heap's pending record) and a
+        // finalized userdata with no queue record (settled).
+        //
+        // This heap has one owner chain and does not model LuaJIT's dense
+        // array part. A guest string key (an ordinary name or the reserved
+        // `__mode` field, which `EdgeKey::named` stores as field id 0) and an
+        // object key are always hash keys, so those branches are claimed. A
+        // numeric key may name a dense array slot in LuaJIT: a negative
+        // number or a non-integer is never an integer array index, and an
+        // integer above `LAST_POSSIBLE_ARRAY_INDEX` cannot be one either, so
+        // those are hash keys. Zero, negative zero, and integers up to that
+        // bound can be array slots or hash nodes depending on the real array
+        // part, which this slice does not carry, so they keep the previous
+        // strong-value rule. Boolean keys have no representation here. The
+        // LuaJIT layout of an integer within the possible array range is
+        // therefore not claimed.
+        let hash_key = match &edge.key {
+            EdgeKey::Utf8(_) | EdgeKey::Object { .. } => true,
+            EdgeKey::Field(field) => *field == LuaHeap::MODE_FIELD,
+            EdgeKey::Number(bits) => {
+                let number = f64::from_bits(*bits);
+                number < 0.0 || number.fract() != 0.0 || number > LAST_POSSIBLE_ARRAY_INDEX
+            }
+        };
+        let finalized_value = match &edge.value {
+            EdgeValue::Userdata { slot, generation } => {
+                self.pending(*slot, *generation) || self.settled(*slot, *generation)
+            }
+            EdgeValue::Table { .. }
+            | EdgeValue::Closure { .. }
+            | EdgeValue::Upvalue { .. }
+            | EdgeValue::Scalar(_) => false,
+        };
+        let k_hash_finalized =
+            owner_marked && weak_keys && !weak_values && hash_key && finalized_value;
+        let clear_value = (weak_values && value_dead) || k_hash_finalized;
+        let make_gap = owner_marked && clear_value && self.guest_cursor(&edge.key);
         let value_ok = make_gap
             || match &edge.value {
                 EdgeValue::Table { slot, .. } => self.is_marked(*slot),
@@ -689,13 +773,17 @@ impl<'a> SweepSession<'a> {
                     self.typed(*slot, *generation, HandleKind::Upvalue)
                 }
                 EdgeValue::Userdata { slot, generation } => {
-                    // A value-weak pending userdata is value-dead even though
-                    // it stays marked and retained. A guest-cursor key can
-                    // publish that as a gap; a bare userdata key cannot, so
-                    // the whole `kv`/`v` record is dropped instead of keeping
-                    // the retained object as a strong value.
+                    // A pending or settled userdata is value-dead for a weak
+                    // value and for the hash value of a `k`-only table, even
+                    // though it stays marked and retained. A guest-cursor key
+                    // can publish that as a gap; a bare userdata key cannot,
+                    // so the whole record is dropped instead of keeping the
+                    // retained object as a strong value.
                     self.typed(*slot, *generation, HandleKind::Userdata)
-                        && !(weak && self.pending(*slot, *generation))
+                        && !(weak_values
+                            && (self.pending(*slot, *generation)
+                                || self.settled(*slot, *generation)))
+                        && !k_hash_finalized
                 }
             };
         let key_ok = match &edge.key {
@@ -737,6 +825,20 @@ impl<'a> SweepSession<'a> {
     fn pending(&self, slot: u32, generation: u32) -> bool {
         self.snapshot.get(slot as usize).is_some_and(|found| {
             found.pending && found.kind == HandleKind::Userdata && found.generation == generation
+        })
+    }
+
+    /// One settled (finalized without a queue record) userdata generation in
+    /// this sweep's snapshot.
+    ///
+    /// Settlement is not retention. The weak-value rule still applies when
+    /// the object is marked through another edge or a later root, matching
+    /// the upstream finalized flag. A weak key is decided by the real mark
+    /// bit elsewhere, not by this flag. A stale edge to a reused generation is
+    /// not settled.
+    fn settled(&self, slot: u32, generation: u32) -> bool {
+        self.snapshot.get(slot as usize).is_some_and(|found| {
+            found.settled && found.kind == HandleKind::Userdata && found.generation == generation
         })
     }
 
@@ -841,10 +943,16 @@ impl<'a> SweepSession<'a> {
         Some((live, stored.generation))
     }
 
+    /// Whether a cleared value under this key can stay as a cursor gap.
+    ///
+    /// The reserved `__mode` field is the one internal field id that is a
+    /// guest-visible string key: `guest_key` renders it as "__mode" and a
+    /// stored `__mode` name matches that field, so a real `next` cursor can
+    /// continue past it. Every other internal field id is not a guest key.
     fn guest_cursor(&self, key: &EdgeKey) -> bool {
         match key {
             EdgeKey::Utf8(_) | EdgeKey::Number(_) => true,
-            EdgeKey::Field(_) => false,
+            EdgeKey::Field(field) => *field == LuaHeap::MODE_FIELD,
             EdgeKey::Object {
                 slot,
                 generation,

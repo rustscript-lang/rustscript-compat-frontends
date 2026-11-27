@@ -32,15 +32,56 @@
 //! raw non-nil `__gc` field, and marks the userdata so the ordinary gray pass
 //! follows its userdata-to-metatable strong edge and the metatable's own
 //! strong entries. A retained userdata keeps its original generation, typed
-//! payload, and Core token. At weak publication a weak value that names it is
-//! cleared, while a weak key keeps the entry and its scalar; a sweep with no
-//! dead slot still runs the Owners walk when a pending finalizer needs that
-//! publication. Ordinary collections never select; they offer every existing
-//! record as a host-retained edge, so no live token is closed or orphaned
-//! while it waits for a consumer. No callback, resurrection, guest step, or
-//! production entry is added here. The test-only retirement control consumes
-//! one record so a later collection can close the token and advance the slot
-//! generation; it is not a finalizer.
+//! payload, and Core token. A white candidate whose raw `__gc` is missing, nil,
+//! or a weak-cleared gap is settled instead: that exact generation is marked
+//! finalized without a queue record and without a mark, so it is never queued
+//! again even if a raw `__gc` is installed later, and an unreachable one dies
+//! in the same cycle. Settlement is not retention.
+//!
+//! At weak publication a weak value that names a retained pending userdata or
+//! a live settled generation is cleared, while a weak key keeps the entry and
+//! its scalar only when the object is actually marked. A `k`-only table also
+//! clears a pending or settled userdata value from its string-keyed and
+//! object-keyed hash entries; numeric keys keep the previous strong-value rule
+//! because this representation has no array/hash split. A sweep with no dead
+//! slot still runs the Owners walk when a pending finalizer or a marked
+//! settled generation needs that publication. Ordinary collections never
+//! select; they offer every existing record as a host-retained edge, so no
+//! live token is closed or orphaned while it waits for a consumer.
+//!
+//! A successful private collection records the queue length it published as a
+//! consumable prefix only after the real weak publication finished. The
+//! private real handoff [`take_published_pending_finalizer`] then pops exactly
+//! that front record with one `VecDeque` front removal, verifies the exact
+//! live userdata and typed Core token, writes the userdata into one specified
+//! empty root slot, and settles that generation in the same commit. It never
+//! calls guest code. A saved mark or Release tail refuses before any write, and
+//! records retained by a failed or ordinary collection stay outside the ready
+//! prefix. The first-round order is only the selecting scan's offered order
+//! (ascending slots in this representation), not LuaJIT's reverse allocation
+//! order and not a guest callback order. The test-only retirement control
+//! remains a historical fixture with the same prefix invariant. No callback,
+//! resurrection, guest step, or production entry is added here.
+//!
+//! The private action handoff [`take_published_pending_finalizer_action`]
+//! resolves the current raw `__gc` of that same published head in the exclusive
+//! borrow that pops it, so a change made between two dequeues is observed. It
+//! never reuses the selection cache and never pre-parses a batch. A missing
+//! metatable, a missing field, or a true stored-nil gap is `Skip`; a present
+//! non-callable value keeps only its original Lua type tag, never the scalar
+//! bytes; a live closure is the direct action; a live table or a live
+//! userdata adds only its own current instance metatable's raw `__call`
+//! closure, with the original object kept as the receiver. Neither receiver
+//! form inherits `__call` and neither dispatches a table-valued `__call`
+//! again. The commit roots the userdata, the actual closure, and every
+//! independent receiver in caller-supplied empty, distinct slots, then settles
+//! once; a userdata receiver that is the pending object itself is already
+//! rooted as that object and needs no second slot. `Skip` and a typed reject
+//! retire exactly once with only the userdata root. An independent userdata
+//! receiver is checked through the same typed `lua.userdata` owner contract as
+//! the head before the pop, and the commit re-resolves the action in its own
+//! exclusive borrow and requires that exact identity. No guest callback,
+//! diagnostic text, or Core handle copy is produced here.
 //!
 //! Borrowed from the ES5 heap at `3e348a010bc8d84baa5b7d1169a5f50aeb4e46ec`
 //! `src/javascript/heap.rs`: slot plus generation handles, explicit root
@@ -546,13 +587,14 @@ pub fn collect(host: &mut HostContext) -> Result<table::CollectReport, HeapError
 /// Publish stopped before release, or the heap had no weak edge to publish.
 #[derive(Debug)]
 pub(crate) enum PublishedBoundary {
-    /// Neither a dead slot nor a retained pending finalizer needs a weak
-    /// publication. Sweep finished and recorded the one report.
+    /// Neither a dead slot, nor a retained pending finalizer, nor a live
+    /// settled userdata needs a weak publication. Sweep finished and
+    /// recorded the one report.
     Completed(table::CollectReport),
     /// Weak edges are published. Dead slots are still physical. No report.
     /// `window_heads`/`window_edges` are the actual Owners walk, which can
-    /// be non-empty with no dead slot when a pending finalizer's weak value
-    /// is cleared.
+    /// be non-empty with no dead slot when a pending finalizer's or a settled
+    /// userdata's weak value is cleared.
     Published {
         window_heads: u64,
         window_edges: u64,
@@ -586,19 +628,32 @@ pub(crate) fn collect_until_published(
         return Err(HeapError::MarkActive);
     }
     let marked = with_heap(host, |heap| Ok(heap.mark_and_doomed_tokens()))?;
-    close_then_halt_at_publish(host, marked)
+    close_then_halt_at_publish(host, marked, false)
 }
 
 /// Closes doomed tokens, then publishes or finishes. Same order as the
 /// original collector: a close error returns before publish, so there is no
-/// tail and no report. Pending-close enumeration already ran; per-token close
-/// and the Owners walk are not limited by a step budget.
+/// tail and no report.
+///
+/// `settle_rollback` is true only for the selecting entry. On a close error
+/// that pass's new settlement flags are returned to their previous state, just
+/// like its new pending records are handled by the caller; an already closed
+/// prefix stays closed and a pending record from an earlier pass is untouched.
 fn close_then_halt_at_publish(
     host: &mut HostContext,
     marked: table::DoomedMark,
+    settle_rollback: bool,
 ) -> Result<PublishedBoundary, HeapError> {
     for token in marked.tokens {
-        retire_doomed_token(host, token)?;
+        if let Err(error) = retire_doomed_token(host, token) {
+            if settle_rollback {
+                with_heap(host, |heap| {
+                    heap.discard_settlements();
+                    Ok(())
+                })?;
+            }
+            return Err(error);
+        }
     }
     let halt = with_heap(host, |heap| Ok(heap.halt_at_publish(marked.modes)))?;
     Ok(match halt {
@@ -621,20 +676,30 @@ fn close_then_halt_at_publish(
 ///    once. Select each live, unmarked userdata that binds a typed Core token
 ///    and whose metatable has a raw non-nil `__gc` field. Mark it through the
 ///    ordinary target follow; the next gray pass follows its metatable edge
-///    and the metatable's own strong entries. A slot already pending or
-///    settled by the explicit retirement control is not selected again.
+///    and the metatable's own strong entries. A raw field that is missing,
+///    nil, or already a weak-cleared cursor gap settles that exact white
+///    identity instead: the generation is finalized without a queue record
+///    and without a mark. A slot already pending or settled is not selected
+///    again. Candidates that share a metatable pay one lookup for that
+///    metatable per round, but each one still receives its own queue or
+///    settlement result.
 /// 4. Enumerate pending-close candidates as usual. A selected userdata is
-///    marked, so it is not in that list and its token stays bound.
+///    marked, so it is not in that list and its token stays bound. A settled
+///    userdata is not marked by the settlement, so an unreachable one is
+///    ordinary dead garbage in this same cycle.
 /// 5. Borrow every pending record with its exact `lua.userdata` token and
 ///    require the payload to name the same slot and generation. A mismatch
-///    returns before any close or publish.
-/// 6. Close each doomed token synchronously and confirm `Ready`.
+///    returns before any close or publish and rolls back this pass's new
+///    records and settlement flags.
+/// 6. Close each doomed token synchronously and confirm `Ready`. A close
+///    error also rolls back this pass's new settlement flags; an already
+///    closed prefix and earlier pending records stay as they were.
 /// 7. Run the Owners walk once. Weak values that name a retained pending
-///    userdata are published as gaps; weak keys keep the entry and its
-///    scalar because the selected object is marked. A dead slot is not
-///    required for this step. Store the Release/Roots tail and return
-///    [`PublishedBoundary::Published`]; a heap with neither a dead slot nor a
-///    pending finalizer finishes and returns
+///    userdata or a live settled generation are published as gaps; weak keys
+///    keep the entry and its scalar only when the object is marked. A dead
+///    slot is not required for this step. Store the Release/Roots tail and
+///    return [`PublishedBoundary::Published`]; a heap with no dead slot, no
+///    pending finalizer, and no live settled userdata finishes and returns
 ///    [`PublishedBoundary::Completed`].
 ///
 /// Release and Roots do not run here. The caller finishes them with
@@ -657,17 +722,28 @@ pub(crate) fn collect_pending_finalizers(
     let marked = with_heap(host, |heap| Ok(heap.mark_and_pending_tokens()))?;
     if let Err(error) = verify_pending_finalizers(host) {
         // This is the owner-verification preflight's own transaction: remove
-        // only the records and flags appended by this selecting pass. Earlier
-        // valid records are untouched, no doomed token has been closed yet,
-        // and no weak edge has been published, so the two later failure
-        // prefixes are not mixed into this rollback.
+        // only the records and settlement flags appended by this selecting
+        // pass. Earlier valid records and settled generations are untouched,
+        // no doomed token has been closed yet, and no weak edge has been
+        // published, so the two later failure prefixes are not mixed into
+        // this rollback.
         with_heap(host, |heap| {
             heap.discard_pending_finalizers_from(base);
+            heap.discard_settlements();
             Ok(())
         })?;
         return Err(error);
     }
-    close_then_halt_at_publish(host, marked)
+    let boundary = close_then_halt_at_publish(host, marked, true)?;
+    with_heap(host, |heap| {
+        // The real weak publication finished in this call. Only now do the
+        // retained records become a consumable prefix. A saved Release tail
+        // still refuses a dequeue until the caller resumes it to completion.
+        heap.publish_pending_finalizer_prefix();
+        heap.clear_selecting_settlements();
+        Ok(())
+    })?;
+    Ok(boundary)
 }
 
 /// Borrows each pending record with its concrete `lua.userdata` key and
@@ -707,13 +783,315 @@ fn verify_pending_finalizers(host: &HostContext) -> Result<(), HeapError> {
 /// settled without closing the token or running guest code. Selection will
 /// not pick the settled object again; a later collection may then close that
 /// token and advance the slot generation. It is not a callback and does not
-/// fabricate a close status.
+/// fabricate a close status. It also keeps the queue's published-prefix
+/// invariant: removing a published position drops the ready prefix by one,
+/// while removing an unpublished position leaves it unchanged.
 #[cfg(test)]
 pub fn retire_pending_finalizer_test_control(
     host: &mut HostContext,
     userdata: UserdataRef,
 ) -> Result<(), HeapError> {
     with_heap(host, |heap| heap.retire_pending_finalizer(userdata))
+}
+
+/// Private real handoff for one published pending-finalizer head.
+///
+/// This is not a guest `__gc` callback and does not run guest code. It refuses
+/// a saved mark ([`HeapError::MarkActive`]) or release tail
+/// ([`HeapError::SweepPending`]) before reading the queue. The head must be in
+/// the prefix that one successful private publication made consumable; an
+/// unpublished or absent head returns a scope error. The specified frame and
+/// slot must name an open, previously empty root slot
+/// ([`HeapError::StaleFrame`] or a scope error for an occupied slot). The
+/// record's live slot must still bind its exact generation, kind, pending
+/// flag, and raw handle, and the typed `lua.userdata` payload must name that
+/// same userdata ([`HeapError::TokenMismatch`] otherwise). All of those checks
+/// happen before the first queue, root, or slot write.
+///
+/// On success the head is popped with one `VecDeque` front removal, the exact
+/// `UserdataRef` is written into the specified root slot, and that generation
+/// is marked settled and no longer pending. The returned handle is the same
+/// typed object the queue verified; the raw Core token is not returned or
+/// copied into a guest value. The order is only the selecting scan's offered
+/// order, not LuaJIT's reverse allocation or callback order.
+pub(crate) fn take_published_pending_finalizer(
+    host: &mut HostContext,
+    frame: RootFrameId,
+    slot: u32,
+) -> Result<UserdataRef, HeapError> {
+    let Some(heap) = host.scope_state::<LuaHeap>() else {
+        return Err(HeapError::SweepDenied);
+    };
+    if heap.has_sweep_tail() {
+        return Err(HeapError::SweepPending);
+    }
+    if heap.has_saved_mark() {
+        return Err(HeapError::MarkActive);
+    }
+    let head = heap.pending_finalizer_published_front()?;
+    heap.pending_finalizer_root_slot(frame, slot)?;
+    let userdata = UserdataRef::userdata(heap.domain(), head.slot, head.generation);
+    if heap.published_userdata_token(userdata)? != head.raw {
+        return Err(HeapError::TokenMismatch);
+    }
+    let handle =
+        vm::ResourceHandle::from_raw(head.raw).map_err(|_| HeapError::CarrierOutOfRange)?;
+    let borrowed = host
+        .borrow_resource_with_key::<LuaUserdataResource>(handle, &LuaUserdataResource::key())
+        .map_err(HeapError::from_scope)?;
+    if borrowed.get().userdata() != userdata {
+        return Err(HeapError::TokenMismatch);
+    }
+    drop(borrowed);
+    with_heap(host, |heap| {
+        heap.take_published_finalizer_into_root(frame, slot, head)
+    })
+}
+
+/// The current raw finalizer decision for one published pending head.
+///
+/// This is a private dispatch plan, not a guest callable. It is recomputed at
+/// dequeue time from the userdata's current metatable, so a modifier that ran
+/// earlier in the same batch is observed. A `Closure`, the `call` inside
+/// `TableCall`, or the `call` inside `UserdataCall` is an actual closure
+/// identity; a receiver form also keeps the original object instead of
+/// replacing it with the callable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PendingFinalizerAction {
+    /// No live metatable, no raw `__gc` record, or a true stored-nil gap.
+    Skip,
+    /// A present raw `__gc` value that is not callable in this slice's
+    /// one-layer raw form.
+    NonCallable(PendingFinalizerNotCallable),
+    /// The raw `__gc` is a live closure.
+    Closure(ClosureRef),
+    /// The raw `__gc` is a live table whose own current metatable stores a raw
+    /// `__call` closure. The receiver is that original table.
+    TableCall {
+        receiver: TableRef,
+        call: ClosureRef,
+    },
+    /// The raw `__gc` is a live userdata whose own current metatable stores a
+    /// raw `__call` closure. The receiver is that original userdata.
+    UserdataCall {
+        receiver: UserdataRef,
+        call: ClosureRef,
+    },
+}
+
+/// The original Lua type tag of a present raw `__gc` value that is not
+/// callable in this slice.
+///
+/// These tags carry no scalar payload: a boolean, number, or string keeps only
+/// its type, never its bytes. A table or userdata reason keeps the exact
+/// original receiver identity, so a later diagnostic can name the original
+/// called type instead of the invalid `__call` value. This slice emits no
+/// diagnostic text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PendingFinalizerNotCallable {
+    /// The original value was a boolean.
+    Boolean,
+    /// The original value was a number (`Int` or `Float`).
+    Number,
+    /// The original value was a Lua string (`String` or byte string).
+    String,
+    /// An internal upvalue carrier from the existing `EdgeValue` contract. No
+    /// named-field writer stores it; it is not a guest Lua value.
+    Upvalue,
+    /// A live userdata receiver with no live own metatable or no raw `__call`
+    /// field.
+    UserdataWithoutCall(UserdataRef),
+    /// A live userdata receiver whose raw `__call` exists but is not a live
+    /// closure. Another table is refused here: this slice does not dispatch
+    /// twice.
+    UserdataCallNotClosure(UserdataRef),
+    /// A table receiver with no live metatable or no raw `__call` field.
+    TableWithoutCall(TableRef),
+    /// A table receiver whose raw `__call` exists but is not a live closure.
+    /// Another table is refused here: this slice does not dispatch twice.
+    TableCallNotClosure(TableRef),
+    /// A stored object target no longer names a live node of its kind, or a
+    /// scalar carrier outside the named-field writer contract.
+    Detached,
+}
+
+/// The no-allocation reject tag for one stored scalar, or `None` for a stored
+/// nil.
+///
+/// The private named-field writers can store a boolean or a Lua string
+/// directly under `__gc`; a binary64 number remains limited to the reserved
+/// `__mode` field and a byte string has no named-field writer. This helper is
+/// therefore the narrowest complete classification: it maps `Int`/`Float` to
+/// [`PendingFinalizerNotCallable::Number`] and `String`/`Bytes` to
+/// [`PendingFinalizerNotCallable::String`] without copying either payload.
+/// `Array`, `Map`, and `Callable` are outside this heap's named-field scalar
+/// contract and are reported as `Detached`, not as a new guest tag.
+pub(crate) fn pending_finalizer_scalar_reject(
+    value: &Value,
+) -> Option<PendingFinalizerNotCallable> {
+    match value {
+        Value::Null => None,
+        Value::Bool(_) => Some(PendingFinalizerNotCallable::Boolean),
+        Value::Int(_) | Value::Float(_) => Some(PendingFinalizerNotCallable::Number),
+        Value::String(_) | Value::Bytes(_) => Some(PendingFinalizerNotCallable::String),
+        Value::Array(_) | Value::Map(_) | Value::Callable(_) => {
+            Some(PendingFinalizerNotCallable::Detached)
+        }
+    }
+}
+
+/// One committed private action handoff.
+///
+/// The identities are already rooted in the caller's frame. No raw Core token
+/// or guest callable is copied out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TakenPendingFinalizer {
+    /// The exact typed userdata that left the published prefix.
+    pub userdata: UserdataRef,
+    /// The current raw decision that this same commit rooted.
+    pub action: PendingFinalizerAction,
+    /// Root slots written from the caller's plan: one for a skip or typed
+    /// reject, two for a direct closure or a self-receiver userdata call, and
+    /// three for a table call or an independent userdata receiver.
+    pub roots_written: u32,
+}
+
+/// Private real dequeue that re-reads the current raw finalizer of the head.
+///
+/// This is not a guest `__gc` callback and does not run guest code. It refuses
+/// a saved mark ([`HeapError::MarkActive`]) or release tail
+/// ([`HeapError::SweepPending`]) before reading the queue. The head must be in
+/// the prefix that one successful private publication made consumable; an
+/// unpublished or absent head returns a scope error. The record's live slot
+/// must still bind its exact generation, kind, pending flag, and raw handle,
+/// and the typed `lua.userdata` payload must name that same userdata
+/// ([`HeapError::TokenMismatch`] otherwise). Every one of those checks happens
+/// before the first queue, root, or slot write.
+///
+/// The current raw `__gc` is resolved after the head checks. When it is a live
+/// userdata receiver different from the head, that receiver must still own a
+/// real typed `lua.userdata` token naming it (the same checked owner contract
+/// as the head); a payload for another object is [`HeapError::TokenMismatch`].
+/// The commit then re-resolves the action in the same exclusive borrow that
+/// pops the head and requires the exact prepared identity, so no fallible
+/// action or owner check remains after the pop. `slots[0]` must be an open,
+/// empty root slot for the userdata. A direct closure adds an empty distinct
+/// `slots[1]`; the table form and an independent userdata receiver add the
+/// closure at `slots[1]` and the original receiver at an empty distinct
+/// `slots[2]`. A userdata receiver that is the pending object itself is
+/// already rooted at `slots[0]`, so its call needs only two positions. A short
+/// plan, an overlapping plan, a stale frame, an occupied slot, or an
+/// out-of-range position is refused before any write, so the head and every
+/// existing root stay. A `Skip` or typed reject needs only `slots[0]`, is
+/// returned as its typed result, and is settled exactly once; it is never
+/// re-queued. The commit pops one `VecDeque` front record, writes the required
+/// roots together, and settles that generation. The returned action and rooted
+/// identities are private; the raw Core token is not copied into a guest
+/// value.
+pub(crate) fn take_published_pending_finalizer_action(
+    host: &mut HostContext,
+    frame: RootFrameId,
+    slots: &[u32],
+) -> Result<TakenPendingFinalizer, HeapError> {
+    let Some(heap) = host.scope_state::<LuaHeap>() else {
+        return Err(HeapError::SweepDenied);
+    };
+    if heap.has_sweep_tail() {
+        return Err(HeapError::SweepPending);
+    }
+    if heap.has_saved_mark() {
+        return Err(HeapError::MarkActive);
+    }
+    let head = heap.pending_finalizer_published_front()?;
+    let userdata = UserdataRef::userdata(heap.domain(), head.slot, head.generation);
+    if heap.published_userdata_token(userdata)? != head.raw {
+        return Err(HeapError::TokenMismatch);
+    }
+    let handle =
+        vm::ResourceHandle::from_raw(head.raw).map_err(|_| HeapError::CarrierOutOfRange)?;
+    let borrowed = host
+        .borrow_resource_with_key::<LuaUserdataResource>(handle, &LuaUserdataResource::key())
+        .map_err(HeapError::from_scope)?;
+    if borrowed.get().userdata() != userdata {
+        return Err(HeapError::TokenMismatch);
+    }
+    drop(borrowed);
+    // One fixed-size prepared action: the independent receiver's typed owner is
+    // checked before the commit borrow. The commit re-resolves the same action
+    // in its own exclusive borrow and refuses any identity change before the
+    // pop, so the root set always matches the checked receiver.
+    let action = with_heap(host, |heap| Ok(heap.pending_finalizer_action(userdata)))?;
+    verify_pending_finalizer_receiver(host, userdata, action)?;
+    with_heap(host, |heap| {
+        heap.take_published_finalizer_action_into_roots(frame, slots, head, action)
+    })
+}
+
+/// Checks that one independent userdata receiver still owns a real typed
+/// `lua.userdata` token naming that same object.
+///
+/// A receiver that is the pending object itself is already covered by the head
+/// payload check and is not borrowed twice; the commit roots it at `slots[0]`.
+/// This is one slot token read and one checked Core borrow with a payload
+/// identity comparison. It reads no queue record and writes nothing.
+fn verify_pending_finalizer_receiver(
+    host: &HostContext,
+    userdata: UserdataRef,
+    action: PendingFinalizerAction,
+) -> Result<(), HeapError> {
+    let PendingFinalizerAction::UserdataCall { receiver, .. } = action else {
+        return Ok(());
+    };
+    if receiver == userdata {
+        return Ok(());
+    }
+    let Some(heap) = host.scope_state::<LuaHeap>() else {
+        return Err(HeapError::SweepDenied);
+    };
+    let raw = heap.published_userdata_token(receiver)?;
+    let handle = vm::ResourceHandle::from_raw(raw).map_err(|_| HeapError::CarrierOutOfRange)?;
+    let borrowed = host
+        .borrow_resource_with_key::<LuaUserdataResource>(handle, &LuaUserdataResource::key())
+        .map_err(HeapError::from_scope)?;
+    if borrowed.get().userdata() != receiver {
+        return Err(HeapError::TokenMismatch);
+    }
+    Ok(())
+}
+
+/// Number of pending records in the published prefix. Test-only header read;
+/// it does not read a stored record.
+#[cfg(test)]
+pub fn pending_finalizer_published_count(host: &mut HostContext) -> Result<usize, HeapError> {
+    with_heap(host, |heap| Ok(heap.pending_finalizer_published_count()))
+}
+
+/// One userdata root slot. Test-only; does not scan or read the queue.
+#[cfg(test)]
+pub fn rooted_userdata(
+    host: &mut HostContext,
+    frame: RootFrameId,
+    slot: u32,
+) -> Result<Option<UserdataRef>, HeapError> {
+    with_heap(host, |heap| heap.rooted_userdata(frame, slot))
+}
+
+/// One closure root slot. Test-only; does not scan or read the queue.
+#[cfg(test)]
+pub fn rooted_closure(
+    host: &mut HostContext,
+    frame: RootFrameId,
+    slot: u32,
+) -> Result<Option<ClosureRef>, HeapError> {
+    with_heap(host, |heap| heap.rooted_closure(frame, slot))
+}
+
+/// Saves one empty private mark for a handoff refusal test. Test-only: the
+/// real handoff must refuse a saved mark before it reads the queue. It does
+/// not scan, close, publish, or run guest code.
+#[cfg(test)]
+pub fn open_saved_mark_for_test(host: &mut HostContext) -> Result<(), HeapError> {
+    with_heap(host, |heap| heap.open_private_step())
 }
 
 /// Continues a published sweep this scope already saved. Does not install a
@@ -811,7 +1189,7 @@ fn step_private_cycle(
     let Some(marked) = marked else {
         return Ok(StepOutcome::Paused { tail: false });
     };
-    match close_then_halt_at_publish(host, marked)? {
+    match close_then_halt_at_publish(host, marked, false)? {
         PublishedBoundary::Completed(report) => Ok(StepOutcome::Completed(report)),
         PublishedBoundary::Published {
             window_heads,
