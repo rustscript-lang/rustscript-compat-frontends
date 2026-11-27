@@ -112,9 +112,20 @@
 //! equal-valued but never issued array, built at run time from the issued
 //! carrier's two integers, and stops in the static body. Not claimed: a queue
 //! write, dequeue, commit, root plan, generation snapshot, or GC.
+//!
+//! ## Compile and run scope ownership
+//!
+//! The compile input (`GATE_MODE`) and the structural patch report belong to
+//! the plugin instance that performed that compile. The runtime selection
+//! (`SELECT`) and the observation witness belong to the execution scope of
+//! the VM that ran the fixture. Two arms compiled and interpreted on two
+//! threads therefore cannot read, overwrite or take each other's patch or
+//! records; the two-thread controls at the bottom of this module drive the
+//! real compiler and the real interpreter concurrently.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::cell::Cell;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use vm::compiler::{HostCallResolver, ResolvedHostCall};
 use vm::vm::VmFrameContinuation;
@@ -155,22 +166,220 @@ const PRECOMMIT_REFUSAL_RECEIVER: &str =
 const TARGET_LABEL: &str = "target-enter";
 const OTHER_LABEL: &str = "other-enter";
 
-// ---- one run at a time ----------------------------------------------------
+// ---- compile state per plugin, run state per VM execution scope ----------
 
-/// The exact observation of the last run, like the sibling active-frame
-/// witness: this module drives its arms sequentially in one test body.
-static WITNESS: Mutex<Option<Witness>> = Mutex::new(None);
+/// Compile-time arm input and the structural report belong to one plugin
+/// instance. Two arms compiled on two threads cannot observe each other's
+/// gate mode or patch report.
+struct TransportPlugin {
+    gate_mode: usize,
+    pause_on_compile: bool,
+    patch: Mutex<Option<PatchReport>>,
+}
 
-/// The integer the marker host returns and `note` uses as its selection mode.
-static SELECT: AtomicUsize = AtomicUsize::new(0);
+impl TransportPlugin {
+    fn new(arm: Arm) -> Self {
+        Self {
+            gate_mode: arm.gate_mode(),
+            pause_on_compile: false,
+            patch: Mutex::new(None),
+        }
+    }
 
-/// Which operand the private plugin hands to the second exact static import:
-/// `0` keeps the original arms untouched, `1` passes the issued receiver, `2`
-/// passes an equal-valued array that the heap never issued.
-static GATE_MODE: AtomicUsize = AtomicUsize::new(0);
+    fn with_compile_pause(arm: Arm) -> Self {
+        Self {
+            gate_mode: arm.gate_mode(),
+            pause_on_compile: true,
+            patch: Mutex::new(None),
+        }
+    }
 
-/// The structural record the plugin produced for the last compile.
-static PATCH: Mutex<Option<PatchReport>> = Mutex::new(None);
+    fn take_patch(&self, arm: Arm) -> PatchReport {
+        self.patch
+            .lock()
+            .expect("typed resource patch report")
+            .take()
+            .unwrap_or_else(|| panic!("{}: the plugin produced no patch report", arm.label()))
+    }
+}
+
+/// Runtime arm input and the observation witness belong to exactly the
+/// execution scope of the VM that produced them. Another VM cannot read,
+/// overwrite or take them.
+struct RunScope {
+    select: usize,
+    witness: Witness,
+}
+
+fn with_run_scope<T>(vm: &mut Vm, body: impl FnOnce(&mut RunScope) -> T) -> T {
+    let mut host = vm.host_context();
+    let scope = host
+        .scope_state_mut::<RunScope>()
+        .expect("the typed resource run scope must be installed before the run");
+    body(scope)
+}
+
+// ---- controlled interleaving for the two-thread controls ------------------
+
+/// The test-only ordering points. They gate timing only, and no lock that
+/// protects shared observation is held across either wait.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InterleavePoint {
+    /// Inside `TransportPlugin::parse_source`, after that plugin instance
+    /// wrote its own patch report and before it returns.
+    Compile,
+    /// In `host_mark("chunk-mode")`, before the VM's own selected arm is read.
+    Runtime,
+    /// In the run driver, after the VM stopped and before its own execution
+    /// scope is taken.
+    Take,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InterleaveRole {
+    First,
+    Second,
+}
+
+const POINT_RUNTIME: u8 = 1 << 0;
+const POINT_TAKE: u8 = 1 << 1;
+
+thread_local! {
+    static INTERLEAVE_PLAN: Cell<Option<(InterleaveRole, u8)>> = const { Cell::new(None) };
+}
+
+fn interleave_plan(role: InterleaveRole, points: u8) {
+    INTERLEAVE_PLAN.with(|plan| plan.set(Some((role, points))));
+}
+
+fn clear_interleave_plan() {
+    INTERLEAVE_PLAN.with(|plan| plan.set(None));
+}
+
+fn interleave_pause(point: InterleavePoint) {
+    let Some((role, points)) = INTERLEAVE_PLAN.with(|plan| plan.get()) else {
+        return;
+    };
+    let bit = match point {
+        InterleavePoint::Compile => return,
+        InterleavePoint::Runtime => POINT_RUNTIME,
+        InterleavePoint::Take => POINT_TAKE,
+    };
+    let expected_role = match point {
+        InterleavePoint::Compile | InterleavePoint::Runtime => InterleaveRole::First,
+        InterleavePoint::Take => InterleaveRole::Second,
+    };
+    if role != expected_role || points & bit == 0 {
+        return;
+    }
+    interleave_gate_for(point).park(point);
+}
+
+struct InterleaveGate {
+    reached: Mutex<Option<InterleavePoint>>,
+    reached_signal: Condvar,
+    released: Mutex<Vec<InterleavePoint>>,
+    released_signal: Condvar,
+}
+
+static COMPILE_INTERLEAVE_GATE: OnceLock<InterleaveGate> = OnceLock::new();
+static RUNTIME_INTERLEAVE_GATE: OnceLock<InterleaveGate> = OnceLock::new();
+
+fn compile_interleave_gate() -> &'static InterleaveGate {
+    COMPILE_INTERLEAVE_GATE.get_or_init(InterleaveGate::new)
+}
+
+fn runtime_interleave_gate() -> &'static InterleaveGate {
+    RUNTIME_INTERLEAVE_GATE.get_or_init(InterleaveGate::new)
+}
+
+fn interleave_gate_for(point: InterleavePoint) -> &'static InterleaveGate {
+    match point {
+        InterleavePoint::Compile => compile_interleave_gate(),
+        InterleavePoint::Runtime | InterleavePoint::Take => runtime_interleave_gate(),
+    }
+}
+
+impl InterleaveGate {
+    fn new() -> Self {
+        Self {
+            reached: Mutex::new(None),
+            reached_signal: Condvar::new(),
+            released: Mutex::new(Vec::new()),
+            released_signal: Condvar::new(),
+        }
+    }
+
+    fn park(&self, point: InterleavePoint) {
+        *self
+            .reached
+            .lock()
+            .expect("typed transport interleave reached") = Some(point);
+        self.reached_signal.notify_all();
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let mut released = self
+            .released
+            .lock()
+            .expect("typed transport interleave released");
+        while !released.contains(&point) {
+            let now = Instant::now();
+            assert!(
+                now < deadline,
+                "typed transport interleave: the {point:?} point was not released"
+            );
+            let wait = deadline
+                .saturating_duration_since(now)
+                .min(Duration::from_millis(100));
+            let (guard, _) = self
+                .released_signal
+                .wait_timeout(released, wait)
+                .expect("typed transport interleave released wait");
+            released = guard;
+        }
+    }
+
+    fn wait_reached<T: Send>(
+        &self,
+        point: InterleavePoint,
+        thread: &std::thread::JoinHandle<T>,
+    ) -> Result<(), String> {
+        let mut reached = self
+            .reached
+            .lock()
+            .expect("typed transport interleave reached");
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while reached.as_ref() != Some(&point) {
+            if thread.is_finished() {
+                return Err(format!(
+                    "the first thread ended before the {point:?} interleave point"
+                ));
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(format!(
+                    "the first thread did not reach the {point:?} interleave point"
+                ));
+            }
+            let wait = deadline
+                .saturating_duration_since(now)
+                .min(Duration::from_millis(100));
+            let (guard, _) = self
+                .reached_signal
+                .wait_timeout(reached, wait)
+                .expect("typed transport interleave reached wait");
+            reached = guard;
+        }
+        Ok(())
+    }
+
+    fn release(&self, point: InterleavePoint) {
+        self.released
+            .lock()
+            .expect("typed transport interleave release")
+            .push(point);
+        self.released_signal.notify_all();
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Arm {
@@ -467,14 +676,6 @@ struct Witness {
     table_token: Option<TableTokenRecord>,
 }
 
-fn with_witness<T>(body: impl FnOnce(&mut Witness) -> T) -> T {
-    let mut guard = WITNESS.lock().expect("typed resource witness");
-    let witness = guard
-        .as_mut()
-        .expect("the typed resource witness must be installed before the run");
-    body(witness)
-}
-
 /// The independent entry record of the active (last) frame, read from the live
 /// frames alone before any host-side probe can fail.
 fn frame_entry(vm: &Vm, label: &str) -> EntryRecord {
@@ -557,10 +758,11 @@ fn host_mark(vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
     // probe that fails after the frame really entered still leaves the
     // entered frame's actual prototype, depth and resume address recorded.
     let entry = frame_entry(vm, &label);
-    with_witness(|witness| witness.entries.push(entry));
+    with_run_scope(vm, |scope| scope.witness.entries.push(entry));
 
     if label == "chunk-mode" {
-        let select = i64::try_from(SELECT.load(Ordering::SeqCst))
+        interleave_pause(InterleavePoint::Runtime);
+        let select = i64::try_from(with_run_scope(vm, |scope| scope.select))
             .map_err(|_| host_fault_error("the selected arm does not fit a guest integer"))?;
         return Ok(CallOutcome::Return(CallReturn::one(Value::Int(select))));
     }
@@ -572,7 +774,9 @@ fn host_mark(vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
             return Err(host_fault_error("the issued table token is not a handle"));
         };
         let parts = probe_table(&host, raw)?;
-        with_witness(|witness| witness.table_token = Some(TableTokenRecord { raw, parts }));
+        with_run_scope(vm, |scope| {
+            scope.witness.table_token = Some(TableTokenRecord { raw, parts });
+        });
         return Ok(CallOutcome::Return(CallReturn::one(Value::Int(raw))));
     }
 
@@ -770,7 +974,7 @@ fn host_mark(vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
         record.continuation = Some(probe_userdata(&host, raw)?);
     }
 
-    with_witness(|witness| witness.marks.push(record));
+    with_run_scope(vm, |scope| scope.witness.marks.push(record));
     Ok(CallOutcome::Return(CallReturn::one(Value::Int(0))))
 }
 
@@ -784,7 +988,7 @@ fn raw_handle(raw: i64) -> vm::VmResult<ResourceHandle> {
 
 /// Returns one of the candidates the fixture already wrote at the call site.
 /// The returned value is always the exact `SharedCallable` the VM produced.
-fn host_note(_vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
+fn host_note(vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
     let [Value::Int(mode), target, first, second, single, other] = args else {
         return Err(host_fault_error(
             "note expects a mode and five written candidates",
@@ -815,7 +1019,7 @@ fn host_note(_vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
         chosen_is_target: same_callable(chosen, target),
         chosen_is_other: same_callable(chosen, other),
     };
-    with_witness(|witness| witness.picks.push(record));
+    with_run_scope(vm, |scope| scope.witness.picks.push(record));
     Ok(CallOutcome::Return(CallReturn::one(chosen.clone())))
 }
 
@@ -833,9 +1037,9 @@ fn host_tick(vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
             "the issued carrier is not a live heap table",
         ));
     };
-    with_witness(|witness| {
-        witness.issued_table_ref = Some(table);
-        witness.issued_table = Some(issued.clone());
+    with_run_scope(vm, |scope| {
+        scope.witness.issued_table_ref = Some(table);
+        scope.witness.issued_table = Some(issued.clone());
     });
     Ok(CallOutcome::Return(CallReturn::one(issued)))
 }
@@ -851,9 +1055,9 @@ fn host_fault(vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
         .map_err(heap_fault)?;
     let raw = i64::try_from(raw)
         .map_err(|_| host_fault_error("the userdata token does not fit a signed carrier"))?;
-    with_witness(|witness| {
-        witness.issued_userdata = Some(userdata);
-        witness.issued_userdata_raw = Some(raw);
+    with_run_scope(vm, |scope| {
+        scope.witness.issued_userdata = Some(userdata);
+        scope.witness.issued_userdata_raw = Some(raw);
     });
     Ok(CallOutcome::Return(CallReturn::one(Value::Int(raw))))
 }
@@ -870,7 +1074,7 @@ fn host_precommit(vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
     // frames alone, so a later probe failure cannot erase that this static
     // body ran in the parent frame.
     let entry = frame_entry(vm, PRECOMMIT_ENTRY_LABEL);
-    with_witness(|witness| witness.entries.push(entry));
+    with_run_scope(vm, |scope| scope.witness.entries.push(entry));
 
     let [callable, receiver, token] = args else {
         return Err(host_fault_error(
@@ -890,12 +1094,15 @@ fn host_precommit(vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
 
     // The exact static `note` has already selected the callable and the
     // fixture has already issued the one carrier and the one userdata token.
-    let (issued_table, issued_userdata) = with_witness(|witness| {
+    let (issued_table, issued_userdata) = with_run_scope(vm, |scope| {
         assert!(
-            !witness.picks.is_empty(),
+            !scope.witness.picks.is_empty(),
             "the exact static note must run before the precommit import"
         );
-        (witness.issued_table_ref, witness.issued_userdata)
+        (
+            scope.witness.issued_table_ref,
+            scope.witness.issued_userdata,
+        )
     });
 
     let mut host = vm.host_context();
@@ -930,7 +1137,7 @@ fn host_precommit(vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
         token_is_issued,
         refused: !receiver_is_issued,
     };
-    with_witness(|witness| witness.gates.push(record));
+    with_run_scope(vm, |scope| scope.witness.gates.push(record));
 
     if !receiver_is_issued {
         return Err(host_fault_error(PRECOMMIT_REFUSAL_RECEIVER));
@@ -939,10 +1146,6 @@ fn host_precommit(vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
 }
 
 // ---- the private plugin: real lowering plus declared schemas --------------
-
-struct TransportPlugin;
-
-static TRANSPORT_PLUGIN: TransportPlugin = TransportPlugin;
 
 #[derive(Clone, Debug)]
 struct CallPatch {
@@ -992,8 +1195,11 @@ impl SourcePlugin for TransportPlugin {
     fn parse_source(&self, source: &str) -> Result<FrontendIr, ParseError> {
         let resolver = HostCallResolver::new(transport_catalog());
         let mut ir = super::lower::lower_source_with(source, Some(&resolver))?;
-        let report = patch_ir(&mut ir, &resolver)?;
-        *PATCH.lock().expect("typed resource patch report") = Some(report);
+        let report = patch_ir(&mut ir, &resolver, self.gate_mode)?;
+        *self.patch.lock().expect("typed resource patch report") = Some(report);
+        if self.pause_on_compile {
+            compile_interleave_gate().park(InterleavePoint::Compile);
+        }
         Ok(ir)
     }
 }
@@ -1013,9 +1219,9 @@ struct GateSpec {
 fn patch_ir(
     ir: &mut FrontendIr,
     resolver: &HostCallResolver<'_>,
+    gate_mode: usize,
 ) -> Result<PatchReport, ParseError> {
     let mut report = PatchReport::default();
-    let gate_mode = GATE_MODE.load(Ordering::SeqCst);
     let gate = if gate_mode == 0 {
         None
     } else {
@@ -1457,23 +1663,37 @@ fn fixture_path(fixture: &str) -> std::path::PathBuf {
         .join(fixture)
 }
 
-fn run_arm(arm: Arm) -> ArmRun {
-    *PATCH.lock().expect("typed resource patch report") = None;
-    SELECT.store(arm.select(), Ordering::SeqCst);
-    GATE_MODE.store(arm.gate_mode(), Ordering::SeqCst);
-    *WITNESS.lock().expect("typed resource witness") = Some(Witness::default());
+/// One real compile of one arm. The plugin instance owns both the arm's
+/// compile input and the structural report it produced.
+struct CompiledArm {
+    arm: Arm,
+    program: Program,
+    patch: PatchReport,
+    call_sites: Vec<super::DecodedCallSite>,
+    host_call_sites: Vec<(usize, u8, Option<u32>)>,
+    prototypes: Vec<vm::CallablePrototype>,
+    host_imports: Vec<HostImport>,
+    host_schemas: Vec<Option<HostImportSchema>>,
+    local_schemas: Vec<Option<TypeSchema>>,
+}
 
+fn compile_arm(arm: Arm) -> CompiledArm {
+    compile_arm_with(arm, TransportPlugin::new(arm))
+}
+
+fn compile_arm_paused(arm: Arm) -> CompiledArm {
+    compile_arm_with(arm, TransportPlugin::with_compile_pause(arm))
+}
+
+fn compile_arm_with(arm: Arm, plugin: TransportPlugin) -> CompiledArm {
+    let plugin: &'static TransportPlugin = Box::leak(Box::new(plugin));
     let options = CompileSourceFileOptions::new()
-        .with_source_plugin(&TRANSPORT_PLUGIN)
+        .with_source_plugin(plugin)
         .with_host_api_catalog(Arc::clone(transport_catalog()));
     let path = fixture_path(arm.fixture());
     let compiled = vm::compile_source_file_with_options(&path, options)
         .unwrap_or_else(|error| panic!("{}: compile failed: {error:?}", arm.label()));
-    let patch = PATCH
-        .lock()
-        .expect("typed resource patch report")
-        .clone()
-        .unwrap_or_else(|| panic!("{}: the plugin produced no patch report", arm.label()));
+    let patch = plugin.take_patch(arm);
     let call_sites = decoded_call_sites(&compiled.program);
     let host_call_sites = patch
         .gate
@@ -1489,7 +1709,25 @@ fn run_arm(arm: Arm) -> ArmRun {
         .as_ref()
         .map(|map| map.local_schemas.clone())
         .unwrap_or_default();
+    CompiledArm {
+        arm,
+        program: compiled.program,
+        patch,
+        call_sites,
+        host_call_sites,
+        prototypes,
+        host_imports,
+        host_schemas,
+        local_schemas,
+    }
+}
 
+fn run_arm(arm: Arm) -> ArmRun {
+    run_compiled(compile_arm(arm))
+}
+
+fn run_compiled(compiled: CompiledArm) -> ArmRun {
+    let arm = compiled.arm;
     let mut runtime = Vm::new_with_jit_config(
         compiled.program,
         JitConfig {
@@ -1500,6 +1738,14 @@ fn run_arm(arm: Arm) -> ArmRun {
     );
     bind_hosts(&mut runtime)
         .unwrap_or_else(|error| panic!("{}: bind failed: {error}", arm.label()));
+    {
+        let mut host = runtime.host_context();
+        host.scope_state_or_insert_with(|| RunScope {
+            select: arm.select(),
+            witness: Witness::default(),
+        })
+        .unwrap_or_else(|error| panic!("{}: run scope: {error:?}", arm.label()));
+    }
     runtime
         .set_fuel_check_interval(FUEL_CHECK_INTERVAL)
         .unwrap_or_else(|error| panic!("{}: fuel interval: {error}", arm.label()));
@@ -1513,24 +1759,25 @@ fn run_arm(arm: Arm) -> ArmRun {
         .unwrap_or_else(|| panic!("{}: fuel increased", arm.label()));
     let stack = runtime.stack().to_vec();
     let bound_functions = runtime.bound_function_count();
-    let witness = WITNESS
-        .lock()
-        .expect("typed resource witness")
-        .take()
-        .unwrap_or_else(|| panic!("{}: the witness was not installed", arm.label()));
+    interleave_pause(InterleavePoint::Take);
+    let scope = {
+        let mut host = runtime.host_context();
+        host.take_scope_state::<RunScope>()
+            .unwrap_or_else(|| panic!("{}: the run scope was not installed", arm.label()))
+    };
 
     let run = ArmRun {
         arm,
         status,
         stack,
-        witness,
-        patch,
-        call_sites,
-        host_call_sites,
-        prototypes,
-        host_imports,
-        host_schemas,
-        local_schemas,
+        witness: scope.witness,
+        patch: compiled.patch,
+        call_sites: compiled.call_sites,
+        host_call_sites: compiled.host_call_sites,
+        prototypes: compiled.prototypes,
+        host_imports: compiled.host_imports,
+        host_schemas: compiled.host_schemas,
+        local_schemas: compiled.local_schemas,
         fuel_consumed,
         bound_functions,
     };
@@ -3010,4 +3257,324 @@ fn assert_precommit_unissued_receiver_control(run: &ArmRun) {
     eprintln!(
         "LUA_TYPED_RESOURCE arm=precommit-unissued-receiver seam_ip={seam_ip} callvalue_ip={callvalue_ip} receiver_class=Unissued equal_values=true child_entered=0"
     );
+}
+
+// ---- two-thread scope controls -------------------------------------------
+
+/// The parked seam compile must carry its own `admit` input and patch; the
+/// concurrent control arm must carry neither. Both compiles are real: lexer,
+/// parser, resolver, the private plugin and the fixed Core pipeline.
+fn assert_compile_scope_ownership(first: &CompiledArm, second: &CompiledArm) {
+    assert_eq!(first.arm, Arm::PrecommitBorrowSeam);
+    assert_eq!(second.arm, Arm::OtherResourceKey);
+    let gate = first.patch.gate.as_ref().unwrap_or_else(|| {
+        panic!(
+            "compile isolation: the parked seam compile must own its own admit gate patch, saw {:?}",
+            first.patch
+        )
+    });
+    assert_eq!(
+        gate.resolution.name, PRECOMMIT_IMPORT,
+        "compile isolation: the parked arm's gate resolution"
+    );
+    assert_eq!(
+        gate.resolution.passing,
+        [
+            HostParamPassing::Borrow,
+            HostParamPassing::Value,
+            HostParamPassing::Borrow,
+        ],
+        "compile isolation: the parked arm's own Borrow/Value/Borrow input"
+    );
+    assert_eq!(
+        first.patch.call.as_ref().map(|call| call.typed_callee),
+        Some(gate.typed_local),
+        "compile isolation: the parked arm's seam and CallValue share its typed local"
+    );
+    assert!(
+        second.patch.gate.is_none(),
+        "compile isolation: the concurrent arm must not inherit the parked arm's gate, saw {:?}",
+        second.patch
+    );
+    assert_eq!(
+        second.patch.declared_schema,
+        Some(userdata_callable_schema()),
+        "compile isolation: the concurrent arm keeps its own declared typed local"
+    );
+    assert!(
+        second.patch.call.is_some(),
+        "compile isolation: the concurrent arm still patches its own dynamic call"
+    );
+
+    let first_import = first
+        .host_imports
+        .iter()
+        .position(|import| import.name == PRECOMMIT_IMPORT)
+        .unwrap_or_else(|| panic!("compile isolation: the parked arm has no admit import"));
+    assert_eq!(
+        first.host_imports[first_import].arity, 3,
+        "compile isolation: the parked arm's admit arity"
+    );
+    assert_eq!(
+        first.host_schemas[first_import]
+            .as_ref()
+            .expect("compile isolation: the parked arm's full admit schema")
+            .fingerprint,
+        transport_catalog().fingerprint(),
+        "compile isolation: the parked arm's catalog fingerprint"
+    );
+    assert!(
+        second
+            .host_imports
+            .iter()
+            .all(|import| import.name != PRECOMMIT_IMPORT),
+        "compile isolation: the concurrent arm must compile without admit, saw {:?}",
+        second.host_imports
+    );
+    assert_eq!(
+        second.host_call_sites.len(),
+        0,
+        "compile isolation: the concurrent arm has no static seam call"
+    );
+    assert_eq!(
+        first.host_call_sites.len(),
+        1,
+        "compile isolation: the parked arm has exactly its own static seam call"
+    );
+    let (seam_ip, argc, owner) = first.host_call_sites[0];
+    assert_eq!(argc, 3, "compile isolation: the seam arity");
+    assert!(seam_ip > 0, "compile isolation: the seam address is real");
+    let owner = owner.expect("compile isolation: the seam has a caller region");
+    assert_eq!(
+        first
+            .prototypes
+            .get(owner as usize)
+            .expect("compile isolation: the Seam caller prototype")
+            .parameter_slots
+            .len(),
+        PARENT_PARAMS,
+        "compile isolation: the seam belongs to the parked arm's parent prototype"
+    );
+    eprintln!(
+        "LUA_TYPED_RESOURCE compile-isolation seam_gate=1 control_gate=0 seam_ip={seam_ip} seam_owner={owner}"
+    );
+}
+
+/// The seam VM's own witness, checked before any concurrent-arm panic is
+/// surfaced so a mixed or lost observation is reported as the business
+/// failure it is.
+fn assert_runtime_first_scope_only(run: &ArmRun) {
+    let modes: Vec<i64> = run.witness.picks.iter().map(|pick| pick.mode).collect();
+    assert_eq!(
+        modes,
+        [0],
+        "runtime isolation: the seam VM must keep exactly its own selected mode, saw {modes:?}"
+    );
+    let entries: Vec<&str> = run
+        .witness
+        .entries
+        .iter()
+        .map(|entry| entry.label.as_str())
+        .collect();
+    assert_eq!(
+        entries,
+        [
+            "chunk-mode",
+            "table-token",
+            "parent-enter",
+            PRECOMMIT_ENTRY_LABEL,
+            "target-enter",
+            "parent-after",
+            "done",
+        ],
+        "runtime isolation: the seam VM must keep its own entry records, saw {entries:?}"
+    );
+    assert_eq!(
+        run.witness.gates.len(),
+        1,
+        "runtime isolation: the seam VM must keep its own admit observation"
+    );
+}
+
+/// Each concurrent arm keeps its own runtime selection, witness records,
+/// issued carrier, issued userdata token and callable closures.
+fn assert_runtime_scope_ownership(first: &ArmRun, second: &ArmRun) {
+    assert_eq!(
+        second.witness.picks.len(),
+        1,
+        "runtime isolation: the control VM must keep exactly its own pick"
+    );
+    assert_eq!(
+        second.witness.picks[0].mode, 5,
+        "runtime isolation: the control VM must read its own selection 5"
+    );
+    let entries: Vec<&str> = second
+        .witness
+        .entries
+        .iter()
+        .map(|entry| entry.label.as_str())
+        .collect();
+    assert_eq!(
+        entries,
+        ["chunk-mode", "table-token", "parent-enter"],
+        "runtime isolation: the control VM must keep its own entry records, saw {entries:?}"
+    );
+    assert_eq!(
+        precommit_entries(second).len(),
+        0,
+        "runtime isolation: the control VM must have no seam entry"
+    );
+    assert!(
+        second.witness.gates.is_empty(),
+        "runtime isolation: the control VM must have no admit observation"
+    );
+    assert!(
+        second.patch.gate.is_none(),
+        "runtime isolation: the control compile must carry no gate"
+    );
+
+    let first_table = first
+        .witness
+        .issued_table
+        .as_ref()
+        .expect("runtime isolation: the seam VM issued one table");
+    let second_table = second
+        .witness
+        .issued_table
+        .as_ref()
+        .expect("runtime isolation: the control VM issued one table");
+    assert!(
+        !same_array(first_table, second_table),
+        "runtime isolation: the two VMs must issue different carrier Arcs"
+    );
+    assert_ne!(
+        first.witness.issued_table_ref, second.witness.issued_table_ref,
+        "runtime isolation: the two VMs must issue different heap tables"
+    );
+    assert_ne!(
+        first.witness.issued_userdata_raw, second.witness.issued_userdata_raw,
+        "runtime isolation: the two VMs must issue different userdata tokens"
+    );
+    assert!(
+        !same_callable(&first.pick().chosen, &second.pick().chosen),
+        "runtime isolation: the two VMs must return their own callable Arcs"
+    );
+    assert!(
+        !same_callable(&first.pick().chosen, &second.pick().target),
+        "runtime isolation: the seam VM's callable must not be the control VM's target"
+    );
+
+    let gate = gate_record(first);
+    assert_eq!(
+        gate.receiver_class,
+        GuestClass::Table(
+            first
+                .witness
+                .issued_table_ref
+                .expect("runtime isolation: the seam VM issued one table")
+        ),
+        "runtime isolation: the seam gate must classify its own issued table"
+    );
+    assert!(
+        same_array(&gate.receiver, first_table),
+        "runtime isolation: the seam gate must borrow its own receiver Arc"
+    );
+    assert_eq!(
+        gate.token_raw,
+        first
+            .witness
+            .issued_userdata_raw
+            .expect("runtime isolation: the seam VM issued one userdata"),
+        "runtime isolation: the seam gate must receive its own token"
+    );
+    assert!(
+        gate.token_is_issued && !gate.refused,
+        "runtime isolation: the seam gate must accept its own issued operands"
+    );
+    eprintln!(
+        "LUA_TYPED_RESOURCE runtime-isolation seam_entries={} control_entries={} seam_mode=0 control_mode=5 tables_distinct=1 tokens_distinct=1",
+        first.witness.entries.len(),
+        second.witness.entries.len()
+    );
+}
+
+#[test]
+fn typed_transport_compile_scope_is_isolated_between_two_concurrent_arms() {
+    let gate = compile_interleave_gate();
+    let first = std::thread::spawn(|| compile_arm_paused(Arm::PrecommitBorrowSeam));
+    let second = match gate.wait_reached(InterleavePoint::Compile, &first) {
+        Ok(()) => {
+            let compiled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                compile_arm(Arm::OtherResourceKey)
+            }));
+            gate.release(InterleavePoint::Compile);
+            match compiled {
+                Ok(compiled) => compiled,
+                Err(panic) => {
+                    let _ = first.join();
+                    std::panic::resume_unwind(panic);
+                }
+            }
+        }
+        Err(message) => {
+            gate.release(InterleavePoint::Compile);
+            let _ = first.join();
+            panic!("typed transport compile isolation: {message}");
+        }
+    };
+    let first = match first.join() {
+        Ok(compiled) => compiled,
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
+    assert_compile_scope_ownership(&first, &second);
+}
+
+#[test]
+fn typed_transport_runtime_scope_is_isolated_between_two_concurrent_arms() {
+    let gate = runtime_interleave_gate();
+    let first = std::thread::spawn(|| {
+        interleave_plan(InterleaveRole::First, POINT_RUNTIME);
+        let run = run_arm(Arm::PrecommitBorrowSeam);
+        clear_interleave_plan();
+        run
+    });
+    if let Err(message) = gate.wait_reached(InterleavePoint::Runtime, &first) {
+        gate.release(InterleavePoint::Runtime);
+        gate.release(InterleavePoint::Take);
+        let _ = first.join();
+        panic!("typed transport runtime isolation: {message}");
+    }
+    let second = std::thread::spawn(|| {
+        interleave_plan(InterleaveRole::Second, POINT_TAKE);
+        let run = run_arm(Arm::OtherResourceKey);
+        clear_interleave_plan();
+        run
+    });
+    if let Err(message) = gate.wait_reached(InterleavePoint::Take, &second) {
+        gate.release(InterleavePoint::Runtime);
+        gate.release(InterleavePoint::Take);
+        let _ = first.join();
+        let _ = second.join();
+        panic!("typed transport runtime isolation: {message}");
+    }
+    gate.release(InterleavePoint::Runtime);
+    let first = first.join();
+    gate.release(InterleavePoint::Take);
+    let second = second.join();
+    let first = match first {
+        Ok(run) => run,
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
+    // The seam witness is checked before the concurrent arm's outcome so a
+    // mixed or lost observation names the real business failure.
+    assert_runtime_first_scope_only(&first);
+    let second = match second {
+        Ok(run) => run,
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
+    assert_positive(&first);
+    assert_precommit_import(&first);
+    assert_precommit_positive(&first);
+    assert_other_resource_key_control(&first, &second);
+    assert_runtime_scope_ownership(&first, &second);
 }
