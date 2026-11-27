@@ -122,7 +122,7 @@ mod handle;
 #[path = "heap/resource.rs"]
 mod resource;
 #[path = "heap/table.rs"]
-pub(crate) mod table;
+mod table;
 
 pub use handle::{ClosureRef, HandleKind, TableRef, UpvalueRef, UserdataRef};
 pub use resource::{LuaTableResource, LuaUserdataResource};

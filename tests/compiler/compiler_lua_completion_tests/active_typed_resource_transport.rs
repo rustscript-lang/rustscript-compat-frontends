@@ -164,9 +164,7 @@ use vm::{
 };
 
 use super::{FUEL_BUDGET, FUEL_CHECK_INTERVAL, decoded_call_sites};
-use crate::heap::{
-    self, GuestClass, HandleKind, LuaTableResource, LuaUserdataResource, TableRef, UserdataRef,
-};
+use crate::heap::{self, GuestClass, LuaTableResource, LuaUserdataResource, TableRef, UserdataRef};
 
 /// The fixture the positive and resource-key control arms execute.
 const FIXTURE: &str = "active_typed_resource_transport.lua";
@@ -4570,7 +4568,9 @@ fn heap_query<T>(
 }
 
 /// One read-only view of the current published head for the typed commit
-/// body. It holds a `Weak` callable identity, never a strong `Arc` or root.
+/// body. The heap owner performs the reads; this wrapper only re-shapes its
+/// test-only view. It holds a `Weak` callable identity, never a strong `Arc`
+/// or root.
 #[derive(Clone)]
 struct PublishedTypedCommitSnapshot {
     userdata: UserdataRef,
@@ -4586,59 +4586,25 @@ struct PublishedTypedCommitSnapshot {
 fn snapshot_published_typed_table_call(
     host: &mut vm::HostContext,
 ) -> Result<PublishedTypedCommitSnapshot, heap::HeapError> {
-    let Some(heap) = host.scope_state::<heap::LuaHeap>() else {
-        return Err(heap::HeapError::SweepDenied);
-    };
-    if heap.has_sweep_tail() {
-        return Err(heap::HeapError::SweepPending);
-    }
-    if heap.has_saved_mark() {
-        return Err(heap::HeapError::MarkActive);
-    }
-    let head = heap.pending_finalizer_published_front()?;
-    let handle =
-        ResourceHandle::from_raw(head.raw).map_err(|_| heap::HeapError::CarrierOutOfRange)?;
-    let userdata = {
-        let borrowed = host
-            .borrow_resource_with_key::<LuaUserdataResource>(handle, &LuaUserdataResource::key())
-            .map_err(heap::HeapError::from_scope)?;
-        borrowed.get().userdata()
-    };
-    if userdata.domain() != heap.domain()
-        || userdata.slot() != head.slot
-        || userdata.generation() != head.generation
-        || userdata.kind() != HandleKind::Userdata
-    {
-        return Err(heap::HeapError::TokenMismatch);
-    }
-    if heap.published_userdata_token(userdata)? != head.raw {
-        return Err(heap::HeapError::TokenMismatch);
-    }
-    let metatable = heap
-        .userdata_metatable(userdata)?
-        .ok_or(heap::HeapError::StaleHandle)?;
-    let heap::PendingFinalizerAction::TableCall { receiver, call } =
-        heap.pending_finalizer_action(userdata)
-    else {
-        return Err(heap::HeapError::Scope(
-            "lua typed published head is not a table call".to_string(),
-        ));
-    };
-    let callable = Arc::downgrade(&heap.closure_callable(call)?);
-    Ok(PublishedTypedCommitSnapshot {
-        userdata,
-        raw_token: head.raw,
-        metatable,
-        receiver,
-        closure: call,
-        callable,
-        published_count: heap.pending_finalizer_published_count(),
-        queue_len: heap.pending_finalizer_count(),
+    heap::with_heap(host, |heap| {
+        let call = heap.test_snapshot_published_typed_call()?;
+        Ok(PublishedTypedCommitSnapshot {
+            userdata: call.userdata,
+            raw_token: call.raw_token,
+            metatable: call.metatable,
+            receiver: call.receiver,
+            closure: call.closure,
+            callable: call.callable,
+            published_count: call.published_count,
+            queue_len: call.queue_len,
+        })
     })
 }
 
-/// The typed commit body's exclusive entry: every identity check runs in the
-/// one borrow that pops, roots, and settles, before the first write.
+/// The typed commit body's exclusive entry. The heap owner reads the live
+/// published head and performs every identity check in the one borrow that
+/// pops, roots, and settles, before the first write. No external queue record,
+/// generation, or root index crosses this seam.
 fn commit_published_typed_table_call(
     host: &mut vm::HostContext,
     expected_callable: &Arc<vm::CallableValue>,
@@ -4648,86 +4614,25 @@ fn commit_published_typed_table_call(
     expected_token: u64,
 ) -> Result<(heap::RootFrameId, heap::TakenPendingFinalizer), heap::HeapError> {
     heap::with_heap(host, |heap| {
-        heap.deny_unbarriered()?;
-        let head = heap.pending_finalizer_published_front()?;
-        let Some(userdata) = expected_payload else {
-            return Err(heap::HeapError::TokenMismatch);
-        };
-        let head_userdata = heap.pending_finalizer_head_identity(head)?;
-        if head_userdata != userdata {
-            return Err(heap::HeapError::TokenMismatch);
-        }
-        if heap.published_userdata_token(userdata)? != expected_token {
-            return Err(heap::HeapError::TokenMismatch);
-        }
-        if heap.userdata_metatable(userdata)? != Some(expected_metatable) {
-            return Err(heap::HeapError::StaleHandle);
-        }
-        let action = heap.pending_finalizer_action(userdata);
-        let heap::PendingFinalizerAction::TableCall { receiver, call } = action else {
-            return Err(heap::HeapError::Scope(
-                "lua typed published commit requires a table call".to_string(),
-            ));
-        };
-        if heap.guest_class(expected_receiver) != GuestClass::Table(receiver) {
-            return Err(heap::HeapError::WrongKind);
-        }
-        let Value::Array(operand) = expected_receiver else {
-            return Err(heap::HeapError::WrongKind);
-        };
-        let Value::Array(issued) = heap.issued_value(receiver)? else {
-            return Err(heap::HeapError::StaleHandle);
-        };
-        if !Arc::ptr_eq(operand, &issued) {
-            return Err(heap::HeapError::WrongKind);
-        }
-        let stored = heap.closure_callable(call)?;
-        if !Arc::ptr_eq(&stored, expected_callable) {
-            return Err(heap::HeapError::TokenMismatch);
-        }
-        let frame = heap.enter_roots(3)?;
-        let slots = [0u32, 1, 2];
-        let indices = heap.pending_finalizer_root_indices(frame, &slots, 3)?;
-        let userdata = heap.commit_published_finalizer(
-            head,
-            userdata,
-            &[
-                (indices[0], heap::table::Rooted::Userdata(userdata)),
-                (indices[1], heap::table::Rooted::Closure(call)),
-                (indices[2], heap::table::Rooted::Table(receiver)),
-            ],
-        )?;
-        Ok((
-            frame,
-            heap::TakenPendingFinalizer {
-                userdata,
-                action,
-                roots_written: 3,
-            },
-        ))
+        heap.test_commit_published_typed_table_call(
+            expected_callable,
+            expected_payload,
+            expected_metatable,
+            expected_receiver,
+            expected_token,
+        )
     })
 }
 
-/// Test-only bridge to the private heap-owned guest callable field admission.
+/// Test-only bridge to the heap-owned guest callable field admission. The VM
+/// operand values are the actual guest values; the heap owner resolves the
+/// prototype shape and performs its private read-before-write transaction.
 fn install_guest_callable_into_raw_call(
     vm: &mut Vm,
     owner: &Value,
     target: &Value,
 ) -> Result<(), heap::HeapError> {
-    let Value::Callable(target_arc) = target else {
-        return Err(heap::HeapError::CallableHasEnvironment);
-    };
-    let prototype = vm
-        .program()
-        .callable_prototypes
-        .get(target_arc.prototype_id as usize)
-        .ok_or(heap::HeapError::CarrierNotBound)?;
-    let captures = prototype.capture_slots.len();
-    let mut host = vm.host_context();
-    heap::with_heap(&mut host, |heap| {
-        heap.handoff_guest_callable_to_raw_call(owner, Arc::clone(target_arc), captures)
-            .map(|_| ())
-    })
+    heap::LuaHeap::test_admit_guest_callable_to_raw_call(vm, owner, target).map(|_| ())
 }
 
 fn published_pending(run: &mut ArmRun) -> Vec<(u64, u32, u32)> {
@@ -5125,10 +5030,15 @@ fn assert_published_positive(run: &mut ArmRun) {
         .find_map(|mark| mark.callee.as_ref())
         .expect("published-commit: the child frame must be observed");
     assert_eq!(callee.prototype_id, target_id);
-    assert_eq!(
-        callee.parameter_values.first().cloned().flatten(),
-        Some(commit.receiver.clone()),
-        "published-commit: the child receiver slot reuses the commit operand"
+    let child_receiver = callee
+        .parameter_values
+        .first()
+        .cloned()
+        .flatten()
+        .expect("published-commit: the child receiver formal slot must be populated");
+    assert!(
+        same_array(&child_receiver, &commit.receiver),
+        "published-commit: the child receiver slot must hold the exact commit operand Arc"
     );
     assert_eq!(
         callee.parameter_values.get(1).cloned().flatten(),
@@ -5380,6 +5290,20 @@ fn assert_published_queue_intact(run: &mut ArmRun) {
         run.arm.label()
     );
     let mut host = run.vm.host_context();
+    let top = heap::with_heap(&mut host, |heap| Ok(heap.current_frame()))
+        .unwrap_or_else(|error| panic!("{}: top root frame: {error:?}", run.arm.label()));
+    assert_eq!(
+        top,
+        Some(prepared.root_frame),
+        "{}: the refused commit must not open a root frame",
+        run.arm.label()
+    );
+    assert_eq!(
+        heap::rooted_table(&mut host, prepared.root_frame, 0),
+        Ok(Some(prepared.weak_table)),
+        "{}: the independent weak witness root is unchanged",
+        run.arm.label()
+    );
     assert_eq!(
         heap::rooted_table(&mut host, prepared.root_frame, 1),
         Ok(Some(prepared.receiver)),
@@ -5392,6 +5316,49 @@ fn assert_published_queue_intact(run: &mut ArmRun) {
         "{}: the independent sentinel root is unchanged",
         run.arm.label()
     );
+    assert_eq!(
+        heap::rooted_table(&mut host, prepared.root_frame, 3),
+        Ok(None),
+        "{}: the unused prepare slot must stay empty",
+        run.arm.label()
+    );
+    assert_eq!(
+        heap::rooted_userdata(&mut host, prepared.root_frame, 3),
+        Ok(None),
+        "{}: the unused prepare slot must hold no userdata",
+        run.arm.label()
+    );
+    assert_eq!(
+        heap::rooted_closure(&mut host, prepared.root_frame, 3),
+        Ok(None),
+        "{}: the unused prepare slot must hold no closure",
+        run.arm.label()
+    );
+    for (owner_label, userdata, raw) in [
+        ("A", prepared.userdata, prepared.userdata_raw),
+        ("B", prepared.successor, prepared.successor_raw),
+    ] {
+        let handle = ResourceHandle::from_raw(u64::try_from(raw).expect("prepared typed token"))
+            .expect("prepared typed handle");
+        let borrowed = host
+            .borrow_resource_with_key::<LuaUserdataResource>(handle, &LuaUserdataResource::key())
+            .unwrap_or_else(|error| {
+                panic!("{}: {owner_label} token borrow: {error}", run.arm.label())
+            });
+        assert_eq!(
+            borrowed.get().userdata(),
+            userdata,
+            "{}: {owner_label}'s borrowable token must name its exact owner",
+            run.arm.label()
+        );
+        drop(borrowed);
+        assert_eq!(
+            heap::borrow_published_userdata(&host, userdata),
+            Ok(userdata),
+            "{}: {owner_label}'s published heap token must stay bound to its owner",
+            run.arm.label()
+        );
+    }
 }
 
 fn assert_commit_refusal(

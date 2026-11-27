@@ -132,7 +132,7 @@ pub enum HeapError {
 }
 
 impl HeapError {
-    pub(crate) fn from_scope(error: HostContextError) -> Self {
+    pub(super) fn from_scope(error: HostContextError) -> Self {
         Self::Scope(error.to_string())
     }
 }
@@ -758,7 +758,7 @@ pub enum CellValue {
 ///
 /// Visible to the private host continuation. Not a public heap schema.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Rooted {
+pub(super) enum Rooted {
     Table(TableRef),
     Closure(ClosureRef),
     Upvalue(UpvalueRef),
@@ -1375,10 +1375,10 @@ impl LiveTrace {
 /// name a different object. The record is not a root vector entry, is not a
 /// guest value, and is visible only to this table module and its heap parent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct PendingFinalizer {
-    pub(crate) slot: u32,
-    pub(crate) generation: u32,
-    pub(crate) raw: u64,
+pub(super) struct PendingFinalizer {
+    pub(super) slot: u32,
+    pub(super) generation: u32,
+    pub(super) raw: u64,
 }
 
 /// The one-layer raw `__call` result on one receiver's own current instance
@@ -2482,7 +2482,7 @@ impl LuaHeap {
     /// generation, and one in-place replacement of the existing edge value.
     /// None of those three steps can fail, and none inserts a new edge, root,
     /// scan rule, or metatable.
-    pub(crate) fn handoff_guest_callable_to_raw_call(
+    fn handoff_guest_callable_to_raw_call(
         &mut self,
         owner_value: &Value,
         callable: Arc<CallableValue>,
@@ -4829,13 +4829,13 @@ impl LuaHeap {
 
     /// Number of pending-finalizer records. Does not read the graph or a
     /// stored record; it reads only the queue length.
-    pub(crate) fn pending_finalizer_count(&self) -> usize {
+    pub(super) fn pending_finalizer_count(&self) -> usize {
         self.pending_finalizers.len()
     }
 
     /// Number of leading records that a successful private publication made
     /// consumable. A header read only; no stored record is read.
-    pub(crate) fn pending_finalizer_published_count(&self) -> usize {
+    pub(super) fn pending_finalizer_published_count(&self) -> usize {
         self.pending_finalizers.published_len()
     }
 
@@ -4845,7 +4845,7 @@ impl LuaHeap {
     /// but no published prefix is not consumable: selection may have retained
     /// them for a later mark, but no successful weak publication has released
     /// them to a consumer yet.
-    pub(crate) fn pending_finalizer_published_front(&self) -> Result<PendingFinalizer, HeapError> {
+    pub(super) fn pending_finalizer_published_front(&self) -> Result<PendingFinalizer, HeapError> {
         self.pending_finalizers
             .published_front(&self.slots)
             .ok_or_else(|| {
@@ -4901,7 +4901,7 @@ impl LuaHeap {
     /// walking the open-frame stack, so this plan is linear in the number of
     /// open frames and the number of required positions; it does not read the
     /// queue, any edge chain, or the root vector beyond the checked entries.
-    pub(crate) fn pending_finalizer_root_indices(
+    fn pending_finalizer_root_indices(
         &self,
         frame: RootFrameId,
         slots: &[u32],
@@ -4930,7 +4930,7 @@ impl LuaHeap {
     /// flag, raw handle, and live state. A successor generation in the same
     /// slot is refused. This is the shared identity preflight of both dequeue
     /// entries; it reads one record and writes nothing.
-    pub(crate) fn pending_finalizer_head_identity(
+    fn pending_finalizer_head_identity(
         &self,
         head: PendingFinalizer,
     ) -> Result<UserdataRef, HeapError> {
@@ -4965,7 +4965,7 @@ impl LuaHeap {
     /// `__call` a second time. Each raw field lookup walks one owner chain, so
     /// the cost is linear in the receiver metatable's stored edge count. Nothing
     /// is written.
-    pub(crate) fn pending_finalizer_action(&self, userdata: UserdataRef) -> PendingFinalizerAction {
+    pub(super) fn pending_finalizer_action(&self, userdata: UserdataRef) -> PendingFinalizerAction {
         let Some(slot) = self.slots.get(userdata.slot() as usize) else {
             return PendingFinalizerAction::Skip;
         };
@@ -5079,7 +5079,7 @@ impl LuaHeap {
     /// record. The pop happens before the first root or slot write, and a
     /// refusal leaves the queue and every root unchanged. No guest code is
     /// called.
-    pub(crate) fn commit_published_finalizer(
+    fn commit_published_finalizer(
         &mut self,
         head: PendingFinalizer,
         userdata: UserdataRef,
@@ -5486,12 +5486,12 @@ impl LuaHeap {
     }
 
     /// True when a mark is already stored. Does not read slots, edges, or a batch.
-    pub(crate) fn has_saved_mark(&self) -> bool {
+    pub(super) fn has_saved_mark(&self) -> bool {
         self.mark.is_some()
     }
 
     /// True when a published sweep tail is stored. Does not read slots or edges.
-    pub(crate) fn has_sweep_tail(&self) -> bool {
+    pub(super) fn has_sweep_tail(&self) -> bool {
         self.sweep_tail.is_some()
     }
 
@@ -5586,7 +5586,7 @@ impl LuaHeap {
     }
 
     /// Domain that issued handles for this heap. Does not read slots.
-    pub(crate) fn domain(&self) -> u64 {
+    pub(super) fn domain(&self) -> u64 {
         self.domain
     }
 
@@ -5616,7 +5616,7 @@ impl LuaHeap {
     /// A saved tail is reported first. A parked mark, including paused gray, is
     /// `MarkDenied`. `alloc_slot` only checks the tail, so callers that cannot
     /// barrier the new node must use this before taking or growing a slot.
-    pub(crate) fn deny_unbarriered(&self) -> Result<(), HeapError> {
+    fn deny_unbarriered(&self) -> Result<(), HeapError> {
         self.ensure_sweep_open()?;
         if self.mark.is_some() {
             return Err(HeapError::MarkDenied);
@@ -6658,6 +6658,18 @@ impl<'a> SelectingPendingMark<'a> {
         (finished, meter)
     }
 }
+
+/// Test-only typed published-head transaction surface.
+///
+/// This relative path resolves to the real module in the compiler harness
+/// (`tests/compiler/heap_file_entry/tests/luajit_heap_runtime/`) and to the
+/// empty stand-in in the heap harness (`tests/luajit_heap_runtime/`), so only
+/// the compiler harness compiles and consumes these heap-owner entries. The
+/// module is a child of this table module, so it can use the private head,
+/// root, and settle primitives without widening any of them.
+#[cfg(test)]
+#[path = "../../../../tests/luajit_heap_runtime/typed_published_api.rs"]
+mod typed_published_api;
 
 /// Slot-level callable-carrier units. The business path (a real `.lua` guest
 /// import) is exercised by the file-entry witness; these units use fabricated
