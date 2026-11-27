@@ -572,11 +572,24 @@ struct Slot {
     rescan_next: Option<u32>,
     /// This marked target is linked in the current mark's deferred-replay
     /// queue. The links live on the slot, so a replay append is constant work
-    /// and never pushes the shared Gray `Vec`. A tag from an older mark is
+    /// and never touches the ordinary Gray chain. A tag from an older mark is
     /// inert; release unlinks the slot before reuse.
     late_target_epoch: u64,
     late_target_prev: Option<u32>,
     late_target_next: Option<u32>,
+    /// This marked slot is linked in the current mark's ordinary Gray LIFO.
+    /// The head and its exact slot generation live in `MarkState`; the two
+    /// neighbour links and this round's tag live here, beside but separate
+    /// from the late, rescan, and pending links. Push and pop are constant
+    /// work and never allocate, copy, or relocate a work vector. `epoch` is
+    /// the mark round that linked the node, so a link left by an abandoned
+    /// mark is inert; `generation` is the exact slot generation that was
+    /// linked. Release unlinks this node before the slot generation advances,
+    /// which is what keeps a middle item from cutting its successors off.
+    gray_epoch: u64,
+    gray_generation: u32,
+    gray_prev: Option<u32>,
+    gray_next: Option<u32>,
 }
 
 /// Empty slot reserved for one late table. It is not a handle and cannot be
@@ -763,17 +776,6 @@ pub(super) enum Rooted {
     Closure(ClosureRef),
     Upvalue(UpvalueRef),
     Userdata(UserdataRef),
-}
-
-impl Rooted {
-    fn slot(self) -> u32 {
-        match self {
-            Self::Table(handle) => handle.slot(),
-            Self::Closure(handle) => handle.slot(),
-            Self::Upvalue(handle) => handle.slot(),
-            Self::Userdata(handle) => handle.slot(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2182,6 +2184,10 @@ impl LuaHeap {
         slot.late_target_epoch = 0;
         slot.late_target_prev = None;
         slot.late_target_next = None;
+        slot.gray_epoch = 0;
+        slot.gray_generation = 0;
+        slot.gray_prev = None;
+        slot.gray_next = None;
         Ok((index, slot.generation))
     }
 
@@ -2236,6 +2242,10 @@ impl LuaHeap {
             late_target_epoch: 0,
             late_target_prev: None,
             late_target_next: None,
+            gray_epoch: 0,
+            gray_generation: 0,
+            gray_prev: None,
+            gray_next: None,
         });
         self.note_node_peak();
         Ok((index, 1))
@@ -6239,6 +6249,8 @@ impl LuaHeap {
         self.slots[index as usize].pending_gc_generation = 0;
         self.slots[index as usize].pending_gc_round = 0;
         self.slots[index as usize].pending_gc_non_nil = false;
+        let mark = self.mark.as_mut();
+        mark::release_ordinary_gray(mark, &mut self.slots, index);
         let mark = self.mark.as_mut();
         mark::release_rescan_slot(mark, &mut self.slots, index);
         let mark = self.mark.as_mut();
