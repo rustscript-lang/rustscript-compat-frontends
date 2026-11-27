@@ -43,9 +43,17 @@
 //! then withdrawn and another real collection reclaims the receiver. The
 //! pre-replacement edge is recorded as the omission control, and the second
 //! take is required not to return the old original Arc.
+//!
+//! A third test runs those two fixtures in two real VMs on two threads. The
+//! first VM parks in a test-only mark gate after its owner tick and first
+//! picture; the second runs its whole file entry and takes its witness while
+//! the first is parked. Each witness lives in its own VM execution scope, so
+//! the first keeps its complete arm sequence, its own heap domain, its own
+//! owner and ready rows, and its own Core Arcs.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use vm::compiler::HostCallResolver;
 use vm::{
@@ -94,15 +102,82 @@ struct Witness {
     pictures: Vec<(String, Picture)>,
 }
 
-static WITNESS: Mutex<Witness> = Mutex::new(Witness {
-    owners: Vec::new(),
-    positive_owner: None,
-    pictures: Vec::new(),
-});
+/// The witness lives in the execution scope of exactly the VM that produced
+/// it. A second VM's clear or take cannot reach it, and no process-global lock
+/// serializes independent runs.
+fn with_witness<T>(vm: &mut Vm, body: impl FnOnce(&mut Witness) -> T) -> T {
+    let mut host = vm.host_context();
+    let witness = host
+        .scope_state_mut::<Witness>()
+        .expect("raw call field: this VM has no file-entry witness");
+    body(witness)
+}
 
-fn with_witness<T>(body: impl FnOnce(&mut Witness) -> T) -> T {
-    let mut guard = WITNESS.lock().expect("raw call field witness");
-    body(&mut guard)
+/// One test-only ordering gate for the two-VM witness isolation test. The
+/// first VM parks inside `host_mark` after it has issued its owner and pushed
+/// its `first-before` picture; the second VM runs its whole fixture (clear,
+/// observations, take) while the first is parked. The gate is observation
+/// ordering only: no witness lock is held at either wait.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InterleaveRole {
+    FirstVm,
+}
+
+struct InterleaveGate {
+    reached: Mutex<bool>,
+    reached_signal: Condvar,
+    released: Mutex<bool>,
+    released_signal: Condvar,
+}
+
+static INTERLEAVE_GATE: OnceLock<InterleaveGate> = OnceLock::new();
+
+thread_local! {
+    static INTERLEAVE_ROLE: std::cell::Cell<Option<InterleaveRole>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn interleave_gate() -> &'static InterleaveGate {
+    INTERLEAVE_GATE.get_or_init(|| InterleaveGate {
+        reached: Mutex::new(false),
+        reached_signal: Condvar::new(),
+        released: Mutex::new(false),
+        released_signal: Condvar::new(),
+    })
+}
+
+fn interleave_pause(label: &str) {
+    if INTERLEAVE_ROLE.with(|role| role.get()) != Some(InterleaveRole::FirstVm)
+        || label != "first-after"
+    {
+        return;
+    }
+    let gate = interleave_gate();
+    *gate
+        .reached
+        .lock()
+        .expect("raw call field: interleave reached") = true;
+    gate.reached_signal.notify_all();
+    let mut released = gate
+        .released
+        .lock()
+        .expect("raw call field: interleave released");
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !*released {
+        let now = Instant::now();
+        assert!(
+            now < deadline,
+            "raw call field: the first VM was not released by the second VM"
+        );
+        let wait = deadline
+            .saturating_duration_since(now)
+            .min(Duration::from_millis(100));
+        let (guard, _) = gate
+            .released_signal
+            .wait_timeout(released, wait)
+            .expect("raw call field: interleave released wait");
+        released = guard;
+    }
 }
 
 impl Witness {
@@ -198,7 +273,8 @@ fn host_mark(vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
         return Err(host_fault("mark expects one string label"));
     };
     let label = label.as_str().to_string();
-    let owners: Vec<(String, TableRef, TableRef)> = with_witness(|witness| {
+    interleave_pause(&label);
+    let owners: Vec<(String, TableRef, TableRef)> = with_witness(vm, |witness| {
         witness
             .owners
             .iter()
@@ -225,7 +301,7 @@ fn host_mark(vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
         })
         .map_err(heap_fault)?
     };
-    with_witness(|witness| witness.pictures.push((label, picture)));
+    with_witness(vm, |witness| witness.pictures.push((label, picture)));
     Ok(CallOutcome::Return(CallReturn::one(Value::Int(0))))
 }
 
@@ -238,7 +314,7 @@ fn host_tick(vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
     };
     let label = label.as_str().to_string();
     if label == "owner-slot" || label == "owner-generation" {
-        let owner = with_witness(|witness| {
+        let owner = with_witness(vm, |witness| {
             witness
                 .positive_owner
                 .expect("the owner tick must run before a slot field")
@@ -285,7 +361,7 @@ fn host_tick(vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
         }
         (issued, owner, metatable, metatable_value)
     };
-    with_witness(|witness| {
+    with_witness(vm, |witness| {
         if label == "owner" {
             witness.positive_owner = Some(owner);
         }
@@ -344,8 +420,6 @@ fn run_fixture() -> RawCallRun {
 }
 
 fn run_fixture_named(fixture: &str) -> RawCallRun {
-    *WITNESS.lock().expect("raw call field witness") = Witness::default();
-
     let options = CompileSourceFileOptions::new()
         .with_source_plugin(&RAW_CALL_PLUGIN)
         .with_host_api_catalog(Arc::clone(raw_call_catalog()));
@@ -361,6 +435,11 @@ fn run_fixture_named(fixture: &str) -> RawCallRun {
         },
     );
     bind_hosts(&mut runtime).unwrap_or_else(|error| panic!("raw call field: bind failed: {error}"));
+    {
+        let mut host = runtime.host_context();
+        host.scope_state_or_insert_with(Witness::default)
+            .unwrap_or_else(|error| panic!("raw call field: witness scope: {error:?}"));
+    }
     runtime
         .set_fuel_check_interval(FUEL_CHECK_INTERVAL)
         .unwrap_or_else(|error| panic!("raw call field: fuel interval: {error}"));
@@ -373,7 +452,11 @@ fn run_fixture_named(fixture: &str) -> RawCallRun {
         .checked_sub(remaining)
         .unwrap_or_else(|| panic!("raw call field: fuel increased"));
     let stack = runtime.stack().to_vec();
-    let witness = std::mem::take(&mut *WITNESS.lock().expect("raw call field witness"));
+    let witness = {
+        let mut host = runtime.host_context();
+        host.take_scope_state::<Witness>()
+            .expect("raw call field: this VM keeps its file-entry witness")
+    };
     RawCallRun {
         vm: runtime,
         status,
@@ -1660,5 +1743,297 @@ fn raw_call_published_dequeue_keeps_fifo_and_relooks_the_live_guest_call() {
     assert!(
         !heap_with(&mut run.vm, |heap| Ok(heap.alive(weak))),
         "raw call dequeue: the weak witness table is reclaimed with its final root"
+    );
+}
+
+/// The observation witness of one file-entry run belongs to that VM. Two real
+/// VMs run the two existing fixtures on two threads. The first VM parks in a
+/// guest mark after it has issued its owner and recorded `first-before`; the
+/// second VM runs its complete witness window, including its own clear and
+/// take, while the first is parked. Each returned witness must contain only
+/// its own fixture labels, only its own owner/ready row with its own heap
+/// domain, and only its own Core Arcs.
+#[test]
+fn raw_call_witness_is_isolated_between_two_concurrent_vms() {
+    let gate = interleave_gate();
+    let first = std::thread::spawn(|| {
+        INTERLEAVE_ROLE.with(|role| role.set(Some(InterleaveRole::FirstVm)));
+        let run = run_fixture_named(FIXTURE);
+        INTERLEAVE_ROLE.with(|role| role.set(None));
+        run
+    });
+
+    {
+        let mut reached = gate
+            .reached
+            .lock()
+            .expect("raw call witness isolation: reached");
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while !*reached {
+            assert!(
+                !first.is_finished(),
+                "raw call witness isolation: the first VM ended before its interleave point"
+            );
+            let now = Instant::now();
+            assert!(
+                now < deadline,
+                "raw call witness isolation: the first VM did not reach its interleave point"
+            );
+            let wait = deadline
+                .saturating_duration_since(now)
+                .min(Duration::from_millis(100));
+            let (guard, _) = gate
+                .reached_signal
+                .wait_timeout(reached, wait)
+                .expect("raw call witness isolation: reached wait");
+            reached = guard;
+        }
+    }
+
+    let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_fixture_named(PUBLISHED_DEQUEUE_FIXTURE)
+    }));
+    *gate
+        .released
+        .lock()
+        .expect("raw call witness isolation: released") = true;
+    gate.released_signal.notify_all();
+    let first = first.join();
+    let mut second = match second {
+        Ok(run) => run,
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
+    let mut first = match first {
+        Ok(run) => run,
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
+
+    for (name, run) in [("first", &first), ("second", &second)] {
+        assert!(
+            matches!(run.status, Ok(VmStatus::Halted)),
+            "raw call witness isolation: the {name} VM must halt, got {:?}",
+            run.status
+        );
+        assert!(
+            run.fuel_consumed > 0 && run.fuel_consumed < FUEL_BUDGET,
+            "raw call witness isolation: the {name} VM must use real fuel, saw {}",
+            run.fuel_consumed
+        );
+    }
+
+    let first_labels: Vec<String> = first
+        .witness
+        .pictures
+        .iter()
+        .map(|(label, _)| label.clone())
+        .collect();
+    assert_eq!(
+        first_labels,
+        vec![
+            "first-before",
+            "first-after",
+            "second-after",
+            "capture-before",
+            "capture-after",
+            "unissued-before",
+            "unissued-after",
+            "missing-before",
+            "missing-after",
+            "true-before",
+            "true-after",
+            "gap-before",
+            "gap-after",
+            "done",
+        ],
+        "raw call witness isolation: the first VM must observe its own complete arm sequence"
+    );
+    let second_labels: Vec<String> = second
+        .witness
+        .pictures
+        .iter()
+        .map(|(label, _)| label.clone())
+        .collect();
+    assert_eq!(
+        second_labels,
+        vec!["ready"],
+        "raw call witness isolation: the second VM must observe only its own arm"
+    );
+
+    let first_record = first.witness.record("owner");
+    let second_record = second.witness.record("owner");
+    assert_ne!(
+        first_record.owner.domain(),
+        second_record.owner.domain(),
+        "raw call witness isolation: the two VMs own distinct heap domains"
+    );
+    assert_eq!(
+        first_record.metatable.domain(),
+        first_record.owner.domain(),
+        "raw call witness isolation: the first owner and its metatable share one heap"
+    );
+    assert_eq!(
+        second_record.metatable.domain(),
+        second_record.owner.domain(),
+        "raw call witness isolation: the second owner and its metatable share one heap"
+    );
+    let first_metatable = heap_with(&mut first.vm, |heap| heap.metatable(first_record.owner))
+        .expect("raw call witness isolation: first VM metatable");
+    let second_metatable = heap_with(&mut second.vm, |heap| heap.metatable(second_record.owner))
+        .expect("raw call witness isolation: second VM metatable");
+    assert_eq!(first_metatable, first_record.metatable);
+    assert_eq!(second_metatable, second_record.metatable);
+    assert_eq!(
+        heap_with(&mut first.vm, |heap| heap.metatable(first_record.owner)),
+        Some(first_record.metatable),
+        "raw call witness isolation: the first record must come from the first live heap"
+    );
+    assert_eq!(
+        heap_with(&mut second.vm, |heap| heap.metatable(second_record.owner)),
+        Some(second_record.metatable),
+        "raw call witness isolation: the second record must come from the second live heap"
+    );
+    assert!(
+        same_array(
+            &heap_with(&mut first.vm, |heap| heap.issued_value(first_metatable)),
+            &first_record.metatable_value,
+        ),
+        "raw call witness isolation: the first metatable carrier belongs to the first heap"
+    );
+    assert!(
+        same_array(
+            &heap_with(&mut second.vm, |heap| heap.issued_value(second_metatable)),
+            &second_record.metatable_value,
+        ),
+        "raw call witness isolation: the second metatable carrier belongs to the second heap"
+    );
+
+    let first_items = exit_items(&first.stack);
+    let second_items = exit_items(&second.stack);
+    let first_owner_class = heap_with(&mut first.vm, |heap| Ok(heap.guest_class(&first_items[1])));
+    let second_owner_class =
+        heap_with(
+            &mut second.vm,
+            |heap| Ok(heap.guest_class(&second_items[1])),
+        );
+    assert_eq!(
+        first_owner_class,
+        GuestClass::Table(first_record.owner),
+        "raw call witness isolation: the first guest returned the first witness owner"
+    );
+    assert_eq!(
+        second_owner_class,
+        GuestClass::Table(second_record.owner),
+        "raw call witness isolation: the second guest returned the second witness owner"
+    );
+
+    let first_edge = heap_try(&mut first.vm, |heap| {
+        heap.named_closure_edge(first_metatable, RAW_CALL_FIELD)
+    })
+    .expect("raw call witness isolation: first raw edge");
+    let second_edge = heap_try(&mut second.vm, |heap| {
+        heap.named_closure_edge(second_metatable, RAW_CALL_FIELD)
+    })
+    .expect("raw call witness isolation: second raw edge");
+    assert_eq!(first_edge.domain(), first_record.owner.domain());
+    assert_eq!(second_edge.domain(), second_record.owner.domain());
+    assert_ne!(
+        first_edge.domain(),
+        second_edge.domain(),
+        "raw call witness isolation: the two raw edges live in distinct heap domains"
+    );
+
+    let first_done = first.witness.picture("done");
+    let first_row = first_done
+        .rows
+        .iter()
+        .find(|row| row.label == "owner")
+        .expect("raw call witness isolation: first done owner row");
+    assert_eq!(
+        first_row.raw_call,
+        closure_tag(first_edge),
+        "raw call witness isolation: the first witness must name only its own raw closure"
+    );
+    let second_ready = second.witness.picture("ready");
+    let second_row = second_ready
+        .rows
+        .iter()
+        .find(|row| row.label == "owner")
+        .expect("raw call witness isolation: second ready owner row");
+    assert_eq!(
+        second_row.raw_call,
+        closure_tag(second_edge),
+        "raw call witness isolation: the second witness must name only its own raw closure"
+    );
+    let first_domain_tag = format!("closure({},", first_record.owner.domain());
+    let second_domain_tag = format!("closure({},", second_record.owner.domain());
+    assert!(
+        first_row.raw_call.contains(&first_domain_tag),
+        "raw call witness isolation: the first raw row names the first domain"
+    );
+    assert!(
+        second_row.raw_call.contains(&second_domain_tag),
+        "raw call witness isolation: the second raw row names the second domain"
+    );
+    assert!(
+        !first_row.raw_call.contains(&second_domain_tag),
+        "raw call witness isolation: the first raw row must not name the second domain"
+    );
+    assert!(
+        !second_row.raw_call.contains(&first_domain_tag),
+        "raw call witness isolation: the second raw row must not name the first domain"
+    );
+    assert_eq!(
+        first_done
+            .rows
+            .iter()
+            .map(|row| row.label.as_str())
+            .collect::<Vec<_>>(),
+        vec!["owner", "missing", "true", "gap"],
+        "raw call witness isolation: the first witness keeps its own four owner rows"
+    );
+    assert_eq!(
+        second_ready
+            .rows
+            .iter()
+            .map(|row| row.label.as_str())
+            .collect::<Vec<_>>(),
+        vec!["owner"],
+        "raw call witness isolation: the second witness keeps its own one owner row"
+    );
+
+    let first_first = callable_item(&first_items[2]);
+    let first_second = callable_item(&first_items[3]);
+    let second_first = callable_item(&second_items[2]);
+    let second_second = callable_item(&second_items[3]);
+    assert!(
+        !Arc::ptr_eq(&first_first, &second_first),
+        "raw call witness isolation: the two VMs' first Arcs must not cross"
+    );
+    assert!(
+        !Arc::ptr_eq(&first_first, &second_second),
+        "raw call witness isolation: the first VM's first Arc is not the second VM's second"
+    );
+    assert!(
+        !Arc::ptr_eq(&first_second, &second_first),
+        "raw call witness isolation: the first VM's second Arc is not the second VM's first"
+    );
+    assert!(
+        !Arc::ptr_eq(&first_second, &second_second),
+        "raw call witness isolation: the two VMs' second Arcs must not cross"
+    );
+    assert!(
+        first_done.admissions == 2 && second_ready.admissions == 1,
+        "raw call witness isolation: each witness counts only its own admissions, saw {} and {}",
+        first_done.admissions,
+        second_ready.admissions
+    );
+    eprintln!(
+        "LUA_RAW_CALL_WITNESS_ISOLATION first_domain={} second_domain={} first_edge={} second_edge={} first_labels={} second_labels={}",
+        first_record.owner.domain(),
+        second_record.owner.domain(),
+        closure_tag(first_edge),
+        closure_tag(second_edge),
+        first_labels.len(),
+        second_labels.len()
     );
 }
