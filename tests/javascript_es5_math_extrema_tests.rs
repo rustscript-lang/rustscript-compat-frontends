@@ -152,7 +152,7 @@ fn number(source: &str) -> f64 {
 /// Ordinary-call discriminators for `Math.min` / `Math.max`. The exact script
 /// body is also fed to the pinned MicroQuickJS `mqjs` binary, so both engines
 /// compare the same completion value. `n` is zero only when every probe passes;
-/// each bit isolates one behavior: function length, last-argument dominance at
+/// each of the twelve bits isolates one behavior: function length, last-argument dominance at
 /// three and four arguments, extracted and foreign-object borrowed calls,
 /// first-argument NaN continuing to the second conversion, and a second
 /// argument throwing a sentinel before the already-evaluated last argument is
