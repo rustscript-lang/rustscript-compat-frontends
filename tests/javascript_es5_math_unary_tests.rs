@@ -55,6 +55,7 @@ fn prepare(source: &str) -> vm::Vm {
     let started = std::time::Instant::now();
     eprintln!("MATH_UNARY_SOURCE bytes={}", source.len());
     let catalog = pd_vm_compat_frontends::runtime::cli::reference_array_cli_effective_catalog();
+    eprintln!("MATH_UNARY_CATALOG ms={}", started.elapsed().as_millis());
     let options = vm::CompileSourceFileOptions::new()
         .with_host_api_catalog(catalog.clone())
         .with_source_plugin(&JAVASCRIPT_ES5_PLUGIN);
@@ -223,663 +224,309 @@ fn expect_bits(method: &str, source: &str, expected: f64) {
     assert_eq!(bits, expected.to_bits(), "{source}");
 }
 
-const ABS_CASE: &str = r#"(function () {
-  var n = 0;
-  var z = 1 / (-1 / 0);
-  if (!(1 / z === -1 / 0)) n = 1;
-  if (n === 0) {
-    if (!(Math.abs.length === 1)) n = 2;
-  }
-  if (n === 0) {
-    if (!(1 / Math.abs(z) === 1 / 0)) n = 3;
-  }
-  if (n === 0) {
-    if (!(Math.abs(-5e-324) === 5e-324)) n = 4;
-  }
-  var fnum = Math.abs;
-  if (n === 0) {
-    if (!(1 / fnum(z) === 1 / 0 && fnum(-5e-324) === 5e-324)) n = 5;
-  }
-  var onum = {};
-  onum.m = Math.abs;
-  if (n === 0) {
-    if (!(1 / onum.m(z) === 1 / 0 && onum.m(-5e-324) === 5e-324)) n = 6;
-  }
-  var seq = 0;
-  var tail = {
-    hits: 0,
-    valueOf: function () { "use strict"; this.hits = this.hits + 1; throw 11; },
-    toString: function () { "use strict"; this.hits = this.hits + 1; throw 12; }
-  };
-  var direct = Math.abs((seq = seq * 10 + 1, -4), (seq = seq * 10 + 2, tail));
-  if (n === 0) {
-    if (!(seq === 12 && tail.hits === 0 && direct === 4)) n = 30;
-  }
-  var seqLeft = 0;
-  var left = {
-    mark: {},
-    boom: function () { "use strict"; throw this.mark; }
-  };
-  var leftHit = 0;
-  try {
-    Math.abs((seqLeft = seqLeft * 10 + 1, left.boom()), (seqLeft = seqLeft * 10 + 2, 1));
-  } catch (e1) {
-    if (e1 === left.mark) leftHit = 1;
-  }
-  if (n === 0) {
-    if (!(leftHit === 1 && seqLeft === 1)) n = 31;
-  }
-  var f = Math.abs;
-  var fseq = 0;
-  var ftail = {
-    hits: 0,
-    valueOf: function () { "use strict"; this.hits = this.hits + 1; throw 13; },
-    toString: function () { "use strict"; this.hits = this.hits + 1; throw 14; }
-  };
-  var extracted = f((fseq = fseq * 10 + 1, -4), (fseq = fseq * 10 + 2, ftail));
-  if (n === 0) {
-    if (!(fseq === 12 && ftail.hits === 0 && extracted === 4)) n = 32;
-  }
-  var o = {};
-  o.m = Math.abs;
-  var oseq = 0;
-  var otail = {
-    hits: 0,
-    valueOf: function () { "use strict"; this.hits = this.hits + 1; throw 15; },
-    toString: function () { "use strict"; this.hits = this.hits + 1; throw 16; }
-  };
-  var borrowed = o.m((oseq = oseq * 10 + 1, -4), (oseq = oseq * 10 + 2, otail));
-  if (n === 0) {
-    if (!(oseq === 12 && otail.hits === 0 && borrowed === 4)) n = 33;
-  }
-  var live = 0;
-  try { tail.valueOf(); } catch (e2) { if (e2 === 11) live = live + 1; }
-  try { tail.toString(); } catch (e3) { if (e3 === 12) live = live + 1; }
-  if (n === 0) {
-    if (!(tail.hits === 2 && live === 2)) n = 34;
-  }
-  var boxed = {
-    vo: 0,
-    ts: 0,
-    valueOf: function () { "use strict"; this.vo = this.vo + 1; return {}; },
-    toString: function () { "use strict"; this.ts = this.ts + 1; return '-8'; }
-  };
-  if (n === 0) {
-    if (!(Math.abs(boxed) === 8 && boxed.vo === 1 && boxed.ts === 1)) n = 35;
-  }
-  var prim = {
-    vo: 0,
-    ts: 0,
-    valueOf: function () { "use strict"; this.vo = this.vo + 1; return -6; },
-    toString: function () { "use strict"; this.ts = this.ts + 1; return '1'; }
-  };
-  if (n === 0) {
-    if (!(Math.abs(prim) === 6 && prim.vo === 1 && prim.ts === 0)) n = 36;
-  }
-  var getter = {
-    mark: {},
-    hits: 0,
-    get valueOf() { "use strict"; throw this.mark; },
-    toString: function () { "use strict"; this.hits = this.hits + 1; return '1'; }
-  };
-  var caughtG = 0;
-  try { Math.abs(getter); } catch (e4) { if (e4 === getter.mark) caughtG = 1; }
-  if (n === 0) {
-    if (!(caughtG === 1 && getter.hits === 0)) n = 37;
-  }
-  var methodObj = {
-    mark: {},
-    hits: 0,
-    valueOf: function () { "use strict"; throw this.mark; },
-    toString: function () { "use strict"; this.hits = this.hits + 1; return '1'; }
-  };
-  var caughtM = 0;
-  try { Math.abs(methodObj); } catch (e5) { if (e5 === methodObj.mark) caughtM = 1; }
-  if (n === 0) {
-    if (!(caughtM === 1 && methodObj.hits === 0)) n = 38;
-  }
-  var both = {
-    hits: 0,
-    valueOf: function () { "use strict"; this.hits = this.hits + 1; return {}; },
-    toString: function () { "use strict"; this.hits = this.hits + 1; return {}; }
-  };
-  var typeHits = 0;
-  try { Math.abs(both); } catch (e6) { if (e6 && e6.name === 'TypeError') typeHits = 1; }
-  if (n === 0) {
-    if (!(typeHits === 1 && both.hits === 2)) n = 39;
-  }
-  if (n !== 0) return n;
-  return Math.abs(-5e-324);
-})();
+const ABS_CASE: &str = r#"var n = 0;
+var z = 1 / (-1 / 0);
+var seq = 0;
+var markG = {};
+var markM = {};
+var markL = {};
+var tail = { mark: 11 };
+var p = { ts: 0 };
+var b = { hits: 0 };
+var g = { mark: markG };
+var m = { mark: markM };
+var both = { hits: 0 };
+var L = { mark: markL };
+function retObj() { "use strict"; this.hits = this.hits + 1; return {}; }
+function retStr() { "use strict"; return '-8'; }
+function throwThis() { "use strict"; throw this.mark; }
+p.valueOf = retStr;
+p.toString = throwThis;
+b.valueOf = retObj;
+b.toString = retStr;
+m.valueOf = throwThis;
+both.valueOf = retObj;
+both.toString = retObj;
+tail.valueOf = throwThis;
+tail.toString = throwThis;
+L.boom = throwThis;
+Object.defineProperty(g, 'valueOf', { get: throwThis });
+var A = Math.abs;
+var D = Math.abs((seq = seq * 10 + 1, -5e-324), (seq = seq * 10 + 2, tail));
+if (!(A.length === 1)) n = 1;
+if (n === 0 && !(D === 5e-324 && seq === 12)) n = 2;
+if (n === 0 && !(1 / A(z) === 1 / 0)) n = 3;
+if (n === 0 && !(A(-1 / 0) === 1 / 0 && A(1 / 0) === 1 / 0)) n = 4;
+if (n === 0 && !(1 / A(0) === 1 / 0)) n = 5;
+if (n === 0 && !(A(-4) === 4)) n = 6;
+if (n === 0 && !(A() !== A())) n = 7;
+if (n === 0 && !(A(0 / 0) !== A(0 / 0))) n = 8;
+var o = {};
+o.m = A;
+if (n === 0 && !(o.m(-4) === 4 && 1 / o.m(z) === 1 / 0)) n = 9;
+var ex = A((seq = seq * 10 + 3, -4), (seq = seq * 10 + 4, tail));
+var bo = o.m((seq = seq * 10 + 5, -4), (seq = seq * 10 + 6, tail));
+if (n === 0 && !(ex === 4 && bo === 4 && seq === 123456)) n = 10;
+if (n === 0 && !(A(p) === 8)) n = 20;
+if (n === 0 && !(A(b) === 8 && b.hits === 1)) n = 21;
+var cg = 0;
+try { A(g); } catch (e1) { if (e1 === markG) cg = 1; }
+if (n === 0 && !(cg === 1)) n = 22;
+var cm = 0;
+try { A(m); } catch (e2) { if (e2 === markM) cm = 1; }
+if (n === 0 && !(cm === 1)) n = 23;
+var ct = 0;
+try { A(both); } catch (e3) { if (e3 && e3.name === 'TypeError') ct = 1; }
+if (n === 0 && !(ct === 1 && both.hits === 2)) n = 24;
+var sl = 0;
+var lh = 0;
+try { A((sl = sl * 10 + 1, L.boom()), (sl = sl * 10 + 2, 1)); } catch (e4) { if (e4 === markL) lh = 1; }
+if (n === 0 && !(lh === 1 && sl === 1)) n = 25;
+n === 0 ? A(-5e-324) : n;
 "#;
 
-const FLOOR_CASE: &str = r#"(function () {
-  var n = 0;
-  var z = 1 / (-1 / 0);
-  if (!(1 / z === -1 / 0)) n = 1;
-  if (n === 0) {
-    if (!(Math.floor.length === 1)) n = 2;
-  }
-  if (n === 0) {
-    if (!(Math.floor(-1.2) === -2 && 1 / Math.floor(z) === -1 / 0)) n = 3;
-  }
-  var fnum = Math.floor;
-  if (n === 0) {
-    if (!(fnum(-1.2) === -2 && 1 / fnum(z) === -1 / 0)) n = 4;
-  }
-  var onum = {};
-  onum.m = Math.floor;
-  if (n === 0) {
-    if (!(onum.m(-1.2) === -2 && 1 / onum.m(z) === -1 / 0)) n = 5;
-  }
-  var seq = 0;
-  var tail = {
-    hits: 0,
-    valueOf: function () { "use strict"; this.hits = this.hits + 1; throw 11; },
-    toString: function () { "use strict"; this.hits = this.hits + 1; throw 12; }
-  };
-  var direct = Math.floor((seq = seq * 10 + 1, -1.2), (seq = seq * 10 + 2, tail));
-  if (n === 0) {
-    if (!(seq === 12 && tail.hits === 0 && direct === -2)) n = 30;
-  }
-  var seqLeft = 0;
-  var left = {
-    mark: {},
-    boom: function () { "use strict"; throw this.mark; }
-  };
-  var leftHit = 0;
-  try {
-    Math.floor((seqLeft = seqLeft * 10 + 1, left.boom()), (seqLeft = seqLeft * 10 + 2, 1));
-  } catch (e1) {
-    if (e1 === left.mark) leftHit = 1;
-  }
-  if (n === 0) {
-    if (!(leftHit === 1 && seqLeft === 1)) n = 31;
-  }
-  var f = Math.floor;
-  var fseq = 0;
-  var ftail = {
-    hits: 0,
-    valueOf: function () { "use strict"; this.hits = this.hits + 1; throw 13; },
-    toString: function () { "use strict"; this.hits = this.hits + 1; throw 14; }
-  };
-  var extracted = f((fseq = fseq * 10 + 1, -1.2), (fseq = fseq * 10 + 2, ftail));
-  if (n === 0) {
-    if (!(fseq === 12 && ftail.hits === 0 && extracted === -2)) n = 32;
-  }
-  var o = {};
-  o.m = Math.floor;
-  var oseq = 0;
-  var otail = {
-    hits: 0,
-    valueOf: function () { "use strict"; this.hits = this.hits + 1; throw 15; },
-    toString: function () { "use strict"; this.hits = this.hits + 1; throw 16; }
-  };
-  var borrowed = o.m((oseq = oseq * 10 + 1, -1.2), (oseq = oseq * 10 + 2, otail));
-  if (n === 0) {
-    if (!(oseq === 12 && otail.hits === 0 && borrowed === -2)) n = 33;
-  }
-  var live = 0;
-  try { tail.valueOf(); } catch (e2) { if (e2 === 11) live = live + 1; }
-  try { tail.toString(); } catch (e3) { if (e3 === 12) live = live + 1; }
-  if (n === 0) {
-    if (!(tail.hits === 2 && live === 2)) n = 34;
-  }
-  var boxed = {
-    vo: 0,
-    ts: 0,
-    valueOf: function () { "use strict"; this.vo = this.vo + 1; return {}; },
-    toString: function () { "use strict"; this.ts = this.ts + 1; return '-1.2'; }
-  };
-  if (n === 0) {
-    if (!(Math.floor(boxed) === -2 && boxed.vo === 1 && boxed.ts === 1)) n = 35;
-  }
-  var prim = {
-    vo: 0,
-    ts: 0,
-    valueOf: function () { "use strict"; this.vo = this.vo + 1; return -1.2; },
-    toString: function () { "use strict"; this.ts = this.ts + 1; return '1'; }
-  };
-  if (n === 0) {
-    if (!(Math.floor(prim) === -2 && prim.vo === 1 && prim.ts === 0)) n = 36;
-  }
-  var getter = {
-    mark: {},
-    hits: 0,
-    get valueOf() { "use strict"; throw this.mark; },
-    toString: function () { "use strict"; this.hits = this.hits + 1; return '1'; }
-  };
-  var caughtG = 0;
-  try { Math.floor(getter); } catch (e4) { if (e4 === getter.mark) caughtG = 1; }
-  if (n === 0) {
-    if (!(caughtG === 1 && getter.hits === 0)) n = 37;
-  }
-  var methodObj = {
-    mark: {},
-    hits: 0,
-    valueOf: function () { "use strict"; throw this.mark; },
-    toString: function () { "use strict"; this.hits = this.hits + 1; return '1'; }
-  };
-  var caughtM = 0;
-  try { Math.floor(methodObj); } catch (e5) { if (e5 === methodObj.mark) caughtM = 1; }
-  if (n === 0) {
-    if (!(caughtM === 1 && methodObj.hits === 0)) n = 38;
-  }
-  var both = {
-    hits: 0,
-    valueOf: function () { "use strict"; this.hits = this.hits + 1; return {}; },
-    toString: function () { "use strict"; this.hits = this.hits + 1; return {}; }
-  };
-  var typeHits = 0;
-  try { Math.floor(both); } catch (e6) { if (e6 && e6.name === 'TypeError') typeHits = 1; }
-  if (n === 0) {
-    if (!(typeHits === 1 && both.hits === 2)) n = 39;
-  }
-  if (n !== 0) return n;
-  return Math.floor(z);
-})();
+const FLOOR_CASE: &str = r#"var n = 0;
+var z = 1 / (-1 / 0);
+var seq = 0;
+var markG = {};
+var markM = {};
+var markL = {};
+var tail = { mark: 11 };
+var p = { ts: 0 };
+var b = { hits: 0 };
+var g = { mark: markG };
+var m = { mark: markM };
+var both = { hits: 0 };
+var L = { mark: markL };
+function retObj() { "use strict"; this.hits = this.hits + 1; return {}; }
+function retStr() { "use strict"; return '-1.2'; }
+function throwThis() { "use strict"; throw this.mark; }
+p.valueOf = retStr;
+p.toString = throwThis;
+b.valueOf = retObj;
+b.toString = retStr;
+m.valueOf = throwThis;
+both.valueOf = retObj;
+both.toString = retObj;
+tail.valueOf = throwThis;
+tail.toString = throwThis;
+L.boom = throwThis;
+Object.defineProperty(g, 'valueOf', { get: throwThis });
+var F = Math.floor;
+var D = Math.floor((seq = seq * 10 + 1, -1.2), (seq = seq * 10 + 2, tail));
+if (!(F.length === 1)) n = 1;
+if (n === 0 && !(D === -2 && seq === 12)) n = 2;
+if (n === 0 && !(1 / F(z) === -1 / 0)) n = 3;
+if (n === 0 && !(F(-1.2) === -2 && F(1.2) === 1)) n = 4;
+if (n === 0 && !(1 / F(0) === 1 / 0)) n = 5;
+if (n === 0 && !(F(-1 / 0) === -1 / 0 && F(1 / 0) === 1 / 0)) n = 6;
+if (n === 0 && !(F(0 / 0) !== F(0 / 0))) n = 7;
+if (n === 0 && !(F(-0.5) === -1)) n = 8;
+var o = {};
+o.m = F;
+if (n === 0 && !(o.m(-1.2) === -2 && 1 / o.m(z) === -1 / 0)) n = 9;
+var ex = F((seq = seq * 10 + 3, -1.2), (seq = seq * 10 + 4, tail));
+var bo = o.m((seq = seq * 10 + 5, -1.2), (seq = seq * 10 + 6, tail));
+if (n === 0 && !(ex === -2 && bo === -2 && seq === 123456)) n = 10;
+if (n === 0 && !(F(p) === -2)) n = 20;
+if (n === 0 && !(F(b) === -2 && b.hits === 1)) n = 21;
+var cg = 0;
+try { F(g); } catch (e1) { if (e1 === markG) cg = 1; }
+if (n === 0 && !(cg === 1)) n = 22;
+var cm = 0;
+try { F(m); } catch (e2) { if (e2 === markM) cm = 1; }
+if (n === 0 && !(cm === 1)) n = 23;
+var ct = 0;
+try { F(both); } catch (e3) { if (e3 && e3.name === 'TypeError') ct = 1; }
+if (n === 0 && !(ct === 1 && both.hits === 2)) n = 24;
+var sl = 0;
+var lh = 0;
+try { F((sl = sl * 10 + 1, L.boom()), (sl = sl * 10 + 2, 1)); } catch (e4) { if (e4 === markL) lh = 1; }
+if (n === 0 && !(lh === 1 && sl === 1)) n = 25;
+n === 0 ? F(z) : n;
 "#;
 
-const CEIL_CASE: &str = r#"(function () {
-  var n = 0;
-  var z = 1 / (-1 / 0);
-  if (!(1 / z === -1 / 0)) n = 1;
-  if (n === 0) {
-    if (!(Math.ceil.length === 1)) n = 2;
-  }
-  if (n === 0) {
-    if (!(Math.ceil(-1.2) === -1 && 1 / Math.ceil(-0.5) === -1 / 0)) n = 3;
-  }
-  var fnum = Math.ceil;
-  if (n === 0) {
-    if (!(fnum(-1.2) === -1 && 1 / fnum(-0.5) === -1 / 0)) n = 4;
-  }
-  var onum = {};
-  onum.m = Math.ceil;
-  if (n === 0) {
-    if (!(onum.m(-1.2) === -1 && 1 / onum.m(-0.5) === -1 / 0)) n = 5;
-  }
-  var seq = 0;
-  var tail = {
-    hits: 0,
-    valueOf: function () { "use strict"; this.hits = this.hits + 1; throw 11; },
-    toString: function () { "use strict"; this.hits = this.hits + 1; throw 12; }
-  };
-  var direct = Math.ceil((seq = seq * 10 + 1, -1.2), (seq = seq * 10 + 2, tail));
-  if (n === 0) {
-    if (!(seq === 12 && tail.hits === 0 && direct === -1)) n = 30;
-  }
-  var seqLeft = 0;
-  var left = {
-    mark: {},
-    boom: function () { "use strict"; throw this.mark; }
-  };
-  var leftHit = 0;
-  try {
-    Math.ceil((seqLeft = seqLeft * 10 + 1, left.boom()), (seqLeft = seqLeft * 10 + 2, 1));
-  } catch (e1) {
-    if (e1 === left.mark) leftHit = 1;
-  }
-  if (n === 0) {
-    if (!(leftHit === 1 && seqLeft === 1)) n = 31;
-  }
-  var f = Math.ceil;
-  var fseq = 0;
-  var ftail = {
-    hits: 0,
-    valueOf: function () { "use strict"; this.hits = this.hits + 1; throw 13; },
-    toString: function () { "use strict"; this.hits = this.hits + 1; throw 14; }
-  };
-  var extracted = f((fseq = fseq * 10 + 1, -1.2), (fseq = fseq * 10 + 2, ftail));
-  if (n === 0) {
-    if (!(fseq === 12 && ftail.hits === 0 && extracted === -1)) n = 32;
-  }
-  var o = {};
-  o.m = Math.ceil;
-  var oseq = 0;
-  var otail = {
-    hits: 0,
-    valueOf: function () { "use strict"; this.hits = this.hits + 1; throw 15; },
-    toString: function () { "use strict"; this.hits = this.hits + 1; throw 16; }
-  };
-  var borrowed = o.m((oseq = oseq * 10 + 1, -1.2), (oseq = oseq * 10 + 2, otail));
-  if (n === 0) {
-    if (!(oseq === 12 && otail.hits === 0 && borrowed === -1)) n = 33;
-  }
-  var live = 0;
-  try { tail.valueOf(); } catch (e2) { if (e2 === 11) live = live + 1; }
-  try { tail.toString(); } catch (e3) { if (e3 === 12) live = live + 1; }
-  if (n === 0) {
-    if (!(tail.hits === 2 && live === 2)) n = 34;
-  }
-  var boxed = {
-    vo: 0,
-    ts: 0,
-    valueOf: function () { "use strict"; this.vo = this.vo + 1; return {}; },
-    toString: function () { "use strict"; this.ts = this.ts + 1; return '-1.2'; }
-  };
-  if (n === 0) {
-    if (!(Math.ceil(boxed) === -1 && boxed.vo === 1 && boxed.ts === 1)) n = 35;
-  }
-  var prim = {
-    vo: 0,
-    ts: 0,
-    valueOf: function () { "use strict"; this.vo = this.vo + 1; return -1.2; },
-    toString: function () { "use strict"; this.ts = this.ts + 1; return '1'; }
-  };
-  if (n === 0) {
-    if (!(Math.ceil(prim) === -1 && prim.vo === 1 && prim.ts === 0)) n = 36;
-  }
-  var getter = {
-    mark: {},
-    hits: 0,
-    get valueOf() { "use strict"; throw this.mark; },
-    toString: function () { "use strict"; this.hits = this.hits + 1; return '1'; }
-  };
-  var caughtG = 0;
-  try { Math.ceil(getter); } catch (e4) { if (e4 === getter.mark) caughtG = 1; }
-  if (n === 0) {
-    if (!(caughtG === 1 && getter.hits === 0)) n = 37;
-  }
-  var methodObj = {
-    mark: {},
-    hits: 0,
-    valueOf: function () { "use strict"; throw this.mark; },
-    toString: function () { "use strict"; this.hits = this.hits + 1; return '1'; }
-  };
-  var caughtM = 0;
-  try { Math.ceil(methodObj); } catch (e5) { if (e5 === methodObj.mark) caughtM = 1; }
-  if (n === 0) {
-    if (!(caughtM === 1 && methodObj.hits === 0)) n = 38;
-  }
-  var both = {
-    hits: 0,
-    valueOf: function () { "use strict"; this.hits = this.hits + 1; return {}; },
-    toString: function () { "use strict"; this.hits = this.hits + 1; return {}; }
-  };
-  var typeHits = 0;
-  try { Math.ceil(both); } catch (e6) { if (e6 && e6.name === 'TypeError') typeHits = 1; }
-  if (n === 0) {
-    if (!(typeHits === 1 && both.hits === 2)) n = 39;
-  }
-  if (n !== 0) return n;
-  return Math.ceil(-0.5);
-})();
+const CEIL_CASE: &str = r#"var n = 0;
+var z = 1 / (-1 / 0);
+var seq = 0;
+var markG = {};
+var markM = {};
+var markL = {};
+var tail = { mark: 11 };
+var p = { ts: 0 };
+var b = { hits: 0 };
+var g = { mark: markG };
+var m = { mark: markM };
+var both = { hits: 0 };
+var L = { mark: markL };
+function retObj() { "use strict"; this.hits = this.hits + 1; return {}; }
+function retStr() { "use strict"; return '-1.2'; }
+function throwThis() { "use strict"; throw this.mark; }
+p.valueOf = retStr;
+p.toString = throwThis;
+b.valueOf = retObj;
+b.toString = retStr;
+m.valueOf = throwThis;
+both.valueOf = retObj;
+both.toString = retObj;
+tail.valueOf = throwThis;
+tail.toString = throwThis;
+L.boom = throwThis;
+Object.defineProperty(g, 'valueOf', { get: throwThis });
+var F = Math.ceil;
+var D = Math.ceil((seq = seq * 10 + 1, -1.2), (seq = seq * 10 + 2, tail));
+if (!(F.length === 1)) n = 1;
+if (n === 0 && !(D === -1 && seq === 12)) n = 2;
+if (n === 0 && !(F(-1.2) === -1 && F(1.2) === 2)) n = 3;
+if (n === 0 && !(1 / F(-0.5) === -1 / 0)) n = 4;
+if (n === 0 && !(1 / F(z) === -1 / 0)) n = 5;
+if (n === 0 && !(1 / F(0) === 1 / 0)) n = 6;
+if (n === 0 && !(F(-1 / 0) === -1 / 0 && F(1 / 0) === 1 / 0)) n = 7;
+if (n === 0 && !(F(0 / 0) !== F(0 / 0))) n = 8;
+var o = {};
+o.m = F;
+if (n === 0 && !(o.m(-1.2) === -1 && 1 / o.m(-0.5) === -1 / 0)) n = 9;
+var ex = F((seq = seq * 10 + 3, -1.2), (seq = seq * 10 + 4, tail));
+var bo = o.m((seq = seq * 10 + 5, -1.2), (seq = seq * 10 + 6, tail));
+if (n === 0 && !(ex === -1 && bo === -1 && seq === 123456)) n = 10;
+if (n === 0 && !(F(p) === -1)) n = 20;
+if (n === 0 && !(F(b) === -1 && b.hits === 1)) n = 21;
+var cg = 0;
+try { F(g); } catch (e1) { if (e1 === markG) cg = 1; }
+if (n === 0 && !(cg === 1)) n = 22;
+var cm = 0;
+try { F(m); } catch (e2) { if (e2 === markM) cm = 1; }
+if (n === 0 && !(cm === 1)) n = 23;
+var ct = 0;
+try { F(both); } catch (e3) { if (e3 && e3.name === 'TypeError') ct = 1; }
+if (n === 0 && !(ct === 1 && both.hits === 2)) n = 24;
+var sl = 0;
+var lh = 0;
+try { F((sl = sl * 10 + 1, L.boom()), (sl = sl * 10 + 2, 1)); } catch (e4) { if (e4 === markL) lh = 1; }
+if (n === 0 && !(lh === 1 && sl === 1)) n = 25;
+n === 0 ? F(-0.5) : n;
 "#;
 
-const ROUND_CASE: &str = r#"(function () {
-  var n = 0;
-  var z = 1 / (-1 / 0);
-  if (!(1 / z === -1 / 0)) n = 1;
-  if (n === 0) {
-    if (!(Math.round.length === 1)) n = 2;
-  }
-  if (n === 0) {
-    if (!(1 / Math.round(-0.5) === -1 / 0)) n = 3;
-  }
-  if (n === 0) {
-    if (!(Math.round(-1.5) === -1)) n = 4;
-  }
-  if (n === 0) {
-    if (!(Math.round(-0.5000000000000001) === -1)) n = 5;
-  }
-  if (n === 0) {
-    if (!(1 / Math.round(0.49999999999999994) === 1 / 0)) n = 6;
-  }
-  if (n === 0) {
-    if (!(Math.round(4503599627370497) === 4503599627370497)) n = 7;
-  }
-  var fnum = Math.round;
-  if (n === 0) {
-    if (!(1 / fnum(-0.5) === -1 / 0 && fnum(-1.5) === -1 && fnum(4503599627370497) === 4503599627370497)) n = 8;
-  }
-  var onum = {};
-  onum.m = Math.round;
-  if (n === 0) {
-    if (!(1 / onum.m(-0.5) === -1 / 0 && onum.m(-1.5) === -1 && onum.m(4503599627370497) === 4503599627370497)) n = 9;
-  }
-  var seq = 0;
-  var tail = {
-    hits: 0,
-    valueOf: function () { "use strict"; this.hits = this.hits + 1; throw 11; },
-    toString: function () { "use strict"; this.hits = this.hits + 1; throw 12; }
-  };
-  var direct = Math.round((seq = seq * 10 + 1, -1.5), (seq = seq * 10 + 2, tail));
-  if (n === 0) {
-    if (!(seq === 12 && tail.hits === 0 && direct === -1)) n = 30;
-  }
-  var seqLeft = 0;
-  var left = {
-    mark: {},
-    boom: function () { "use strict"; throw this.mark; }
-  };
-  var leftHit = 0;
-  try {
-    Math.round((seqLeft = seqLeft * 10 + 1, left.boom()), (seqLeft = seqLeft * 10 + 2, 1));
-  } catch (e1) {
-    if (e1 === left.mark) leftHit = 1;
-  }
-  if (n === 0) {
-    if (!(leftHit === 1 && seqLeft === 1)) n = 31;
-  }
-  var f = Math.round;
-  var fseq = 0;
-  var ftail = {
-    hits: 0,
-    valueOf: function () { "use strict"; this.hits = this.hits + 1; throw 13; },
-    toString: function () { "use strict"; this.hits = this.hits + 1; throw 14; }
-  };
-  var extracted = f((fseq = fseq * 10 + 1, -1.5), (fseq = fseq * 10 + 2, ftail));
-  if (n === 0) {
-    if (!(fseq === 12 && ftail.hits === 0 && extracted === -1)) n = 32;
-  }
-  var o = {};
-  o.m = Math.round;
-  var oseq = 0;
-  var otail = {
-    hits: 0,
-    valueOf: function () { "use strict"; this.hits = this.hits + 1; throw 15; },
-    toString: function () { "use strict"; this.hits = this.hits + 1; throw 16; }
-  };
-  var borrowed = o.m((oseq = oseq * 10 + 1, -1.5), (oseq = oseq * 10 + 2, otail));
-  if (n === 0) {
-    if (!(oseq === 12 && otail.hits === 0 && borrowed === -1)) n = 33;
-  }
-  var live = 0;
-  try { tail.valueOf(); } catch (e2) { if (e2 === 11) live = live + 1; }
-  try { tail.toString(); } catch (e3) { if (e3 === 12) live = live + 1; }
-  if (n === 0) {
-    if (!(tail.hits === 2 && live === 2)) n = 34;
-  }
-  var boxed = {
-    vo: 0,
-    ts: 0,
-    valueOf: function () { "use strict"; this.vo = this.vo + 1; return {}; },
-    toString: function () { "use strict"; this.ts = this.ts + 1; return '-1.5'; }
-  };
-  if (n === 0) {
-    if (!(Math.round(boxed) === -1 && boxed.vo === 1 && boxed.ts === 1)) n = 35;
-  }
-  var prim = {
-    vo: 0,
-    ts: 0,
-    valueOf: function () { "use strict"; this.vo = this.vo + 1; return -1.5; },
-    toString: function () { "use strict"; this.ts = this.ts + 1; return '1'; }
-  };
-  if (n === 0) {
-    if (!(Math.round(prim) === -1 && prim.vo === 1 && prim.ts === 0)) n = 36;
-  }
-  var getter = {
-    mark: {},
-    hits: 0,
-    get valueOf() { "use strict"; throw this.mark; },
-    toString: function () { "use strict"; this.hits = this.hits + 1; return '1'; }
-  };
-  var caughtG = 0;
-  try { Math.round(getter); } catch (e4) { if (e4 === getter.mark) caughtG = 1; }
-  if (n === 0) {
-    if (!(caughtG === 1 && getter.hits === 0)) n = 37;
-  }
-  var methodObj = {
-    mark: {},
-    hits: 0,
-    valueOf: function () { "use strict"; throw this.mark; },
-    toString: function () { "use strict"; this.hits = this.hits + 1; return '1'; }
-  };
-  var caughtM = 0;
-  try { Math.round(methodObj); } catch (e5) { if (e5 === methodObj.mark) caughtM = 1; }
-  if (n === 0) {
-    if (!(caughtM === 1 && methodObj.hits === 0)) n = 38;
-  }
-  var both = {
-    hits: 0,
-    valueOf: function () { "use strict"; this.hits = this.hits + 1; return {}; },
-    toString: function () { "use strict"; this.hits = this.hits + 1; return {}; }
-  };
-  var typeHits = 0;
-  try { Math.round(both); } catch (e6) { if (e6 && e6.name === 'TypeError') typeHits = 1; }
-  if (n === 0) {
-    if (!(typeHits === 1 && both.hits === 2)) n = 39;
-  }
-  if (n !== 0) return n;
-  return Math.round(-0.5);
-})();
+const ROUND_CASE: &str = r#"var n = 0;
+var z = 1 / (-1 / 0);
+var seq = 0;
+var markG = {};
+var markM = {};
+var markL = {};
+var tail = { mark: 11 };
+var p = { ts: 0 };
+var b = { hits: 0 };
+var g = { mark: markG };
+var m = { mark: markM };
+var both = { hits: 0 };
+var L = { mark: markL };
+function retObj() { "use strict"; this.hits = this.hits + 1; return {}; }
+function retStr() { "use strict"; return '-1.5'; }
+function throwThis() { "use strict"; throw this.mark; }
+p.valueOf = retStr;
+p.toString = throwThis;
+b.valueOf = retObj;
+b.toString = retStr;
+m.valueOf = throwThis;
+both.valueOf = retObj;
+both.toString = retObj;
+tail.valueOf = throwThis;
+tail.toString = throwThis;
+L.boom = throwThis;
+Object.defineProperty(g, 'valueOf', { get: throwThis });
+var F = Math.round;
+var D = Math.round((seq = seq * 10 + 1, -1.5), (seq = seq * 10 + 2, tail));
+if (!(F.length === 1)) n = 1;
+if (n === 0 && !(D === -1 && seq === 12)) n = 2;
+if (n === 0 && !(1 / F(-0.5) === -1 / 0)) n = 3;
+if (n === 0 && !(F(-1.5) === -1 && F(-0.5000000000000001) === -1)) n = 4;
+if (n === 0 && !(1 / F(0.49999999999999994) === 1 / 0)) n = 5;
+if (n === 0 && !(F(2.5) === 3 && F(-2.5) === -2)) n = 6;
+if (n === 0 && !(F(4503599627370497) === 4503599627370497)) n = 7;
+if (n === 0 && !(1 / F(z) === -1 / 0 && 1 / F(0) === 1 / 0)) n = 8;
+if (n === 0 && !(F(-1 / 0) === -1 / 0 && F(1 / 0) === 1 / 0)) n = 11;
+if (n === 0 && !(F(0 / 0) !== F(0 / 0))) n = 12;
+var o = {};
+o.m = F;
+if (n === 0 && !(o.m(-1.5) === -1 && 1 / o.m(-0.5) === -1 / 0)) n = 9;
+var ex = F((seq = seq * 10 + 3, -1.5), (seq = seq * 10 + 4, tail));
+var bo = o.m((seq = seq * 10 + 5, -1.5), (seq = seq * 10 + 6, tail));
+if (n === 0 && !(ex === -1 && bo === -1 && seq === 123456)) n = 10;
+if (n === 0 && !(F(p) === -1)) n = 20;
+if (n === 0 && !(F(b) === -1 && b.hits === 1)) n = 21;
+var cg = 0;
+try { F(g); } catch (e1) { if (e1 === markG) cg = 1; }
+if (n === 0 && !(cg === 1)) n = 22;
+var cm = 0;
+try { F(m); } catch (e2) { if (e2 === markM) cm = 1; }
+if (n === 0 && !(cm === 1)) n = 23;
+var ct = 0;
+try { F(both); } catch (e3) { if (e3 && e3.name === 'TypeError') ct = 1; }
+if (n === 0 && !(ct === 1 && both.hits === 2)) n = 24;
+var sl = 0;
+var lh = 0;
+try { F((sl = sl * 10 + 1, L.boom()), (sl = sl * 10 + 2, 1)); } catch (e4) { if (e4 === markL) lh = 1; }
+if (n === 0 && !(lh === 1 && sl === 1)) n = 25;
+n === 0 ? F(-0.5) : n;
 "#;
 
-const SQRT_CASE: &str = r#"(function () {
-  var n = 0;
-  var z = 1 / (-1 / 0);
-  if (!(1 / z === -1 / 0)) n = 1;
-  if (n === 0) {
-    if (!(Math.sqrt.length === 1)) n = 2;
-  }
-  if (n === 0) {
-    if (!(Math.sqrt(-1) !== Math.sqrt(-1))) n = 3;
-  }
-  if (n === 0) {
-    if (!(Math.sqrt(-1 / 0) !== Math.sqrt(-1 / 0))) n = 4;
-  }
-  if (n === 0) {
-    if (!(1 / Math.sqrt(z) === -1 / 0)) n = 5;
-  }
-  if (n === 0) {
-    if (!(Math.sqrt(5e-324) === 2.2227587494850775e-162)) n = 6;
-  }
-  var fnum = Math.sqrt;
-  if (n === 0) {
-    if (!(fnum(-2) !== fnum(-2) && 1 / fnum(z) === -1 / 0 && fnum(5e-324) === 2.2227587494850775e-162)) n = 7;
-  }
-  var onum = {};
-  onum.m = Math.sqrt;
-  if (n === 0) {
-    if (!(onum.m(-3) !== onum.m(-3) && 1 / onum.m(z) === -1 / 0 && onum.m(5e-324) === 2.2227587494850775e-162)) n = 8;
-  }
-  var seq = 0;
-  var tail = {
-    hits: 0,
-    valueOf: function () { "use strict"; this.hits = this.hits + 1; throw 11; },
-    toString: function () { "use strict"; this.hits = this.hits + 1; throw 12; }
-  };
-  var direct = Math.sqrt((seq = seq * 10 + 1, 9), (seq = seq * 10 + 2, tail));
-  if (n === 0) {
-    if (!(seq === 12 && tail.hits === 0 && direct === 3)) n = 30;
-  }
-  var seqLeft = 0;
-  var left = {
-    mark: {},
-    boom: function () { "use strict"; throw this.mark; }
-  };
-  var leftHit = 0;
-  try {
-    Math.sqrt((seqLeft = seqLeft * 10 + 1, left.boom()), (seqLeft = seqLeft * 10 + 2, 1));
-  } catch (e1) {
-    if (e1 === left.mark) leftHit = 1;
-  }
-  if (n === 0) {
-    if (!(leftHit === 1 && seqLeft === 1)) n = 31;
-  }
-  var f = Math.sqrt;
-  var fseq = 0;
-  var ftail = {
-    hits: 0,
-    valueOf: function () { "use strict"; this.hits = this.hits + 1; throw 13; },
-    toString: function () { "use strict"; this.hits = this.hits + 1; throw 14; }
-  };
-  var extracted = f((fseq = fseq * 10 + 1, 9), (fseq = fseq * 10 + 2, ftail));
-  if (n === 0) {
-    if (!(fseq === 12 && ftail.hits === 0 && extracted === 3)) n = 32;
-  }
-  var o = {};
-  o.m = Math.sqrt;
-  var oseq = 0;
-  var otail = {
-    hits: 0,
-    valueOf: function () { "use strict"; this.hits = this.hits + 1; throw 15; },
-    toString: function () { "use strict"; this.hits = this.hits + 1; throw 16; }
-  };
-  var borrowed = o.m((oseq = oseq * 10 + 1, 9), (oseq = oseq * 10 + 2, otail));
-  if (n === 0) {
-    if (!(oseq === 12 && otail.hits === 0 && borrowed === 3)) n = 33;
-  }
-  var live = 0;
-  try { tail.valueOf(); } catch (e2) { if (e2 === 11) live = live + 1; }
-  try { tail.toString(); } catch (e3) { if (e3 === 12) live = live + 1; }
-  if (n === 0) {
-    if (!(tail.hits === 2 && live === 2)) n = 34;
-  }
-  var boxed = {
-    vo: 0,
-    ts: 0,
-    valueOf: function () { "use strict"; this.vo = this.vo + 1; return {}; },
-    toString: function () { "use strict"; this.ts = this.ts + 1; return '9'; }
-  };
-  if (n === 0) {
-    if (!(Math.sqrt(boxed) === 3 && boxed.vo === 1 && boxed.ts === 1)) n = 35;
-  }
-  var prim = {
-    vo: 0,
-    ts: 0,
-    valueOf: function () { "use strict"; this.vo = this.vo + 1; return 9; },
-    toString: function () { "use strict"; this.ts = this.ts + 1; return '1'; }
-  };
-  if (n === 0) {
-    if (!(Math.sqrt(prim) === 3 && prim.vo === 1 && prim.ts === 0)) n = 36;
-  }
-  var getter = {
-    mark: {},
-    hits: 0,
-    get valueOf() { "use strict"; throw this.mark; },
-    toString: function () { "use strict"; this.hits = this.hits + 1; return '1'; }
-  };
-  var caughtG = 0;
-  try { Math.sqrt(getter); } catch (e4) { if (e4 === getter.mark) caughtG = 1; }
-  if (n === 0) {
-    if (!(caughtG === 1 && getter.hits === 0)) n = 37;
-  }
-  var methodObj = {
-    mark: {},
-    hits: 0,
-    valueOf: function () { "use strict"; throw this.mark; },
-    toString: function () { "use strict"; this.hits = this.hits + 1; return '1'; }
-  };
-  var caughtM = 0;
-  try { Math.sqrt(methodObj); } catch (e5) { if (e5 === methodObj.mark) caughtM = 1; }
-  if (n === 0) {
-    if (!(caughtM === 1 && methodObj.hits === 0)) n = 38;
-  }
-  var both = {
-    hits: 0,
-    valueOf: function () { "use strict"; this.hits = this.hits + 1; return {}; },
-    toString: function () { "use strict"; this.hits = this.hits + 1; return {}; }
-  };
-  var typeHits = 0;
-  try { Math.sqrt(both); } catch (e6) { if (e6 && e6.name === 'TypeError') typeHits = 1; }
-  if (n === 0) {
-    if (!(typeHits === 1 && both.hits === 2)) n = 39;
-  }
-  if (n !== 0) return n;
-  return Math.sqrt(z);
-})();
+const SQRT_CASE: &str = r#"var n = 0;
+var z = 1 / (-1 / 0);
+var seq = 0;
+var markG = {};
+var markM = {};
+var markL = {};
+var tail = { mark: 11 };
+var p = { ts: 0 };
+var b = { hits: 0 };
+var g = { mark: markG };
+var m = { mark: markM };
+var both = { hits: 0 };
+var L = { mark: markL };
+function retObj() { "use strict"; this.hits = this.hits + 1; return {}; }
+function retStr() { "use strict"; return '9'; }
+function throwThis() { "use strict"; throw this.mark; }
+p.valueOf = retStr;
+p.toString = throwThis;
+b.valueOf = retObj;
+b.toString = retStr;
+m.valueOf = throwThis;
+both.valueOf = retObj;
+both.toString = retObj;
+tail.valueOf = throwThis;
+tail.toString = throwThis;
+L.boom = throwThis;
+Object.defineProperty(g, 'valueOf', { get: throwThis });
+var F = Math.sqrt;
+var D = Math.sqrt((seq = seq * 10 + 1, 9), (seq = seq * 10 + 2, tail));
+if (!(F.length === 1)) n = 1;
+if (n === 0 && !(D === 3 && seq === 12)) n = 2;
+if (n === 0 && !(F(-1) !== F(-1) && F(-1 / 0) !== F(-1 / 0))) n = 3;
+if (n === 0 && !(1 / F(z) === -1 / 0 && 1 / F(0) === 1 / 0)) n = 4;
+if (n === 0 && !(F(1 / 0) === 1 / 0 && F(4) === 2)) n = 5;
+if (n === 0 && !(F(5e-324) === 2.2227587494850775e-162)) n = 6;
+var o = {};
+o.m = F;
+if (n === 0 && !(o.m(9) === 3 && 1 / o.m(z) === -1 / 0)) n = 9;
+var ex = F((seq = seq * 10 + 3, 9), (seq = seq * 10 + 4, tail));
+var bo = o.m((seq = seq * 10 + 5, 9), (seq = seq * 10 + 6, tail));
+if (n === 0 && !(ex === 3 && bo === 3 && seq === 123456)) n = 10;
+if (n === 0 && !(F(p) === 3)) n = 20;
+if (n === 0 && !(F(b) === 3 && b.hits === 1)) n = 21;
+var cg = 0;
+try { F(g); } catch (e1) { if (e1 === markG) cg = 1; }
+if (n === 0 && !(cg === 1)) n = 22;
+var cm = 0;
+try { F(m); } catch (e2) { if (e2 === markM) cm = 1; }
+if (n === 0 && !(cm === 1)) n = 23;
+var ct = 0;
+try { F(both); } catch (e3) { if (e3 && e3.name === 'TypeError') ct = 1; }
+if (n === 0 && !(ct === 1 && both.hits === 2)) n = 24;
+var sl = 0;
+var lh = 0;
+try { F((sl = sl * 10 + 1, L.boom()), (sl = sl * 10 + 2, 1)); } catch (e4) { if (e4 === markL) lh = 1; }
+if (n === 0 && !(lh === 1 && sl === 1)) n = 25;
+n === 0 ? F(z) : n;
 "#;
 
 #[test]
