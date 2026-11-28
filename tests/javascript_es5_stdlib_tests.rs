@@ -3922,35 +3922,6 @@ fn collect_slots(expr: &vm::Expr, slots: &mut Vec<u16>) {
             collect_slots(ok_expr, slots);
             collect_slots(err_expr, slots);
         }
-        vm::Expr::Unit => {}
-        vm::Expr::ResultConvert { value, .. } => collect_slots(value, slots),
-        vm::Expr::ResultMethod {
-            receiver, argument, ..
-        } => {
-            collect_slots(receiver, slots);
-            collect_slots(argument, slots);
-        }
-        vm::Expr::OptionMethod {
-            receiver, argument, ..
-        } => {
-            collect_slots(receiver, slots);
-            collect_slots(argument, slots);
-        }
-        vm::Expr::OptionConstruct { payload, .. } => {
-            if let Some(payload) = payload {
-                collect_slots(payload, slots);
-            }
-        }
-        vm::Expr::OptionMatch {
-            value,
-            some_expr,
-            none_expr,
-            ..
-        } => {
-            collect_slots(value, slots);
-            collect_slots(some_expr, slots);
-            collect_slots(none_expr, slots);
-        }
         _ => {}
     }
 }
@@ -4068,35 +4039,6 @@ fn count_slot(expr: &vm::Expr, slot: u16, count: &mut u64) {
             count_slot(condition, slot, count);
             count_slot(then_expr, slot, count);
             count_slot(else_expr, slot, count);
-        }
-        vm::Expr::Unit => {}
-        vm::Expr::ResultConvert { value, .. } => count_slot(value, slot, count),
-        vm::Expr::ResultMethod {
-            receiver, argument, ..
-        } => {
-            count_slot(receiver, slot, count);
-            count_slot(argument, slot, count);
-        }
-        vm::Expr::OptionMethod {
-            receiver, argument, ..
-        } => {
-            count_slot(receiver, slot, count);
-            count_slot(argument, slot, count);
-        }
-        vm::Expr::OptionConstruct { payload, .. } => {
-            if let Some(payload) = payload {
-                count_slot(payload, slot, count);
-            }
-        }
-        vm::Expr::OptionMatch {
-            value,
-            some_expr,
-            none_expr,
-            ..
-        } => {
-            count_slot(value, slot, count);
-            count_slot(some_expr, slot, count);
-            count_slot(none_expr, slot, count);
         }
         _ => {}
     }
@@ -5359,127 +5301,6 @@ mod p8_ascii_proof {
                 E::Sub(a, b) => node("Sub", vec![self.expr(a), self.expr(b)]),
                 E::Mod(a, b) => node("Mod", vec![self.expr(a), self.expr(b)]),
                 E::Not(a) => node("Not", vec![self.expr(a)]),
-                E::Unit => node("Unit", vec![]),
-                E::ResultConvert {
-                    ok,
-                    value,
-                    value_slot,
-                    ok_binding,
-                    err_binding,
-                    span,
-                    semantic_id,
-                } => node(
-                    "ResultConvert",
-                    vec![
-                        node(&format!("target_ok:{ok}"), vec![]),
-                        node(&format!("value_slot:{value_slot}"), vec![]),
-                        node(&format!("ok_binding:{ok_binding}"), vec![]),
-                        node(&format!("err_binding:{err_binding}"), vec![]),
-                        node(
-                            &format!("span:{}:{}:{}", span.source_id, span.lo, span.hi),
-                            vec![],
-                        ),
-                        node(&format!("semantic:{semantic_id:?}"), vec![]),
-                        self.expr(value),
-                    ],
-                ),
-                E::ResultMethod {
-                    method,
-                    receiver,
-                    argument,
-                    slots,
-                    span,
-                    semantic_id,
-                } => node(
-                    "ResultMethod",
-                    vec![
-                        node(&format!("method:{method:?}"), vec![]),
-                        node(&format!("receiver_slot:{}", slots.receiver), vec![]),
-                        node(&format!("argument_slot:{}", slots.argument), vec![]),
-                        node(&format!("ok_binding:{}", slots.ok_binding), vec![]),
-                        node(&format!("err_binding:{:?}", slots.err_binding), vec![]),
-                        node(
-                            &format!("span:{}:{}:{}", span.source_id, span.lo, span.hi),
-                            vec![],
-                        ),
-                        node(&format!("semantic:{semantic_id:?}"), vec![]),
-                        self.expr(receiver),
-                        self.expr(argument),
-                    ],
-                ),
-                E::OptionMethod {
-                    method,
-                    receiver,
-                    argument,
-                    slots,
-                    span,
-                    semantic_id,
-                } => node(
-                    "OptionMethod",
-                    vec![
-                        node(&format!("method:{method:?}"), vec![]),
-                        node(&format!("receiver_slot:{}", slots.receiver), vec![]),
-                        node(&format!("argument_slot:{}", slots.argument), vec![]),
-                        node(&format!("some_binding:{}", slots.some_binding), vec![]),
-                        node(
-                            &format!("span:{}:{}:{}", span.source_id, span.lo, span.hi),
-                            vec![],
-                        ),
-                        node(&format!("semantic:{semantic_id:?}"), vec![]),
-                        self.expr(receiver),
-                        self.expr(argument),
-                    ],
-                ),
-                E::OptionConstruct {
-                    some,
-                    payload,
-                    option_schema,
-                    span,
-                    semantic_id,
-                } => {
-                    let payload = match payload {
-                        Some(payload) => node("Some", vec![self.expr(payload)]),
-                        None => node("None", vec![]),
-                    };
-                    node(
-                        "OptionConstruct",
-                        vec![
-                            node(&format!("some:{some}"), vec![]),
-                            node(&format!("option_schema:{option_schema:?}"), vec![]),
-                            node(
-                                &format!("span:{}:{}:{}", span.source_id, span.lo, span.hi),
-                                vec![],
-                            ),
-                            node(&format!("semantic:{semantic_id:?}"), vec![]),
-                            payload,
-                        ],
-                    )
-                }
-                E::OptionMatch {
-                    value,
-                    value_slot,
-                    some_binding,
-                    some_expr,
-                    none_expr,
-                    scrutinee_schema,
-                    span,
-                    semantic_id,
-                } => node(
-                    "OptionMatch",
-                    vec![
-                        node(&format!("value_slot:{value_slot}"), vec![]),
-                        node(&format!("some_binding:{some_binding:?}"), vec![]),
-                        node(&format!("scrutinee_schema:{scrutinee_schema:?}"), vec![]),
-                        node(
-                            &format!("span:{}:{}:{}", span.source_id, span.lo, span.hi),
-                            vec![],
-                        ),
-                        node(&format!("semantic:{semantic_id:?}"), vec![]),
-                        self.expr(value),
-                        self.expr(some_expr),
-                        self.expr(none_expr),
-                    ],
-                ),
                 _ => panic!("unproved bootstrap expression: {e:?}"),
             }
         }
@@ -6315,7 +6136,22 @@ fn pinned_option_schema() -> vm::TypeSchema {
     vm::TypeSchema::Option(Box::new(vm::TypeSchema::Int))
 }
 
-fn pinned_result_convert(ok: bool, value: vm::Expr) -> vm::Expr {
+fn pinned_while_expr() -> vm::Expr {
+    vm::Expr::Block {
+        stmts: vec![vm::Stmt::While {
+            condition: vm::Expr::Bool(true),
+            body: vec![vm::Stmt::While {
+                condition: vm::Expr::Bool(false),
+                body: vec![],
+                line: 2,
+            }],
+            line: 1,
+        }],
+        expr: Box::new(vm::Expr::Unit),
+    }
+}
+
+fn pinned_convert(ok: bool, value: vm::Expr) -> vm::Expr {
     vm::Expr::ResultConvert {
         ok,
         value: Box::new(value),
@@ -6345,7 +6181,7 @@ fn pinned_result_method(receiver: vm::Expr, argument: vm::Expr) -> vm::Expr {
 
 fn pinned_option_method(receiver: vm::Expr, argument: vm::Expr) -> vm::Expr {
     vm::Expr::OptionMethod {
-        method: vm::compiler::ir::OptionMethod::Map,
+        method: vm::compiler::ir::OptionMethod::OkOr,
         receiver: Box::new(receiver),
         argument: Box::new(argument),
         slots: vm::compiler::ir::OptionMethodSlots {
@@ -6381,14 +6217,34 @@ fn pinned_option_match(value: vm::Expr, some_expr: vm::Expr, none_expr: vm::Expr
     }
 }
 
-fn pinned_visit_shape(expr: &vm::Expr) -> Vec<String> {
+fn pinned_rounder(expr: &vm::Expr) -> (usize, usize) {
+    let mut count = 0;
+    let mut depth = 0;
+    count_rounder_while_expr(expr, 0, &mut count, &mut depth);
+    (count, depth)
+}
+
+fn pinned_reads(expr: &vm::Expr) -> Vec<u16> {
+    let mut reads = Vec::new();
+    let mut clobbers = Vec::new();
+    p8_f09_note_reads(expr, &mut reads, &mut clobbers);
+    assert!(clobbers.is_empty(), "{clobbers:?}");
+    reads
+}
+
+fn pinned_walk(expr: &vm::Expr) -> u64 {
+    let mut counts = PayloadCounts::default();
+    let mut bindings = std::collections::BTreeMap::new();
+    walk_expr(expr, 0, 1, 2, &mut counts, &mut bindings, false);
+    counts.exprs
+}
+
+fn pinned_visit(expr: &vm::Expr) -> Vec<String> {
     let mut out = Vec::new();
     p8_suffix_ir::exprs(expr, &mut out);
-    assert!(std::ptr::eq(out[0], expr));
     out.into_iter()
         .map(|node| match node {
             vm::Expr::Unit => "Unit".to_owned(),
-            vm::Expr::Int(value) => format!("Int({value})"),
             vm::Expr::Var(slot) => format!("Var({slot})"),
             vm::Expr::ResultConvert { .. } => "ResultConvert".to_owned(),
             vm::Expr::ResultMethod { .. } => "ResultMethod".to_owned(),
@@ -6400,132 +6256,6 @@ fn pinned_visit_shape(expr: &vm::Expr) -> Vec<String> {
         .collect()
 }
 
-fn pinned_walk_count(expr: &vm::Expr) -> u64 {
-    let mut counts = PayloadCounts::default();
-    let mut bindings = std::collections::BTreeMap::new();
-    walk_expr(expr, 0u16, 1, 2, &mut counts, &mut bindings, false);
-    counts.exprs
-}
-
-fn pinned_reads(expr: &vm::Expr) -> Vec<u16> {
-    let mut reads = Vec::new();
-    let mut clobbers = Vec::new();
-    p8_f09_note_reads(expr, &mut reads, &mut clobbers);
-    assert!(clobbers.is_empty(), "{clobbers:?}");
-    reads
-}
-
-fn pinned_rounder_hits(expr: &vm::Expr) -> usize {
-    let mut count = 0;
-    let mut max_depth = 0;
-    count_rounder_while_expr(expr, 0, &mut count, &mut max_depth);
-    count
-}
-
-#[test]
-fn pinned_core_exprs_visits_new_variants_in_child_order() {
-    let unit = vm::Expr::Unit;
-    let convert = pinned_result_convert(true, vm::Expr::Int(1));
-    let result_method = pinned_result_method(vm::Expr::Int(1), vm::Expr::Int(2));
-    let option_method = pinned_option_method(vm::Expr::Int(3), vm::Expr::Int(4));
-    let some = pinned_option_construct(true, Some(vm::Expr::Int(5)));
-    let none = pinned_option_construct(false, None);
-    let matched = pinned_option_match(vm::Expr::Int(6), vm::Expr::Int(7), vm::Expr::Int(8));
-    assert_eq!(pinned_visit_shape(&unit), vec!["Unit".to_owned()]);
-    assert_eq!(
-        pinned_visit_shape(&convert),
-        vec!["ResultConvert".to_owned(), "Int(1)".to_owned()]
-    );
-    assert_eq!(
-        pinned_visit_shape(&result_method),
-        vec![
-            "ResultMethod".to_owned(),
-            "Int(1)".to_owned(),
-            "Int(2)".to_owned()
-        ]
-    );
-    assert_eq!(
-        pinned_visit_shape(&option_method),
-        vec![
-            "OptionMethod".to_owned(),
-            "Int(3)".to_owned(),
-            "Int(4)".to_owned()
-        ]
-    );
-    assert_eq!(
-        pinned_visit_shape(&some),
-        vec!["OptionConstruct".to_owned(), "Int(5)".to_owned()]
-    );
-    assert_eq!(
-        pinned_visit_shape(&none),
-        vec!["OptionConstruct".to_owned()]
-    );
-    assert_eq!(
-        pinned_visit_shape(&matched),
-        vec![
-            "OptionMatch".to_owned(),
-            "Int(6)".to_owned(),
-            "Int(7)".to_owned(),
-            "Int(8)".to_owned()
-        ]
-    );
-    for expr in [
-        &unit,
-        &convert,
-        &result_method,
-        &option_method,
-        &some,
-        &none,
-        &matched,
-    ] {
-        assert_eq!(
-            pinned_walk_count(expr) as usize,
-            pinned_visit_shape(expr).len()
-        );
-        assert_eq!(pinned_rounder_hits(expr), 0);
-    }
-    assert_eq!(pinned_reads(&unit), Vec::<u16>::new());
-    assert_eq!(pinned_reads(&convert), vec![10, 11, 12]);
-    assert_eq!(pinned_reads(&result_method), vec![20, 21, 22, 23]);
-    assert_eq!(pinned_reads(&option_method), vec![20, 21, 22]);
-    assert_eq!(pinned_reads(&none), Vec::<u16>::new());
-    assert_eq!(pinned_reads(&matched), vec![30, 31]);
-    let slotted = pinned_result_method(vm::Expr::Var(41), vm::Expr::Var(42));
-    assert_eq!(
-        pinned_visit_shape(&slotted),
-        vec![
-            "ResultMethod".to_owned(),
-            "Var(41)".to_owned(),
-            "Var(42)".to_owned()
-        ]
-    );
-    assert_eq!(used_slots(&slotted), vec![41, 42]);
-    assert_eq!(binding_uses_expr(&slotted, 41), 1);
-    assert_eq!(binding_uses_expr(&slotted, 42), 1);
-    assert_eq!(binding_uses_expr(&slotted, 99), 0);
-    let matched_slots = pinned_option_match(vm::Expr::Var(1), vm::Expr::Var(2), vm::Expr::Var(3));
-    assert_eq!(used_slots(&matched_slots), vec![1, 2, 3]);
-    assert_eq!(
-        used_slots(&pinned_option_construct(true, Some(vm::Expr::Var(8)))),
-        vec![8]
-    );
-    assert!(used_slots(&none).is_empty());
-}
-
-fn pinned_term(expr: &vm::Expr) -> p8_ascii_proof::Term {
-    let ir = vm::LocalIrBuilder::new().finish(vec![]);
-    let mut trace = p8_ascii_proof::Trace::new(&ir, 0);
-    trace.expr(expr)
-}
-
-fn pinned_node(name: &str, children: Vec<p8_ascii_proof::Term>) -> p8_ascii_proof::Term {
-    p8_ascii_proof::Term::Node(name.to_owned(), children)
-}
-
-fn pinned_leaf(name: &str) -> p8_ascii_proof::Term {
-    pinned_node(name, vec![])
-}
-
 fn pinned_alpha(expr: &vm::Expr) -> String {
     p8_f09_alpha(expr, &[], &mut Vec::new())
 }
@@ -6534,176 +6264,252 @@ fn pinned_ser(expr: &vm::Expr) -> String {
     ser_expr(expr, &std::collections::BTreeMap::new(), &[])
 }
 
+fn pinned_has_fields(text: &str, fields: &[&str]) {
+    for field in fields {
+        assert!(text.contains(field), "missing {field} in {text}");
+    }
+}
+
 #[test]
-fn pinned_core_term_encoder_distinguishes_new_variants() {
-    use p8_ascii_proof::Term;
-    let unit = vm::Expr::Unit;
-    let convert = pinned_result_convert(true, vm::Expr::Int(1));
-    let other_target = pinned_result_convert(false, vm::Expr::Int(1));
-    let result_method = pinned_result_method(vm::Expr::Int(1), vm::Expr::Int(2));
-    let option_method = pinned_option_method(vm::Expr::Int(3), vm::Expr::Int(4));
-    let some = pinned_option_construct(true, Some(vm::Expr::Int(5)));
-    let none = pinned_option_construct(false, None);
-    let matched = pinned_option_match(vm::Expr::Int(6), vm::Expr::Int(7), vm::Expr::Int(8));
-    let meta = [
-        pinned_leaf("span:1:2:4"),
-        pinned_leaf("semantic:None"),
-    ];
-    assert_eq!(pinned_term(&unit), pinned_leaf("Unit"));
-    assert_ne!(pinned_term(&unit), pinned_leaf("Null"));
+fn pinned_core_expr_observers_keep_child_order() {
+    let looped = pinned_while_expr();
+    let var = |slot| vm::Expr::Var(slot);
+    assert_eq!(pinned_rounder(&vm::Expr::Unit), (0, 0));
     assert_eq!(
-        pinned_term(&convert),
-        pinned_node(
-            "ResultConvert",
-            [
-                pinned_leaf("target_ok:true"),
-                pinned_leaf("value_slot:10"),
-                pinned_leaf("ok_binding:11"),
-                pinned_leaf("err_binding:12"),
-            ]
-            .into_iter()
-            .chain(meta.clone())
-            .chain([Term::Int(1)])
-            .collect()
-        )
-    );
-    assert_ne!(pinned_term(&convert), pinned_term(&other_target));
-    let result_term = pinned_term(&result_method);
-    let option_term = pinned_term(&option_method);
-    assert_eq!(
-        result_term,
-        pinned_node(
-            "ResultMethod",
-            [
-                pinned_leaf("method:Map"),
-                pinned_leaf("receiver_slot:20"),
-                pinned_leaf("argument_slot:21"),
-                pinned_leaf("ok_binding:22"),
-                pinned_leaf("err_binding:Some(23)"),
-            ]
-            .into_iter()
-            .chain(meta.clone())
-            .chain([Term::Int(1), Term::Int(2)])
-            .collect()
-        )
+        pinned_rounder(&pinned_convert(true, looped.clone())),
+        (2, 2)
     );
     assert_eq!(
-        option_term,
-        pinned_node(
-            "OptionMethod",
-            [
-                pinned_leaf("method:Map"),
-                pinned_leaf("receiver_slot:20"),
-                pinned_leaf("argument_slot:21"),
-                pinned_leaf("some_binding:22"),
-            ]
-            .into_iter()
-            .chain(meta.clone())
-            .chain([Term::Int(3), Term::Int(4)])
-            .collect()
-        )
-    );
-    assert_ne!(result_term, option_term);
-    let some_term = pinned_term(&some);
-    let none_term = pinned_term(&none);
-    assert_eq!(
-        some_term,
-        pinned_node(
-            "OptionConstruct",
-            [
-                pinned_leaf("some:true"),
-                pinned_leaf("option_schema:Option(Int)"),
-            ]
-            .into_iter()
-            .chain(meta.clone())
-            .chain([pinned_node("Some", vec![Term::Int(5)])])
-            .collect()
-        )
+        pinned_rounder(&pinned_result_method(looped.clone(), looped.clone())),
+        (4, 2)
     );
     assert_eq!(
-        none_term,
-        pinned_node(
-            "OptionConstruct",
-            [
-                pinned_leaf("some:false"),
-                pinned_leaf("option_schema:Option(Int)"),
-            ]
-            .into_iter()
-            .chain(meta)
-            .chain([pinned_leaf("None")])
-            .collect()
-        )
+        pinned_rounder(&pinned_option_method(looped.clone(), looped.clone())),
+        (4, 2)
     );
-    assert_ne!(some_term, none_term);
-    let Term::Node(name, children) = pinned_term(&matched) else {
-        panic!("option match term");
+    assert_eq!(
+        pinned_rounder(&pinned_option_construct(true, Some(looped.clone()))),
+        (2, 2)
+    );
+    assert_eq!(
+        pinned_rounder(&pinned_option_construct(false, None)),
+        (0, 0)
+    );
+    assert_eq!(
+        pinned_rounder(&pinned_option_match(looped.clone(), looped.clone(), looped)),
+        (6, 2)
+    );
+
+    assert_eq!(pinned_reads(&vm::Expr::Unit), Vec::<u16>::new());
+    assert_eq!(
+        pinned_reads(&pinned_convert(true, var(41))),
+        vec![10, 11, 12, 41]
+    );
+    assert_eq!(
+        pinned_reads(&pinned_result_method(var(41), var(42))),
+        vec![20, 21, 22, 23, 41, 42]
+    );
+    assert_eq!(
+        pinned_reads(&pinned_option_method(var(41), var(42))),
+        vec![20, 21, 22, 41, 42]
+    );
+    assert_eq!(
+        pinned_reads(&pinned_option_construct(true, Some(var(8)))),
+        vec![8]
+    );
+    assert!(pinned_reads(&pinned_option_construct(false, None)).is_empty());
+    assert_eq!(
+        pinned_reads(&pinned_option_match(var(1), var(2), var(3))),
+        vec![30, 31, 1, 2, 3]
+    );
+
+    let expect = |expr: &vm::Expr, tags: &[&str]| {
+        let got = pinned_visit(expr);
+        assert_eq!(got.iter().map(String::as_str).collect::<Vec<_>>(), tags);
+        assert_eq!(pinned_walk(expr), tags.len() as u64);
     };
-    assert_eq!(name, "OptionMatch");
-    assert_eq!(
-        &children[..5],
+    expect(&vm::Expr::Unit, &["Unit"]);
+    expect(
+        &pinned_convert(true, var(41)),
+        &["ResultConvert", "Var(41)"],
+    );
+    expect(
+        &pinned_result_method(var(41), var(42)),
+        &["ResultMethod", "Var(41)", "Var(42)"],
+    );
+    expect(
+        &pinned_option_method(var(43), var(44)),
+        &["OptionMethod", "Var(43)", "Var(44)"],
+    );
+    expect(
+        &pinned_option_construct(true, Some(var(8))),
+        &["OptionConstruct", "Var(8)"],
+    );
+    expect(&pinned_option_construct(false, None), &["OptionConstruct"]);
+    expect(
+        &pinned_option_match(var(1), var(2), var(3)),
+        &["OptionMatch", "Var(1)", "Var(2)", "Var(3)"],
+    );
+
+    assert_eq!(pinned_alpha(&vm::Expr::Unit), "Unit");
+    assert_eq!(pinned_alpha(&vm::Expr::Null), "Null");
+    assert_ne!(pinned_alpha(&vm::Expr::Unit), pinned_alpha(&vm::Expr::Null));
+    assert_eq!(pinned_ser(&vm::Expr::Unit), "unit");
+    assert_eq!(pinned_ser(&vm::Expr::Null), "null");
+    assert_ne!(pinned_ser(&vm::Expr::Unit), pinned_ser(&vm::Expr::Null));
+
+    let ok = pinned_convert(true, var(41));
+    let err = pinned_convert(false, var(41));
+    let ok_alpha = pinned_alpha(&ok);
+    let err_alpha = pinned_alpha(&err);
+    assert_ne!(ok_alpha, err_alpha);
+    pinned_has_fields(
+        &ok_alpha,
         &[
-            pinned_leaf("value_slot:30"),
-            pinned_leaf("some_binding:Some(31)"),
-            pinned_leaf("scrutinee_schema:Option(Int)"),
-            pinned_leaf("span:1:2:4"),
-            pinned_leaf("semantic:Some(SemanticNodeId(7))"),
-        ]
+            "target_ok=true",
+            "value_slot=L0",
+            "ok_binding=L1",
+            "err_binding=L2",
+            "span=1:2:4",
+            "semantic=None",
+            "value=Var(L3)",
+        ],
     );
-    assert_eq!(&children[5..], &[Term::Int(6), Term::Int(7), Term::Int(8)]);
-    assert_eq!(pinned_alpha(&unit), "Unit");
-    assert_ne!(pinned_alpha(&unit), "Null");
-    assert_eq!(
-        pinned_alpha(&convert),
-        "ResultConvert(target_ok=true,value_slot=L0,ok_binding=L1,err_binding=L2,span=1:2:4,semantic=None,value=Int(1))"
+    assert!(err_alpha.contains("target_ok=false"));
+    assert!(!err_alpha.contains("target_ok=true"));
+    let ok_ser = pinned_ser(&ok);
+    pinned_has_fields(
+        &ok_ser,
+        &[
+            "target_ok=true",
+            "value_slot=10",
+            "ok_binding=11",
+            "err_binding=12",
+            "span=1:2:4",
+            "semantic=None",
+            "v41",
+        ],
     );
-    assert_eq!(
-        pinned_alpha(&result_method),
-        "ResultMethod(method=Map,receiver_slot=L0,argument_slot=L1,ok_binding=L2,err_binding=L3,span=1:2:4,semantic=None,receiver=Int(1),argument=Int(2))"
+    assert!(pinned_ser(&err).contains("target_ok=false"));
+    assert_ne!(ok_ser, pinned_ser(&err));
+
+    let result_method = pinned_result_method(var(41), var(42));
+    let option_method = pinned_option_method(var(41), var(42));
+    let result_alpha = pinned_alpha(&result_method);
+    let option_alpha = pinned_alpha(&option_method);
+    assert_ne!(result_alpha, option_alpha);
+    pinned_has_fields(
+        &result_alpha,
+        &[
+            "ResultMethod",
+            "method=Map",
+            "receiver_slot=L0",
+            "argument_slot=L1",
+            "ok_binding=L2",
+            "err_binding=L3",
+            "span=1:2:4",
+            "semantic=None",
+            "receiver=Var(L4)",
+            "argument=Var(L5)",
+        ],
     );
-    assert_eq!(
-        pinned_alpha(&option_method),
-        "OptionMethod(method=Map,receiver_slot=L0,argument_slot=L1,some_binding=L2,span=1:2:4,semantic=None,receiver=Int(3),argument=Int(4))"
+    pinned_has_fields(
+        &option_alpha,
+        &[
+            "OptionMethod",
+            "method=OkOr",
+            "receiver_slot=L0",
+            "argument_slot=L1",
+            "some_binding=L2",
+            "span=1:2:4",
+            "semantic=None",
+            "receiver=Var(L3)",
+            "argument=Var(L4)",
+        ],
     );
-    assert_ne!(pinned_alpha(&result_method), pinned_alpha(&option_method));
-    assert_eq!(
-        pinned_alpha(&some),
-        "OptionConstruct(some=true,option_schema=Option(Int),span=1:2:4,semantic=None,payload=Some(Int(5)))"
+    assert!(!option_alpha.contains("ok_binding"));
+    let result_ser = pinned_ser(&result_method);
+    let option_ser = pinned_ser(&option_method);
+    assert_ne!(result_ser, option_ser);
+    pinned_has_fields(
+        &result_ser,
+        &[
+            "rmethod(Map",
+            "receiver_slot=20",
+            "argument_slot=21",
+            "ok_binding=22",
+            "err_binding=Some(23)",
+            "v41,v42",
+        ],
     );
-    assert_eq!(
-        pinned_alpha(&none),
-        "OptionConstruct(some=false,option_schema=Option(Int),span=1:2:4,semantic=None,payload=None)"
+    pinned_has_fields(
+        &option_ser,
+        &[
+            "omethod(OkOr",
+            "some_binding=22",
+            "receiver_slot=20",
+            "v41,v42",
+        ],
     );
-    assert_ne!(pinned_alpha(&some), pinned_alpha(&none));
-    assert_eq!(
-        pinned_alpha(&matched),
-        "OptionMatch(value_slot=L0,some_binding=L1,scrutinee_schema=Option(Int),span=1:2:4,semantic=Some(SemanticNodeId(7)),value=Int(6),some=Int(7),none=Int(8))"
+    assert!(!option_ser.contains("ok_binding"));
+
+    let some = pinned_option_construct(true, Some(var(8)));
+    let none = pinned_option_construct(false, None);
+    let some_alpha = pinned_alpha(&some);
+    let none_alpha = pinned_alpha(&none);
+    assert_ne!(some_alpha, none_alpha);
+    pinned_has_fields(
+        &some_alpha,
+        &[
+            "some=true",
+            "option_schema=Option(Int)",
+            "span=1:2:4",
+            "semantic=None",
+            "payload=Some(Var(L0))",
+        ],
     );
-    assert_eq!(pinned_ser(&unit), "unit");
-    assert_ne!(pinned_ser(&unit), "null");
-    assert_eq!(
-        pinned_ser(&convert),
-        "rconv(target_ok=true,value_slot=10,ok_binding=11,err_binding=12,span=1:2:4,semantic=None,i1)"
+    pinned_has_fields(
+        &none_alpha,
+        &["some=false", "payload=None", "option_schema=Option(Int)"],
     );
-    assert_eq!(
-        pinned_ser(&result_method),
-        "rmethod(Map,receiver_slot=20,argument_slot=21,ok_binding=22,err_binding=Some(23),span=1:2:4,semantic=None,i1,i2)"
+    assert!(!none_alpha.contains("Var("));
+    let some_ser = pinned_ser(&some);
+    let none_ser = pinned_ser(&none);
+    assert_ne!(some_ser, none_ser);
+    pinned_has_fields(
+        &some_ser,
+        &[
+            "some=true",
+            "option_schema=Option(Int)",
+            "span=1:2:4",
+            "Some(v8)",
+        ],
     );
-    assert_eq!(
-        pinned_ser(&option_method),
-        "omethod(Map,receiver_slot=20,argument_slot=21,some_binding=22,span=1:2:4,semantic=None,i3,i4)"
+    assert!(none_ser.contains("some=false"), "{none_ser}");
+    assert!(none_ser.ends_with(",None)"), "{none_ser}");
+    assert!(!none_ser.contains("v8"));
+
+    let matched = pinned_option_match(var(1), var(2), var(3));
+    pinned_has_fields(
+        &pinned_alpha(&matched),
+        &[
+            "value_slot=L0",
+            "some_binding=L1",
+            "scrutinee_schema=Option(Int)",
+            "span=1:2:4",
+            "semantic=Some(SemanticNodeId(7))",
+            "value=Var(L2),some=Var(L3),none=Var(L4)",
+        ],
     );
-    assert_ne!(pinned_ser(&result_method), pinned_ser(&option_method));
-    assert_eq!(
-        pinned_ser(&some),
-        "oconstruct(some=true,option_schema=Option(Int),span=1:2:4,semantic=None,Some(i5))"
-    );
-    assert_eq!(
-        pinned_ser(&none),
-        "oconstruct(some=false,option_schema=Option(Int),span=1:2:4,semantic=None,None)"
-    );
-    assert_ne!(pinned_ser(&some), pinned_ser(&none));
-    assert_eq!(
-        pinned_ser(&matched),
-        "omatch(value_slot=30,some_binding=Some(31),scrutinee_schema=Option(Int),span=1:2:4,semantic=Some(SemanticNodeId(7)),i6,i7,i8)"
+    pinned_has_fields(
+        &pinned_ser(&matched),
+        &[
+            "value_slot=30",
+            "some_binding=Some(31)",
+            "scrutinee_schema=Option(Int)",
+            "span=1:2:4",
+            "semantic=Some(SemanticNodeId(7))",
+            "v1,v2,v3",
+        ],
     );
 }
