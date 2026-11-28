@@ -12455,6 +12455,95 @@ mod scalar_boundary_tests {
             && writers.get(slot).is_none_or(Vec::is_empty)
     }
 
+    // Production `ScalarBoundary` models local IR functions only. These test
+    // observers additionally admit the exact pinned Core producers the
+    // maintained scalar helpers actually emit. They widen no production
+    // boundary: `policy.schema` must still reject every one of them.
+    fn unary_call_argument<'e>(e: &'e E, builtin: B) -> Option<&'e E> {
+        let E::Call(index, type_args, args, metadata, semantic) = e else {
+            return None;
+        };
+        let [argument] = args.as_slice() else {
+            return None;
+        };
+        (*index == builtin.call_index()
+            && builtin.accepts_arity(1)
+            && type_args.is_empty()
+            && metadata.is_none()
+            && semantic.is_none())
+        .then_some(argument)
+    }
+
+    fn borrowed_local<'a>(policy: &'a ScalarBoundary<'_>, e: &E) -> Option<&'a T> {
+        let E::Borrow(receiver) = e else {
+            return None;
+        };
+        let E::Var(slot) = receiver.as_ref() else {
+            return None;
+        };
+        policy.locals.get(slot)
+    }
+
+    /// `CheckedIntFromNumber` is the pinned Core `(Number) -> Int` conversion;
+    /// a non-numeric or unobserved operand has no Int result.
+    fn checked_int_from_number_schema(policy: &ScalarBoundary<'_>, e: &E) -> Option<T> {
+        let operand = unary_call_argument(e, B::CheckedIntFromNumber)?;
+        // The conversion rejects non-numbers, so an Int result needs an
+        // observed numeric operand and never an unrelated or unproved one.
+        matches!(
+            policy.schema(operand),
+            Some(T::Int | T::Float | T::Number)
+        )
+        .then_some(T::Int)
+    }
+
+    /// Core `len` is total on arrays; the maintained helpers apply it to
+    /// observed Int-unit and argument arrays that production schema cannot
+    /// name. The unwritten Bytes-parameter case keeps its own narrower proof.
+    fn core_array_len_schema(policy: &ScalarBoundary<'_>, e: &E) -> Option<T> {
+        let operand = unary_call_argument(e, B::Len)?;
+        matches!(borrowed_local(policy, operand), Some(T::Array(_))).then_some(T::Int)
+    }
+
+    /// Core `get` on an observed `Int` array at an observed `Int` index is the
+    /// element domain, not a generic property read.
+    fn core_int_array_get_schema(policy: &ScalarBoundary<'_>, e: &E) -> Option<T> {
+        let E::Call(index, type_args, args, metadata, semantic) = e else {
+            return None;
+        };
+        if *index != B::Get.call_index()
+            || !type_args.is_empty()
+            || metadata.is_some()
+            || semantic.is_some()
+        {
+            return None;
+        }
+        let [receiver, at] = args.as_slice() else {
+            return None;
+        };
+        let E::Borrow(array) = receiver else {
+            return None;
+        };
+        let E::Var(array_slot) = array.as_ref() else {
+            return None;
+        };
+        let Some(T::Array(element)) = policy.locals.get(array_slot) else {
+            return None;
+        };
+        if element.as_ref() != &T::Int {
+            return None;
+        }
+        (policy.schema(at) == Some(T::Int)).then_some(T::Int)
+    }
+
+    fn observed_schema(policy: &ScalarBoundary<'_>, e: &E) -> Option<T> {
+        policy
+            .schema(e)
+            .or_else(|| checked_int_from_number_schema(policy, e))
+            .or_else(|| core_array_len_schema(policy, e))
+            .or_else(|| core_int_array_get_schema(policy, e))
+    }
+
     #[test]
     fn p7_scalar_private_int_producers_and_domain_exclusions() {
         let catalog = crate::runtime::cli::reference_array_cli_effective_catalog();
@@ -12535,7 +12624,7 @@ mod scalar_boundary_tests {
                             physical_bytes_len_writers += 1;
                         }
                         assert!(
-                            policy.schema(definition) == Some(T::Int) || physical_bytes_len,
+                            observed_schema(&policy, definition) == Some(T::Int) || physical_bytes_len,
                             "actual Int writer in {} slot {i}: {definition:?}",
                             decl.name
                         );
@@ -12782,5 +12871,119 @@ mod scalar_boundary_tests {
         eprintln!(
             "P7_SCALAR_PRODUCERS int_fields={producers} int_writers={writers_checked} Bool_opaque_unknown_unchanged=true Number_power_two_not_Shl=true"
         );
+    }
+
+    #[test]
+    fn p7_scalar_core_physical_observer_shape_guards() {
+        let catalog = crate::runtime::cli::reference_array_cli_effective_catalog();
+        let context = vm::SourceFrontendContext {
+            source_id: 11,
+            original_path: None,
+            phase: vm::compiler::ParsePhase::Standalone,
+            host_api_catalog: Some(&catalog),
+            imports: &[],
+        };
+        let ir = crate::JAVASCRIPT_ES5_PLUGIN
+            .parse_source("var o={x:1};o;", &context)
+            .unwrap();
+        let identity = ir
+            .functions
+            .iter()
+            .find(|f| f.name == "__compat_es5_int_identity")
+            .unwrap()
+            .index;
+        let policy = ScalarBoundary {
+            ir: &ir,
+            locals: std::collections::HashMap::from([
+                (0, T::Number),
+                (1, T::Array(Box::new(T::Int))),
+                (2, T::Bool),
+                (3, T::Bytes),
+                (4, T::Array(Box::new(T::Bool))),
+                (5, T::Int),
+            ]),
+            concrete: Default::default(),
+            floats: Default::default(),
+            proven_ints: std::collections::HashSet::from([5]),
+            identity,
+        };
+        let call =
+            |builtin: B, args: Vec<E>| E::Call(builtin.call_index(), Vec::new(), args, None, None);
+        let borrow = |slot: u16| E::Borrow(Box::new(var(slot)));
+        let mut producers = 0;
+        for proven in [
+            call(B::CheckedIntFromNumber, vec![var(0)]),
+            call(B::Len, vec![borrow(1)]),
+            call(B::Get, vec![borrow(1), var(5)]),
+        ] {
+            // The widened observer is test-only: production schema stays None.
+            assert_eq!(policy.schema(&proven), None);
+            assert_eq!(
+                observed_schema(&policy, &proven),
+                Some(T::Int),
+                "pinned Core physical producer: {proven:?}"
+            );
+            producers += 1;
+        }
+        let metadata = vm::compiler::ResolvedHostCall {
+            name: "len".into(),
+            params: vec![vm::compiler::ResolvedHostParam {
+                name: "bytes".into(),
+                schema: T::Bytes,
+            }],
+            return_type: T::Int,
+            passing: vec![vm::host_api::HostParamPassing::Borrow],
+            fingerprint: serde_json::from_str("7").unwrap(),
+            host_params: vec![vm::host_api::HostTypeSchema::Bytes],
+            host_return_type: vm::host_api::HostTypeSchema::Int,
+        };
+        let mut guards = 0;
+        for rejected in [
+            E::Var(9),
+            call(B::ArrayPush, vec![E::MoveVar(1), var(5)]),
+            call(B::CheckedIntFromNumber, vec![]),
+            call(B::CheckedIntFromNumber, vec![var(0), var(0)]),
+            call(B::CheckedIntFromNumber, vec![E::Bool(true)]),
+            call(B::CheckedIntFromNumber, vec![var(9)]),
+            E::Call(
+                B::CheckedIntFromNumber.call_index(),
+                vec![T::Number],
+                vec![var(0)],
+                None,
+                None,
+            ),
+            E::Call(
+                B::CheckedIntFromNumber.call_index(),
+                Vec::new(),
+                vec![var(0)],
+                Some(Box::new(metadata)),
+                None,
+            ),
+            E::Call(
+                B::CheckedIntFromNumber.call_index(),
+                Vec::new(),
+                vec![var(0)],
+                None,
+                Some(vm::compiler::ir::SemanticNodeId(1)),
+            ),
+            call(B::Len, vec![]),
+            call(B::Len, vec![borrow(1), var(5)]),
+            call(B::Len, vec![var(1)]),
+            call(B::Len, vec![borrow(2)]),
+            call(B::Len, vec![borrow(9)]),
+            call(B::Get, vec![borrow(1)]),
+            call(B::Get, vec![borrow(4), var(5)]),
+            call(B::Get, vec![borrow(1), var(2)]),
+            call(B::Get, vec![var(1), var(5)]),
+            call(B::Get, vec![borrow(1), var(9)]),
+        ] {
+            assert_eq!(
+                observed_schema(&policy, &rejected),
+                None,
+                "unproven Core physical shape: {rejected:?}"
+            );
+            guards += 1;
+        }
+        eprintln!("P7_SCALAR_CORE_PHYSICAL producers={producers} guards={guards}");
     }
 }
