@@ -28,7 +28,7 @@
 //! plain TypeScript, JIT/AOT/native execution, cross-realm identity, and the
 //! whole of ES5.1. A member value is never used here as evidence that the
 //! namespace is complete.
-use pd_vm_compat_frontends::{javascript_es5_flavor, JAVASCRIPT_ES5_PLUGIN};
+use pd_vm_compat_frontends::{JAVASCRIPT_ES5_PLUGIN, javascript_es5_flavor};
 use vm::{HostFunctionRegistry, Value, VmStatus};
 
 /// Production base under test. This file adds tests only.
@@ -244,7 +244,10 @@ if(dt!==1)bad=bad+262144;
 bad;
 "#;
 
-/// A single compact interpreter program covers the whole namespace contract.
+/// A single interpreter program checks same-realm bare `Math` reads, alias
+/// identity, rebinding, and formal-parameter and function-local shadowing. It
+/// also checks that the saved object is neither callable nor constructible
+/// and that actual arguments are evaluated in order before the throw.
 /// It contains one bare `Math` requirement; that requirement selects the
 /// production namespace bootstrap (25 methods and 8 constants), not a
 /// member-minimal allocation, because every unshadowed `Math` read installs
