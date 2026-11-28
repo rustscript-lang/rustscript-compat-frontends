@@ -1,14 +1,44 @@
 //! JIT-disabled ordinary calls for Math.abs/floor/ceil/round/sqrt.
 //!
 //! Each script is the MicroQuickJS oracle program for that method only.
-//! Return values are boxed Number tags. Signed zero uses reciprocal checks
+//! Return values are boxed Number tags. Tail arguments are evaluated but
+//! never converted; guest counters assert the shared order state and a zero
+//! tail conversion count. Signed zero uses reciprocal checks
 //! in the script and exact IEEE bits on the direct-call receipt. NaN is a
 //! category, not a payload. This file does not cover full string ToNumber,
 //! JIT, AOT, TypeScript, or argument-bearing `.call`/`.apply`.
-use pd_vm_compat_frontends::{javascript_es5_flavor, JAVASCRIPT_ES5_PLUGIN};
+use pd_vm_compat_frontends::{JAVASCRIPT_ES5_PLUGIN, javascript_es5_flavor};
 use vm::{HostFunctionRegistry, Value, VmStatus};
 
+const FUEL_LIMIT: u64 = 16_000_000;
+
+fn resource_floor_path() -> std::path::PathBuf {
+    if let Some(dir) = std::env::var_os("CARGO_TARGET_DIR") {
+        let path = std::path::PathBuf::from(dir);
+        if !path.as_os_str().is_empty() {
+            return if path.is_absolute() {
+                path
+            } else {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path)
+            };
+        }
+    }
+    if let Some(dir) = std::env::var_os("TMPDIR") {
+        let path = std::path::PathBuf::from(dir);
+        if !path.as_os_str().is_empty() {
+            return path;
+        }
+    }
+    let fallback = std::env::temp_dir();
+    if fallback.as_os_str().is_empty() {
+        std::env::current_dir().expect("current directory for free floor")
+    } else {
+        fallback
+    }
+}
+
 fn free_floor() {
+    let path = resource_floor_path();
     let text = std::fs::read_to_string("/proc/meminfo").expect("meminfo");
     let kb = text
         .lines()
@@ -20,7 +50,8 @@ fn free_floor() {
         .parse::<u64>()
         .expect("kb number");
     let output = std::process::Command::new("df")
-        .args(["-B1", "/mnt/TEMP"])
+        .args(["-B1"])
+        .arg(&path)
         .output()
         .expect("df");
     let df = String::from_utf8(output.stdout).expect("df utf8");
@@ -30,14 +61,18 @@ fn free_floor() {
         .and_then(|line| line.split_whitespace().nth(3))
         .and_then(|field| field.parse::<u64>().ok())
         .expect("df available bytes");
-    eprintln!("MATH_UNARY_BUDGET mem_available_kib={kb} fs_available_bytes={available}");
+    eprintln!(
+        "MATH_UNARY_BUDGET path={} mem_available_kib={kb} fs_available_bytes={available}",
+        path.display()
+    );
     assert!(
         kb.saturating_mul(1024) >= 8_589_934_592,
         "memory free floor below 8589934592 bytes: {kb}kB"
     );
     assert!(
         available >= 8_589_934_592,
-        "allocated filesystem free floor below 8589934592 bytes: {available}"
+        "filesystem free floor below 8589934592 bytes at {}: {available}",
+        path.display()
     );
 }
 
@@ -121,7 +156,9 @@ fn prepare(source: &str) -> vm::Vm {
         .allow_builtin("bytes::from_utf8")
         .expect("numeric string conversion");
     registry.bind_vm_cached(&mut machine).expect("binding");
-    machine.set_fuel(10_000_000);
+    // The ordered tail-conversion guest adds one object conversion on top of the
+    // realm prelude's variable startup fuel; keep a bounded but safe budget.
+    machine.set_fuel(FUEL_LIMIT);
     machine
 }
 
@@ -133,7 +170,7 @@ fn execute(source: &str) -> Value {
             let mut machine = prepare(&source);
             let before = machine.get_fuel();
             assert!(
-                matches!(before, Some(fuel) if fuel <= 10_000_000),
+                matches!(before, Some(fuel) if fuel <= FUEL_LIMIT),
                 "interpreter fuel {before:?}"
             );
             let status = machine.run();
@@ -156,7 +193,7 @@ fn execute(source: &str) -> Value {
                 (0, 0)
             );
             assert!(
-                matches!((before, after), (Some(left), Some(right)) if right <= left && right <= 10_000_000)
+                matches!((before, after), (Some(left), Some(right)) if right <= left && right <= FUEL_LIMIT)
             );
             assert!(machine
                 .capture_certification_stats()
@@ -230,7 +267,7 @@ var seq = 0;
 var markG = {};
 var markM = {};
 var markL = {};
-var tail = { mark: 11 };
+var tail = { mark: 11, th: 0 };
 var p = { ts: 0 };
 var b = { hits: 0 };
 var g = { mark: markG };
@@ -247,8 +284,10 @@ b.toString = retStr;
 m.valueOf = throwThis;
 both.valueOf = retObj;
 both.toString = retObj;
-tail.valueOf = throwThis;
-tail.toString = throwThis;
+function tailValue() { "use strict"; this.th = this.th + 1; return 0; }
+function tailText() { "use strict"; this.th = this.th + 1; return '-8'; }
+tail.valueOf = tailValue;
+tail.toString = tailText;
 L.boom = throwThis;
 Object.defineProperty(g, 'valueOf', { get: throwThis });
 var A = Math.abs;
@@ -267,6 +306,12 @@ if (n === 0 && !(o.m(-4) === 4 && 1 / o.m(z) === 1 / 0)) n = 9;
 var ex = A((seq = seq * 10 + 3, -4), (seq = seq * 10 + 4, tail));
 var bo = o.m((seq = seq * 10 + 5, -4), (seq = seq * 10 + 6, tail));
 if (n === 0 && !(ex === 4 && bo === 4 && seq === 123456)) n = 10;
+var k1 = { ord: 0 };
+function co1() { "use strict"; this.ord = this.ord * 10 + 3; return -5e-324; }
+k1.valueOf = co1;
+var t1 = Math.abs((k1.ord = 1, k1), (k1.ord = k1.ord * 10 + 2, tail));
+if (n === 0 && !(t1 === 5e-324 && k1.ord === 123)) n = 26;
+if (n === 0 && !(tail.th === 0)) throw 'TAIL_COUNT';
 if (n === 0 && !(A(p) === 8)) n = 20;
 if (n === 0 && !(A(b) === 8 && b.hits === 1)) n = 21;
 var cg = 0;
@@ -291,7 +336,7 @@ var seq = 0;
 var markG = {};
 var markM = {};
 var markL = {};
-var tail = { mark: 11 };
+var tail = { mark: 11, th: 0 };
 var p = { ts: 0 };
 var b = { hits: 0 };
 var g = { mark: markG };
@@ -308,8 +353,10 @@ b.toString = retStr;
 m.valueOf = throwThis;
 both.valueOf = retObj;
 both.toString = retObj;
-tail.valueOf = throwThis;
-tail.toString = throwThis;
+function tailValue() { "use strict"; this.th = this.th + 1; return 0; }
+function tailText() { "use strict"; this.th = this.th + 1; return '-1.2'; }
+tail.valueOf = tailValue;
+tail.toString = tailText;
 L.boom = throwThis;
 Object.defineProperty(g, 'valueOf', { get: throwThis });
 var F = Math.floor;
@@ -328,6 +375,12 @@ if (n === 0 && !(o.m(-1.2) === -2 && 1 / o.m(z) === -1 / 0)) n = 9;
 var ex = F((seq = seq * 10 + 3, -1.2), (seq = seq * 10 + 4, tail));
 var bo = o.m((seq = seq * 10 + 5, -1.2), (seq = seq * 10 + 6, tail));
 if (n === 0 && !(ex === -2 && bo === -2 && seq === 123456)) n = 10;
+var k1 = { ord: 0 };
+function co1() { "use strict"; this.ord = this.ord * 10 + 3; return -1.2; }
+k1.valueOf = co1;
+var t1 = Math.floor((k1.ord = 1, k1), (k1.ord = k1.ord * 10 + 2, tail));
+if (n === 0 && !(t1 === -2 && k1.ord === 123)) n = 26;
+if (n === 0 && !(tail.th === 0)) throw 'TAIL_COUNT';
 if (n === 0 && !(F(p) === -2)) n = 20;
 if (n === 0 && !(F(b) === -2 && b.hits === 1)) n = 21;
 var cg = 0;
@@ -352,7 +405,7 @@ var seq = 0;
 var markG = {};
 var markM = {};
 var markL = {};
-var tail = { mark: 11 };
+var tail = { mark: 11, th: 0 };
 var p = { ts: 0 };
 var b = { hits: 0 };
 var g = { mark: markG };
@@ -369,8 +422,10 @@ b.toString = retStr;
 m.valueOf = throwThis;
 both.valueOf = retObj;
 both.toString = retObj;
-tail.valueOf = throwThis;
-tail.toString = throwThis;
+function tailValue() { "use strict"; this.th = this.th + 1; return 0; }
+function tailText() { "use strict"; this.th = this.th + 1; return '-1.2'; }
+tail.valueOf = tailValue;
+tail.toString = tailText;
 L.boom = throwThis;
 Object.defineProperty(g, 'valueOf', { get: throwThis });
 var F = Math.ceil;
@@ -389,6 +444,12 @@ if (n === 0 && !(o.m(-1.2) === -1 && 1 / o.m(-0.5) === -1 / 0)) n = 9;
 var ex = F((seq = seq * 10 + 3, -1.2), (seq = seq * 10 + 4, tail));
 var bo = o.m((seq = seq * 10 + 5, -1.2), (seq = seq * 10 + 6, tail));
 if (n === 0 && !(ex === -1 && bo === -1 && seq === 123456)) n = 10;
+var k1 = { ord: 0 };
+function co1() { "use strict"; this.ord = this.ord * 10 + 3; return -1.2; }
+k1.valueOf = co1;
+var t1 = Math.ceil((k1.ord = 1, k1), (k1.ord = k1.ord * 10 + 2, tail));
+if (n === 0 && !(t1 === -1 && k1.ord === 123)) n = 26;
+if (n === 0 && !(tail.th === 0)) throw 'TAIL_COUNT';
 if (n === 0 && !(F(p) === -1)) n = 20;
 if (n === 0 && !(F(b) === -1 && b.hits === 1)) n = 21;
 var cg = 0;
@@ -413,7 +474,7 @@ var seq = 0;
 var markG = {};
 var markM = {};
 var markL = {};
-var tail = { mark: 11 };
+var tail = { mark: 11, th: 0 };
 var p = { ts: 0 };
 var b = { hits: 0 };
 var g = { mark: markG };
@@ -430,8 +491,10 @@ b.toString = retStr;
 m.valueOf = throwThis;
 both.valueOf = retObj;
 both.toString = retObj;
-tail.valueOf = throwThis;
-tail.toString = throwThis;
+function tailValue() { "use strict"; this.th = this.th + 1; return 0; }
+function tailText() { "use strict"; this.th = this.th + 1; return '-1.5'; }
+tail.valueOf = tailValue;
+tail.toString = tailText;
 L.boom = throwThis;
 Object.defineProperty(g, 'valueOf', { get: throwThis });
 var F = Math.round;
@@ -452,6 +515,12 @@ if (n === 0 && !(o.m(-1.5) === -1 && 1 / o.m(-0.5) === -1 / 0)) n = 9;
 var ex = F((seq = seq * 10 + 3, -1.5), (seq = seq * 10 + 4, tail));
 var bo = o.m((seq = seq * 10 + 5, -1.5), (seq = seq * 10 + 6, tail));
 if (n === 0 && !(ex === -1 && bo === -1 && seq === 123456)) n = 10;
+var k1 = { ord: 0 };
+function co1() { "use strict"; this.ord = this.ord * 10 + 3; return -1.5; }
+k1.valueOf = co1;
+var t1 = Math.round((k1.ord = 1, k1), (k1.ord = k1.ord * 10 + 2, tail));
+if (n === 0 && !(t1 === -1 && k1.ord === 123)) n = 26;
+if (n === 0 && !(tail.th === 0)) throw 'TAIL_COUNT';
 if (n === 0 && !(F(p) === -1)) n = 20;
 if (n === 0 && !(F(b) === -1 && b.hits === 1)) n = 21;
 var cg = 0;
@@ -476,7 +545,7 @@ var seq = 0;
 var markG = {};
 var markM = {};
 var markL = {};
-var tail = { mark: 11 };
+var tail = { mark: 11, th: 0 };
 var p = { ts: 0 };
 var b = { hits: 0 };
 var g = { mark: markG };
@@ -493,8 +562,10 @@ b.toString = retStr;
 m.valueOf = throwThis;
 both.valueOf = retObj;
 both.toString = retObj;
-tail.valueOf = throwThis;
-tail.toString = throwThis;
+function tailValue() { "use strict"; this.th = this.th + 1; return 0; }
+function tailText() { "use strict"; this.th = this.th + 1; return '9'; }
+tail.valueOf = tailValue;
+tail.toString = tailText;
 L.boom = throwThis;
 Object.defineProperty(g, 'valueOf', { get: throwThis });
 var F = Math.sqrt;
@@ -511,6 +582,12 @@ if (n === 0 && !(o.m(9) === 3 && 1 / o.m(z) === -1 / 0)) n = 9;
 var ex = F((seq = seq * 10 + 3, 9), (seq = seq * 10 + 4, tail));
 var bo = o.m((seq = seq * 10 + 5, 9), (seq = seq * 10 + 6, tail));
 if (n === 0 && !(ex === 3 && bo === 3 && seq === 123456)) n = 10;
+var k1 = { ord: 0 };
+function co1() { "use strict"; this.ord = this.ord * 10 + 3; return 9; }
+k1.valueOf = co1;
+var t1 = Math.sqrt((k1.ord = 1, k1), (k1.ord = k1.ord * 10 + 2, tail));
+if (n === 0 && !(t1 === 3 && k1.ord === 123)) n = 26;
+if (n === 0 && !(tail.th === 0)) throw 'TAIL_COUNT';
 if (n === 0 && !(F(p) === 3)) n = 20;
 if (n === 0 && !(F(b) === 3 && b.hits === 1)) n = 21;
 var cg = 0;
