@@ -385,7 +385,33 @@ fn visit_expr(e: &mut vm::Expr, f: &mut impl FnMut(&mut vm::Expr)) {
             visit_expr(expr, f);
         }
         E::ResultConstruct { payload, .. } => visit_expr(payload, f),
-        E::ResultQuery { value, .. } | E::ResultTry { value, .. } => visit_expr(value, f),
+        E::ResultQuery { value, .. }
+        | E::ResultTry { value, .. }
+        | E::ResultConvert { value, .. } => visit_expr(value, f),
+        E::ResultMethod {
+            receiver, argument, ..
+        }
+        | E::OptionMethod {
+            receiver, argument, ..
+        } => {
+            visit_expr(receiver, f);
+            visit_expr(argument, f);
+        }
+        E::OptionConstruct { payload, .. } => {
+            if let Some(payload) = payload {
+                visit_expr(payload, f);
+            }
+        }
+        E::OptionMatch {
+            value,
+            some_expr,
+            none_expr,
+            ..
+        } => {
+            visit_expr(value, f);
+            visit_expr(some_expr, f);
+            visit_expr(none_expr, f);
+        }
         E::ResultMatch {
             value,
             ok_expr,
@@ -426,6 +452,7 @@ fn visit_expr(e: &mut vm::Expr, f: &mut impl FnMut(&mut vm::Expr)) {
             }
         }
         E::Null
+        | E::Unit
         | E::Int(_)
         | E::Float(_)
         | E::Bool(_)
@@ -496,6 +523,8 @@ fn bitwise133_numeric_refusals() {
             uncaught: false,
             type_error: false,
             realm_header: false,
+            collect_phases: false,
+            collect_stop: None,
         };
         let source = source.to_owned();
         std::thread::Builder::new().stack_size(33_554_432).spawn(move || {
@@ -646,6 +675,8 @@ fn bitwise133_managed_roots_gc() {
         uncaught: false,
         type_error: false,
         realm_header: false,
+        collect_phases: false,
+        collect_stop: None,
     };
     static ALIAS: AliasRootObserver = AliasRootObserver;
     for source in [
@@ -706,6 +737,8 @@ fn bitwise133_managed_throw_finally_gc() {
         uncaught: true,
         type_error: false,
         realm_header: false,
+        collect_phases: false,
+        collect_stop: None,
     };
     let source = "function f(){throw 'P\\0\\ud800';}try{5&f();}finally{var t='garbage'+'!';}";
     std::thread::Builder::new()
@@ -756,6 +789,8 @@ impl vm::SourcePlugin for AliasRootObserver {
             uncaught: false,
             type_error: false,
             realm_header: false,
+            collect_phases: false,
+            collect_stop: None,
         };
         let mut ir = vm::SourcePlugin::parse_source(&obs, source, cx)?;
         let h = |name: &str| ir.functions.iter().find(|f| f.name == name).unwrap().index;
@@ -883,6 +918,8 @@ fn bitwise133_public_file_controls() {
         uncaught: true,
         type_error: false,
         realm_header: false,
+        collect_phases: false,
+        collect_stop: None,
     };
     for (id, body, expected) in [
         ("positive", BODY.to_owned(), None),
@@ -1150,6 +1187,8 @@ fn bitwise133_all7_refusals() {
             uncaught: false,
             type_error: false,
             realm_header: false,
+            collect_phases: false,
+            collect_stop: None,
         };
         let source = source.to_owned();
         std::thread::Builder::new().stack_size(33_554_432).spawn(move || {
