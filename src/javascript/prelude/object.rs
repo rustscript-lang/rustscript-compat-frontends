@@ -9632,17 +9632,26 @@ fn append_api(
 ///
 /// `JSON` is an ordinary global object and `stringify` its one own data
 /// property, so the unchanged ordinary Get finds this function on the real
-/// object. Only the admitted shape succeeds: a callable function value, the
-/// ordinary `JSON` object as receiver, exactly one argument, and that argument
-/// an ordinary Object node or the admitted `/a/` RegExp node whose whole own
-/// row set is either empty (the result is the guest String `{}`) or one data
-/// property whose key is the one-unit String `a` and whose value is the
-/// Number 1 (the result is the guest String `{"a":1}` with no spaces).
+/// object. Two shapes are admitted:
 ///
-/// Everything else — `JSON.parse`, other arities (replacer/space), primitives,
-/// arrays, functions, accessor or exotic rows, other keys, nested objects and
-/// values — keeps the existing TypeError instead of growing the method. Array
-/// elements are never enumerated and no Core array is rooted here.
+/// * an ordinary Object node or the admitted `/a/` RegExp node whose whole own
+///   row set is empty (the guest String `{}`) or one data property whose key
+///   is the one-unit String `a` and whose value is the Number 1 (the guest
+///   String `{"a":1}` with no spaces). This shape still requires the ordinary
+///   `JSON` object receiver and exactly one argument.
+/// * a top-level scalar: `null`, a Boolean, Undefined (including a missing
+///   argument), a non-finite Number, either zero sign, or a signed i32. The
+///   text is `null`, `true`, `false`, `0`, or the decimal integer produced by
+///   the accepted managed Number-to-String producer. Scalar calls read only
+///   the first argument, ignore trailing values (already evaluated by the call
+///   lowering) and do not read the receiver brand, so an extracted
+///   `var s=JSON.stringify; s(x)` reaches the same runtime tags.
+///
+/// Everything else — `JSON.parse`, String, Array, other finite numbers,
+/// functions, general objects, accessor or exotic rows, other keys, nested
+/// objects and values, replacer/space — keeps the existing TypeError instead
+/// of growing the method. Array elements are never enumerated and no Core
+/// array is rooted here.
 fn append_json_stringify(
     lower: &mut Lowerer<'_>,
     ir: &mut FrontendIr,
@@ -9657,6 +9666,7 @@ fn append_json_stringify(
     let args = lower.slot(span)?;
     let heap = lower.heap_ref(span)?.helpers;
     let intrinsic = lower.intrinsics.expect("intrinsics");
+    let number_string = lower.number_string_managed();
     let mut e = Emit::new(lower, span, c)?;
     let l = e.line;
     let sp = e.lower.ir_span(span);
@@ -9673,6 +9683,7 @@ fn append_json_stringify(
     let key_length = e.temp(T::Number, E::Float(0.0))?;
     let unit = e.integer()?;
     let error = e.boxed()?;
+    let formatted = e.boxed()?;
     let mut body = vec![
         assert_stmt(
             eq(var(code), int(super::intrinsics::JSON_STRINGIFY_CODE)),
@@ -9695,6 +9706,107 @@ fn append_json_stringify(
         value::result_ok(value::completion_return(var(text)), sp),
         l,
     ));
+    // Top-level scalar lexemes are real guest Strings published into the same
+    // root entry. The dispatch is by runtime tag, so a parameter, conditional
+    // or alias reaches these arms exactly like a source literal.
+    let mut null_text = Vec::new();
+    let null_string = super::intrinsics::string(&mut e, "null", frame, 2, &mut null_text)?;
+    null_text.push(assign(
+        out,
+        value::result_ok(value::completion_return(var(null_string)), sp),
+        l,
+    ));
+    let mut true_text = Vec::new();
+    let true_string = super::intrinsics::string(&mut e, "true", frame, 2, &mut true_text)?;
+    true_text.push(assign(
+        out,
+        value::result_ok(value::completion_return(var(true_string)), sp),
+        l,
+    ));
+    let mut false_text = Vec::new();
+    let false_string = super::intrinsics::string(&mut e, "false", frame, 2, &mut false_text)?;
+    false_text.push(assign(
+        out,
+        value::result_ok(value::completion_return(var(false_string)), sp),
+        l,
+    ));
+    // A Number is formatted by the accepted managed 9.8.1 producer, so the
+    // guest text of an admitted integer is derived at runtime instead of being
+    // hard-coded per test value. Non-finite Numbers are the JSON token `null`.
+    let number_text = vec![
+        assign(
+            formatted,
+            call(
+                number_string,
+                vec![
+                    var(c),
+                    num(field(var(argument), "number")),
+                    var(frame),
+                    int(2),
+                ],
+            ),
+            l,
+        ),
+        assign(
+            out,
+            value::result_ok(value::completion_return(var(formatted)), sp),
+            l,
+        ),
+    ];
+    let number = num(field(var(argument), "number"));
+    let integer_in_i32 = and(
+        eq(
+            number.clone(),
+            call(B::MathFloor.call_index(), vec![number.clone()]),
+        ),
+        and(
+            not(lt(number.clone(), E::Float(-2_147_483_648.0))),
+            not(lt(E::Float(2_147_483_647.0), number.clone())),
+        ),
+    );
+    let number_arm = vec![branch(
+        or(
+            not(eq(number.clone(), number.clone())),
+            or(
+                eq(number.clone(), E::Float(f64::INFINITY)),
+                eq(number.clone(), E::Float(f64::NEG_INFINITY)),
+            ),
+        ),
+        null_text.clone(),
+        vec![branch(
+            integer_in_i32,
+            number_text,
+            fail.clone(),
+            l,
+        )],
+        l,
+    )];
+    let scalar = vec![branch(
+        tag_is(var(argument), value::NULL),
+        null_text.clone(),
+        vec![branch(
+            tag_is(var(argument), value::UNDEFINED),
+            null_text.clone(),
+            vec![branch(
+                tag_is(var(argument), value::BOOLEAN),
+                vec![branch(
+                    field(var(argument), "flag"),
+                    true_text,
+                    false_text,
+                    l,
+                )],
+                vec![branch(
+                    tag_is(var(argument), value::NUMBER),
+                    number_arm,
+                    fail.clone(),
+                    l,
+                )],
+                l,
+            )],
+            l,
+        )],
+        l,
+    )];
     // Only two own row sets are admitted: the empty set and the single data
     // row `a` with the Number 1. The header is decoded once and the row set is
     // never read before its exact count is known.
@@ -9767,10 +9879,13 @@ fn append_json_stringify(
         call(B::Len.call_index(), vec![E::Borrow(Box::new(var(args)))]),
         l,
     ));
+    // A scalar call reads its first argument even when trailing argument
+    // expressions were supplied; only the object shape keeps exact arity.
+    // A missing argument stays Undefined and therefore serializes as `null`.
     body.push(assign(
         argument,
         choose(
-            eq(var(count), int(1)),
+            lt(int(0), var(count)),
             call(
                 B::Get.call_index(),
                 vec![E::Borrow(Box::new(var(args))), int(0)],
@@ -9817,21 +9932,36 @@ fn append_json_stringify(
             and(
                 tag_is(var(receiver), value::OBJECT),
                 and(
-                    and(
-                        eq(
-                            num(field(var(receiver), "ref_slot")),
-                            num(field(var(json), "ref_slot")),
-                        ),
-                        eq(
-                            num(field(var(receiver), "generation")),
-                            num(field(var(json), "generation")),
-                        ),
+                    eq(
+                        num(field(var(receiver), "ref_slot")),
+                        num(field(var(json), "ref_slot")),
                     ),
-                    and(eq(var(count), int(1)), tag_is(var(argument), value::OBJECT)),
+                    eq(
+                        num(field(var(receiver), "generation")),
+                        num(field(var(json), "generation")),
+                    ),
                 ),
             ),
-            admitted,
-            fail,
+            // The object path keeps its brand, exact arity and shape checks.
+            // A scalar argument never reads the receiver brand, so an extracted
+            // `var s=JSON.stringify; s(x)` reaches the same runtime tags.
+            vec![branch(
+                and(eq(var(count), int(1)), tag_is(var(argument), value::OBJECT)),
+                admitted,
+                vec![branch(
+                    tag_is(var(argument), value::OBJECT),
+                    fail.clone(),
+                    scalar.clone(),
+                    l,
+                )],
+                l,
+            )],
+            vec![branch(
+                tag_is(var(argument), value::OBJECT),
+                fail,
+                scalar,
+                l,
+            )],
             l,
         ));
     } else {

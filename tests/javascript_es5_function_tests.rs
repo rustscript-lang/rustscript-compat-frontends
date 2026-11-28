@@ -1104,6 +1104,375 @@ fn json_stringify_borrowed_receiver_throws() {
 }
 
 #[test]
+fn json_stringify_top_level_scalar_dispatch() {
+    // Real guest source through the production frontend. The one call site
+    // receives dynamically produced primitives from a function parameter, so
+    // no source spelling can be folded into a precomputed result.
+    let source = "function f(x){return JSON.stringify(x);}\
+        var n=0;\
+        if(!(f(null)===\"null\"))n=1;\
+        if(n===0&&!(f(true)===\"true\"))n=2;\
+        if(n===0&&!(f(false)===\"false\"))n=3;\
+        n;";
+    let (mut machine, _) = function_vm(source, false);
+    assert_eq!(
+        unboxed_number(&mut machine),
+        Value::Float(0.0),
+        "top-level null/Boolean JSON text mismatch; source={source:?}"
+    );
+}
+
+#[test]
+fn json_stringify_top_level_undefined_and_number_dispatch() {
+    // Missing arguments, explicit undefined, non-finite Numbers and both zero
+    // signs all become the JSON token `null` or `0` through the same runtime
+    // tags; the values are produced by guest functions, not literal spellings.
+    let source = "function f(x){return JSON.stringify(x);}\
+        function undef(){return undefined;}\
+        function nan(){return 0/0;}\
+        function pinf(){return 1/0;}\
+        function ninf(){return -1/0;}\
+        function zero(){return 0;}\
+        function nzero(){return -0;}\
+        var n=0;\
+        if(!(f(undef())===\"null\"))n=1;\
+        if(n===0&&!(JSON.stringify()===\"null\"))n=2;\
+        if(n===0&&!(f(nan())===\"null\"))n=3;\
+        if(n===0&&!(f(pinf())===\"null\"))n=4;\
+        if(n===0&&!(f(ninf())===\"null\"))n=5;\
+        if(n===0&&!(f(zero())===\"0\"))n=6;\
+        if(n===0&&!(f(nzero())===\"0\"))n=7;\
+        n;";
+    let (mut machine, _) = function_vm(source, false);
+    assert_eq!(
+        unboxed_number(&mut machine),
+        Value::Float(0.0),
+        "top-level undefined/non-finite/zero JSON text mismatch; source={source:?}"
+    );
+}
+
+#[test]
+fn json_stringify_top_level_i32_dynamic_dispatch() {
+    // The signed i32 domain crosses the same runtime Number arm at one call
+    // site. Text must be decimal with no `.0` or exponent, and the extracted
+    // alias must read its first argument instead of a receiver brand.
+    let source = "function f(x){return JSON.stringify(x);}\
+        var n=0;\
+        if(!(f(7)===\"7\"))n=1;\
+        if(n===0&&!(f(-7)===\"-7\"))n=2;\
+        if(n===0&&!(f(1000)===\"1000\"))n=3;\
+        if(n===0&&!(f(-1000000000)===\"-1000000000\"))n=4;\
+        if(n===0&&!(f(2147483647)===\"2147483647\"))n=5;\
+        if(n===0&&!(f(-2147483648)===\"-2147483648\"))n=6;\
+        if(n===0&&!(JSON.stringify(true?123456789:-1)===\"123456789\"))n=7;\
+        var s=JSON.stringify;\
+        if(n===0&&!(s(99)===\"99\"))n=8;\
+        n;";
+    let (mut machine, _) = function_vm(source, false);
+    assert_eq!(
+        unboxed_number(&mut machine),
+        Value::Float(0.0),
+        "top-level i32/dynamic JSON text mismatch; source={source:?}"
+    );
+}
+
+#[test]
+fn json_stringify_top_level_scalar_extra_arguments() {
+    // Every argument expression is evaluated once, left to right, before the
+    // scalar dispatch. The tail value is ignored without invoking valueOf or
+    // toString, and a throwing head prevents both the tail and stringify.
+    let source = "var box={order:\"\",late:0};\
+        function head(b){b.order=b.order+\"a\";return 7;}\
+        function tail(b){b.order=b.order+\"b\";return {valueOf:function(){throw 99;},toString:function(){throw 98;}};}\
+        var n=0;\
+        var r=JSON.stringify(head(box),tail(box));\
+        if(!(r===\"7\"))n=1;\
+        if(n===0&&!(box.order===\"ab\"))n=2;\
+        var q=JSON.stringify(null,{valueOf:function(){throw 96;}});\
+        if(n===0&&!(q===\"null\"))n=3;\
+        if(n===0&&!(box.order===\"ab\"))n=4;\
+        function boom(){throw 77;}\
+        function late(b){b.late=1;return 1;}\
+        var caught=0;\
+        try{JSON.stringify(boom(),late(box));}catch(e){if(e===77)caught=1;}\
+        if(n===0&&!(caught===1))n=5;\
+        if(n===0&&!(box.late===0))n=6;\
+        if(n===0&&!(box.order===\"ab\"))n=7;\
+        n;";
+    let (mut machine, _) = function_vm(source, false);
+    assert_eq!(
+        unboxed_number(&mut machine),
+        Value::Float(0.0),
+        "top-level scalar argument evaluation mismatch; source={source:?}"
+    );
+}
+
+#[test]
+fn json_stringify_top_level_scalar_shadowing() {
+    // `JSON` is an ordinary global object: a parameter with that name, a
+    // same-shape member replacement and a rewritten own method must all win
+    // over the builtin, while the restored method keeps the scalar dispatch.
+    let source = "var Fake={stringify:function(x){return \"fake\";}};\
+        function withParam(JSON){return JSON.stringify(7);}\
+        function viaMember(o){return o.stringify(7);}\
+        var n=0;\
+        if(!(withParam(Fake)===\"fake\"))n=1;\
+        if(n===0&&!(viaMember(Fake)===\"fake\"))n=2;\
+        var original=JSON.stringify;\
+        JSON.stringify=function(){return \"swapped\";};\
+        if(n===0&&!(JSON.stringify(7)===\"swapped\"))n=3;\
+        JSON.stringify=original;\
+        if(n===0&&!(JSON.stringify(7)===\"7\"))n=4;\
+        n;";
+    let (mut machine, _) = function_vm(source, false);
+    assert_eq!(
+        unboxed_number(&mut machine),
+        Value::Float(0.0),
+        "JSON shadowing/replacement mismatch; source={source:?}"
+    );
+}
+
+#[test]
+fn json_stringify_top_level_scalar_extracted_call() {
+    // An extracted method value and a function-value parameter both read the
+    // first scalar argument. The existing shared `.call`/`.apply` lowering
+    // still refuses this builtin method value (documented RED dependency);
+    // this slice deliberately does not change that shared adapter.
+    let source = "function via(h){return h(7);}\
+        var s=JSON.stringify;\
+        var n=0;\
+        if(!(s(7)===\"7\"))n=1;\
+        if(n===0&&!(via(JSON.stringify)===\"7\"))n=2;\
+        n;";
+    let (mut machine, _) = function_vm(source, false);
+    assert_eq!(
+        unboxed_number(&mut machine),
+        Value::Float(0.0),
+        "extracted scalar JSON call form mismatch; source={source:?}"
+    );
+}
+
+#[test]
+fn json_stringify_top_level_scalar_scope_boundary() {
+    // Everything outside this slice keeps the existing TypeError: String,
+    // Array, finite non-integer, finite outside i32 and a general object.
+    // Distinct weights 1+2+4+8+16+32 make a partial mismatch visible.
+    let source = "var n=0;\
+        try{JSON.stringify(\"x\");}catch(e){if(e.name===\"TypeError\")n=n+1;}\
+        try{JSON.stringify([1]);}catch(e){if(e.name===\"TypeError\")n=n+2;}\
+        try{JSON.stringify(1.5);}catch(e){if(e.name===\"TypeError\")n=n+4;}\
+        try{JSON.stringify(2147483648);}catch(e){if(e.name===\"TypeError\")n=n+8;}\
+        try{JSON.stringify(-2147483649);}catch(e){if(e.name===\"TypeError\")n=n+16;}\
+        try{JSON.stringify({b:2});}catch(e){if(e.name===\"TypeError\")n=n+32;}\
+        n;";
+    let (mut machine, _) = function_vm(source, false);
+    assert_eq!(
+        unboxed_number(&mut machine),
+        Value::Float(63.0),
+        "out-of-scope values changed their existing behavior; source={source:?}"
+    );
+}
+
+// ---- JSON scalar real-collection observer (test-only) ----
+// The plugin delegates the real source to the real JS plugin and only appends
+// one call to the existing heap observer after the source has run. Selector 5
+// reads the carrier's collection counter, so two otherwise identical programs
+// differ only by the guest allocations between the scalar result and its
+// readback.
+
+struct JsonScalarGcPlugin;
+
+static JSON_SCALAR_GC_PLUGIN: JsonScalarGcPlugin = JsonScalarGcPlugin;
+
+impl vm::SourcePlugin for JsonScalarGcPlugin {
+    fn descriptor(&self) -> vm::SourceFrontendDescriptor {
+        vm::SourceFrontendDescriptor {
+            id: vm::FrontendId::new("javascript-es5-json-scalar-gc-observer"),
+            extensions: &["js"],
+            typing_policy: vm::FrontendTypingPolicy::Strict,
+            supports_ownership_checking: true,
+        }
+    }
+
+    fn parse_source(
+        &self,
+        source: &str,
+        context: &vm::SourceFrontendContext<'_>,
+    ) -> Result<vm::FrontendIr, vm::ParseError> {
+        let mut ir = pd_vm_compat_frontends::JAVASCRIPT_ES5_PLUGIN.parse_source(source, context)?;
+        let make = ir
+            .functions
+            .iter()
+            .find(|f| f.name == "__compat_ref_make")
+            .map(|f| f.index)
+            .ok_or_else(|| {
+                helper_completion_rejection("JSON GC observer requires the realm make helper".into())
+            })?;
+        let mut carriers = Vec::new();
+        for stmt in &ir.stmts {
+            if let vm::Stmt::Let {
+                index,
+                declared_schema: None,
+                expr: vm::Expr::Call(target, _, args, _, _),
+                ..
+            } = stmt
+                && *target == make
+                && args.len() == 1
+            {
+                carriers.push(*index);
+            }
+        }
+        let [carrier] = carriers.as_slice() else {
+            return Err(helper_completion_rejection(format!(
+                "JSON GC observer requires exactly one realm carrier, found {}",
+                carriers.len()
+            )));
+        };
+        let observe = ir
+            .functions
+            .iter()
+            .find(|f| f.name == "__compat_es5_heap_observe")
+            .map(|f| f.index)
+            .ok_or_else(|| {
+                helper_completion_rejection(
+                    "JSON GC observer requires the heap observer helper".into(),
+                )
+            })?;
+        let slot = u16::try_from(ir.locals)
+            .map_err(|_| helper_completion_rejection("JSON GC slot space exhausted".into()))?;
+        ir.locals += 1;
+        ir.stmts.push(vm::Stmt::Let {
+            index: slot,
+            declared_schema: Some(vm::TypeSchema::Int),
+            expr: vm::Expr::Call(
+                observe,
+                Vec::new(),
+                vec![
+                    vm::Expr::Var(*carrier),
+                    vm::Expr::Int(5),
+                    vm::Expr::Int(0),
+                ],
+                None,
+                None,
+            ),
+            line: 1,
+        });
+        ir.stmts.push(vm::Stmt::Expr {
+            expr: vm::Expr::Var(slot),
+            line: 1,
+        });
+        Ok(ir)
+    }
+}
+
+fn json_scalar_gc_run(source: &str) -> (bool, i64) {
+    let catalog = function_catalog();
+    let options = vm::CompileSourceFileOptions::new()
+        .with_source_plugin(&JSON_SCALAR_GC_PLUGIN)
+        .with_host_api_catalog(std::sync::Arc::clone(&catalog));
+    let flavor =
+        vm::SourceFlavor::Plugin(vm::FrontendId::new("javascript-es5-json-scalar-gc-observer"));
+    let compilation = vm::compile_source_with_flavor_and_options_with_capture_certification(
+        source, flavor, options,
+    )
+    .expect("JSON GC observer compilation should succeed");
+    let mut machine = compilation
+        .into_vm()
+        .expect("certified compilation should create a source-certified VM");
+    machine.set_jit_config(vm::JitConfig {
+        enabled: false,
+        ..vm::JitConfig::default()
+    });
+    machine.set_fuel(10_000_000);
+    pd_vm_compat_frontends::runtime::array::initialize_typescript_owned_arrays(
+        &mut machine,
+        pd_vm_compat_frontends::runtime::array::OwnedArrayLimits::default(),
+    )
+    .expect("explicit owned-array initialization should succeed");
+    let mut registry = HostFunctionRegistry::restricted();
+    pd_vm_compat_frontends::runtime::array::typescript_array_host_module()
+        .install_from_catalog(&mut registry, &catalog)
+        .expect("manual arrays adapters should match the effective catalog");
+    pd_vm_compat_frontends::runtime::array::typescript_owned_array_host_module()
+        .install_from_catalog(&mut registry, &catalog)
+        .expect("owned adapters should match the effective catalog");
+    pd_vm_compat_frontends::runtime::array::typescript_array_snapshot_host_module()
+        .install_from_catalog(&mut registry, &catalog)
+        .expect("snapshot adapter should match the effective catalog");
+    pd_vm_compat_frontends::runtime::scalar_math::typescript_scalar_math_host_module()
+        .install_from_catalog(&mut registry, &catalog)
+        .expect("scalar-math adapter should match the effective catalog");
+    pd_vm_compat_frontends::runtime::scalar_error::typescript_error_host_module()
+        .install_from_catalog(&mut registry, &catalog)
+        .expect("scalar-error adapter should match the effective catalog");
+    registry
+        .allow_builtin("math::floor")
+        .expect("math::floor should be allow-listable");
+    registry
+        .allow_builtin("math::copysign")
+        .expect("math::copysign should be allow-listable");
+    registry
+        .allow_builtin("bytes::from_utf8")
+        .expect("bootstrap strings");
+    registry
+        .allow_builtin("math::is_finite")
+        .expect("numeric guards");
+    registry
+        .allow_builtin("math::trunc")
+        .expect("numeric guards");
+    registry
+        .allow_builtin("math::powf")
+        .expect("numeric guards");
+    registry
+        .bind_vm_cached(&mut machine)
+        .expect("production adapters should bind to this VM");
+    assert_eq!(
+        machine.run().expect("JSON GC observer run should finish"),
+        VmStatus::Halted,
+        "JSON GC observer program should halt"
+    );
+    let stack = machine.stack().to_vec();
+    assert!(stack.len() >= 2, "completion plus collection counter");
+    let collections = match &stack[stack.len() - 1] {
+        Value::Int(n) => *n,
+        other => panic!("heap observer must return Int, got {other:?}"),
+    };
+    let Value::Map(fields) = &stack[stack.len() - 2] else {
+        panic!("expected boxed boolean completion, got {:?}", stack[stack.len() - 2]);
+    };
+    assert_eq!(fields.get(&Value::string("tag")), Some(&Value::Int(2)));
+    let flag = match fields.get(&Value::string("flag")) {
+        Some(Value::Bool(flag)) => *flag,
+        other => panic!("boolean completion must carry a Bool flag, got {other:?}"),
+    };
+    (flag, collections)
+}
+
+#[test]
+fn json_stringify_top_level_scalar_survives_real_collection() {
+    // The churn program allocates 64 objects after the scalar String has been
+    // returned and before its text is read again. That crosses the allocation
+    // interval, so the collector must trace the String through the live frame
+    // and the older object `o`; both readbacks then validate checked handles.
+    let baseline = "var s=JSON.stringify(123456789);s===\"123456789\"&&s.length===9;";
+    let churn = "var s=JSON.stringify(123456789);var o={a:1};\
+        function churn(){var i=0;while(i<64){var t={v:i};i=i+1;}return 0;}\
+        churn();\
+        s===\"123456789\"&&s.length===9&&JSON.stringify(o)===\"{\\\"a\\\":1}\";";
+    let (base_ok, base_collections) = json_scalar_gc_run(baseline);
+    let (churn_ok, churn_collections) = json_scalar_gc_run(churn);
+    assert!(base_ok, "baseline scalar String must read back; source={baseline:?}");
+    assert!(churn_ok, "scalar String/object must survive real collection; source={churn:?}");
+    eprintln!(
+        "JSON_SCALAR_GC base_collections={base_collections} churn_collections={churn_collections}"
+    );
+    assert!(
+        churn_collections > base_collections,
+        "guest object churn must cross a real collection: base={base_collections} churn={churn_collections}"
+    );
+}
+
+#[test]
 fn json_parse_inventory_object_field_returns_seven() {
     let source = "JSON.parse(\"{\\\"a\\\":7}\").a;";
     let mut machine = pd_vm_compat_frontends::javascript::cli::compile_javascript_es5_source(source)
