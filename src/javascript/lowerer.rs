@@ -8140,18 +8140,21 @@ helper_construct: None,
     let throw_facts = reference::script_throw_facts(Some(&lower), &script.body);
     let catches_callee_throw = throw_facts.may_guest_throw;
     let array_buffer_used = lower.array_buffer_used.get();
-    // The ArrayBuffer constructor's per-buffer quota branch is a fatal host
-    // error, so the adapter is required exactly when a construction can reach
-    // it. When every reachable `new ArrayBuffer(...)` is a proven literal the
-    // branch is dead and the catalog-free compile survives; the same adapter
-    // serves the uncaught guest throw when that channel is open.
+    // Three independent facts, kept apart on purpose:
+    //   A. `array_buffer_used` installs the ArrayBuffer realm (a public
+    //      spelling or an owned Uint8 backing prototype pair needs it);
+    //   B. `array_buffer_quota_reachable` is the public `new ArrayBuffer(...)`
+    //      helper's fatal quota branch;
+    //   C. `owned_uint8_quota_reachable` is the owned `new Uint8Array(...)`
+    //      backing's fatal quota branch.
+    // The realm fact never implies B or C: a safe owned literal installs the
+    // realm without reaching either branch. B and C are the only fatal
+    // adapter demands, and each is decided by the construction route's first
+    // actual alone.
     let array_buffer_quota = array_buffer_used && throw_facts.array_buffer_quota_reachable;
-    // The owned-length Uint8 route has its own fatal per-backing quota branch.
-    // It participates in the same adapter reachability: when a reachable site
-    // cannot prove its length inside the budget, the compile requires the
-    // adapter instead of degrading the branch to a guest RangeError.
-    let typed_array_quota =
-        lower.typed_array_used() && lower.typed_array_owned_quota_reachable.get();
+    let typed_array_quota = lower.typed_array_used()
+        && (lower.typed_array_owned_quota_reachable.get()
+            || throw_facts.owned_uint8_quota_reachable);
     let scalar_error_host = if catches_callee_throw || array_buffer_quota || typed_array_quota {
         Some(install_scalar_error_host(
             context,

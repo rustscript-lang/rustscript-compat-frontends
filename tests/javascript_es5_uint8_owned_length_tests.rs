@@ -792,6 +792,23 @@ fn u8_owned_length_quota_and_route_interpreter() {
     u8_quota_observer_probe();
 }
 
+#[test]
+fn u8_owned_length_unknown_tail_keeps_the_owned_realm() {
+    // The safe first actual still installs the ArrayBuffer realm for the
+    // owned backing; the unknown tail is evaluated by the call argument
+    // path but never converted by the owned-length branch.
+    assert_eq!(
+        run_number("function f(x){ return new Uint8Array(4, x).buffer.byteLength; } f(9);"),
+        4.0
+    );
+    // With the adapter present, an unknown tail cannot hide the fatal quota
+    // of a 32769 first actual from the guest catch: the owned branch never
+    // reads the tail.
+    assert_host_quota(
+        "function f(x){ try { new Uint8Array(32769, x); } catch (e) { return 1; } return 0; } f(9);",
+    );
+}
+
 fn u8_quota_observer_probe() {
     static QUOTA: OwnedQuotaObserver = OwnedQuotaObserver;
     with_big_stack(|| {

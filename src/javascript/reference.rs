@@ -693,12 +693,15 @@ pub(super) fn lower_script_statements(
 /// Script-wide throw-channel facts from one admitted-AST walk.
 ///
 /// `may_guest_throw` drives the adapter install and the Script pending
-/// ownership; `array_buffer_quota_reachable` drives the fatal per-buffer quota
-/// adapter the ArrayBuffer constructor helper calls. Both come from the same
-/// route classification the validation walk and the emitter consume.
+/// ownership. `array_buffer_quota_reachable` and
+/// `owned_uint8_quota_reachable` are the two fatal per-buffer quota facts:
+/// the public `ArrayBuffer` constructor helper and the owned-length
+/// `Uint8Array` branch respectively. Installing the ArrayBuffer realm is a
+/// third, independent fact and never implies either quota.
 pub(super) struct ScriptThrowFacts {
     pub may_guest_throw: bool,
     pub array_buffer_quota_reachable: bool,
+    pub owned_uint8_quota_reachable: bool,
 }
 
 /// Every general Call can fail the runtime callability check, even when no
@@ -706,19 +709,22 @@ pub(super) struct ScriptThrowFacts {
 /// activations and do not provision the Script's channel by themselves.
 /// This fact drives both adapter installation and Script pending ownership.
 /// `lower` supplies the binding resolution that decides whether a `new` site
-/// is a builtin construction or a guest-throwing source construction.
+/// is a builtin construction or a guest-throwing source construction, and the
+/// script's lexical scope that body-local aliases resolve against.
 pub(super) fn script_throw_facts(
     lower: Option<&Lowerer<'_>>,
     statements: &[ast::Stmt],
 ) -> ScriptThrowFacts {
     let mut scan = SourceScan {
         lower,
+        scope: lower.map(|lower| lower.graph.script),
         ..SourceScan::default()
     };
     scan.statements(statements, false);
     ScriptThrowFacts {
         may_guest_throw: scan.may_guest_throw,
         array_buffer_quota_reachable: scan.array_buffer_quota_reachable,
+        owned_uint8_quota_reachable: scan.owned_uint8_quota_reachable,
     }
 }
 
@@ -1155,10 +1161,19 @@ struct SourceScan<'a> {
     /// owns the scope graph; the parser-stage helpers pass `None` and keep the
     /// spelling-only answer because they never decide a Script throw channel.
     lower: Option<&'a Lowerer<'a>>,
+    /// Lexical scope of the statement under the cursor when `lower` owns the
+    /// scope graph. `None` means this walk cannot resolve bindings: either a
+    /// parser-stage scan or a function body the graph did not collect. A
+    /// deferred body without its own scope keeps the conservative quota answer.
+    scope: Option<ScopeId>,
     /// Some `new ArrayBuffer(...)` in this walk names a length the guest cannot
     /// prove inside the per-buffer byte budget, so the constructor helper's
     /// fatal quota branch is reachable and needs the scalar adapter.
     array_buffer_quota_reachable: bool,
+    /// Some owned-length `new Uint8Array(...)` in this walk names a length the
+    /// guest cannot prove inside the per-buffer byte budget, so the typed-array
+    /// helper's fatal owned quota branch is reachable and needs the adapter.
+    owned_uint8_quota_reachable: bool,
 }
 
 /// True when any statement/expression in the source passes the bare
@@ -1205,33 +1220,35 @@ impl SourceScan<'_> {
         }
     }
 
-    /// Record the throw-channel demand of one `new` site. The route is the one
-    /// classification the validation walk and the emitter consume, so the
-    /// scanner cannot disagree with them about the same source.
+    /// Record the throw-channel and fatal-quota demand of one `new` site. The
+    /// route is the one classification the validation walk and the emitter
+    /// consume, so the scanner cannot disagree with them about the same source.
     ///
     /// A route that can answer the Script with a guest `Err` needs the pending
-    /// channel even when no other Call/Throw/Try spelling appears, and its
-    /// `ArrayBuffer` arm additionally decides whether the fatal per-buffer
-    /// quota adapter can be reached.
+    /// channel even when no other Call/Throw/Try spelling appears. The fatal
+    /// per-buffer quota facts are separate from both that channel and the
+    /// ArrayBuffer realm: only a real `ArrayBuffer` or owned `Uint8Array`
+    /// construction with an unproven first actual reaches them.
     fn note_construct(&mut self, construct: &ast::NewExpr, deferred: bool) {
-        let route = construct_route(self.lower, construct);
+        let route = construct_route_in_scope(self.lower, construct, self.scope);
         let open = route.needs_guest_throw(construct);
-        if matches!(route, ConstructRoute::ArrayBuffer(_)) && open {
-            // The quota branch is a fatal host error raised inside the
-            // constructor helper itself, so a deferred body still needs the
-            // adapter at run time: this fact ignores the channel deferral.
-            self.array_buffer_quota_reachable = true;
+        match construct_quota(&route, construct, self.lower, self.scope) {
+            ConstructQuota::PublicArrayBuffer => self.array_buffer_quota_reachable = true,
+            ConstructQuota::OwnedUint8 => self.owned_uint8_quota_reachable = true,
+            ConstructQuota::None => {}
         }
-        // This walk carries the Script's scope into function bodies, not the
-        // body's own lexical scope. A function-local `var B = ArrayBuffer`
-        // therefore reads as a source (or other non-ArrayBuffer) route here
-        // while the emitter constructs through the ArrayBuffer helper. If the
-        // helper is built without the adapter, its per-buffer quota branch
-        // silently degrades the fatal host error into a catchable guest
-        // RangeError. Conservative rule for deferred bodies: any construction
-        // whose actuals are not proven inside the byte budget may reach that
-        // branch. An unused catalog entry is the cheap side of this choice.
-        if deferred && !actuals_are_proven_within_budget(construct) {
+        // This walk carries the script's lexical scope into function bodies.
+        // When the body's own scope was not collected, a body-local alias of
+        // ArrayBuffer cannot be ruled out: the emitter would then construct
+        // through the ArrayBuffer helper while this walk classified a source
+        // route. Keep the conservative deferred answer so the fatal host error
+        // cannot silently degrade into a catchable guest RangeError. The
+        // proof here cannot resolve identifiers, so only literals qualify.
+        if deferred
+            && self.lower.is_some()
+            && self.scope.is_none()
+            && first_actual_may_reach_byte_quota(construct, None, None)
+        {
             self.array_buffer_quota_reachable = true;
         }
         if !deferred {
@@ -1372,17 +1389,29 @@ impl SourceScan<'_> {
     }
 
     /// A function body is a deferred activation: everything inside it is
-    /// `deferred`, including nested functions and their parameters.
+    /// `deferred`, including nested functions and their parameters. Its own
+    /// lexical scope is resolved from the graph so a body-local
+    /// `var B = ArrayBuffer` classifies as the ArrayBuffer route here exactly
+    /// as the validation walk and the emitter see it.
     fn function(&mut self, function: &ast::Function) {
         if self.activation_local {
             return;
         }
+        let saved_scope = self.scope;
+        self.scope = self.lower.and_then(|lower| {
+            lower
+                .graph
+                .function_scopes
+                .get(&(function.span.lo.0, function.span.hi.0))
+                .copied()
+        });
         for param in &function.params {
             self.pat(&param.pat, true);
         }
         if let Some(body) = &function.body {
             self.statements(&body.stmts, true);
         }
+        self.scope = saved_scope;
     }
 
     fn expr(&mut self, expr: &ast::Expr, deferred: bool) {
@@ -6537,21 +6566,6 @@ impl ConstructRoute {
 /// this proof: its admitted actual is an ArrayBuffer object, never a count.
 const PROVEN_COUNT_MAX: f64 = 4_096.0;
 
-/// The conservative budget proof used for deferred bodies. True when every
-/// actual is a parenthesized non-negative integer literal inside the byte
-/// budget (no actuals proves the empty case). Unlike
-/// [`ConstructRoute::actuals_are_proven_safe`] this asks no route question:
-/// the walk cannot resolve the body's lexical bindings, so any unproven
-/// actual may be an ArrayBuffer length the emitter will construct.
-fn actuals_are_proven_within_budget(construct: &ast::NewExpr) -> bool {
-    construct
-        .args
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .all(|arg| arg.spread.is_none() && proven_count(&arg.expr).is_some())
-}
-
 /// A parenthesized non-negative integer numeric literal inside every guest
 /// limit. Variables, expressions, negatives, fractions and out-of-range
 /// literals answer `None` and keep the route's channel.
@@ -6567,16 +6581,176 @@ fn proven_count(expression: &ast::Expr) -> Option<f64> {
         .then_some(value)
 }
 
-/// True when an owned-length `new Uint8Array(...)` site can reach the fatal
-/// host byte quota: zero actuals allocate zero bytes, and one proven literal
-/// count is below `PROVEN_COUNT_MAX` (and so below `BYTES_MAX_LENGTH`). Every
-/// other first actual, including a variable, string or spread, may convert to
-/// a length above the quota, so the adapter demand is conservative.
-fn u8_owned_length_may_exceed_quota(construct: &ast::NewExpr) -> bool {
-    let args = construct.args.as_deref().unwrap_or_default();
-    match args {
-        [] => false,
-        [first, ..] => first.spread.is_some() || proven_count(&first.expr).is_none(),
+/// Which fatal per-buffer quota branch one construction site can reach.
+///
+/// The ArrayBuffer realm installation is deliberately not represented here:
+/// the realm is a separate fact ([`Lowerer::array_buffer_used`]) that owned
+/// Uint8 backings also need, and it never by itself reaches either
+/// constructor's quota branch.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConstructQuota {
+    /// No fatal quota branch is reachable for this site.
+    None,
+    /// The public `ArrayBuffer(length)` helper's quota branch.
+    PublicArrayBuffer,
+    /// The owned-length `Uint8Array(length)` branch.
+    OwnedUint8,
+}
+
+/// One per-buffer first-actual domain after the runtime's conversion.
+///
+/// Both helpers convert only actual 0, truncate toward zero (`NaN` becomes
+/// `+0`), decide the guest index domain first, and only then compare against
+/// the byte budget. Trailing actuals are evaluated by the call path but never
+/// converted by either quota branch, so they never participate here.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LengthDomain {
+    /// The converted length stays inside `BYTES_MAX_LENGTH`.
+    WithinBudget,
+    /// The converted length can land in `32_769..=2^30-1`.
+    Quota,
+    /// The converted length stays outside the non-negative index domain, so
+    /// the guest `RangeError` wins before the quota branch.
+    GuestIndex,
+}
+
+/// The shared `JS_ToIndex` upper bound both fatal quota branches check before
+/// the byte budget (`array_buffer.rs`/`typed_array.rs` both compare 2^30-1).
+const INDEX_MAX: f64 = 1_073_741_823.0;
+
+/// The one fatal-quota classification for one `new` site. The scan, the
+/// validation walk and the emitter all consume this; only the first actual is
+/// read because that is the only actual either constructor converts.
+fn construct_quota(
+    route: &ConstructRoute,
+    construct: &ast::NewExpr,
+    lower: Option<&Lowerer<'_>>,
+    scope: Option<ScopeId>,
+) -> ConstructQuota {
+    let reachable = || first_actual_may_reach_byte_quota(construct, lower, scope);
+    match route {
+        ConstructRoute::ArrayBuffer(_) if reachable() => ConstructQuota::PublicArrayBuffer,
+        ConstructRoute::TypedArray {
+            element: Element::Uint8,
+            ..
+        } if reachable() => ConstructQuota::OwnedUint8,
+        _ => ConstructQuota::None,
+    }
+}
+
+/// True when the first actual can reach the fatal per-buffer byte quota.
+/// Omitted actuals convert to zero. A proven literal is classified exactly
+/// (including truncation and the guest index domain); every unproven actual,
+/// including a spread, stays conservative. A body whose lexical scope is not
+/// available cannot prove identifier actuals (`undefined`/`NaN`).
+fn first_actual_may_reach_byte_quota(
+    construct: &ast::NewExpr,
+    lower: Option<&Lowerer<'_>>,
+    scope: Option<ScopeId>,
+) -> bool {
+    let Some(first) = construct.args.as_deref().unwrap_or_default().first() else {
+        return false;
+    };
+    if first.spread.is_some() {
+        return true;
+    }
+    match length_domain(&first.expr, lower, scope) {
+        Some(LengthDomain::Quota) => true,
+        Some(LengthDomain::WithinBudget | LengthDomain::GuestIndex) => false,
+        None => true,
+    }
+}
+
+/// The convertible first-actual shapes: numeric literals (with an optional
+/// unary sign), the `null`/boolean literals, strings that cannot spell a
+/// finite non-zero number, and the builtin `undefined`/`NaN` names when the
+/// caller can resolve them in the real lexical scope.
+fn length_domain(
+    expression: &ast::Expr,
+    lower: Option<&Lowerer<'_>>,
+    scope: Option<ScopeId>,
+) -> Option<LengthDomain> {
+    match unwrap_parens(expression) {
+        ast::Expr::Lit(ast::Lit::Num(number)) => Some(number_length_domain(number.value)),
+        ast::Expr::Lit(ast::Lit::Null(_)) | ast::Expr::Lit(ast::Lit::Bool(_)) => {
+            Some(LengthDomain::WithinBudget)
+        }
+        ast::Expr::Lit(ast::Lit::Str(text)) => {
+            // ToNumber of a string without an ASCII digit can only be NaN
+            // (+0), zero (empty) or +/-Infinity, and none of those is inside
+            // the fatal quota range.
+            (!text
+                .value
+                .to_string_lossy()
+                .chars()
+                .any(|c| c.is_ascii_digit()))
+            .then_some(LengthDomain::WithinBudget)
+        }
+        ast::Expr::Unary(unary) if matches!(unary.op, ast::UnaryOp::Plus | ast::UnaryOp::Minus) => {
+            match unwrap_parens(&unary.arg) {
+                ast::Expr::Lit(ast::Lit::Num(number)) => {
+                    let value = if unary.op == ast::UnaryOp::Minus {
+                        -number.value
+                    } else {
+                        number.value
+                    };
+                    Some(number_length_domain(value))
+                }
+                // +/-Infinity and +/-NaN keep their non-quota domain: the
+                // sign never turns an out-of-domain value into a quota value.
+                ast::Expr::Ident(ident)
+                    if ident.sym == *"Infinity"
+                        || ident.sym == *"NaN"
+                        || ident.sym == *"undefined" =>
+                {
+                    let lower = lower?;
+                    let scope = scope?;
+                    match resolve_from(lower, ident.sym.as_str(), scope) {
+                        NameHit::BuiltinNumber(true) if ident.sym == *"Infinity" => {
+                            Some(LengthDomain::GuestIndex)
+                        }
+                        NameHit::BuiltinNumber(false) if ident.sym == *"NaN" => {
+                            Some(LengthDomain::WithinBudget)
+                        }
+                        NameHit::BuiltinUndefined => Some(LengthDomain::WithinBudget),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        }
+        ast::Expr::Ident(ident)
+            if ident.sym == *"undefined" || ident.sym == *"NaN" || ident.sym == *"Infinity" =>
+        {
+            // A shadowed spelling is not the builtin; without the exact
+            // lexical scope the identifier stays conservative.
+            let lower = lower?;
+            let scope = scope?;
+            match resolve_from(lower, ident.sym.as_str(), scope) {
+                NameHit::BuiltinUndefined => Some(LengthDomain::WithinBudget),
+                NameHit::BuiltinNumber(true) if ident.sym == *"Infinity" => {
+                    Some(LengthDomain::GuestIndex)
+                }
+                NameHit::BuiltinNumber(false) if ident.sym == *"NaN" => {
+                    Some(LengthDomain::WithinBudget)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// `JS_ToInt32Sat`/`math.trunc` domain: NaN becomes +0, values truncate toward
+/// zero, and `-0.9` therefore keeps -0 (not below zero).
+fn number_length_domain(value: f64) -> LengthDomain {
+    let truncated = if value.is_nan() { 0.0 } else { value.trunc() };
+    if truncated < 0.0 || truncated > INDEX_MAX {
+        LengthDomain::GuestIndex
+    } else if truncated > layout::BYTES_MAX_LENGTH as f64 {
+        LengthDomain::Quota
+    } else {
+        LengthDomain::WithinBudget
     }
 }
 
@@ -6630,37 +6804,57 @@ fn spelling_construct_route(construct: &ast::NewExpr) -> ConstructRoute {
 /// scan, `validate_new_expr` and `lower_new_expr` share: a builtin spelling is
 /// never "channel-free" by itself, and only the binding decides whether the
 /// spelling still names the intrinsic.
+fn resolve_at(lower: &Lowerer<'_>, name: &str, scope: Option<ScopeId>) -> NameHit {
+    match scope {
+        Some(scope) => resolve_from(lower, name, scope),
+        None => resolve(lower, name),
+    }
+}
+
 pub(super) fn construct_route(
     lower: Option<&Lowerer<'_>>,
     construct: &ast::NewExpr,
+) -> ConstructRoute {
+    construct_route_in_scope(lower, construct, None)
+}
+
+/// Resolve one `new` site in an explicit lexical scope. The scan enters a
+/// function body with that body's own scope, so a `var B = ArrayBuffer` local
+/// to the activation classifies exactly as the validation walk and the
+/// emitter see it. `None` keeps the ambient resolution of [`resolve`] and
+/// [`construct_alias`], which already carry the active scope.
+pub(super) fn construct_route_in_scope(
+    lower: Option<&Lowerer<'_>>,
+    construct: &ast::NewExpr,
+    scope: Option<ScopeId>,
 ) -> ConstructRoute {
     let Some(lower) = lower else {
         return spelling_construct_route(construct);
     };
     let alias = match unwrap_parens(&construct.callee) {
-        ast::Expr::Ident(ident) => construct_alias(lower, ident, construct.span.lo.0),
+        ast::Expr::Ident(ident) => construct_alias(lower, ident, construct.span.lo.0, scope),
         _ => None,
     };
-    if let Some(call) = array_constructor_call(lower, construct, alias) {
+    if let Some(call) = array_constructor_call(lower, construct, alias, scope) {
         return ConstructRoute::Array(call);
     }
-    if let Some(call) = array_buffer_constructor_call(lower, construct, alias) {
+    if let Some(call) = array_buffer_constructor_call(lower, construct, alias, scope) {
         return ConstructRoute::ArrayBuffer(call);
     }
-    if let Some((call, element)) = typed_array_constructor_call(lower, construct, alias) {
+    if let Some((call, element)) = typed_array_constructor_call(lower, construct, alias, scope) {
         return ConstructRoute::TypedArray { call, element };
     }
     if matches!(alias, Some(ConstructorAlias::Object))
         || matches!(
             unwrap_parens(&construct.callee),
             ast::Expr::Ident(callee) if callee.sym == *"Object"
-        ) && matches!(resolve(lower, "Object"), NameHit::BuiltinObject)
+        ) && matches!(resolve_at(lower, "Object", scope), NameHit::BuiltinObject)
     {
         return ConstructRoute::Object { alias };
     }
     if let ast::Expr::Ident(callee) = unwrap_parens(&construct.callee)
         && callee.sym == *"Error"
-        && matches!(resolve(lower, "Error"), NameHit::Missing)
+        && matches!(resolve_at(lower, "Error", scope), NameHit::Missing)
     {
         return ConstructRoute::Error;
     }
@@ -6669,7 +6863,7 @@ pub(super) fn construct_route(
         _ => None,
     };
     let native_kind = match unwrap_parens(&construct.callee) {
-        ast::Expr::Ident(callee) => match resolve(lower, callee.sym.as_str()) {
+        ast::Expr::Ident(callee) => match resolve_at(lower, callee.sym.as_str(), scope) {
             NameHit::BuiltinTypeError => Some(NativeErrorKind::TypeError),
             NameHit::BuiltinRangeError => Some(NativeErrorKind::RangeError),
             _ => None,
@@ -6695,7 +6889,7 @@ pub(super) fn construct_route(
         };
     }
     if let ast::Expr::Ident(callee) = unwrap_parens(&construct.callee)
-        && let NameHit::BuiltinOptionalError(error) = resolve(lower, callee.sym.as_str())
+        && let NameHit::BuiltinOptionalError(error) = resolve_at(lower, callee.sym.as_str(), scope)
     {
         return ConstructRoute::OptionalError(error);
     }
@@ -6707,7 +6901,7 @@ pub(super) fn construct_route(
         _ => matches!(
             unwrap_parens(&construct.callee),
             ast::Expr::Ident(callee)
-                if matches!(resolve(lower, callee.sym.as_str()),
+                if matches!(resolve_at(lower, callee.sym.as_str(), scope),
                     NameHit::BuiltinNumberNamespace | NameHit::BuiltinStringNamespace | NameHit::BuiltinBoolean)
         ),
     };
@@ -6718,7 +6912,7 @@ pub(super) fn construct_route(
     // Date spelling is an ordinary source construction instead.
     let builtin_date = matches!(
         unwrap_parens(&construct.callee),
-        ast::Expr::Ident(ident) if ident.sym == *"Date" && matches!(resolve(lower, "Date"), NameHit::Missing)
+        ast::Expr::Ident(ident) if ident.sym == *"Date" && matches!(resolve_at(lower, "Date", scope), NameHit::Missing)
     );
     if builtin_date {
         return ConstructRoute::Date;
@@ -6732,10 +6926,14 @@ pub(super) fn array_constructor_call(
     lower: &Lowerer<'_>,
     construct: &ast::NewExpr,
     alias: Option<ConstructorAlias>,
+    scope: Option<ScopeId>,
 ) -> Option<ast::CallExpr> {
     if !matches!(alias, Some(ConstructorAlias::Array)) {
         let ident = array_constructor_ident(&construct.callee)?;
-        if !matches!(resolve(lower, ident.sym.as_str()), NameHit::BuiltinArrayNamespace) {
+        if !matches!(
+            resolve_at(lower, ident.sym.as_str(), scope),
+            NameHit::BuiltinArrayNamespace
+        ) {
             return None;
         }
     }
@@ -6752,10 +6950,14 @@ pub(super) fn array_buffer_constructor_call(
     lower: &Lowerer<'_>,
     construct: &ast::NewExpr,
     alias: Option<ConstructorAlias>,
+    scope: Option<ScopeId>,
 ) -> Option<ast::CallExpr> {
     if !matches!(alias, Some(ConstructorAlias::ArrayBuffer)) {
         let ast::Expr::Ident(ident) = unwrap_parens(&construct.callee) else { return None };
-        if !matches!(resolve(lower, ident.sym.as_str()), NameHit::BuiltinArrayBuffer) {
+        if !matches!(
+            resolve_at(lower, ident.sym.as_str(), scope),
+            NameHit::BuiltinArrayBuffer
+        ) {
             return None;
         }
     }
@@ -6772,12 +6974,14 @@ pub(super) fn typed_array_constructor_call(
     lower: &Lowerer<'_>,
     construct: &ast::NewExpr,
     alias: Option<ConstructorAlias>,
+    scope: Option<ScopeId>,
 ) -> Option<(ast::CallExpr, Element)> {
     let element = if let Some(ConstructorAlias::TypedArray(element)) = alias {
         element
     } else {
         let ast::Expr::Ident(ident) = unwrap_parens(&construct.callee) else { return None };
-        let NameHit::BuiltinTypedArray(element) = resolve(lower, ident.sym.as_str()) else {
+        let NameHit::BuiltinTypedArray(element) = resolve_at(lower, ident.sym.as_str(), scope)
+        else {
             return None;
         };
         element
@@ -6792,17 +6996,15 @@ pub(super) fn typed_array_constructor_call(
 }
 
 /// The alias of one identifier at a `new` site, in the same scope the name
-/// resolution below uses. Only a `var X = <builtin>` binding that is never
-/// written again qualifies.
+/// resolution uses. Only a `var X = <builtin>` binding that is never written
+/// again qualifies. `None` keeps the ambient scope of validation/emission.
 pub(super) fn construct_alias(
     lower: &Lowerer<'_>,
     ident: &ast::Ident,
     use_lo: u32,
+    scope: Option<ScopeId>,
 ) -> Option<ConstructorAlias> {
-    let scope = lower
-        .catch_overlay
-        .get()
-        .unwrap_or(lower.active_scope);
+    let scope = scope.unwrap_or_else(|| lower.catch_overlay.get().unwrap_or(lower.active_scope));
     super::scope::constructor_alias(&lower.graph, scope, ident.sym.as_str(), use_lo)
 }
 
@@ -6813,8 +7015,16 @@ fn validate_new_expr(
 ) -> Result<ProfileFact, ParseError> {
     // One route resolution, shared with the scan and the emitter: every arm
     // below consumes what `construct_route` decided instead of re-deriving the
-    // binding questions.
-    match construct_route(Some(lower), construct) {
+    // binding questions. The quota classification reads that same route and
+    // only its first actual, exactly like the scan and the emitted helpers.
+    let route = construct_route(Some(lower), construct);
+    let quota = construct_quota(
+        &route,
+        construct,
+        Some(lower),
+        Some(lower.catch_overlay.get().unwrap_or(lower.active_scope)),
+    );
+    match route {
         ConstructRoute::Array(call) | ConstructRoute::ArrayBuffer(call) => {
             validate_expr(lower, &ast::Expr::Call(call), facts)
         }
@@ -6826,9 +7036,9 @@ fn validate_new_expr(
             if matches!(element, Element::Uint8) {
                 lower.needs_ordinary_realm.set(true);
                 lower.array_buffer_used.set(true);
-                if u8_owned_length_may_exceed_quota(construct) {
-                    lower.typed_array_owned_quota_reachable.set(true);
-                }
+            }
+            if quota == ConstructQuota::OwnedUint8 {
+                lower.typed_array_owned_quota_reachable.set(true);
             }
             validate_expr(lower, &ast::Expr::Call(call), facts)
         }

@@ -495,3 +495,102 @@ fn c2_array_length_proof_boundary_is_4096() {
         "{source} must name the adapter: {compile}"
     );
 }
+
+// -------------------------------- owned Uint8 quota vs. realm demand --
+#[test]
+fn b10_owned_uint8_safe_length_ignores_unknown_tail_for_the_quota() {
+    // The owned backing quota only reads the first actual. The safe literal 4
+    // proves the backing inside the byte budget, and a trailing actual is
+    // evaluated without being converted, so it cannot reach the fatal quota.
+    // The ArrayBuffer realm is still installed for the owned backing's
+    // prototype pair; that realm fact must not demand the fatal adapter by
+    // itself.
+    // The runtime `.buffer.byteLength === 4` receipt lives in the owned
+    // interpreter suite: a Script-level call would open the uncaught-throw
+    // channel and legitimately require the adapter for another reason.
+    let source = "function f(x){ return new Uint8Array(4, x); }";
+    parse_without_throw_error(source)
+        .unwrap_or_else(|error| panic!("{source} must stay catalog-free: {error}"));
+    compile_without_throw_error(source)
+        .unwrap_or_else(|error| panic!("{source} must stay catalog-free: {error}"));
+}
+
+#[test]
+fn b11_owned_uint8_first_actual_keeps_the_quota_gate() {
+    // The first actual is the only owned-length input: a proven 32769 and an
+    // unknown variable both need the fatal quota adapter, and the separate
+    // owned route must name its own adapter classification.
+    for source in [
+        "function f(x){ return new Uint8Array(32769, x); }",
+        "function f(x){ return new Uint8Array(x); }",
+    ] {
+        let error = compile_without_throw_error(source)
+            .expect_err("an unproven owned length needs the fatal quota adapter");
+        assert!(
+            error.contains("JavaScript Uint8Array quota handling"),
+            "{source} must classify the owned quota: {error}"
+        );
+        assert!(
+            !error.contains("JavaScript ArrayBuffer quota handling"),
+            "{source} must not classify the realm install as a public ArrayBuffer quota: {error}"
+        );
+    }
+    // A function-local ArrayBuffer alias still needs the public ArrayBuffer
+    // quota adapter when its first actual is unproven.
+    let source = "function f(x){ var B = ArrayBuffer; return new B(x); }";
+    let error = compile_without_throw_error(source)
+        .expect_err("a function-local ArrayBuffer alias needs the fatal quota adapter");
+    assert!(
+        error.contains("JavaScript ArrayBuffer quota handling"),
+        "{source} must classify the public ArrayBuffer quota: {error}"
+    );
+    // A script-level alias used from a function body stays a conservative
+    // refusal (free-variable capture), never a catalog-free construction.
+    let source = "var B = ArrayBuffer; function f(x){ return new B(x); }";
+    compile_without_throw_error(source)
+        .expect_err("a captured ArrayBuffer alias must stay refused");
+}
+
+#[test]
+fn b12_owned_uint8_first_actual_domain_matches_the_runtime() {
+    // The owned route converts only the first actual, truncates toward zero,
+    // and decides the guest index domain before the byte quota. These domains
+    // therefore keep the catalog-free compile in a deferred body.
+    for source in [
+        "function f(){ return new Uint8Array().length; }",
+        "function f(){ return new Uint8Array(undefined).length; }",
+        "function f(){ return new Uint8Array(null).length; }",
+        "function f(){ return new Uint8Array(false).length; }",
+        "function f(){ return new Uint8Array(true).length; }",
+        "function f(){ return new Uint8Array(NaN).length; }",
+        "function f(){ return new Uint8Array(\"junk\").length; }",
+        "function f(){ return new Uint8Array(32768).length; }",
+        "function f(){ return new Uint8Array(32768.9).length; }",
+        "function f(){ return new Uint8Array(-0.9).length; }",
+        // The guest index domain wins before the quota branch.
+        "function f(){ return new Uint8Array(-1).length; }",
+        "function f(){ return new Uint8Array(-1.9).length; }",
+        "function f(){ return new Uint8Array(Infinity).length; }",
+        "function f(){ return new Uint8Array(-Infinity).length; }",
+        "function f(){ return new Uint8Array(1073741824).length; }",
+        "function f(){ return new Uint8Array(1073741825).length; }",
+    ] {
+        parse_without_throw_error(source)
+            .unwrap_or_else(|error| panic!("{source} must stay catalog-free: {error}"));
+    }
+    // The fatal quota range still demands its own adapter classification.
+    for source in [
+        "function f(){ return new Uint8Array(32769).length; }",
+        "function f(){ return new Uint8Array(32769.9).length; }",
+        "function f(){ return new Uint8Array(40000).length; }",
+        "function f(){ return new Uint8Array(1073741823).length; }",
+        "function f(x){ return new Uint8Array(x).length; }",
+    ] {
+        let error = parse_without_throw_error(source)
+            .expect_err("a quota-range owned length needs the fatal adapter");
+        assert!(
+            error.contains("JavaScript Uint8Array quota handling"),
+            "{source} must classify the owned quota: {error}"
+        );
+    }
+}
