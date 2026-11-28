@@ -4,18 +4,21 @@
 //! `Math` reads, a `var m=Math` alias, a rewritten script binding (`Math=7`),
 //! formal and function-local `Math` shadows, and the original object's
 //! not-callable / not-constructible `TypeError` with argument evaluation order.
-//! Every identity claim is a guest `===`; the host only reads the final boxed
-//! Number completion and never inspects a Rust realm object in its place.
+//! Every identity claim is a guest `===` preceded by an explicit
+//! `typeof m==="object"` plus `m!==null` check; the host only reads the final
+//! boxed Number completion as the exact IEEE-754 `+0` bit pattern and never
+//! inspects a Rust realm object in its place.
 //!
 //! The execution witness is the pinned MicroQuickJS commit
-//! `6d4d7eb6b99011d5aab6e88a9b99e8fd4d86c6e9`. Its answers are: `m===Math`
-//! true; after `Math=7`, `m` keeps the old object and the bare name reads 7;
-//! `function f(Math){return Math}` returns its argument; `var Math=8` inside a
-//! function wins locally; `m()` and `new m()` each throw `TypeError`; the call
-//! evaluates both actuals before the throw, and `new` also evaluates its
-//! actual before the throw (the pinned order). The namespace selector passed
-//! unchanged at `CANDIDATE_BASE`, so this file accepts existing production
-//! behavior rather than reproducing a feature failure.
+//! `6d4d7eb6b99011d5aab6e88a9b99e8fd4d86c6e9`. Its answers are: the saved
+//! `m` and `n` are both the non-null object `Math`; after `Math=7`, `m` keeps
+//! the old object and the bare name reads 7; `function f(Math){return Math}`
+//! returns its argument; `var Math=8` inside a function wins locally; `m()`
+//! and `new m()` each throw `TypeError`; the call evaluates both actuals
+//! before the throw, and `new` also evaluates its actual before the throw
+//! (the pinned order). The namespace selector passed unchanged at
+//! `CANDIDATE_BASE`, so this file accepts existing production behavior rather
+//! than reproducing a feature failure.
 //!
 //! Out of scope: `globalThis` descriptors/attribute bridges, catch-binding
 //! details and same-name catch rules, `Object.prototype.toString` branding
@@ -25,7 +28,7 @@
 //! plain TypeScript, JIT/AOT/native execution, cross-realm identity, and the
 //! whole of ES5.1. A member value is never used here as evidence that the
 //! namespace is complete.
-use pd_vm_compat_frontends::{JAVASCRIPT_ES5_PLUGIN, javascript_es5_flavor};
+use pd_vm_compat_frontends::{javascript_es5_flavor, JAVASCRIPT_ES5_PLUGIN};
 use vm::{HostFunctionRegistry, Value, VmStatus};
 
 /// Production base under test. This file adds tests only.
@@ -180,9 +183,10 @@ fn execute(source: &str) -> Value {
         .expect("test thread")
 }
 
-/// The completion must be a boxed Number (tag 3). A nonzero code identifies
-/// the first failing guest invariant on the host side.
-fn completion_code(source: &str) -> i64 {
+/// The completion must be a boxed Number (tag 3) whose payload is exactly
+/// IEEE-754 `+0`. Comparing the raw bits rejects NaN, `-0`, and every other
+/// magnitude instead of letting a lossy cast collapse them to the zero code.
+fn completion_zero(source: &str) {
     let value = execute(source);
     assert_eq!(
         field(&value, "tag"),
@@ -190,9 +194,12 @@ fn completion_code(source: &str) -> i64 {
         "boxed Number completion for {source}"
     );
     match field(&value, "number") {
-        Value::Float(number) => number as i64,
-        Value::Int(number) => number,
-        other => panic!("completion number for {source}: {other:?}"),
+        Value::Float(number) => assert_eq!(
+            number.to_bits(),
+            0x0000_0000_0000_0000u64,
+            "exact +0 completion bits for {source}: {number:?}"
+        ),
+        other => panic!("boxed Number Float payload for {source}: {other:?}"),
     }
 }
 
@@ -201,34 +208,39 @@ var m=Math;
 var n=Math;
 var a=m;
 var bad=0;
-if(!(m===n))bad=bad+1;
-if(!(a===Math))bad=bad+2;
-if(!(Math===Math))bad=bad+4;
+if(!(typeof m==="object"&&m!==null))bad=bad+1;
+if(!(m===n))bad=bad+2;
+if(!(a===Math))bad=bad+4;
+if(!(Math===Math))bad=bad+8;
 Math=7;
-if(!(Math===7))bad=bad+8;
-if(m===Math)bad=bad+16;
-if(m===7)bad=bad+32;
-if(!(a===m))bad=bad+64;
+if(!(Math===7))bad=bad+16;
+if(m===Math)bad=bad+32;
+if(m===7)bad=bad+64;
+if(!(a===m))bad=bad+128;
 function f(Math){return Math;}
 var o={};
-if(!(f(o)===o))bad=bad+128;
-if(!(f(7)===7))bad=bad+256;
-if(!(Math===7))bad=bad+512;
+if(!(f(o)===o))bad=bad+256;
+if(!(f(7)===7))bad=bad+512;
+if(!(Math===7))bad=bad+1024;
 function g(){var Math=8;return Math;}
-if(!(g()===8))bad=bad+1024;
-if(!(Math===7))bad=bad+2048;
+if(!(g()===8))bad=bad+2048;
+if(!(Math===7))bad=bad+4096;
 var t1=0;
 try{m();}catch(e1){t1=e1.name==="TypeError"?1:2;}
-if(t1!==1)bad=bad+4096;
+if(t1!==1)bad=bad+8192;
 var t2=0;
 try{new m();}catch(e2){t2=e2.name==="TypeError"?1:2;}
-if(t2!==1)bad=bad+8192;
+if(t2!==1)bad=bad+16384;
 var c=0;
-try{m(c=c*10+1,c=c*10+2);}catch(e3){c=c+1000;}
-if(c!==1012)bad=bad+16384;
+var ct=0;
+try{m(c=c*10+1,c=c*10+2);}catch(e3){ct=e3.name==="TypeError"?1:2;}
+if(c!==12)bad=bad+32768;
+if(ct!==1)bad=bad+65536;
 var d=0;
-try{new m(d=d*10+1);}catch(e4){d=d+100;}
-if(d!==101)bad=bad+32768;
+var dt=0;
+try{new m(d=d*10+1);}catch(e4){d=d+100;dt=e4.name==="TypeError"?1:2;}
+if(d!==101)bad=bad+131072;
+if(dt!==1)bad=bad+262144;
 bad;
 "#;
 
@@ -236,14 +248,15 @@ bad;
 /// It contains one bare `Math` requirement; that requirement selects the
 /// production namespace bootstrap (25 methods and 8 constants), not a
 /// member-minimal allocation, because every unshadowed `Math` read installs
-/// the namespace. The expected completion is exactly zero: any flipped
-/// identity, alias, rebinding, shadow, throw name, or evaluation order has its
-/// own nonzero code.
+/// the namespace. The first check proves the saved binding is a non-null
+/// object before any identity comparison, so a pre-seeded `Math=undefined` or
+/// `Math=42` cannot satisfy the alias rows. The expected completion is exactly
+/// boxed `+0`: any flipped identity, alias, rebinding, shadow, throw class, or
+/// evaluation order has its own nonzero code.
 #[test]
 fn math_namespace_identity_alias_rebinding_shadow_and_throws() {
-    let code = completion_code(NAMESPACE_SOURCE);
-    eprintln!("MATH_NS_CODES identity_alias_rebinding shadow throws order code={code}");
-    assert_eq!(code, 0, "Math namespace guest invariant code");
+    completion_zero(NAMESPACE_SOURCE);
+    eprintln!("MATH_NS_CODES identity_alias_rebinding shadow throws order completion=positive+0");
 }
 
 fn catalog_without(function_name: &str) -> std::sync::Arc<vm::HostApiCatalog> {
