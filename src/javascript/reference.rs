@@ -1222,6 +1222,18 @@ impl SourceScan<'_> {
             // adapter at run time: this fact ignores the channel deferral.
             self.array_buffer_quota_reachable = true;
         }
+        // This walk carries the Script's scope into function bodies, not the
+        // body's own lexical scope. A function-local `var B = ArrayBuffer`
+        // therefore reads as a source (or other non-ArrayBuffer) route here
+        // while the emitter constructs through the ArrayBuffer helper. If the
+        // helper is built without the adapter, its per-buffer quota branch
+        // silently degrades the fatal host error into a catchable guest
+        // RangeError. Conservative rule for deferred bodies: any construction
+        // whose actuals are not proven inside the byte budget may reach that
+        // branch. An unused catalog entry is the cheap side of this choice.
+        if deferred && !actuals_are_proven_within_budget(construct) {
+            self.array_buffer_quota_reachable = true;
+        }
         if !deferred {
             self.may_guest_throw |= open;
         }
@@ -6479,7 +6491,9 @@ impl ConstructRoute {
     /// The Script-channel verdict for one site: an open route stays closed
     /// exactly when every actual is a literal the route cannot reject, so its
     /// `Err` branch is unreachable. Anything unprovable (variable, expression,
-    /// negative or out-of-range literal) keeps the channel.
+    /// negative or out-of-range literal) keeps the channel, and TypedArray
+    /// never proves: its admitted actual domain is an ArrayBuffer object, so
+    /// even zero actuals and numeric literals answer the guest `Err`.
     pub(super) fn needs_guest_throw(&self, construct: &ast::NewExpr) -> bool {
         self.may_return_guest_err() && !self.actuals_are_proven_safe(construct)
     }
@@ -6496,11 +6510,17 @@ impl ConstructRoute {
             // length instead, so one literal bound covers both arms.
             Self::Array(_) => args.iter().all(|arg| proven_count(&arg.expr).is_some()),
             // One optional length/index actual.
-            Self::ArrayBuffer(_) | Self::TypedArray { .. } => match args {
+            Self::ArrayBuffer(_) => match args {
                 [] => true,
                 [arg] => proven_count(&arg.expr).is_some(),
                 _ => false,
             },
+            // The admitted TypedArray constructor takes an ArrayBuffer object
+            // as its first actual (prelude/typed_array.rs): zero actuals and
+            // numeric literals both answer the guest TypeError "unsupported
+            // object class". No shape makes the `Err` branch unreachable, so
+            // the nine element classes always keep the channel.
+            Self::TypedArray { .. } => false,
             Self::Object { .. }
             | Self::Error
             | Self::NativeError { .. }
@@ -6513,9 +6533,24 @@ impl ConstructRoute {
 
 /// The largest element count every guest construction route admits: the Array
 /// length bound (1_073_741_823) and the ArrayBuffer byte budget
-/// (`BYTES_MAX_LENGTH`, 32_768) are both above it, and the widest typed-array
-/// element (Float64, 8 bytes) still fits `4_096 * 8 == 32_768` bytes.
+/// (`BYTES_MAX_LENGTH`, 32_768) are both above it. TypedArray does not use
+/// this proof: its admitted actual is an ArrayBuffer object, never a count.
 const PROVEN_COUNT_MAX: f64 = 4_096.0;
+
+/// The conservative budget proof used for deferred bodies. True when every
+/// actual is a parenthesized non-negative integer literal inside the byte
+/// budget (no actuals proves the empty case). Unlike
+/// [`ConstructRoute::actuals_are_proven_safe`] this asks no route question:
+/// the walk cannot resolve the body's lexical bindings, so any unproven
+/// actual may be an ArrayBuffer length the emitter will construct.
+fn actuals_are_proven_within_budget(construct: &ast::NewExpr) -> bool {
+    construct
+        .args
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .all(|arg| arg.spread.is_none() && proven_count(&arg.expr).is_some())
+}
 
 /// A parenthesized non-negative integer numeric literal inside every guest
 /// limit. Variables, expressions, negatives, fractions and out-of-range

@@ -12,10 +12,18 @@
 //!   ordinary guest error value.
 //! * `new Object()`, `new Error("boom")` and `new Date(0)` keep the
 //!   catalog-free compile: no `typescript::throw_error` entry is required.
-//! * A proven literal (`new Array()`, `new Array(1,2)`, `new Uint8Array(4)`,
-//!   `new ArrayBuffer(8)`) also keeps the catalog-free compile, because the
-//!   route's `Err` branch is unreachable for it. A variable, expression,
-//!   negative or out-of-range actual keeps the channel.
+//! * No TypedArray construction is provable: the admitted constructor takes
+//!   an ArrayBuffer object as its one actual, so zero actuals and numeric
+//!   literals are the guest TypeError "unsupported object class". Every one
+//!   of the nine routes therefore keeps the channel.
+//! * A proven Array literal (`new Array()`, `new Array(1,2)`) and a proven
+//!   ArrayBuffer length (`new ArrayBuffer(8)`) keep the catalog-free compile,
+//!   because the route's `Err` branch is unreachable for them. A variable,
+//!   expression, negative or out-of-range actual keeps the channel.
+//! * The per-buffer ArrayBuffer quota is a fatal host error, never a guest
+//!   catch value. A function-local `var B = ArrayBuffer` must not let the
+//!   scan mistake `new B(32769)` for a source construction and so degrade
+//!   that fatal error into a catchable RangeError.
 
 const PROBE_FUEL: u64 = 40_000_000;
 
@@ -157,10 +165,9 @@ fn assert_catch_mask(construct: &str, expected: f64) {
 
 // --------------------------------------------------------------- probe --
 
-const CATALOG_FREE_SOURCES: [&str; 11] = [
+const CATALOG_FREE_SOURCES: [&str; 12] = [
     "new Array();",
     "new Array(1,2);",
-    "new Uint8Array(4);",
     "new ArrayBuffer(8);",
     "new Object();",
     "new Error(\"boom\");",
@@ -168,6 +175,8 @@ const CATALOG_FREE_SOURCES: [&str; 11] = [
     "var n=1;new Array(n);",
     "new Array(-1);",
     "new ArrayBuffer(-1);",
+    "new Uint8Array();",
+    "new Uint8Array(4);",
     "new Uint8Array(-1);",
 ];
 
@@ -295,11 +304,43 @@ fn b2_literal_element_list_is_proven() {
 }
 
 #[test]
-fn b3_literal_typed_array_argument_is_proven() {
-    parse_without_throw_error("new Uint8Array(4);")
-        .unwrap_or_else(|error| panic!("new Uint8Array(4) must stay catalog-free: {error}"));
-    compile_without_throw_error("new Uint8Array(4);")
-        .unwrap_or_else(|error| panic!("new Uint8Array(4) must stay catalog-free: {error}"));
+fn b3_literal_typed_array_argument_keeps_the_channel() {
+    // No TypedArray shape is a proven-safe construction: the admitted
+    // constructor requires an ArrayBuffer object as its first actual, so
+    // zero actuals and the numeric literal are both the guest TypeError
+    // "unsupported object class" (prelude/typed_array.rs). The route must
+    // keep the Script channel for all nine element classes.
+    for element in [
+        "Uint8Array",
+        "Int8Array",
+        "Uint8ClampedArray",
+        "Int16Array",
+        "Uint16Array",
+        "Int32Array",
+        "Uint32Array",
+        "Float32Array",
+        "Float64Array",
+    ] {
+        for arguments in ["", "4"] {
+            let source = format!("new {element}({arguments});");
+            let error = parse_without_throw_error(&source)
+                .expect_err("a TypedArray route must keep the Script channel");
+            assert!(
+                error.contains("typescript::throw_error"),
+                "{source} must name the adapter: {error}"
+            );
+        }
+    }
+    // The full production compile refuses the same two named shapes; a parse
+    // refusal is the same boundary, so one full compile pins it.
+    for source in ["new Uint8Array();", "new Uint8Array(4);"] {
+        let error = compile_without_throw_error(source)
+            .expect_err("the full compile must refuse without the adapter");
+        assert!(
+            error.contains("typescript::throw_error"),
+            "{source} must name the adapter: {error}"
+        );
+    }
 }
 
 #[test]
@@ -350,4 +391,100 @@ fn b7_negative_and_out_of_range_literals_keep_the_channel() {
             "{source} must name the adapter: {error}"
         );
     }
+}
+
+// -------------------------------------- fatal ArrayBuffer quota / scope --
+
+/// Print the pre-fix and post-fix truth for the two review blockers next to
+/// the strict assertions below.
+#[test]
+fn probe_fatal_quota_and_typed_array_matrix() {
+    for construct in ["new Uint8Array();", "new Uint8Array(4);"] {
+        eprintln!(
+            "PROBE typed-array uncaught {construct:<20} -> {:?}",
+            run_outcome(construct)
+        );
+        eprintln!(
+            "PROBE typed-array caught   {construct:<20} -> {:?}",
+            run_outcome(&catch_mask(construct))
+        );
+    }
+    for source in [
+        "function f(){var B=ArrayBuffer;try{new B(32769);}catch(e){return 1;}return 0;}f();",
+        "function f(){try{new ArrayBuffer(32769);}catch(e){return 1;}return 0;}f();",
+    ] {
+        eprintln!("PROBE fatal-quota {source} -> {:?}", run_outcome(source));
+    }
+}
+
+#[test]
+fn b8_function_local_array_buffer_alias_keeps_the_fatal_quota() {
+    // The function-local alias is still `ArrayBuffer` at the emitter, but the
+    // scan walks the body without the function's lexical scope. If it treats
+    // the site as a source construction the helper is built without the
+    // adapter, and the fatal quota error silently becomes a catchable guest
+    // RangeError. The catch must therefore never run.
+    let source =
+        "function f(){var B=ArrayBuffer;try{new B(32769);}catch(e){return 1;}return 0;}f();";
+    let error = run_error(source);
+    assert!(
+        error.contains("array buffer length exceeds host quota"),
+        "a function-local ArrayBuffer alias must keep the fatal quota error: {error}"
+    );
+}
+
+#[test]
+fn b9_function_local_direct_array_buffer_quota_is_fatal() {
+    // The direct spelling is the control for b8: its route is already
+    // ArrayBuffer, so the adapter must be installed and the same guest catch
+    // must not see the error.
+    let source =
+        "function f(){try{new ArrayBuffer(32769);}catch(e){return 1;}return 0;}f();";
+    let error = run_error(source);
+    assert!(
+        error.contains("array buffer length exceeds host quota"),
+        "the direct ArrayBuffer quota must stay a fatal host error: {error}"
+    );
+}
+
+#[test]
+fn c1_typed_array_constructs_use_the_script_throw_channel() {
+    // With the adapter installed, the zero-argument and numeric-literal
+    // TypedArray constructions publish the ordinary uncaught guest throw and
+    // are catchable as the guest TypeError "unsupported object class" (8+16).
+    // Without the route's channel they would abort with a host assertion
+    // instead.
+    for source in ["new Uint8Array();", "new Uint8Array(4);"] {
+        let error = run_error(source);
+        assert!(
+            error.contains("uncaught JavaScript throw"),
+            "{source} must publish the guest throw: {error}"
+        );
+        assert_catch_mask(source, 24.0);
+    }
+}
+
+#[test]
+fn c2_array_length_proof_boundary_is_4096() {
+    // 4096 is the last count every guest route admits inside the ArrayBuffer
+    // byte budget; 4097 is one past it and must not be proven.
+    for source in ["new Array(4096);", "new Array(4096,4096);"] {
+        parse_without_throw_error(source)
+            .unwrap_or_else(|error| panic!("{source} must stay catalog-free: {error}"));
+        compile_without_throw_error(source)
+            .unwrap_or_else(|error| panic!("{source} must stay catalog-free: {error}"));
+    }
+    let source = "new Array(4097);";
+    let error = parse_without_throw_error(source)
+        .expect_err("4097 must keep the Script channel");
+    assert!(
+        error.contains("typescript::throw_error"),
+        "{source} must name the adapter: {error}"
+    );
+    let compile = compile_without_throw_error(source)
+        .expect_err("the full compile must refuse without the adapter");
+    assert!(
+        compile.contains("typescript::throw_error"),
+        "{source} must name the adapter: {compile}"
+    );
 }
