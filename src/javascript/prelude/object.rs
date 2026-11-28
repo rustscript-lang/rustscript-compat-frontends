@@ -8220,19 +8220,197 @@ fn append_function_apply(
     let ok = e.temp(value::completion_schema(), value::completion_normal())?;
     let error = e.boxed()?;
     let payload = e.boxed()?;
+    // Extrema `.apply` reserves one guest root per String/Object element of
+    // the source Array's valid physical prefix. Only the capacity integer and
+    // the caller-rooted boxes cross `root_enter`; every base address is
+    // re-resolved by the existing admission below after entry.
+    let capacity = e.temp(T::Int, int(4))?;
+    let present = e.integer()?;
+    let reserved = e.integer()?;
+    let root_count = e.integer()?;
+    let item = e.boxed()?;
+    let tag = e.integer()?;
     let mut body = vec![
         assert_stmt(
             eq(var(code), int(super::intrinsics::FUNCTION_APPLY_CODE)),
             l,
         ),
-        assign(frame, call(heap.root_enter, vec![var(c), int(4)]), l),
-        e.root(var(frame), int(0), var(receiver))?,
+        assign(
+            count,
+            call(B::Len.call_index(), vec![E::Borrow(Box::new(var(args)))]),
+            l,
+        ),
+        assign(
+            this_arg,
+            choose(
+                lt(int(1), var(count)),
+                call(
+                    B::Get.call_index(),
+                    vec![E::Borrow(Box::new(var(args))), int(0)],
+                ),
+                value::undefined(),
+            ),
+            l,
+        ),
+        assign(
+            arg_array,
+            choose(
+                lt(int(1), var(count)),
+                call(
+                    B::Get.call_index(),
+                    vec![E::Borrow(Box::new(var(args))), int(1)],
+                ),
+                value::undefined(),
+            ),
+            l,
+        ),
     ];
     let fail = vec![
         assign(error, call(intrinsic.type_error, vec![var(c)]), l),
         e.root(var(frame), int(3), var(error))?,
         assign(out, value::result_err(var(error), sp), l),
     ];
+    // Capacity probe for the extrema `.apply` shape. Every read below is a
+    // non-allocating cell read of values the caller keeps rooted, and only
+    // integers survive across the following `root_enter`; a pressure
+    // collection there therefore cannot leave a stale base behind.
+    let prescan = vec![
+        // Valid physical prefix: the public length bounded by the stored
+        // present extent. Cells beyond it were never published and are never
+        // scanned.
+        assign(
+            present,
+            choose(
+                lt(
+                    var(arg_length),
+                    sub(
+                        e.decoded(add(var(arg_base), int(layout::ARRAY_PRESENT_OFFSET))),
+                        int(1),
+                    ),
+                ),
+                var(arg_length),
+                sub(
+                    e.decoded(add(var(arg_base), int(layout::ARRAY_PRESENT_OFFSET))),
+                    int(1),
+                ),
+            ),
+            l,
+        ),
+        assign(cursor, int(0), l),
+        assign(reserved, int(0), l),
+        S::While {
+            condition: lt(var(cursor), var(present)),
+            body: vec![
+                assign(
+                    tag,
+                    e.decoded(add(
+                        var(arg_base),
+                        add(
+                            int(layout::ARRAY_HEADER_CELLS),
+                            mul(int(layout::ARRAY_TAGGED_CELLS_PER_ENTRY), var(cursor)),
+                        ),
+                    )),
+                    l,
+                ),
+                branch(
+                    or(
+                        eq(var(tag), int(value::STRING)),
+                        eq(var(tag), int(value::OBJECT)),
+                    ),
+                    vec![assign(reserved, add(var(reserved), int(1)), l)],
+                    Vec::new(),
+                    l,
+                ),
+                assign(cursor, add(var(cursor), int(1)), l),
+            ],
+            line: l,
+        },
+        assign(capacity, add(int(4), var(reserved)), l),
+    ];
+    let probe = vec![
+        assign(base, e.base(var(receiver)), l),
+        assign(kind, e.decoded(var(base)), l),
+        branch(
+            eq(var(kind), int(layout::KIND_FUNCTION)),
+            vec![
+                assign(target, e.decoded(add(var(base), int(5))), l),
+                assign(
+                    source,
+                    lt(
+                        var(target),
+                        int(super::intrinsics::SOURCE_FUNCTION_CODE_LIMIT),
+                    ),
+                    l,
+                ),
+                branch(
+                    tag_is(var(arg_array), value::OBJECT),
+                    vec![
+                        assign(arg_base, e.base(var(arg_array)), l),
+                        assign(arg_kind, e.decoded(var(arg_base)), l),
+                        assign(
+                            dense,
+                            or(
+                                eq(var(arg_kind), int(layout::KIND_ARRAY)),
+                                eq(var(arg_kind), int(layout::KIND_TAGGED_ARRAY)),
+                            ),
+                            l,
+                        ),
+                        assign(arg_length, int(0), l),
+                        branch(
+                            var(dense),
+                            vec![assign(
+                                arg_length,
+                                call(
+                                    e.decode_u32,
+                                    vec![call(heap.array_length, vec![var(c), var(arg_base)])],
+                                ),
+                                l,
+                            )],
+                            Vec::new(),
+                            l,
+                        ),
+                        branch(
+                            and(
+                                and(
+                                    super::math::extrema_target(var(target)),
+                                    eq(var(arg_kind), int(layout::KIND_TAGGED_ARRAY)),
+                                ),
+                                and(
+                                    lt(int(1), var(count)),
+                                    not(lt(int(MAX_APPLY_ARGUMENTS), var(arg_length))),
+                                ),
+                            ),
+                            prescan,
+                            Vec::new(),
+                            l,
+                        ),
+                    ],
+                    Vec::new(),
+                    l,
+                ),
+            ],
+            Vec::new(),
+            l,
+        ),
+    ];
+    body.push(branch(
+        tag_is(var(receiver), value::OBJECT),
+        probe,
+        Vec::new(),
+        l,
+    ));
+    // One reservation (fixed four slots plus one per reference element) and
+    // then the pre-existing prologue roots. `root_enter` asserts the realm and
+    // physical budgets before the frame is linked, so a failed reservation is
+    // a VM resource failure, never a guest TypeError.
+    body.push(assign(
+        frame,
+        call(heap.root_enter, vec![var(c), var(capacity)]),
+        l,
+    ));
+    body.push(e.root(var(frame), int(0), var(receiver))?);
+    body.push(e.root(var(frame), int(1), var(this_arg))?);
+    body.push(e.root(var(frame), int(2), var(arg_array))?);
     let mut invoke = vec![
         assign(
             raw,
@@ -8342,54 +8520,108 @@ fn append_function_apply(
         expand,
         l,
     )];
-    // Source, bind, and Math.min/max share the expansion, including the 65535
-    // ceiling. Other intrinsics stay on the empty-array fallback below.
-    // Function.prototype (256) is never an extrema code and is never callable.
+    // Extrema keep the original expansion order but write every String and
+    // Object value into the consecutive guest roots reserved above. The
+    // post-entry scan consumes exactly the pre-entry physical-prefix count.
+    let mut extrema_expand = vec![
+        assign(cursor, int(0), l),
+        assign(root_count, int(0), l),
+        S::While {
+            condition: lt(var(cursor), var(arg_length)),
+            body: vec![
+                assign(
+                    item,
+                    call(heap.array_get, vec![var(c), var(arg_base), var(cursor)]),
+                    l,
+                ),
+                assign(
+                    empty,
+                    call(
+                        B::ArrayPush.call_index(),
+                        vec![E::MoveVar(empty), var(item)],
+                    ),
+                    l,
+                ),
+                branch(
+                    or(
+                        tag_is(var(item), value::STRING),
+                        tag_is(var(item), value::OBJECT),
+                    ),
+                    vec![
+                        e.root(var(frame), add(int(4), var(root_count)), var(item))?,
+                        assign(root_count, add(var(root_count), int(1)), l),
+                    ],
+                    Vec::new(),
+                    l,
+                ),
+                assign(cursor, add(var(cursor), int(1)), l),
+            ],
+            line: l,
+        },
+        assert_stmt(eq(var(root_count), var(reserved)), l),
+    ];
+    extrema_expand.extend(invoke.clone());
+    let extrema_forward = vec![branch(
+        lt(int(MAX_APPLY_ARGUMENTS), var(arg_length)),
+        fail.clone(),
+        extrema_expand,
+        l,
+    )];
+    // Source and bind keep the fixed four-slot frame; only the extrema arm
+    // uses the dynamic 4 + R reservation. Every other intrinsic stays on the
+    // empty-array fallback below. Function.prototype (256) is never an
+    // extrema code and is never callable.
     array_args.push(branch(
         and(
             or(
-                or(
-                    var(source),
-                    eq(var(target), int(super::intrinsics::FUNCTION_BIND_CODE)),
-                ),
-                super::math::extrema_target(var(target)),
+                var(source),
+                eq(var(target), int(super::intrinsics::FUNCTION_BIND_CODE)),
             ),
             and(lt(int(1), var(count)), var(dense)),
         ),
         forward,
-        // The else arm keeps the original intrinsic shape: exactly two
-        // arguments, a null thisArg, and an empty dense array. Every
-        // ingredient is required: `arg_length` defaults to zero for a
-        // non-array, so an `{length:0}` object or a zero-length typed array
-        // would otherwise slip through. Extrema targets never reach this arm.
         vec![branch(
             and(
+                super::math::extrema_target(var(target)),
+                and(lt(int(1), var(count)), var(dense)),
+            ),
+            extrema_forward,
+            // The else arm keeps the original intrinsic shape: exactly two
+            // arguments, a null thisArg, and an empty dense array. Every
+            // ingredient is required: `arg_length` defaults to zero for a
+            // non-array, so an `{length:0}` object or a zero-length typed
+            // array would otherwise slip through. Extrema targets never reach
+            // this arm.
+            vec![branch(
                 and(
-                    not(var(source)),
-                    not(eq(
-                        var(target),
-                        int(super::intrinsics::FUNCTION_BIND_CODE),
-                    )),
-                ),
-                and(
-                    not(eq(
-                        var(target),
-                        int(super::intrinsics::FUNCTION_PROTOTYPE_CODE),
-                    )),
                     and(
-                        var(dense),
+                        not(var(source)),
+                        not(eq(
+                            var(target),
+                            int(super::intrinsics::FUNCTION_BIND_CODE),
+                        )),
+                    ),
+                    and(
+                        not(eq(
+                            var(target),
+                            int(super::intrinsics::FUNCTION_PROTOTYPE_CODE),
+                        )),
                         and(
-                            eq(var(count), int(2)),
+                            var(dense),
                             and(
-                                tag_is(var(this_arg), value::NULL),
-                                eq(var(arg_length), int(0)),
+                                eq(var(count), int(2)),
+                                and(
+                                    tag_is(var(this_arg), value::NULL),
+                                    eq(var(arg_length), int(0)),
+                                ),
                             ),
                         ),
                     ),
                 ),
-            ),
-            invoke,
-            fail.clone(),
+                invoke,
+                fail.clone(),
+                l,
+            )],
             l,
         )],
         l,
@@ -8424,37 +8656,6 @@ fn append_function_apply(
         fail.clone(),
         l,
     ));
-    body.push(assign(
-        count,
-        call(B::Len.call_index(), vec![E::Borrow(Box::new(var(args)))]),
-        l,
-    ));
-    body.push(assign(
-        this_arg,
-        choose(
-            lt(int(1), var(count)),
-            call(
-                B::Get.call_index(),
-                vec![E::Borrow(Box::new(var(args))), int(0)],
-            ),
-            value::undefined(),
-        ),
-        l,
-    ));
-    body.push(assign(
-        arg_array,
-        choose(
-            lt(int(1), var(count)),
-            call(
-                B::Get.call_index(),
-                vec![E::Borrow(Box::new(var(args))), int(1)],
-            ),
-            value::undefined(),
-        ),
-        l,
-    ));
-    body.push(e.root(var(frame), int(1), var(this_arg))?);
-    body.push(e.root(var(frame), int(2), var(arg_array))?);
     body.push(branch(
         tag_is(var(receiver), value::OBJECT),
         callable,
