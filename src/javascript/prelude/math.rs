@@ -16,6 +16,14 @@ mod number;
 mod number_to_string;
 
 pub(crate) const FIRST_CODE: i64 = 512;
+/// `Math.max` / `Math.min`. Call and apply share this pair so the variadic
+/// forwarding gate cannot drift from numeric dispatch.
+pub(crate) const MAX_CODE: i64 = FIRST_CODE + 10;
+pub(crate) const MIN_CODE: i64 = FIRST_CODE + 11;
+
+pub(crate) fn extrema_target(target: E) -> E {
+    or(eq(target.clone(), int(MAX_CODE)), eq(target, int(MIN_CODE)))
+}
 pub(crate) const OBJECT_VALUE_OF: i64 = 534;
 pub(crate) const OBJECT_TO_STRING: i64 = 535;
 /// Parser, primitive converter, decimal rounder, and numeric call. The
@@ -776,8 +784,8 @@ pub(crate) fn append(
     let skip_slow = e.boolean()?;
     let first_string = e.boolean()?;
     let answer = e.boxed()?;
-    let max = FIRST_CODE + 10;
-    let min = FIRST_CODE + 11;
+    let max = MAX_CODE;
+    let min = MIN_CODE;
     let pow = FIRST_CODE + 12;
     let rand = FIRST_CODE + 13;
     let pi = FIRST_CODE + 18;

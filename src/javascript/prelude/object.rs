@@ -7915,14 +7915,16 @@ fn append_function_call(
     // A closed source function receives its whole argument vector: every
     // argument after thisArg is appended in order. A bound product forwards
     // it in exactly the same way; its own stored arguments are prepended by
-    // the bind adapter one dispatch level down. The gate below keys on the
-    // target's code cell, so intrinsic method nodes keep the old
-    // single-argument admission and the existing 286/353 TypedArray
-    // carve-outs remain the only intrinsic shapes that see extra arguments.
+    // the bind adapter one dispatch level down. Math.min/max are the only
+    // numeric intrinsics that also receive that vector; dispatch still owns
+    // numeric conversion. Every other intrinsic keeps the old admission.
     prefix.push(branch(
         or(
-            var(source),
-            eq(var(target), int(super::intrinsics::FUNCTION_BIND_CODE)),
+            or(
+                var(source),
+                eq(var(target), int(super::intrinsics::FUNCTION_BIND_CODE)),
+            ),
+            super::math::extrema_target(var(target)),
         ),
         vec![
             assign(cursor, int(1), l),
@@ -8051,17 +8053,23 @@ fn append_function_call(
         var(target),
         int(super::intrinsics::FUNCTION_PROTOTYPE_CODE),
     ));
+    let forwards_arguments = or(
+        or(
+            var(source),
+            eq(var(target), int(super::intrinsics::FUNCTION_BIND_CODE)),
+        ),
+        super::math::extrema_target(var(target)),
+    );
     let can_invoke = if e.lower.typed_array_used() {
         // `Error.prototype.toString` is a zero-arity method: upstream ignores
         // extra arguments, so `.call(e, 1, 2)` must reach the brand check with
         // `e` as thisArg instead of being refused at the argument gate.
+        // Math.min/max join the forwarding admission only; Object, other
+        // Error methods, TypedArray and ordinary intrinsics keep this gate.
         and(
             not_prototype.clone(),
             or(
-                or(
-                    var(source),
-                    eq(var(target), int(super::intrinsics::FUNCTION_BIND_CODE)),
-                ),
+                forwards_arguments,
                 or(
                     or(
                         var(typed_method),
@@ -8078,10 +8086,7 @@ fn append_function_call(
         and(
             not_prototype,
             or(
-                or(
-                    var(source),
-                    eq(var(target), int(super::intrinsics::FUNCTION_BIND_CODE)),
-                ),
+                forwards_arguments,
                 or(
                     eq(var(count), int(1)),
                     or(
@@ -8165,8 +8170,10 @@ const MAX_APPLY_ARGUMENTS: i64 = 65_535;
 /// argument keeps the throw, matching upstream `TypeError: not an array`.
 /// The intrinsic path keeps the pre-existing shape: exactly two arguments, a
 /// null thisArg, a callable function receiver, and an empty array object,
-/// invoked with an empty argument container. Neither the boxed argument array
-/// nor the fresh empty Core array is rooted as a Core array.
+/// invoked with an empty argument container. `Math.min`/`Math.max` do not use
+/// that fallback: they share the source/bind expansion above, including the
+/// 65535 ceiling. Neither the boxed argument array nor the fresh empty Core
+/// array is rooted as a Core array.
 fn append_function_apply(
     lower: &mut Lowerer<'_>,
     ir: &mut FrontendIr,
@@ -8335,21 +8342,26 @@ fn append_function_apply(
         expand,
         l,
     )];
-    // The intrinsic fallback keeps the original shape: exactly two arguments,
-    // a null thisArg, and an empty dense array. Every ingredient is required:
-    // `arg_length` defaults to zero for a non-array, so an `{length:0}` object
-    // or a zero-length typed array would otherwise slip through and invoke the
-    // target with no arguments. Source targets belong to the forward arm
-    // above, and Function.prototype (256) is never callable.
+    // Source, bind, and Math.min/max share the expansion, including the 65535
+    // ceiling. Other intrinsics stay on the empty-array fallback below.
+    // Function.prototype (256) is never an extrema code and is never callable.
     array_args.push(branch(
         and(
             or(
-                var(source),
-                eq(var(target), int(super::intrinsics::FUNCTION_BIND_CODE)),
+                or(
+                    var(source),
+                    eq(var(target), int(super::intrinsics::FUNCTION_BIND_CODE)),
+                ),
+                super::math::extrema_target(var(target)),
             ),
             and(lt(int(1), var(count)), var(dense)),
         ),
         forward,
+        // The else arm keeps the original intrinsic shape: exactly two
+        // arguments, a null thisArg, and an empty dense array. Every
+        // ingredient is required: `arg_length` defaults to zero for a
+        // non-array, so an `{length:0}` object or a zero-length typed array
+        // would otherwise slip through. Extrema targets never reach this arm.
         vec![branch(
             and(
                 and(
