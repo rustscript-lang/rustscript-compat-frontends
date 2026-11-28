@@ -2086,8 +2086,9 @@ fn typed_array176_refusals_and_brand() {
         var count = 0;
         var n = 0;
         try { Uint8Array((n = 1)); } catch (e) { if (e.name === "TypeError" && e.message === "must be called with new") count = count + 1; }
-        var bad = [function(){new Uint8Array();}, function(){new Uint8Array(4);},
-            function(){new Uint8Array([1]);}, function(x){new Uint8Array(x);},
+        var zero = new Uint8Array();
+        var four = new Uint8Array(4);
+        var bad = [function(){new Uint8Array([1]);}, function(x){new Uint8Array(x);},
             function(){new Uint8Array({});}, function(){Uint8Array.prototype.length;},
             function(x){x.extra = 3;}, function(x){x.fill(0);},
             function(){Object.getPrototypeOf(Uint8Array)();},
@@ -2098,7 +2099,8 @@ fn typed_array176_refusals_and_brand() {
             try { attempt(v); } catch (e) { if (e.name === "TypeError" && e.message === "unsupported object class") count = count + 1; }
             i = i + 1;
         }
-        n === 1 && count === 11;
+        n === 1 && count === 9 && zero.length === 0 &&
+            four.length === 4 && four.byteLength === 4;
     "#);
 }
 

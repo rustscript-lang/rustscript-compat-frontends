@@ -264,6 +264,10 @@ pub(super) struct Lowerer<'a> {
     /// around nested activations, like `function_args`.
     pub(super) arguments_object: Option<u16>,
     pub(super) array_buffer_used: std::cell::Cell<bool>,
+    /// Some reachable `new Uint8Array(...)` first actual cannot be proven
+    /// inside the per-buffer byte budget, so the owned-length route's fatal
+    /// host quota branch is live and needs the scalar adapter.
+    pub(super) typed_array_owned_quota_reachable: std::cell::Cell<bool>,
     pub(super) typed_array_elements: std::cell::Cell<u16>,
     /// Ordinary `Boolean(...)` only. A shadowed spelling does not select it.
     pub(super) boolean_used: std::cell::Cell<bool>,
@@ -7460,6 +7464,7 @@ helper_construct: None,
         arguments_sync: None,
         arguments_object: None,
         array_buffer_used: std::cell::Cell::new(false),
+        typed_array_owned_quota_reachable: std::cell::Cell::new(false),
         typed_array_elements: std::cell::Cell::new(0),
         boolean_used: std::cell::Cell::new(false),
         range_error_used: std::cell::Cell::new(false),
@@ -7982,6 +7987,7 @@ helper_construct: None,
         arguments_sync: None,
         arguments_object: None,
         array_buffer_used: std::cell::Cell::new(false),
+        typed_array_owned_quota_reachable: std::cell::Cell::new(false),
         typed_array_elements: std::cell::Cell::new(0),
         boolean_used: std::cell::Cell::new(false),
         range_error_used: std::cell::Cell::new(false),
@@ -8140,7 +8146,13 @@ helper_construct: None,
     // branch is dead and the catalog-free compile survives; the same adapter
     // serves the uncaught guest throw when that channel is open.
     let array_buffer_quota = array_buffer_used && throw_facts.array_buffer_quota_reachable;
-    let scalar_error_host = if catches_callee_throw || array_buffer_quota {
+    // The owned-length Uint8 route has its own fatal per-backing quota branch.
+    // It participates in the same adapter reachability: when a reachable site
+    // cannot prove its length inside the budget, the compile requires the
+    // adapter instead of degrading the branch to a guest RangeError.
+    let typed_array_quota =
+        lower.typed_array_used() && lower.typed_array_owned_quota_reachable.get();
+    let scalar_error_host = if catches_callee_throw || array_buffer_quota || typed_array_quota {
         Some(install_scalar_error_host(
             context,
             &mut base_ir,
@@ -8148,8 +8160,10 @@ helper_construct: None,
             probe_span,
             if catches_callee_throw {
                 "JavaScript uncaught throw"
-            } else {
+            } else if array_buffer_quota {
                 "JavaScript ArrayBuffer quota handling"
+            } else {
+                "JavaScript Uint8Array quota handling"
             },
         )?)
     } else {
@@ -8484,7 +8498,16 @@ helper_construct: None,
         }
         if lower.typed_array_used() {
             let helper = super::prelude::typed_array::append(
-                &mut lower, &mut base_ir, &carrier_schema, probe_span, &mut statements,
+                &mut lower,
+                &mut base_ir,
+                &carrier_schema,
+                probe_span,
+                &mut statements,
+                if typed_array_quota {
+                    scalar_error_host
+                } else {
+                    None
+                },
             )?;
             lower.intrinsics.as_mut().expect("typed array realm").typed_array = Some(helper);
         }

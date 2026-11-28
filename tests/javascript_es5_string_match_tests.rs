@@ -168,9 +168,10 @@ fn micro_string_match_non_regexp_arguments_raise_type_errors() {
 fn micro_string_match_array_like_arguments_raise_type_errors() {
     let source = concat!(
         "var t=0;",
+        "var view1=new Uint8Array(1);",
         "try{\"abc\".match([]);}catch(x){if(x.name===\"TypeError\")t=t+1;}",
         "try{\"abc\".match([\"a\"]);}catch(x){if(x.name===\"TypeError\")t=t+1;}",
-        "try{\"abc\".match(new Uint8Array(1));}catch(x){if(x.name===\"TypeError\")t=t+1;}",
+        "try{\"abc\".match(view1);}catch(x){if(x.name===\"TypeError\")t=t+1;}",
         "try{\"abc\".match(new ArrayBuffer(1));}catch(x){if(x.name===\"TypeError\")t=t+1;}",
         "t===4;"
     );

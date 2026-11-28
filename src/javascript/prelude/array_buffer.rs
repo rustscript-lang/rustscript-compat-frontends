@@ -143,6 +143,84 @@ pub(super) fn bootstrap(
     Ok(())
 }
 
+/// Emit the shared post-validation kind-7 backing allocation: reserve
+/// `BYTES_HEADER_CELLS + length` cells, write the prototype pair, byte length
+/// and every zero byte, then publish the backing into `frame[entry]` and
+/// return the boxed handle. The caller has already applied the guest index
+/// bound and the host byte quota, so this fragment only allocates.
+///
+/// Both `ArrayBuffer(length)` and the owned-length `Uint8Array(length)` route
+/// call this one fragment; neither calls the public constructor entry.
+pub(super) fn emit_bytes_allocation(
+    e: &mut Emit<'_, '_>,
+    length: u16,
+    proto: u16,
+    frame: u16,
+    entry: i64,
+    body: &mut Vec<S>,
+) -> Result<u16, ParseError> {
+    let l = e.line;
+    let c = e.carrier;
+    let heap = e.lower.heap_ref(e.span)?.helpers;
+    let allocation = e.temp(
+        value::allocation_schema(),
+        value::allocation(int(0), int(0), int(0)),
+    )?;
+    let base = e.integer()?;
+    let cursor = e.integer()?;
+    let bytes = e.boxed()?;
+    body.push(assign(
+        allocation,
+        call(
+            heap.node_begin,
+            vec![
+                var(c),
+                add(int(layout::BYTES_HEADER_CELLS), var(length)),
+                int(layout::KIND_BYTES),
+            ],
+        ),
+        l,
+    ));
+    body.push(assign(base, field(var(allocation), "base"), l));
+    body.extend([
+        e.write(add(var(base), int(2)), int(0))?,
+        e.write(add(var(base), int(3)), field(var(proto), "ref_slot"))?,
+        e.write(add(var(base), int(4)), field(var(proto), "generation"))?,
+        e.write(
+            add(var(base), int(layout::BYTES_LENGTH_OFFSET)),
+            var(length),
+        )?,
+        assign(cursor, int(0), l),
+    ]);
+    body.push(S::While {
+        condition: lt(var(cursor), var(length)),
+        body: vec![
+            e.write(
+                add(add(var(base), int(layout::BYTES_HEADER_CELLS)), var(cursor)),
+                E::Float(0.0),
+            )?,
+            assign(cursor, add(var(cursor), int(1)), l),
+        ],
+        line: l,
+    });
+    body.push(assign(
+        bytes,
+        call(
+            heap.node_publish,
+            vec![
+                var(c),
+                field(var(allocation), "slot"),
+                field(var(allocation), "generation"),
+                var(base),
+                var(frame),
+                int(entry),
+            ],
+        ),
+        l,
+    ));
+    Ok(bytes)
+}
+
 pub(crate) fn append(
     lower: &mut Lowerer<'_>,
     ir: &mut FrontendIr,
@@ -176,20 +254,14 @@ pub(crate) fn append(
     let frame = e.integer()?;
     let base = e.integer()?;
     let length = e.integer()?;
-    let cursor = e.integer()?;
     let raw = e.boxed()?;
     let primitive = e.boxed()?;
     let err = e.boxed()?;
     let proto = e.boxed()?;
-    let bytes = e.boxed()?;
     let number = e.temp(T::Number, E::Float(0.0))?;
     let converted = e.temp(
         value::value_result_schema(),
         result(value::value_result_schema(), true, value::undefined(), sp),
-    )?;
-    let allocation = e.temp(
-        value::allocation_schema(),
-        value::allocation(int(0), int(0), int(0)),
     )?;
     let ret = |v| assign(out, value::result_ok(value::completion_return(v), sp), l);
     let throw = |v| assign(out, value::result_err(v, sp), l);
@@ -309,55 +381,8 @@ pub(crate) fn append(
         eq(e.decoded(e.base(var(proto))), int(layout::KIND_OBJECT)),
         l,
     ));
-    make.extend([
-        assign(
-            allocation,
-            call(
-                heap.node_begin,
-                vec![
-                    var(c),
-                    add(int(layout::BYTES_HEADER_CELLS), var(length)),
-                    int(layout::KIND_BYTES),
-                ],
-            ),
-            l,
-        ),
-        assign(base, field(var(allocation), "base"), l),
-        e.write(add(var(base), int(2)), int(0))?,
-        e.write(add(var(base), int(3)), field(var(proto), "ref_slot"))?,
-        e.write(add(var(base), int(4)), field(var(proto), "generation"))?,
-        e.write(
-            add(var(base), int(layout::BYTES_LENGTH_OFFSET)),
-            var(length),
-        )?,
-        S::While {
-            condition: lt(var(cursor), var(length)),
-            body: vec![
-                e.write(
-                    add(add(var(base), int(layout::BYTES_HEADER_CELLS)), var(cursor)),
-                    E::Float(0.0),
-                )?,
-                assign(cursor, add(var(cursor), int(1)), l),
-            ],
-            line: l,
-        },
-        assign(
-            bytes,
-            call(
-                heap.node_publish,
-                vec![
-                    var(c),
-                    field(var(allocation), "slot"),
-                    field(var(allocation), "generation"),
-                    var(base),
-                    var(frame),
-                    int(2),
-                ],
-            ),
-            l,
-        ),
-        ret(var(bytes)),
-    ]);
+    let bytes = emit_bytes_allocation(&mut e, length, proto, frame, 2, &mut make)?;
+    make.push(ret(var(bytes)));
     let invalid = error(&mut e, "invalid array index", true)?;
     // The per-buffer quota is a fatal host error, separate from the guest
     // RangeError and checked before reserving any backing cells. Leave the

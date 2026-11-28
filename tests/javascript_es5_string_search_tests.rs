@@ -105,9 +105,10 @@ fn micro_string_search_non_regexp_arguments_raise_type_errors() {
 fn micro_string_search_array_like_arguments_raise_type_errors() {
     let source = concat!(
         "var t=0;",
+        "var view1=new Uint8Array(1);",
         "try{\"abc\".search([]);}catch(x){if(x.name===\"TypeError\")t=t+1;}",
         "try{\"abc\".search([\"a\"]);}catch(x){if(x.name===\"TypeError\")t=t+1;}",
-        "try{\"abc\".search(new Uint8Array(1));}catch(x){if(x.name===\"TypeError\")t=t+1;}",
+        "try{\"abc\".search(view1);}catch(x){if(x.name===\"TypeError\")t=t+1;}",
         "try{\"abc\".search(new ArrayBuffer(1));}catch(x){if(x.name===\"TypeError\")t=t+1;}",
         "t===4;"
     );

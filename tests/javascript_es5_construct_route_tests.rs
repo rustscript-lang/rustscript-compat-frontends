@@ -12,9 +12,9 @@
 //!   ordinary guest error value.
 //! * `new Object()`, `new Error("boom")` and `new Date(0)` keep the
 //!   catalog-free compile: no `typescript::throw_error` entry is required.
-//! * No TypedArray construction is provable: the admitted constructor takes
-//!   an ArrayBuffer object as its one actual, so zero actuals and numeric
-//!   literals are the guest TypeError "unsupported object class". Every one
+//! * No TypedArray construction is provable. Uint8Array now admits an owned
+//!   numeric length while the other eight classes still answer a numeric
+//!   actual with the guest TypeError "unsupported object class". Every one
 //!   of the nine routes therefore keeps the channel.
 //! * A proven Array literal (`new Array()`, `new Array(1,2)`) and a proven
 //!   ArrayBuffer length (`new ArrayBuffer(8)`) keep the catalog-free compile,
@@ -262,11 +262,14 @@ fn a5_caught_array_buffer_length_is_the_guest_range_error() {
 
 #[test]
 fn a6_caught_typed_array_argument_is_the_guest_error() {
-    // The admitted typed-array construction takes a buffer object as its first
-    // actual only, so a numeric actual is the guest TypeError
-    // "unsupported object class", not a RangeError. The route judgement is
-    // unaffected: either way the construction answers the Script with `Err`.
-    assert_catch_mask("new Uint8Array(-1);", 24.0);
+    // Uint8Array now converts a primitive first actual as an owned length, so
+    // -1 is the catchable RangeError "invalid array index". The route
+    // judgement is unaffected: either way the construction answers the Script
+    // with `Err`.
+    assert_catch_mask("new Uint8Array(-1);", 5.0);
+    // The other eight classes still reject a numeric actual with the guest
+    // TypeError "unsupported object class" (8 + 16).
+    assert_catch_mask("new Int8Array(-1);", 24.0);
 }
 
 #[test]
@@ -305,11 +308,11 @@ fn b2_literal_element_list_is_proven() {
 
 #[test]
 fn b3_literal_typed_array_argument_keeps_the_channel() {
-    // No TypedArray shape is a proven-safe construction: the admitted
-    // constructor requires an ArrayBuffer object as its first actual, so
-    // zero actuals and the numeric literal are both the guest TypeError
-    // "unsupported object class" (prelude/typed_array.rs). The route must
-    // keep the Script channel for all nine element classes.
+    // No TypedArray shape is a proven-safe construction: Uint8Array still
+    // answers a negative or oversized owned length with a guest RangeError,
+    // and the other eight classes still answer any numeric actual with the
+    // guest TypeError "unsupported object class" (prelude/typed_array.rs).
+    // The route must keep the Script channel for all nine element classes.
     for element in [
         "Uint8Array",
         "Int8Array",
@@ -449,18 +452,22 @@ fn b9_function_local_direct_array_buffer_quota_is_fatal() {
 
 #[test]
 fn c1_typed_array_constructs_use_the_script_throw_channel() {
-    // With the adapter installed, the zero-argument and numeric-literal
-    // TypedArray constructions publish the ordinary uncaught guest throw and
-    // are catchable as the guest TypeError "unsupported object class" (8+16).
-    // Without the route's channel they would abort with a host assertion
-    // instead.
-    for source in ["new Uint8Array();", "new Uint8Array(4);"] {
+    // With the adapter installed, a negative owned Uint8 length publishes the
+    // ordinary uncaught guest RangeError and is catchable as "invalid array
+    // index" (1 + 4). The other eight classes keep the guest TypeError
+    // "unsupported object class" (8 + 16). Without the route's channel both
+    // would abort with a host assertion instead.
+    for (source, mask) in [
+        ("new Uint8Array(-1);", 5.0),
+        ("new Int8Array(4);", 24.0),
+        ("new Float64Array(4);", 24.0),
+    ] {
         let error = run_error(source);
         assert!(
             error.contains("uncaught JavaScript throw"),
             "{source} must publish the guest throw: {error}"
         );
-        assert_catch_mask(source, 24.0);
+        assert_catch_mask(source, mask);
     }
 }
 

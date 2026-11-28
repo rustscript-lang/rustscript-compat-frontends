@@ -2145,7 +2145,8 @@ function j(a){"use strict";return a;}
 var hit=0;
 try{j.apply(null,{});}catch(e){if(e.name==="TypeError"){hit=hit+1;}}
 try{j.apply(null,{length:0});}catch(e){if(e.name==="TypeError"){hit=hit+1;}}
-try{j.apply(null,new Uint8Array(0));}catch(e){if(e.name==="TypeError"){hit=hit+1;}}
+var typed0=new Uint8Array(0);
+try{j.apply(null,typed0);}catch(e){if(e.name==="TypeError"){hit=hit+1;}}
 try{j.apply(null);}catch(e){if(e.name==="TypeError"){hit=hit+1;}}
 try{j.apply(null,"ab");}catch(e){if(e.name==="TypeError"){hit=hit+1;}}
 try{j.apply(null,null);}catch(e){if(e.name==="TypeError"){hit=hit+1;}}

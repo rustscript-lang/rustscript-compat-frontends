@@ -575,6 +575,7 @@ pub(crate) fn append(
     carrier_schema: &T,
     span: swc_common::Span,
     stmts: &mut Vec<S>,
+    quota_error_host: Option<u16>,
 ) -> Result<u16, ParseError> {
     let index = super::heap::fresh_index(lower, ir, span)?;
     let heap = lower.heap_ref(span)?.helpers;
@@ -744,7 +745,7 @@ pub(crate) fn append(
         invalid_length,
         l,
     ));
-    let mut bad_index = invalid_index;
+    let mut bad_index = invalid_index.clone();
     bad_index.push(assign(failed, E::Bool(true), l));
     let mut bad_offset = invalid_offset;
     bad_offset.push(assign(failed, E::Bool(true), l));
@@ -808,6 +809,173 @@ pub(crate) fn append(
             vec![thrown(var(err)), assign(failed, E::Bool(true), l)],
         )?,
     ];
+    // --- Owned-length `new Uint8Array(length)` ---------------------------
+    // The first actual is converted exactly once, after every actual
+    // expression already evaluated in JS order. Trailing actuals are never
+    // read by this path, so their valueOf/toString hooks never run.
+    //
+    // Order is load-bearing: the guest index domain is decided before the
+    // host byte quota, so 1073741824 is the catchable RangeError while 32769
+    // is the fatal host error. Both decisions happen before any root frame
+    // or node is reserved.
+    let quota_sink = e.temp(T::Null, E::Null)?;
+    let quota_failure = match quota_error_host {
+        Some(adapter) => vec![assign(
+            quota_sink,
+            call(
+                adapter,
+                vec![E::String(
+                    "array buffer length exceeds host quota".to_owned(),
+                )],
+            ),
+            l,
+        )],
+        // No reachable owned-length site can exceed the budget; keep the
+        // branch a fatal trap rather than degrading it to a guest RangeError.
+        None => vec![assert_stmt(E::Bool(false), l)],
+    };
+    let mut owned = vec![
+        assign(n, number(&e, parser, buffer), l),
+        // JS_ToInt32Sat truncates toward zero and saturates; NaN becomes +0.
+        // `-0.9` therefore truncates to -0 and passes the non-negative test.
+        assign(
+            n,
+            choose(
+                eq(var(n), var(n)),
+                num(call(B::MathTrunc.call_index(), vec![num(var(n))])),
+                E::Float(0.0),
+            ),
+            l,
+        ),
+    ];
+    let mut allocate = Vec::new();
+    {
+        // The ArrayBuffer prototype is permanently reachable from the
+        // constructor's immutable `prototype` row; read it as a slot/generation
+        // handle so a collection during the backing reservation cannot stale it.
+        allocate.push(assign(
+            frame,
+            call(heap.root_enter, vec![var(c), int(2)]),
+            l,
+        ));
+        allocate.push(assign(
+            proto,
+            call(
+                intr.root,
+                vec![
+                    var(c),
+                    int(intrinsics::array_buffer_constructor_root(e.lower)),
+                ],
+            ),
+            l,
+        ));
+        allocate.push(assign(base, e.base(var(proto)), l));
+        allocate.push(assign(
+            proto,
+            value::dynamic_value(
+                int(value::OBJECT),
+                E::Float(0.0),
+                E::Bool(false),
+                e.decoded(add(
+                    var(base),
+                    int(layout::FUNCTION_CELLS + layout::OBJECT_CELLS_PER_PROPERTY + 5),
+                )),
+                e.generation(add(
+                    var(base),
+                    int(layout::FUNCTION_CELLS + layout::OBJECT_CELLS_PER_PROPERTY + 6),
+                )),
+            ),
+            l,
+        ));
+        let bytes = super::array_buffer::emit_bytes_allocation(
+            &mut e, len, proto, frame, 0, &mut allocate,
+        )?;
+        // The publication committed the backing into frame[0]: it is rooted
+        // before the view reservation can collect.
+        allocate.push(assign(buffer, var(bytes), l));
+        // The concrete Uint8Array prototype is immutable on its constructor.
+        allocate.push(assign(
+            base,
+            e.base(call(intr.root, vec![var(c), var(root)])),
+            l,
+        ));
+        allocate.push(assign(
+            proto,
+            value::dynamic_value(
+                int(value::OBJECT),
+                E::Float(0.0),
+                E::Bool(false),
+                e.decoded(add(
+                    var(base),
+                    int(layout::FUNCTION_CELLS + layout::OBJECT_CELLS_PER_PROPERTY + 5),
+                )),
+                e.generation(add(
+                    var(base),
+                    int(layout::FUNCTION_CELLS + layout::OBJECT_CELLS_PER_PROPERTY + 6),
+                )),
+            ),
+            l,
+        ));
+        // Reservation may collect. The backing slot/generation are read back
+        // from the rooted publication handle, never from a stale base local.
+        allocate.push(assign(
+            alloc,
+            call(
+                heap.node_begin,
+                vec![var(c), int(layout::VIEW_CELLS), int(layout::KIND_VIEW)],
+            ),
+            l,
+        ));
+        allocate.push(assign(base, field(var(alloc), "base"), l));
+        for (off, cell) in [
+            (2, int(0)),
+            (3, field(var(proto), "ref_slot")),
+            (4, field(var(proto), "generation")),
+            (layout::VIEW_BUFFER, field(var(buffer), "ref_slot")),
+            (layout::VIEW_BUFFER + 1, field(var(buffer), "generation")),
+            (layout::VIEW_OFFSET, int(0)),
+            (layout::VIEW_LENGTH, var(len)),
+            (layout::VIEW_ELEMENT, int(Element::Uint8 as i64)),
+            (layout::VIEW_WIDTH, int(1)),
+        ] {
+            allocate.push(e.write(add(var(base), int(off)), cell)?);
+        }
+        allocate.push(assign(
+            view,
+            call(
+                heap.node_publish,
+                vec![
+                    var(c),
+                    field(var(alloc), "slot"),
+                    field(var(alloc), "generation"),
+                    var(base),
+                    var(frame),
+                    int(1),
+                ],
+            ),
+            l,
+        ));
+        allocate.push(ret(var(view)));
+        allocate.push(e.effect(heap.root_leave, vec![var(c), var(frame)])?);
+    }
+    owned.push(branch(
+        or(
+            lt(var(n), E::Float(0.0)),
+            lt(E::Float(((1_i64 << 30) - 1) as f64), var(n)),
+        ),
+        invalid_index.clone(),
+        vec![branch(
+            lt(E::Float(layout::BYTES_MAX_LENGTH as f64), var(n)),
+            quota_failure,
+            {
+                let mut success = vec![assign(len, call(e.decode, vec![num(var(n))]), l)];
+                success.extend(allocate);
+                success
+            },
+            l,
+        )],
+        l,
+    ));
     build.extend([
         assign(frame, call(heap.root_enter, vec![var(c), int(1)]), l),
         assign(len, int(-1), l),
@@ -848,29 +1016,44 @@ pub(crate) fn append(
             call(B::Len.call_index(), vec![E::Borrow(Box::new(var(args)))]),
             l,
         ),
+        assign(buffer, value::undefined(), l),
         branch(
-            and(lt(int(0), var(argc)), lt(var(argc), int(4))),
-            vec![
-                assign(buffer, at(int(0)), l),
-                branch(
-                    tag_is(var(buffer), value::OBJECT),
-                    vec![
-                        assign(base, e.base(var(buffer)), l),
-                        branch(
-                            eq(e.decoded(var(base)), int(layout::KIND_BYTES)),
-                            build,
-                            unsupported.clone(),
-                            l,
-                        ),
-                    ],
-                    unsupported.clone(),
-                    l,
-                ),
-            ],
-            unsupported.clone(),
+            lt(int(0), var(argc)),
+            vec![assign(buffer, at(int(0)), l)],
+            Vec::new(),
             l,
         ),
     ]);
+    // A non-object first actual is the owned-length form. An object stays on
+    // the existing shared-window path and still answers the guest TypeError
+    // for every class other than the real kind-7 backing.
+    construct.push(branch(
+        and(
+            eq(var(element), int(Element::Uint8 as i64)),
+            not(tag_is(var(buffer), value::OBJECT)),
+        ),
+        owned,
+        vec![branch(
+            and(lt(int(0), var(argc)), lt(var(argc), int(4))),
+            vec![branch(
+                tag_is(var(buffer), value::OBJECT),
+                vec![
+                    assign(base, e.base(var(buffer)), l),
+                    branch(
+                        eq(e.decoded(var(base)), int(layout::KIND_BYTES)),
+                        build,
+                        unsupported.clone(),
+                        l,
+                    ),
+                ],
+                unsupported.clone(),
+                l,
+            )],
+            unsupported.clone(),
+            l,
+        )],
+        l,
+    ));
     let methods = methods::emit(&mut e, mode, receiver, args, out)?;
     let body = vec![branch(
         not(lt(int(0), var(mode))),

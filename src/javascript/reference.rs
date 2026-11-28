@@ -6515,11 +6515,11 @@ impl ConstructRoute {
                 [arg] => proven_count(&arg.expr).is_some(),
                 _ => false,
             },
-            // The admitted TypedArray constructor takes an ArrayBuffer object
-            // as its first actual (prelude/typed_array.rs): zero actuals and
-            // numeric literals both answer the guest TypeError "unsupported
-            // object class". No shape makes the `Err` branch unreachable, so
-            // the nine element classes always keep the channel.
+            // The admitted TypedArray constructor still answers a guest `Err`
+            // for some actuals: Uint8Array rejects a negative or oversized
+            // owned length and the other eight classes reject every numeric
+            // actual (prelude/typed_array.rs). No shape makes the `Err` branch
+            // unreachable, so the nine element classes always keep the channel.
             Self::TypedArray { .. } => false,
             Self::Object { .. }
             | Self::Error
@@ -6565,6 +6565,19 @@ fn proven_count(expression: &ast::Expr) -> Option<f64> {
         && value <= PROVEN_COUNT_MAX
         && value.fract() == 0.0)
         .then_some(value)
+}
+
+/// True when an owned-length `new Uint8Array(...)` site can reach the fatal
+/// host byte quota: zero actuals allocate zero bytes, and one proven literal
+/// count is below `PROVEN_COUNT_MAX` (and so below `BYTES_MAX_LENGTH`). Every
+/// other first actual, including a variable, string or spread, may convert to
+/// a length above the quota, so the adapter demand is conservative.
+fn u8_owned_length_may_exceed_quota(construct: &ast::NewExpr) -> bool {
+    let args = construct.args.as_deref().unwrap_or_default();
+    match args {
+        [] => false,
+        [first, ..] => first.spread.is_some() || proven_count(&first.expr).is_none(),
+    }
 }
 
 /// The `new` call the admitted argument/completion path lowers for one
@@ -6802,9 +6815,21 @@ fn validate_new_expr(
     // below consumes what `construct_route` decided instead of re-deriving the
     // binding questions.
     match construct_route(Some(lower), construct) {
-        ConstructRoute::Array(call)
-        | ConstructRoute::ArrayBuffer(call)
-        | ConstructRoute::TypedArray { call, .. } => {
+        ConstructRoute::Array(call) | ConstructRoute::ArrayBuffer(call) => {
+            validate_expr(lower, &ast::Expr::Call(call), facts)
+        }
+        ConstructRoute::TypedArray { call, element } => {
+            // Owned-length Uint8 allocation needs the ArrayBuffer realm for
+            // the backing prototype pair and its `byteLength` getter, even
+            // when the source never spells `ArrayBuffer` itself. Merely
+            // reading the constructor name does not reach this walk.
+            if matches!(element, Element::Uint8) {
+                lower.needs_ordinary_realm.set(true);
+                lower.array_buffer_used.set(true);
+                if u8_owned_length_may_exceed_quota(construct) {
+                    lower.typed_array_owned_quota_reachable.set(true);
+                }
+            }
             validate_expr(lower, &ast::Expr::Call(call), facts)
         }
         ConstructRoute::Object { .. } => validate_new_object(lower, construct),
