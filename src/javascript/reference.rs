@@ -1244,8 +1244,10 @@ impl SourceScan<'_> {
         // route. Keep the conservative deferred answer so the fatal host error
         // cannot silently degrade into a catchable guest RangeError. The
         // proof here cannot resolve identifiers, so only literals qualify.
-        if deferred
-            && self.lower.is_some()
+        // The same conservative answer covers a catch handler whose collected
+        // scope is missing: no name inside it can be resolved, so a shadowed
+        // `NaN`/`ArrayBuffer` must never keep the enclosing builtin answer.
+        if self.lower.is_some()
             && self.scope.is_none()
             && first_actual_may_reach_byte_quota(construct, None, None)
         {
@@ -1308,12 +1310,23 @@ impl SourceScan<'_> {
                 }
                 self.statements(&guarded.block.stmts, deferred);
                 if let Some(handler) = &guarded.handler {
+                    let saved_scope = self.scope;
+                    // Validation and emission install the collected catch
+                    // scope for this handler body. Enter the same key so a
+                    // catch parameter that shadows `NaN` or `ArrayBuffer`
+                    // cannot keep its builtin meaning here. A missing entry
+                    // leaves the body unresolvable, and `note_construct`
+                    // keeps the conservative fatal-quota answer.
+                    self.scope = self.catch_handler_scope(handler);
                     if let Some(param) = &handler.param {
                         self.pat(param, deferred);
                     }
                     self.statements(&handler.body.stmts, deferred);
+                    self.scope = saved_scope;
                 }
                 if let Some(finalizer) = &guarded.finalizer {
+                    // `finally` runs in the try statement's own scope, never
+                    // in the catch parameter's scope.
                     self.statements(&finalizer.stmts, deferred);
                 }
             }
@@ -1386,6 +1399,19 @@ impl SourceScan<'_> {
                 self.expr(init, deferred);
             }
         }
+    }
+
+    /// The collected lexical scope of one catch handler. Validation and
+    /// emission key the same `catch_scopes` entry by the handler span; the
+    /// scan must use that exact scope so every binding decision agrees.
+    fn catch_handler_scope(&self, handler: &ast::CatchClause) -> Option<ScopeId> {
+        self.lower.and_then(|lower| {
+            lower
+                .graph
+                .catch_scopes
+                .get(&(handler.span.lo.0, handler.span.hi.0))
+                .copied()
+        })
     }
 
     /// A function body is a deferred activation: everything inside it is

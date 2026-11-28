@@ -594,3 +594,108 @@ fn b12_owned_uint8_first_actual_domain_matches_the_runtime() {
         );
     }
 }
+
+// ------------------- catch handler lexical scope vs. the fatal quota --
+
+/// The catch parameter shadows the builtin `NaN`, so the first actual is the
+/// captured number and emission reads a reachable fatal quota. The scan must
+/// enter the same catch scope validation and emission use; answering from
+/// the enclosing function scope would mistake the spelling for the builtin
+/// NaN and conclude that the quota branch is unreachable.
+const CATCH_SHADOW_NAN_QUOTA: &str = "function f() {\
+     try { throw 32769; }\
+     catch (NaN) {\
+       try { new ArrayBuffer(NaN); }\
+       catch (e) { return 1; }\
+     }\
+     return 0;\
+   }";
+
+#[test]
+fn d1_catch_shadowed_nan_needs_the_public_array_buffer_quota_adapter() {
+    // No Script-position call or throw: the only adapter demand is the
+    // reachable public ArrayBuffer quota, so the missing-catalog refusal
+    // carries that classification and not the uncaught-throw one.
+    let error = compile_without_throw_error(CATCH_SHADOW_NAN_QUOTA)
+        .expect_err("the captured NaN must make the public ArrayBuffer quota reachable");
+    assert!(
+        error.contains("JavaScript ArrayBuffer quota handling"),
+        "the refusal must be classified as the public ArrayBuffer quota: {error}"
+    );
+    assert!(
+        !error.contains("JavaScript Uint8Array quota handling"),
+        "the public route must not be classified as the owned Uint8 quota: {error}"
+    );
+}
+
+#[test]
+fn d2_catch_shadowed_nan_quota_is_a_fatal_host_error() {
+    let source = format!("{CATCH_SHADOW_NAN_QUOTA}\nf();");
+    let error = run_error(&source);
+    assert!(
+        error.contains("HostError(\"array buffer length exceeds host quota\")"),
+        "the captured 32769 must reach the fatal host quota: {error}"
+    );
+    assert!(
+        !error.contains("uncaught JavaScript throw"),
+        "no guest catch may observe the fatal quota: {error}"
+    );
+}
+
+#[test]
+fn d3_catch_handler_scope_restores_after_the_handler() {
+    // After the handler the function scope is back: `NaN` is the builtin
+    // again, so this construction cannot reach the fatal quota. A scan that
+    // leaks the catch scope past the handler refuses this source.
+    let source = "function f() {\
+        try { throw 1; } catch (NaN) { }\
+        new ArrayBuffer(NaN);\
+        return 0;\
+    }";
+    compile_without_throw_error(source)
+        .unwrap_or_else(|error| panic!("the handler scope must end at the handler: {error}"));
+}
+
+#[test]
+fn d4_nested_catch_handlers_resolve_their_own_scopes() {
+    // The inner handler body resolves `NaN` through its own catch scope and
+    // then the outer catch binding, so the first actual is unproven. The
+    // enclosing function scope would still spell the builtin NaN.
+    let source = "function f() {\
+        try { throw 1; } catch (NaN) {\
+          try { throw 2; } catch (e) { new ArrayBuffer(NaN); }\
+        }\
+        return 0;\
+    }";
+    let error = compile_without_throw_error(source)
+        .expect_err("the inner handler must resolve NaN through the outer catch binding");
+    assert!(
+        error.contains("JavaScript ArrayBuffer quota handling"),
+        "the nested handler must reach the public ArrayBuffer quota: {error}"
+    );
+}
+
+#[test]
+fn d5_catch_parameter_shadowing_array_buffer_is_not_the_builtin_route() {
+    // The inner catch parameter shadows the callee spelling, so the scan must
+    // not classify this `new` as the builtin public ArrayBuffer route. The
+    // source-construction slice itself refuses a catch parameter as callee,
+    // but the refusal must stay that admitted-shape diagnostic and must not
+    // become a false fatal-quota demand for the builtin route.
+    let source = "function f(x) {\
+        try { throw 1; } catch (e) {\
+          try { throw 2; } catch (ArrayBuffer) { new ArrayBuffer(x); }\
+        }\
+        return 0;\
+    }";
+    let error = compile_without_throw_error(source)
+        .expect_err("a catch parameter is not an admitted source constructor");
+    assert!(
+        error.contains("unsupported JavaScript ES5 P0 primitive expression"),
+        "the shadowed callee must keep the source-construct refusal: {error}"
+    );
+    assert!(
+        !error.contains("JavaScript ArrayBuffer quota handling"),
+        "the shadowed callee must not be classified as the builtin public route: {error}"
+    );
+}
