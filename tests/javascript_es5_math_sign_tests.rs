@@ -7,8 +7,10 @@
 //! is NaN, and `length` is the callable arity 1. Direct calls, an extracted
 //! `var S = Math.sign` alias and the borrowed `o.f = S; o.f(...)` shape are all
 //! covered, and `this` is ignored. The host checks only the final boxed Number:
-//! tag 3 with exact IEEE-754 bits for finite values, infinities and signed
-//! zeros; NaN is only a semantic category, never a payload. Additional
+//! tag 3 whose payload is a host `Float`; finite values, infinities and signed
+//! zeros compare exact IEEE-754 bits, while NaN is only the `Float::is_nan`
+//! category, never a payload assertion. An `Int` or other non-Float payload is
+//! an immediate test failure instead of being widened to `f64`. Additional
 //! one-expression receipts pin `+0`, `-0`, `+1`, `-1` and the two NaN routes.
 //!
 //! The accepted subset (`P`) is exactly ordinary JS ES5 through the certified,
@@ -241,19 +243,31 @@ fn execute(source: &str) -> Value {
         .expect("test thread")
 }
 
-fn number_bits(source: &str) -> (i64, u64) {
-    let result = execute(source);
-    let tag = match field(&result, "tag") {
+/// Host-side strict reader for a boxed Number completion.
+///
+/// The value must be a boxed Number (`tag` 3) whose payload is exactly
+/// `Value::Float`. An `Int` payload is never widened with `as f64`: the
+/// interpreter represents every `Math.sign` product as a host `Float`, so any
+/// other payload is an immediate assertion failure, not an accepted number.
+fn number_payload(result: &Value, source: &str) -> (i64, f64) {
+    let tag = match field(result, "tag") {
         Value::Int(tag) => tag,
         other => panic!("tag: {other:?}\n{source}"),
     };
-    let bits = match field(&result, "number") {
-        Value::Float(number) => number.to_bits(),
-        Value::Int(number) => (number as f64).to_bits(),
-        other => panic!("number: {other:?}\n{source}"),
+    assert_eq!(tag, 3, "{source}: boxed Number tag {tag}");
+    let number = match field(result, "number") {
+        Value::Float(number) => number,
+        other => panic!("boxed Number payload must be Float, got {other:?}\n{source}"),
     };
+    (tag, number)
+}
+
+fn number_bits(source: &str) -> (i64, u64) {
+    let result = execute(source);
+    let (tag, number) = number_payload(&result, source);
+    let bits = number.to_bits();
     eprintln!(
-        "MATH_SIGN_NUMBER tag={tag} bits={bits:#x} value={}",
+        "MATH_SIGN_NUMBER tag={tag} payload=Float bits={bits:#x} value={}",
         f64::from_bits(bits)
     );
     (tag, bits)
@@ -284,6 +298,10 @@ fn only_method(source: &str, method: &str) {
 
 fn expect_bits(method: &str, source: &str, expected: f64) {
     only_method(source, method);
+    eprintln!(
+        "MATH_SIGN_CASE source={source} expected_bits={:#x}",
+        expected.to_bits()
+    );
     let (tag, bits) = number_bits(source);
     assert_eq!(tag, 3, "{source}");
     assert!(
@@ -295,12 +313,11 @@ fn expect_bits(method: &str, source: &str, expected: f64) {
 
 fn expect_nan_class(method: &str, source: &str) {
     only_method(source, method);
-    let (tag, bits) = number_bits(source);
+    let result = execute(source);
+    let (tag, number) = number_payload(&result, source);
     assert_eq!(tag, 3, "{source}");
-    assert!(
-        f64::from_bits(bits).is_nan(),
-        "{source} NaN class bits={bits:#x}"
-    );
+    assert!(number.is_nan(), "{source} NaN class value={number}");
+    eprintln!("MATH_SIGN_NAN tag={tag} payload=Float value={number} source={source}");
 }
 
 /// Pinned MicroQuickJS oracle program, executed byte-for-byte by both engines.
@@ -393,6 +410,7 @@ fn p8_math_sign_interpreter() {
     // exact boxed -1 that distinguishes sign from abs/identity, and with
     // bounded fuel and no AOT/JIT-native execution.
     only_method(SIGN_CASE, "sign");
+    eprintln!("MATH_SIGN_CASE source=SIGN_CASE completion=S(-2.5)");
     let (tag, bits) = number_bits(SIGN_CASE);
     assert_eq!(tag, 3, "completion must be a boxed Number");
     assert_eq!(bits, (-1.0f64).to_bits(), "sign(-2.5) exact bits");
